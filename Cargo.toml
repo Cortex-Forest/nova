@@ -1,0 +1,57 @@
+# =============================================================================
+# Nova Chain — Cargo Workspace 根
+# PHASE 1: Project Foundation
+#
+# 命名约定（ADR-0001）：
+#   - 所有 package 统一使用 `nova-*` 前缀，避免与标准库/公共 crate 混淆
+#   - 版本统一由 workspace.package 管理，禁止各 crate 自定版本
+#   - 公共依赖统一声明于 [workspace.dependencies]，crate 一律 workspace=true 引用
+# =============================================================================
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/consensus",
+    "crates/crypto",
+    "crates/execution",
+    "crates/network",
+    "crates/node",
+    "crates/rpc",
+    "crates/storage",
+    "crates/wallet",
+]
+
+# ---------------------------------------------------------------------------
+# 统一版本 / 元数据（各 crate 通过 `.workspace = true` 继承，禁止各自指定）
+# ---------------------------------------------------------------------------
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.96"
+description = "Nova Chain — a modular Layer1 blockchain for AI & digital creation ecosystem."
+
+# ---------------------------------------------------------------------------
+# Workspace 级 lints（crate 通过 `[lints] workspace = true` 继承）
+#   - unsafe_code = forbid : 生产代码默认禁止 unsafe（Master Prompt §53）
+# ---------------------------------------------------------------------------
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# ---------------------------------------------------------------------------
+# Workspace Dependency Policy（ADR-0001 §4）
+#   - 所有公共依赖统一在此声明版本
+#   - 各 crate 通过 `foo.workspace = true` 引用，禁止自行升级
+#   - PHASE 1：零第三方运行时依赖（无业务实现）
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+
+# ---------------------------------------------------------------------------
+# Nova Chain 统一版本概念（Software / Protocol / Database / API 四者分离）
+# ---------------------------------------------------------------------------
+[workspace.metadata.nova]
+software-version = "0.1.0"
+protocol-version = "0.1"
+database-version = "1"
+api-version = "v1"

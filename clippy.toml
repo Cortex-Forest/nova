@@ -1,0 +1,2 @@
+# Nova Chain clippy 配置（PHASE 1）
+# 当前无自定义阈值；lint 规则由 [workspace.lints] 统一管理。

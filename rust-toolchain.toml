@@ -1,0 +1,6 @@
+# Nova Chain 工具链锁定（ADR-0001）
+# 注意：本机 rustup 代理不在 PATH，此文件在 CI 中由 dtolnay/rust-toolchain 遵循。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

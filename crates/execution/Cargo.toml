@@ -1,0 +1,14 @@
+[package]
+name = "nova-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Nova Chain WASM execution layer (PHASE 1 placeholder)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# PHASE 1：零第三方运行时依赖。
+# WASM 运行时（Wasmtime 或评审等价）与确定性策略待 ADR-0010 评审后引入。

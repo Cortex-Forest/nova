@@ -1,0 +1,24 @@
+[package]
+name = "nova-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Nova Chain node assembly layer (PHASE 1 placeholder)"
+
+[lints]
+workspace = true
+
+# ---------------------------------------------------------------------------
+# Feature Flags 机制（Master Prompt §11）
+# PHASE 1 仅建立机制占位，不实现任何网络逻辑。
+# 实际网络参数差异归入后续 Phase（Genesis / Config）。
+# ---------------------------------------------------------------------------
+[features]
+default = []
+devnet = []
+testnet = []
+mainnet = []
+
+[dependencies]
+# PHASE 1：零第三方运行时依赖

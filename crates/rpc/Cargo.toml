@@ -1,0 +1,14 @@
+[package]
+name = "nova-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Nova Chain RPC / API layer (PHASE 1 placeholder)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# PHASE 1：零第三方运行时依赖。
+# RPC 接口契约（API Contract First）待 ADR-0011 评审后定义。
