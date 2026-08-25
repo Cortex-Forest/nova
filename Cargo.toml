@@ -50,8 +50,13 @@ unsafe_code = "forbid"
 # --- PHASE 2 STEP 1（测试向量基础设施，仅 dev 用途） ---
 # serde_json：JSON 向量解析（test-vectors crate 依赖；非协议编码，见 crypto-test-vectors-v1.md §3）
 serde_json = "1"
-# sha2：SHA-256 用于 loader 重算 message_hash（仅测试向量重算；生产 hash API 在 STEP 2 实现）
+# sha2：SHA-256（test-vectors loader 重算 + STEP 2 protocol_hash）
 sha2 = "0.10"
+# --- PHASE 2 STEP 2（Hash Infrastructure） ---
+# blake3：内容哈希（ADR-0006；链下用途）
+blake3 = "1"
+# criterion：benchmark harness（dev）
+criterion = "0.5"
 
 # ---------------------------------------------------------------------------
 # Nova Chain 统一版本概念（Software / Protocol / Database / API 四者分离）

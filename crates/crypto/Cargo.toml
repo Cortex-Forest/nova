@@ -4,11 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Nova Chain cryptography infrastructure (PHASE 1 placeholder)"
+description = "Nova Chain cryptography infrastructure"
 
 [lints]
 workspace = true
 
 [dependencies]
-# PHASE 1：零第三方运行时依赖。
-# 密码学库选型（Ed25519/secp256k1/hash/CSPRNG/BLS12-381）必须经 ADR-0003 评审后引入。
+# STEP 2（Hash Infrastructure）：
+# - sha2：协议哈希 SHA-256（protocol_hash，ADR-0006）
+# - blake3：内容哈希（content_hash，链下用途）
+sha2.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+# criterion benchmark 需要禁用默认 test harness
+[[bench]]
+name = "hash_bench"
+harness = false
