@@ -42,8 +42,13 @@ PHASE 1 只建立工程基础，禁止提前实现任何区块链核心功能。
 8. **四版本分离**：Software `0.1.0` / Protocol `0.1` / Database `1` / API `v1`，
    各自独立定义，禁止混用。
 
-9. **错误处理基线**：统一 `Result<T,E>`；生产代码禁止 `unwrap()/expect()/panic!`；
-   仅允许明确不可恢复的内部不变量失败（须注释理由 + 代码审查）。
+9. **错误处理基线（分层边界式，非集中式大杂烩）**：统一 `Result<T,E>`；生产代码禁止
+   `unwrap()/expect()/panic!`；仅允许明确不可恢复的内部不变量失败（须注释理由 + 代码审查）。
+   - `NovaError`（nova-core）只是**根接口标记**，不承载具体错误数据；
+   - `ErrorKind` 仅作**分类标签**（模块边界标识），不是把所有错误塞进一个枚举；
+   - 每个 crate 应拥有**自己的具体错误类型**（如未来的 `CryptoError`/`StorageError`/…），
+     通过明确的边界（`From`/映射）向上一层转换；
+   - **禁止**把跨模块错误集中到一个 NovaError 枚举里（会导致模块强耦合，破坏依赖方向）。
 
 10. **日志基线**：structured logging 约定（levels: error/warn/info/debug/trace；
     模块名 `nova::<crate>::<module>`；事件名 `nova.<crate>.<event>`）；禁止生产 `println!`。
@@ -56,8 +61,12 @@ PHASE 1 只建立工程基础，禁止提前实现任何区块链核心功能。
 
 13. **License**: **Apache-2.0**（宽松、Rust 生态主流，利于依赖合规；可经新 ADR 改为 MIT）。
 
-14. **工具链与 lints**：`rust-toolchain.toml` 锁定 stable + rustfmt/clippy；
+14. **工具链与 lints**：`rust-toolchain.toml` 锁定 **Rust 1.96.1**（当前批准的 stable，含安全修复），
+    本地与 CI 统一（CI 由 dtolnay/rust-toolchain 遵循该文件）；
     `[workspace.lints.rust] unsafe_code = "forbid"`（Master Prompt §53）。
+    **重要认知**：`unsafe_code = "forbid"` 只是减少一类 Rust 内存安全风险，**不是安全证明**——
+    它不能证明共识/密码学/状态机/P2P/经济模型正确，仍需 fuzz、property testing、
+    故障注入与外部安全审计（Master Prompt §58-66）。
 
 ## Alternatives（已评估并否决）
 

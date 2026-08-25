@@ -17,6 +17,13 @@
 | Regression Test | 任何修复必加回归测试 | 全程 |
 | Differential Test | 核心模块差分测试 | 核心模块 |
 
+## Smoke Test 的定位（重要）
+
+- 当前各 crate 的 smoke test 只证明一件事：**工程骨架能编译、测试基础设施可用**。
+- 它**不证明** Nova Core / 共识 / 状态机等任何协议逻辑的正确性。
+- **不把 smoke test 数量当作品质宣传**；协议正确性由各模块的单元/集成/
+  property/fuzz/故障注入测试证明（Master Prompt §58）。
+
 ## 本地命令
 
 ```bash

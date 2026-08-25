@@ -13,6 +13,12 @@
 - `unsafe_code = "forbid"`（workspace 级）。
 - `Cargo.lock` 提交锁定（可复现、防依赖投毒）。
 
+## 安全认知（重要）
+
+- `unsafe_code = "forbid"` **不是安全证明**——它只减少一类 Rust 内存安全风险。
+- 它不能证明：共识正确 / 密码学正确 / 状态机正确 / P2P 安全 / 经济模型安全。
+- 这些仍须通过：fuzz、property testing、故障注入、外部安全审计（Master Prompt §58-66）。
+
 ## 待落实（后续 Phase）
 
 - 每核心模块完成后的 Threat Modeling + Security Review + 攻击面分析（Master Prompt §65）。
