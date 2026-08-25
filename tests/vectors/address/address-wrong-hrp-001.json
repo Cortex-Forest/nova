@@ -1,0 +1,11 @@
+{
+  "id": "address-wrong-hrp-001",
+  "category": "address",
+  "address": "bitcoin1placeholder00000000000000000000000000000",
+  "network_id": 1,
+  "address_type": 1,
+  "address_version": 1,
+  "schema_expected": "VALID",
+  "expected": "INVALID",
+  "note": "wrong HRP (not nova/novat/novad); codec-level rejection DEFERRED_VALIDATION"
+}

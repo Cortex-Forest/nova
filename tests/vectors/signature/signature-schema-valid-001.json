@@ -1,0 +1,15 @@
+{
+  "algorithm_id": 1,
+  "canonical_payload": "0001",
+  "category": "signature",
+  "chain_id": 1,
+  "domain_id": 1,
+  "expected": "VALID",
+  "id": "signature-schema-valid-001",
+  "message_hash": "25fc2a046274ad057bfbbf4e600e476efcf6542ebf2b29fe1aeffe426e990d0f",
+  "note": "placeholder key/sig; Ed25519 verification is DEFERRED_VALIDATION in STEP 1",
+  "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+  "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "signed_bytes": "01010100000000000000020000000001",
+  "validation_scope": "CRYPTO"
+}

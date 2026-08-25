@@ -1,0 +1,11 @@
+{
+  "id": "address-wrong-network-001",
+  "category": "address",
+  "address": "nova1placeholder00000000000000000000000000000",
+  "network_id": 153,
+  "address_type": 1,
+  "address_version": 1,
+  "schema_expected": "INVALID",
+  "expected": "INVALID",
+  "note": "network_id 0x99 not registered -> schema-level rejection"
+}

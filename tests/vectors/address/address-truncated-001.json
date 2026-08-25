@@ -1,0 +1,11 @@
+{
+  "id": "address-truncated-001",
+  "category": "address",
+  "address": "nova1placeholder",
+  "network_id": 1,
+  "address_type": 1,
+  "address_version": 1,
+  "schema_expected": "VALID",
+  "expected": "INVALID",
+  "note": "truncated address; codec-level rejection DEFERRED_VALIDATION"
+}

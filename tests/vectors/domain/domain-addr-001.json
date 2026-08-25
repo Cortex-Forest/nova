@@ -1,0 +1,11 @@
+{
+  "algorithm_id": 1,
+  "canonical_payload": "0001",
+  "category": "domain",
+  "chain_id": 1,
+  "domain_id": 5,
+  "expected": "VALID",
+  "id": "domain-addr-001",
+  "message_hash": "ad6d340c773dd7004114541ebfc9afb11db03506697527ec21ac25de2dc84079",
+  "signed_bytes": "01050100000000000000020000000001"
+}

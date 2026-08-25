@@ -1,0 +1,13 @@
+{
+  "id": "domain-inconsistent-signed-001",
+  "category": "domain",
+  "algorithm_id": 1,
+  "domain_id": 1,
+  "chain_id": 1,
+  "canonical_payload": "0001",
+  "signed_bytes": "00",
+  "message_hash": "0000",
+  "expected": "INVALID",
+  "backfill": false,
+  "note": "signed_bytes intentionally inconsistent with recomputation -> loader must detect"
+}

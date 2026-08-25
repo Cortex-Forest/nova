@@ -1,0 +1,11 @@
+{
+  "id": "address-devnet-valid-001",
+  "category": "address",
+  "address": "novad1placeholder00000000000000000000000000000",
+  "network_id": 3,
+  "address_type": 1,
+  "address_version": 1,
+  "schema_expected": "VALID",
+  "expected": "VALID",
+  "note": "placeholder address string; codec validation DEFERRED_VALIDATION (STEP 5)"
+}

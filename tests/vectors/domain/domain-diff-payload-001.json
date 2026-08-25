@@ -1,0 +1,11 @@
+{
+  "algorithm_id": 1,
+  "canonical_payload": "000102",
+  "category": "domain",
+  "chain_id": 1,
+  "domain_id": 1,
+  "expected": "VALID",
+  "id": "domain-diff-payload-001",
+  "message_hash": "d21ea0a8109aca5de362dfedb5f7c0b2f9e9139eb888834e64d973d9b597f8de",
+  "signed_bytes": "0101010000000000000003000000000102"
+}

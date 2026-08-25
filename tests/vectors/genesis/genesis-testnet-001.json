@@ -1,0 +1,13 @@
+{
+  "id": "genesis-testnet-001",
+  "category": "genesis",
+  "network_id": 2,
+  "chain_id": 2,
+  "genesis_timestamp": 1,
+  "initial_validator_set": [],
+  "initial_accounts": [],
+  "protocol_parameters": {},
+  "economics_parameters": {},
+  "expected_genesis_hash": "",
+  "note": "minimal genesis fixture; genesis_hash computation DEFERRED_VALIDATION (PHASE 7 canonical freeze)"
+}

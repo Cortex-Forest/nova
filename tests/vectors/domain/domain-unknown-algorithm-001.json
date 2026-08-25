@@ -1,0 +1,12 @@
+{
+  "algorithm_id": 2,
+  "canonical_payload": "0001",
+  "category": "domain",
+  "chain_id": 1,
+  "domain_id": 1,
+  "expected": "INVALID",
+  "id": "domain-unknown-algorithm-001",
+  "message_hash": "defa4ab8369f3a5654c287bd0cedd4db4750ba3316a7e5b71b0950e17bc13b00",
+  "note": "algorithm_id 0x02 reserved/unimplemented -> must reject, no fallback to Ed25519",
+  "signed_bytes": "02010100000000000000020000000001"
+}

@@ -1,0 +1,11 @@
+{
+  "algorithm_id": 1,
+  "canonical_payload": "0001",
+  "category": "domain",
+  "chain_id": 1,
+  "domain_id": 4,
+  "expected": "VALID",
+  "id": "domain-gov-001",
+  "message_hash": "12c6658a03f6e9ce3c31afd967dd6c4935fd388f397208d70a966e3f2d18b210",
+  "signed_bytes": "01040100000000000000020000000001"
+}

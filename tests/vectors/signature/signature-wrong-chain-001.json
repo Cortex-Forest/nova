@@ -1,0 +1,15 @@
+{
+  "algorithm_id": 1,
+  "canonical_payload": "0001",
+  "category": "signature",
+  "chain_id": 2,
+  "domain_id": 1,
+  "expected": "INVALID",
+  "id": "signature-wrong-chain-001",
+  "message_hash": "47f8180590da42510703b27d49578a2c1232fa3b0615863a02071893833bba2d",
+  "note": "signature produced for a different chain_id; verification DEFERRED_VALIDATION",
+  "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+  "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+  "signed_bytes": "01010200000000000000020000000001",
+  "validation_scope": "CRYPTO"
+}

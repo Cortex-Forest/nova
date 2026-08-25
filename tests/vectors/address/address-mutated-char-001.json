@@ -1,0 +1,11 @@
+{
+  "id": "address-mutated-char-001",
+  "category": "address",
+  "address": "nova1placeholder00000000000000000000000000001",
+  "network_id": 1,
+  "address_type": 1,
+  "address_version": 1,
+  "schema_expected": "VALID",
+  "expected": "INVALID",
+  "note": "mutated trailing character; codec-level rejection DEFERRED_VALIDATION"
+}

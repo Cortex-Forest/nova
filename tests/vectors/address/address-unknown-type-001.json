@@ -1,0 +1,11 @@
+{
+  "id": "address-unknown-type-001",
+  "category": "address",
+  "address": "nova1placeholder00000000000000000000000000000",
+  "network_id": 1,
+  "address_type": 0,
+  "address_version": 1,
+  "schema_expected": "INVALID",
+  "expected": "INVALID",
+  "note": "address_type 0x00 invalid -> schema-level rejection"
+}

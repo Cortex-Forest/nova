@@ -1,0 +1,11 @@
+{
+  "id": "address-mixed-case-001",
+  "category": "address",
+  "address": "nOvA1placeholder00000000000000000000000000000",
+  "network_id": 1,
+  "address_type": 1,
+  "address_version": 1,
+  "schema_expected": "VALID",
+  "expected": "INVALID",
+  "note": "mixed-case address; canonical case handling DEFERRED_VALIDATION"
+}

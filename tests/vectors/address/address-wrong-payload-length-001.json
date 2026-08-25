@@ -1,0 +1,11 @@
+{
+  "id": "address-wrong-payload-length-001",
+  "category": "address",
+  "address": "nova1short",
+  "network_id": 1,
+  "address_type": 1,
+  "address_version": 1,
+  "schema_expected": "VALID",
+  "expected": "INVALID",
+  "note": "wrong payload length (short); codec-level rejection DEFERRED_VALIDATION"
+}
