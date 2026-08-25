@@ -374,6 +374,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "criterion",
+ "serde_json",
  "sha2",
 ]
 
@@ -401,8 +402,8 @@ version = "0.1.0"
 name = "nova-test-vectors"
 version = "0.1.0"
 dependencies = [
+ "nova-crypto",
  "serde_json",
- "sha2",
 ]
 
 [[package]]

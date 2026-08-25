@@ -4,7 +4,6 @@
 use crate::hex;
 use crate::json;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 /// 冻结注册的 `domain_id`（ADR-0005 Domain Registry）。
 pub const DOMAIN_TRANSACTION: u8 = 0x01;
@@ -36,6 +35,10 @@ pub fn is_implemented_algorithm(algorithm_id: u8) -> bool {
 /// 构造 signed_bytes 的错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildSignedBytesError {
+    /// 未知/未注册 domain_id（拒绝，禁 fallback）。
+    UnknownDomainId(u8),
+    /// 未知/未实现 algorithm_id（拒绝，禁 fallback）。
+    UnknownAlgorithmId(u8),
     /// canonical_payload 长度超出 u32。
     PayloadTooLarge(usize),
 }
@@ -43,6 +46,8 @@ pub enum BuildSignedBytesError {
 impl fmt::Display for BuildSignedBytesError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownDomainId(id) => write!(f, "unknown domain_id: {id:#04x}"),
+            Self::UnknownAlgorithmId(id) => write!(f, "unknown algorithm_id: {id:#04x}"),
             Self::PayloadTooLarge(n) => write!(f, "canonical_payload too large: {n} bytes"),
         }
     }
@@ -54,28 +59,31 @@ use std::fmt;
 
 /// 冻结签名上下文构造（crypto-serialization-v1.md §10）：
 /// `algorithm_id(1B) || domain_id(1B) || chain_id(8B LE) || payload_length(4B LE) || payload`。
+///
+/// **委托** `nova_crypto::domain`（STEP 3 正式实现）——测试夹具不重复定义协议。
 pub fn build_signed_bytes(
     algorithm_id: u8,
     domain_id: u8,
     chain_id: u64,
     canonical_payload: &[u8],
 ) -> Result<Vec<u8>, BuildSignedBytesError> {
-    let len = u32::try_from(canonical_payload.len())
-        .map_err(|_| BuildSignedBytesError::PayloadTooLarge(canonical_payload.len()))?;
-    let mut out = Vec::with_capacity(1 + 1 + 8 + 4 + canonical_payload.len());
-    out.push(algorithm_id);
-    out.push(domain_id);
-    out.extend_from_slice(&chain_id.to_le_bytes());
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(canonical_payload);
-    Ok(out)
+    let alg = nova_crypto::domain::AlgorithmId::try_from(algorithm_id)
+        .map_err(|_| BuildSignedBytesError::UnknownAlgorithmId(algorithm_id))?;
+    let dom = nova_crypto::domain::DomainId::try_from(domain_id)
+        .map_err(|_| BuildSignedBytesError::UnknownDomainId(domain_id))?;
+    match nova_crypto::domain::build_signed_bytes(alg, dom, chain_id, canonical_payload) {
+        Ok(v) => Ok(v),
+        Err(nova_crypto::domain::DomainError::PayloadTooLarge(n)) => {
+            Err(BuildSignedBytesError::PayloadTooLarge(n))
+        }
+        // 不可达：alg/dom 已通过 TryFrom 校验。
+        Err(_) => Err(BuildSignedBytesError::PayloadTooLarge(0)),
+    }
 }
 
-/// 计算 `message_hash = SHA-256(signed_bytes)`。
+/// 计算 `message_hash = SHA-256(signed_bytes)`（委托 `nova_crypto::hash::protocol_hash`）。
 pub fn compute_message_hash(signed_bytes: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(signed_bytes);
-    h.finalize().into()
+    nova_crypto::hash::protocol_hash(signed_bytes)
 }
 
 /// Domain 向量校验结果。

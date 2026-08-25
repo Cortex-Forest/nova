@@ -18,6 +18,8 @@ blake3.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# 向量接入测试（domain_vectors.rs）解析 STEP 1 JSON 向量
+serde_json.workspace = true
 
 # criterion benchmark 需要禁用默认 test harness
 [[bench]]

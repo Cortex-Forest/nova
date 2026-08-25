@@ -3,6 +3,8 @@
 //! # 模块
 //! - [`hash`]：**STEP 2 已实现**——`protocol_hash`（SHA-256，协议承诺）与
 //!   `content_hash`（BLAKE3，链下内容哈希）。API 边界见 ADR-0006 / ADR-0013。
+//! - [`domain`]：**STEP 3 已实现**——`DomainId`/`AlgorithmId` 注册表校验、
+//!   `signed_bytes` 构造（crypto-serialization-v1.md §10）、`SigningMessageHash` newtype。
 //! - 签名（Ed25519）、密钥、地址：后续 STEP（经 ADR-0002/0004/0007 评审后实现）。
 //!
 //! # 纪律（Master Prompt §15/§16）
@@ -10,4 +12,5 @@
 //! - 具体选型经 ADR 评审（ADR-0003 / ADR-0006 / ADR-0012）。
 //! - 生产代码禁止 `unsafe`（workspace lints）。
 
+pub mod domain;
 pub mod hash;
