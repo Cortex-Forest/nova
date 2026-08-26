@@ -23,17 +23,20 @@
 
 ## 各对象签名覆盖（待对应 Phase 规范最终定稿）
 
-### 1. Transaction（PHASE 4 交易模型 ADR 定稿）
+### 1. Transaction（PHASE 3 交易模型 ADR-0019 定稿）
 
 **签名字段**（顺序固定，canonical 编码）：
 
 ```
 version || chain_id || nonce || sender || receiver || amount
-|| gas_limit || gas_price || transaction_type || payload
-|| expiration (如启用) || fee_payer (如启用)
+|| gas_limit || gas_price || transaction_type || payload || expiration
 ```
 
-**不签名**：`signature` 自身；执行后派生数据（`gas_used`/`receipt`/`events`）。
+- **V0.1 `fee_payer = sender`**：不设置独立 `fee_payer` 字段（ADR-0019 §1）。
+  未来引入 fee delegation ⇒ **必须升级 Transaction Version + 新 ADR**（不得向后兼容新增）。
+
+**不签名**：`signature` 自身；`txid`（= SHA-256(canonical_tx_payload ‖ signature)，
+完整交易承诺）；执行后派生数据（`gas_used`/`receipt`/`events`）。
 
 ### 2. Validator Vote（PHASE 9/10 共识规范定稿）
 

@@ -145,3 +145,34 @@ canonical_account_bytes =
 - Trie key = `NovaAddressPayload` raw bytes（35B）；value 与 key 绑定构成完整账户状态
   （ADR-0018 安全不变量）。
 - State Root 聚合 / trie 结构 / 空根 / proof / 持久化：**STEP 8（Storage）** 冻结。
+
+## 13. Transaction Canonical Serialization（ADR-0019）
+
+**canonical_tx_payload**（签名覆盖字段，ADR-0009 §1 顺序固定；**signature 不进入**）：
+
+```
+canonical_tx_payload =
+    version(1B)
+  ‖ chain_id(8B LE)
+  ‖ nonce(8B LE)
+  ‖ sender(35B payload)
+  ‖ receiver(35B payload)
+  ‖ amount(16B LE)
+  ‖ gas_limit(8B LE)
+  ‖ gas_price(16B LE)
+  ‖ transaction_type(1B)
+  ‖ payload_length(u32 LE) ‖ payload
+  ‖ expiration(8B LE)
+```
+
+**完整交易（txid preimage）**：
+
+```
+canonical_transaction_bytes = canonical_tx_payload ‖ signature(64B)
+txid = SHA-256(canonical_transaction_bytes)
+```
+
+- `signed_bytes = algorithm_id(1B) ‖ domain_id(1B, 0x01) ‖ chain_id(8B LE) ‖
+  payload_length(4B LE) ‖ canonical_tx_payload`（本文件 §10）。
+- **必须验证 `Transaction.chain_id == signed_bytes.chain_id`**（双绑；不一致 ⇒ Invalid）。
+- `txid` 含 signature；**txid 不进入 signature coverage**（ADR-0009）。

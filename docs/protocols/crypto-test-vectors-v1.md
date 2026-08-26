@@ -179,3 +179,39 @@ canonical 编码或 `genesis_hash` 计算（`expected_genesis_hash` 在 STEP 6 I
 
 - 账户模型：ADR-0017。
 - 账户承诺 / 序列化：ADR-0018、`crypto-serialization-v1.md` §12。
+
+## 9. Transaction 向量需求（预留，STEP 7H 启用）
+
+交易 Schema / 编码 / 签名 / txid 规范见 **ADR-0019 / ADR-0020**、`crypto-serialization-v1.md` §13。
+**预留向量分类**（STEP 7H Transaction Test Vectors 实现后生成 fixture）：
+
+| 类别 | 断言 |
+|------|------|
+| transfer-valid | 合法 Transfer 通过 admission + 签名验证 + txid 一致 |
+| wrong-chain-id | `chain_id` ≠ 当前链 ⇒ Invalid（含 payload 与 signed_bytes 不一致） |
+| wrong-domain | `domain_id` ≠ 0x01 ⇒ Invalid |
+| wrong-version | `version` ≠ 0x01 ⇒ Invalid |
+| wrong-transaction-type | `transaction_type` 未知/Reserved ⇒ `UnknownTransactionType` |
+| expired | `current_height > expiration` ⇒ Invalid |
+| nonce-too-low | `tx.nonce < account.nonce` ⇒ Invalid |
+| nonce-gap-too-large | future nonce gap > `MAX_FUTURE_NONCE_GAP` ⇒ Mempool reject（policy） |
+| same-nonce-conflict | 同 sender+nonce 第二笔 ⇒ Reject（V0.1 无 replacement） |
+| zero-value | `amount=0` 允许；不创建 receiver；付 gas + nonce |
+| self-transfer | `sender==receiver` 允许；net=0、nonce+1、fee 扣 |
+| contract-receiver-rejected | `receiver.address_type == 0x02`（Contract Reserved）⇒ Reject |
+| gas-mul-overflow | `checked_mul(gas_limit, gas_price)` 溢出 ⇒ Reject |
+| amount-plus-fee-overflow | `checked_add(amount, fee_max)` 溢出 ⇒ Reject |
+| payload-too-large | `size > max_tx_bytes` 或 payload 超限 ⇒ Invalid |
+| signature-invalid | 坏签名 ⇒ Invalid（nonce/balance/state 不变） |
+| txid-with-signature | `txid = SHA-256(canonical_tx_payload ‖ signature)` 与独立重算一致 |
+
+- Mempool policy 类（nonce-gap / lifetime / anti-spam）为**节点本地策略**，**不进入 consensus
+  state**；向量仅验证协议层语义，policy 值（`MAX_FUTURE_NONCE_GAP=64`、`MAX_TX_LIFETIME=100_000`）
+  在节点实现文档标注。
+
+## 10. 来源（Transaction）
+
+- 交易模型 / 编码 / 签名 / txid / 状态机：ADR-0019、`crypto-serialization-v1.md` §13。
+- 交易类型注册表：ADR-0020。
+- 签名覆盖：ADR-0009 §1。
+- 账户交互：ADR-0017。
