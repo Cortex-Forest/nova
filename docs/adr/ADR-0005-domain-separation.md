@@ -55,9 +55,9 @@ message_hash = SHA-256(signed_bytes)
 
 **约束**：
 - 每个域都必须绑定 `chain_id`（ADR-0010/0011；防跨链重放，Master Prompt §10）。
-- **签名上下文 = `domain_id + algorithm_id + chain_id + canonical_payload`**（ADR-0012）；
-  `algorithm_id` **进入 signed bytes**（显式算法绑定；即使 domain separation 已足够，
-  显式纳入提供纵深防御，且签名自包含算法信息）。
+- **签名上下文 = `algorithm_id + domain_id + chain_id + canonical_payload`**（ADR-0012；
+  与上表字段顺序一致：`algorithm_id` 在前，进入 signed bytes——显式算法绑定；
+  即使 domain separation 已足够，显式纳入提供纵深防御，且签名自包含算法信息）。
 - Ed25519 统一采用"前置域哈希"方案（对 `signed_bytes` 做 SHA-256 后签名），
   不依赖 RFC 8032 context 扩展（跨方案一致、避免实现差异）。
 - 未来新增任何签名域必须先在本 ADR 登记 `domain_id`，禁止临时编码。
