@@ -1,0 +1,23 @@
+[package]
+name = "nova-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# 注意：本 crate **不加入** workspace members——避免 libfuzzer-sys 污染 stable
+# production build。运行需 nightly（方案 B：CI 专门 fuzz job，主工程保持 stable 1.96.1）。
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nova-crypto = { path = "../crates/crypto" }
+
+[[bin]]
+name = "signature_decode"
+path = "fuzz_targets/signature_decode.rs"
+
+[[bin]]
+name = "domain_message_decode"
+path = "fuzz_targets/domain_message_decode.rs"

@@ -15,6 +15,13 @@ workspace = true
 # - blake3：内容哈希（content_hash，链下用途）
 sha2.workspace = true
 blake3.workspace = true
+# STEP 4（Ed25519 Signature）：
+# - ed25519-dalek：成熟 Ed25519 库（禁止自研；zeroize feature ⇒ Drop 自动零化 secret）
+# - getrandom：OS 熵源（无 fallback）
+# - zeroize：密钥材料零化
+ed25519-dalek = { workspace = true, features = ["zeroize"] }
+getrandom.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

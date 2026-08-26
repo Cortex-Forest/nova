@@ -57,6 +57,13 @@ sha2 = "0.10"
 blake3 = "1"
 # criterion：benchmark harness（dev）
 criterion = "0.5"
+# --- PHASE 2 STEP 4（Ed25519 Signature） ---
+# ed25519-dalek：Ed25519（RFC 8032；features 在引用处声明，如 zeroize）
+ed25519-dalek = "3.0"
+# getrandom：OS 熵源（SysRng/fill，无 fallback）
+getrandom = "0.3"
+# zeroize：密钥材料零化
+zeroize = "1"
 
 # ---------------------------------------------------------------------------
 # Nova Chain 统一版本概念（Software / Protocol / Database / API 四者分离）
