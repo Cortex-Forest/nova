@@ -1,11 +1,12 @@
 {
-  "id": "address-wrong-network-001",
-  "category": "address",
-  "address": "nova1placeholder00000000000000000000000000000",
-  "network_id": 153,
+  "address": "novat1qyqsr2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2atfg044f",
   "address_type": 1,
   "address_version": 1,
-  "schema_expected": "INVALID",
+  "category": "address",
   "expected": "INVALID",
-  "note": "network_id 0x99 not registered -> schema-level rejection"
+  "expected_error": "NetworkMismatch",
+  "id": "address-wrong-network-001",
+  "key_hash": "abababababababababababababababababababababababababababababababab",
+  "network_id": 1,
+  "note": "HRP 网络 novat 与 payload network_id=mainnet 不一致"
 }

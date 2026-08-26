@@ -1,11 +1,12 @@
 {
-  "id": "address-unknown-version-001",
-  "category": "address",
-  "address": "nova1placeholder00000000000000000000000000000",
-  "network_id": 1,
+  "address": "nova1qgqsr2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2atjuzuvw",
   "address_type": 1,
   "address_version": 2,
-  "schema_expected": "INVALID",
+  "category": "address",
   "expected": "INVALID",
-  "note": "address_version 0x02 unsupported -> schema-level rejection"
+  "expected_error": "UnsupportedVersion",
+  "id": "address-unknown-version-001",
+  "key_hash": "abababababababababababababababababababababababababababababababab",
+  "network_id": 1,
+  "note": "address_version=0x02 未注册（当前 0x01）"
 }

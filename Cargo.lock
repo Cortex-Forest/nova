@@ -36,6 +36,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "bech32"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efbd3e1070bbdf4cd88a75264e18e8a26f7cb5c6949eadf0ceb85fb159cf08f8"
+
+[[package]]
 name = "blake3"
 version = "1.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -476,6 +482,7 @@ version = "0.1.0"
 name = "nova-crypto"
 version = "0.1.0"
 dependencies = [
+ "bech32",
  "blake3",
  "criterion",
  "ed25519-dalek",
@@ -509,6 +516,7 @@ version = "0.1.0"
 name = "nova-test-vectors"
 version = "0.1.0"
 dependencies = [
+ "bech32",
  "nova-crypto",
  "serde_json",
 ]

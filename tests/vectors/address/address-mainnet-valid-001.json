@@ -1,11 +1,12 @@
 {
-  "id": "address-mainnet-valid-001",
-  "category": "address",
-  "address": "nova1placeholder00000000000000000000000000000",
-  "network_id": 1,
+  "address": "nova1qyqsr2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at78vsjf",
   "address_type": 1,
   "address_version": 1,
-  "schema_expected": "VALID",
+  "category": "address",
   "expected": "VALID",
-  "note": "placeholder address string; codec validation DEFERRED_VALIDATION (STEP 5)"
+  "expected_error": null,
+  "id": "address-mainnet-valid-001",
+  "key_hash": "abababababababababababababababababababababababababababababababab",
+  "network_id": 1,
+  "note": "mainnet user account (canonical nova1...)"
 }

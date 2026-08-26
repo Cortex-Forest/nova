@@ -1,11 +1,12 @@
 {
-  "id": "address-uppercase-001",
-  "category": "address",
-  "address": "NOVA1PLACEHOLDER00000000000000000000000000000",
-  "network_id": 1,
+  "address": "NOVA1QYQSR2AT4W46H2AT4W46H2AT4W46H2AT4W46H2AT4W46H2AT4W46H2AT78VSJF",
   "address_type": 1,
   "address_version": 1,
-  "schema_expected": "VALID",
+  "category": "address",
   "expected": "INVALID",
-  "note": "uppercase address; canonical case handling DEFERRED_VALIDATION"
+  "expected_error": "NonCanonicalCase",
+  "id": "address-uppercase-001",
+  "key_hash": "abababababababababababababababababababababababababababababababab",
+  "network_id": 1,
+  "note": "全大写地址拒绝（canonical 为小写）"
 }

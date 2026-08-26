@@ -1,11 +1,12 @@
 {
-  "id": "address-unknown-type-001",
-  "category": "address",
-  "address": "nova1placeholder00000000000000000000000000000",
-  "network_id": 1,
-  "address_type": 0,
+  "address": "nova1qxvsr2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2ats2n63t",
+  "address_type": 153,
   "address_version": 1,
-  "schema_expected": "INVALID",
+  "category": "address",
   "expected": "INVALID",
-  "note": "address_type 0x00 invalid -> schema-level rejection"
+  "expected_error": "UnknownAddressType",
+  "id": "address-unknown-type-001",
+  "key_hash": "abababababababababababababababababababababababababababababababab",
+  "network_id": 1,
+  "note": "address_type=0x99 未注册（仅 0x01 User Account）"
 }

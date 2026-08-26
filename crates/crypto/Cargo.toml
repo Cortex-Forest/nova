@@ -22,6 +22,8 @@ blake3.workspace = true
 ed25519-dalek = { workspace = true, features = ["zeroize"] }
 getrandom.workspace = true
 zeroize.workspace = true
+# STEP 5（Address Encoding）：bech32（Bech32m-derived，ADR-0004）
+bech32.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

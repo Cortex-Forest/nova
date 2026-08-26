@@ -1,11 +1,12 @@
 {
-  "id": "address-wrong-hrp-001",
-  "category": "address",
-  "address": "bitcoin1placeholder00000000000000000000000000000",
-  "network_id": 1,
+  "address": "bitcoin1qyqsr2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at6pz5ks",
   "address_type": 1,
   "address_version": 1,
-  "schema_expected": "VALID",
+  "category": "address",
   "expected": "INVALID",
-  "note": "wrong HRP (not nova/novat/novad); codec-level rejection DEFERRED_VALIDATION"
+  "expected_error": "InvalidHrp",
+  "id": "address-wrong-hrp-001",
+  "key_hash": "abababababababababababababababababababababababababababababababab",
+  "network_id": 1,
+  "note": "HRP 'bitcoin' 未注册（非 nova/novat/novad）"
 }

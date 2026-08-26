@@ -228,23 +228,25 @@ const ADDRESS_VECTORS: &[(&str, &str)] = &[
 fn address_vectors_validate() {
     for (id, json) in ADDRESS_VECTORS {
         let r = validate_address_vector(json);
-        let schema_expected = vector_field(json, "schema_expected");
-        if schema_expected == "VALID" {
+        let expected = vector_field(json, "expected");
+        assert!(
+            !r.codec_deferred,
+            "VECTOR FAILED\nID: {id}\nFIELD: codec status\nEXPECTED: NOT deferred (STEP 5)\nACTUAL: deferred"
+        );
+        if expected == "VALID" {
             assert!(
                 r.ok,
-                "VECTOR FAILED\nID: {id}\nFIELD: schema (network/version/type)\nEXPECTED: valid\nACTUAL: {:?}\nSPEC: ADR-0004 decode rules",
+                "VECTOR FAILED\nID: {id}\nFIELD: codec (decode + field match + canonical roundtrip)\nEXPECTED: valid\nACTUAL: {:?}\nSPEC: ADR-0004 decode rules",
                 r.errors
             );
         } else {
             assert!(
-                !r.ok,
-                "VECTOR FAILED\nID: {id}\nFIELD: schema (network/version/type)\nEXPECTED: invalid\nACTUAL: accepted\nSPEC: ADR-0004 decode rules"
+                r.ok,
+                "VECTOR FAILED\nID: {id}\nFIELD: codec (reject + error category)\nEXPECTED: invalid ({})\nACTUAL: {:?}\nSPEC: ADR-0004 decode rules",
+                vector_field(json, "expected_error"),
+                r.errors
             );
         }
-        assert!(
-            r.codec_deferred,
-            "VECTOR FAILED\nID: {id}\nFIELD: codec status\nEXPECTED: DEFERRED_VALIDATION\nACTUAL: not deferred"
-        );
     }
     assert_eq!(ADDRESS_VECTORS.len(), 14);
 }

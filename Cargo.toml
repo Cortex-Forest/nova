@@ -64,6 +64,9 @@ ed25519-dalek = "3.0"
 getrandom = "0.3"
 # zeroize：密钥材料零化
 zeroize = "1"
+# --- PHASE 2 STEP 5（Address Encoding） ---
+# bech32：Bech32m-derived 编码/校验（0.12；Nova 用自己的 payload，不声称 Bitcoin 兼容）
+bech32 = { version = "0.12", features = ["alloc"] }
 
 # ---------------------------------------------------------------------------
 # Nova Chain 统一版本概念（Software / Protocol / Database / API 四者分离）

@@ -1,11 +1,12 @@
 {
-  "id": "address-wrong-payload-length-001",
-  "category": "address",
-  "address": "nova1short",
-  "network_id": 1,
+  "address": "nova1qyqsr2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2atqq7kvvhp",
   "address_type": 1,
   "address_version": 1,
-  "schema_expected": "VALID",
+  "category": "address",
   "expected": "INVALID",
-  "note": "wrong payload length (short); codec-level rejection DEFERRED_VALIDATION"
+  "expected_error": "InvalidLength",
+  "id": "address-wrong-payload-length-001",
+  "key_hash": "abababababababababababababababababababababababababababababababab",
+  "network_id": 1,
+  "note": "payload 36 字节 ≠ 35"
 }

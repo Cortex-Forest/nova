@@ -1,11 +1,12 @@
 {
-  "id": "address-devnet-valid-001",
-  "category": "address",
-  "address": "novad1placeholder00000000000000000000000000000",
-  "network_id": 3,
+  "address": "novad1qyqsx8clru0378clru0378clru0378clru0378clru0378clru0378cl6h2sc9",
   "address_type": 1,
   "address_version": 1,
-  "schema_expected": "VALID",
+  "category": "address",
   "expected": "VALID",
-  "note": "placeholder address string; codec validation DEFERRED_VALIDATION (STEP 5)"
+  "expected_error": null,
+  "id": "address-devnet-valid-001",
+  "key_hash": "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f",
+  "network_id": 3,
+  "note": "devnet user account (canonical novad1...)"
 }

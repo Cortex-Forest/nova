@@ -1,11 +1,12 @@
 {
-  "id": "address-truncated-001",
-  "category": "address",
-  "address": "nova1placeholder",
-  "network_id": 1,
+  "address": "nova1qyqsr2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at78",
   "address_type": 1,
   "address_version": 1,
-  "schema_expected": "VALID",
+  "category": "address",
   "expected": "INVALID",
-  "note": "truncated address; codec-level rejection DEFERRED_VALIDATION"
+  "expected_error": "InvalidChecksum",
+  "id": "address-truncated-001",
+  "key_hash": "abababababababababababababababababababababababababababababababab",
+  "network_id": 1,
+  "note": "截断导致 checksum 失效"
 }

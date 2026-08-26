@@ -1,11 +1,12 @@
 {
-  "id": "address-mutated-char-001",
-  "category": "address",
-  "address": "nova1placeholder00000000000000000000000000001",
-  "network_id": 1,
+  "address": "nova1qqqsr2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at78vsjf",
   "address_type": 1,
   "address_version": 1,
-  "schema_expected": "VALID",
+  "category": "address",
   "expected": "INVALID",
-  "note": "mutated trailing character; codec-level rejection DEFERRED_VALIDATION"
+  "expected_error": "InvalidChecksum",
+  "id": "address-mutated-char-001",
+  "key_hash": "abababababababababababababababababababababababababababababababab",
+  "network_id": 1,
+  "note": "data 区篡改一字符（key_hash 变化但 checksum 失效）"
 }

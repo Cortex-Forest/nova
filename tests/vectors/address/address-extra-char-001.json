@@ -1,11 +1,12 @@
 {
-  "id": "address-extra-char-001",
-  "category": "address",
-  "address": "nova1placeholder00000000000000000000000000000x",
-  "network_id": 1,
+  "address": "nova1qyqsr2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at4w46h2at78vsjfq",
   "address_type": 1,
   "address_version": 1,
-  "schema_expected": "VALID",
+  "category": "address",
   "expected": "INVALID",
-  "note": "extra character at end; codec-level rejection DEFERRED_VALIDATION"
+  "expected_error": "InvalidChecksum",
+  "id": "address-extra-char-001",
+  "key_hash": "abababababababababababababababababababababababababababababababab",
+  "network_id": 1,
+  "note": "追加字符导致 checksum 失效"
 }
