@@ -309,7 +309,8 @@ pub struct ChainIdentity {
 }
 
 /// 地址 35B payload → NovaAddress（校验 version/type/network 注册；未知 tag ⇒ 拒绝）。
-fn decode_addr_payload(b: &[u8; 35]) -> Result<NovaAddress, GenesisError> {
+/// `pub(crate)`：供 transaction 模块复用（单一来源，ADR-0004）。
+pub(crate) fn decode_addr_payload(b: &[u8; 35]) -> Result<NovaAddress, GenesisError> {
     let version = b[0];
     if version != crate::address::ADDRESS_VERSION {
         return Err(GenesisError::InvalidAddress);
