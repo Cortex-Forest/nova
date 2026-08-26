@@ -10,8 +10,10 @@
 use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
 use nova_crypto::identity::{
     AccountInit, EconomicsParamsV1, GenesisError, GenesisV1, MAX_ACCOUNTS, MAX_VALIDATORS,
-    ProtocolParamsV1, ValidatorInit, canonical_genesis_bytes, compute_genesis_hash, validator_id,
+    ProtocolParamsV1, ValidatorInit, canonical_genesis_bytes, compute_genesis_hash,
+    validate_genesis, validator_id,
 };
+use nova_crypto::key::KeyPair;
 use proptest::collection::vec;
 use proptest::prelude::*;
 use std::collections::HashSet;
@@ -215,4 +217,113 @@ fn collection_limit_deterministic() {
         canonical_genesis_bytes(&g),
         Err(GenesisError::CollectionTooLarge)
     );
+}
+
+// =========================================================================
+// STEP 6B：decode/validate 确定性性质（用户 §20）
+// =========================================================================
+
+/// 用合法 Ed25519 公钥构造 canonical 有序 Genesis（decode 会校验公钥有效性）。
+fn valid_genesis() -> GenesisV1 {
+    let pk1 = KeyPair::generate().expect("kp1").verifying_key().to_bytes();
+    let pk2 = KeyPair::generate().expect("kp2").verifying_key().to_bytes();
+    let mut vals = vec![
+        ValidatorInit {
+            account_address: addr([0x11; 32]),
+            consensus_public_key: pk1,
+            bonded_stake: 1_000_000,
+            commission_bps: 1000,
+        },
+        ValidatorInit {
+            account_address: addr([0x22; 32]),
+            consensus_public_key: pk2,
+            bonded_stake: 800_000,
+            commission_bps: 800,
+        },
+    ];
+    vals.sort_by_key(|v| validator_id(&v.consensus_public_key));
+    let mut accs = vec![
+        AccountInit {
+            address: addr([0x11; 32]),
+            liquid_balance: 2_000_000,
+        },
+        AccountInit {
+            address: addr([0x22; 32]),
+            liquid_balance: 1_500_000,
+        },
+        AccountInit {
+            address: addr([0x33; 32]),
+            liquid_balance: 3_000_000,
+        },
+    ];
+    accs.sort_by_key(|a| nova_crypto::identity::address_payload_bytes(&a.address));
+    GenesisV1 {
+        network_id: NetworkId::Mainnet,
+        chain_id: 1001,
+        genesis_timestamp: 1_750_000_000,
+        initial_validator_set: vals,
+        initial_accounts: accs,
+        protocol_parameters: proto(),
+        economics_parameters: econ(),
+    }
+}
+
+fn addr(kh: [u8; 32]) -> NovaAddress {
+    NovaAddress::from_payload(NovaAddressPayload {
+        address_version: 1,
+        address_type: AddressType::UserAccount,
+        network_id: NetworkId::Mainnet,
+        key_hash: kh,
+    })
+}
+
+/// decode/encode roundtrip：encode → decode → equal；decode(encode) → validate → 相同 hash。
+#[test]
+fn decode_encode_roundtrip() {
+    let g = valid_genesis();
+    let bytes = canonical_genesis_bytes(&g).unwrap();
+    let d = nova_crypto::identity::decode_genesis_bytes(&bytes).unwrap();
+    assert_eq!(d, g, "decode(encode(g)) == g");
+    assert_eq!(
+        canonical_genesis_bytes(&d).unwrap(),
+        bytes,
+        "canonical stability"
+    );
+    let id1 = validate_genesis(&g).unwrap();
+    let id2 = validate_genesis(&d).unwrap();
+    assert_eq!(
+        id1.genesis_hash, id2.genesis_hash,
+        "hash determinism via decode"
+    );
+}
+
+/// Stake accounting rejection：bonded_stake > liquid ⇒ StakeExceedsBalance。
+#[test]
+fn stake_accounting_rejection() {
+    let mut g = valid_genesis();
+    g.initial_validator_set[0].bonded_stake = u128::MAX;
+    assert_eq!(validate_genesis(&g), Err(GenesisError::StakeExceedsBalance));
+}
+
+/// Supply invariant rejection：total_supply != Σ liquid ⇒ SupplyInvariantViolation。
+#[test]
+fn supply_invariant_rejection() {
+    let mut g = valid_genesis();
+    g.economics_parameters.total_supply += 1;
+    assert_eq!(
+        validate_genesis(&g),
+        Err(GenesisError::SupplyInvariantViolation)
+    );
+}
+
+/// Network separation：相同数据不同 network ⇒ 不同 hash；地址网络不匹配 ⇒ validate 拒绝。
+#[test]
+fn network_separation() {
+    let a = valid_genesis();
+    let mut b = valid_genesis();
+    b.network_id = NetworkId::Testnet;
+    let ha = compute_genesis_hash(&a).unwrap();
+    let hb = compute_genesis_hash(&b).unwrap();
+    assert_ne!(ha, hb, "network_id 变化 ⇒ hash 变化");
+    assert_eq!(validate_genesis(&b), Err(GenesisError::InvalidValidator));
 }

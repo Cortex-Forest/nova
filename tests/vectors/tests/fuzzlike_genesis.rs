@@ -1,12 +1,9 @@
-//! STEP 6A：stable fuzz-like 测试（无 nightly 时验证 fuzz 核心逻辑）。
+//! STEP 6A/6B：stable fuzz-like 测试（无 nightly 时验证 fuzz 核心逻辑）。
 //!
-//! 复用 `nova_test_vectors::genesis::genesis_from_bytes`（fuzz 共享解析器，bounded、no-panic），
-//! 用确定性伪随机输入验证：
-//! - **no panic**：任意长度/内容输入，解析器与 canonical/hash 不 panic。
-//! - **deterministic**：相同输入 ⇒ 相同 canonical bytes / hash。
-//! - **bounded**：成功解析的 Genesis 条目数 ≤ 8。
+//! - `genesis_from_bytes`（fuzz 共享解析器）→ canonical/hash：no panic / deterministic / bounded。
+//! - `decode_genesis_bytes`：任意 bytes 解码 no panic；成功路径确定性。
 
-use nova_crypto::identity::{canonical_genesis_bytes, compute_genesis_hash};
+use nova_crypto::identity::{canonical_genesis_bytes, compute_genesis_hash, decode_genesis_bytes};
 use nova_test_vectors::genesis::genesis_from_bytes;
 
 /// 确定性 LCG 伪随机字节流。
@@ -52,4 +49,28 @@ fn genesis_from_bytes_no_panic_and_deterministic() {
         canonical_ok > 0,
         "至少一个解析成功的 Genesis 应通过 canonical 编码"
     );
+}
+
+/// `decode_genesis_bytes`：任意 bytes 解码 **no panic**（STEP 6B）。
+///
+/// 成功路径的确定性/roundtrip 由 `identity_proptests::decode_encode_roundtrip`（合法公钥）覆盖；
+/// 此处只验证严格解码对任意输入不 panic（随机输入几乎必然被拒绝——这是期望行为）。
+#[test]
+fn decode_bytes_no_panic() {
+    let mut state = 0xabcd_ef01_2345_6789u64;
+    for _ in 0..20_000 {
+        let len = (state.wrapping_mul(11) % 512) as usize;
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        let mut data = vec![0u8; len];
+        for b in data.iter_mut() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            *b = (state >> 32) as u8;
+        }
+        // 严格解码允许 Err / Ok，但绝不 panic、绝不无界分配。
+        let _ = decode_genesis_bytes(&data);
+    }
 }

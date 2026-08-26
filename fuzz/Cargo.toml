@@ -27,3 +27,7 @@ path = "fuzz_targets/domain_message_decode.rs"
 [[bin]]
 name = "genesis_canonicalize"
 path = "fuzz_targets/genesis_canonicalize.rs"
+
+[[bin]]
+name = "genesis_decode"
+path = "fuzz_targets/genesis_decode.rs"

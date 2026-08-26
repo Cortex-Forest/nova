@@ -199,3 +199,109 @@ fn canonical_layout_length() {
         assert_eq!(expected_vid, val.account_address.payload().key_hash);
     }
 }
+
+// =========================================================================
+// STEP 6B：decode → validate → ChainIdentity（golden vector / 管线）
+// =========================================================================
+
+/// Golden Vector（跨语言黄金向量，用户 §22）：mainnet fixture 的
+/// `canonical_genesis_bytes`、`genesis_hash`、`chain_id`、`network_id`、`ChainIdentity`。
+#[test]
+fn golden_chain_identity_mainnet() {
+    let v: Value = serde_json::from_str(include_str!(
+        "../../../tests/vectors/genesis/genesis-mainnet-valid-001.json"
+    ))
+    .expect("json");
+    let g = json_to_genesis(&v);
+    let bytes = nova_crypto::identity::canonical_genesis_bytes(&g).unwrap();
+    let identity = nova_crypto::identity::validate_genesis(&g).unwrap();
+
+    // ChainIdentity 三元组
+    assert_eq!(identity.network_id, NetworkId::Mainnet);
+    assert_eq!(identity.chain_id, 1001u64);
+    assert_eq!(identity.genesis_hash.len(), 32);
+    // genesis_hash 与向量回填值一致
+    assert_eq!(
+        hex(&identity.genesis_hash),
+        v["expected_genesis_hash"].as_str().unwrap()
+    );
+    // canonical bytes 长度（1+8+8+4+2×85+4+3×51+40+42 = 430）
+    assert_eq!(bytes.len(), 430);
+    // decode(bytes) == g，且 validate 后 identity 一致（golden 复现）
+    let decoded = nova_crypto::identity::decode_genesis_bytes(&bytes).unwrap();
+    assert_eq!(decoded, g);
+    let identity2 = nova_crypto::identity::validate_genesis(&decoded).unwrap();
+    assert_eq!(identity2.genesis_hash, identity.genesis_hash);
+    // chain_id 是显式配置，不是 genesis_hash 截断派生
+    assert_ne!(
+        identity.chain_id,
+        u64::from_le_bytes(identity.genesis_hash[0..8].try_into().unwrap())
+    );
+}
+
+/// decode → validate 完整管线：decode(encode(g)) → validate → 相同 identity。
+#[test]
+fn decode_validate_pipeline() {
+    for &(id, json) in VALID_VECTORS {
+        let v: Value = serde_json::from_str(json).expect("json");
+        let g = json_to_genesis(&v);
+        let bytes = nova_crypto::identity::canonical_genesis_bytes(&g).unwrap();
+        let decoded = nova_crypto::identity::decode_genesis_bytes(&bytes)
+            .unwrap_or_else(|e| panic!("{id}: decode failed: {e}"));
+        assert_eq!(decoded, g, "{id}: decode(encode(g)) == g");
+        let identity = nova_crypto::identity::validate_genesis(&decoded).unwrap();
+        assert_eq!(
+            identity.genesis_hash,
+            nova_crypto::identity::compute_genesis_hash(&g).unwrap()
+        );
+    }
+}
+
+/// malformed bytes 不 panic（用户 §21：no panic / no OOM / bounded / deterministic）。
+#[test]
+fn malformed_bytes_no_panic() {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (state >> 32) as u8
+    };
+    for _ in 0..10_000 {
+        let len = (next() as usize) % 512;
+        let data: Vec<u8> = (0..len).map(|_| next()).collect();
+        // 必须不 panic（decode 允许 Err / Ok）
+        let _ = nova_crypto::identity::decode_genesis_bytes(&data);
+    }
+}
+
+/// truncated / trailing / unknown network 字节拒绝。
+#[test]
+fn decode_rejects_malformed_bytes() {
+    let v: Value = serde_json::from_str(include_str!(
+        "../../../tests/vectors/genesis/genesis-mainnet-valid-001.json"
+    ))
+    .expect("json");
+    let g = json_to_genesis(&v);
+    let bytes = nova_crypto::identity::canonical_genesis_bytes(&g).unwrap();
+
+    // truncated
+    assert_eq!(
+        nova_crypto::identity::decode_genesis_bytes(&bytes[..bytes.len() - 1]),
+        Err(nova_crypto::identity::GenesisError::DecodeError)
+    );
+    // trailing
+    let mut t = bytes.clone();
+    t.push(0x00);
+    assert_eq!(
+        nova_crypto::identity::decode_genesis_bytes(&t),
+        Err(nova_crypto::identity::GenesisError::TrailingBytes)
+    );
+    // unknown network_id
+    let mut m = bytes.clone();
+    m[0] = 0x04;
+    assert_eq!(
+        nova_crypto::identity::decode_genesis_bytes(&m),
+        Err(nova_crypto::identity::GenesisError::InvalidNetwork)
+    );
+}

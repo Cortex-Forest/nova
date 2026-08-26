@@ -24,7 +24,7 @@ cargo +nightly fuzz run genesis_canonicalize
 | signature decode | malformed/truncated/oversized 签名、畸形公钥 | ✅ 已准备 |
 | domain message decode | signed_bytes 构造、未知 domain/algorithm | ✅ 已准备 |
 | genesis canonicalize | 随机 bytes 构造 Genesis → canonical 编码/哈希（no panic / bounded / deterministic） | ✅ 已准备（STEP 6A） |
-| genesis decode | Genesis canonical bytes → 结构（STEP 6B decode 实现后添加） | 后续 STEP |
+| genesis decode | 任意 bytes → decode（no panic / no OOM / bounded / deterministic） | ✅ 已准备（STEP 6B） |
 | transaction decoding | 随机 bytes / malformed encoding / extreme amount-nonce / chain mismatch | 后续 STEP |
 | block decoding | 畸形区块 / 冲突 proof | 后续 STEP |
 | network messages | malformed/giant packet / handshake abuse / gossip amplification | 后续 STEP |

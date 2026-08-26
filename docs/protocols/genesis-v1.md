@@ -274,4 +274,28 @@ computed_genesis_hash == configured_genesis_hash // 否则拒绝启动
 - **STEP 6A 起**：`expected_genesis_hash` 已由回填器（`gen_genesis_hashes`）用
   `nova_crypto::identity::compute_genesis_hash` 回填；测试真正调用 `nova_crypto::identity`
   （computed == configured 断言）。
+- **STEP 6B 起**：loader 委托 `validate_genesis` 做完整 semantic/canonical 校验。
 - 禁止在测试基础设施中自行重新设计 Genesis 编码（本文件纪律）。
+
+## 19. Golden Vector（跨语言黄金向量，STEP 6B）
+
+**mainnet fixture**（`tests/vectors/genesis/genesis-mainnet-valid-001.json`）的
+**确定性**黄金向量，供跨语言实现复现核验：
+
+| 项 | 值 |
+|----|----|
+| `network_id` | `0x01`（mainnet，HRP `nova`） |
+| `chain_id` | `1001`（Genesis 显式配置，非派生） |
+| `genesis_timestamp` | `1750000000` |
+| canonical 长度 | `430` B |
+| `genesis_hash` | `035b369237201feae92a271897ad1405d8905573ba21d7f1970551f0d49bf1ef` |
+
+`canonical_genesis_bytes`（430 B，hex，LE）：
+
+```
+01e90300000000000080e14e6800000000020000000101013635effc891937e5c08e6cd51dbf43c09cc72bc41fccb985f5ff6556ee2ca1a287aced6f78ab956039c1b8f9e435962bdfa38846505aebf999b02eead45deb3400350c0000000000000000000000000020030101018dd433bf409a7661e18705a8489fb0c5f9c4e9dab0a5d86090e5470fa47e492838c034a3562ed5a66eb5bb9c7113c0af305e40df5a4aa227a4b48afba4b0de9140420f00000000000000000000000000e803030000000101013635effc891937e5c08e6cd51dbf43c09cc72bc41fccb985f5ff6556ee2ca1a260e316000000000000000000000000000101017c26ef0ce873bbbee97593e245bb2ff9b697f363c529d87b5c4279a262a4667dc0c62d000000000000000000000000000101018dd433bf409a7661e18705a8489fb0c5f9c4e9dab0a5d86090e5470fa47e492880841e00000000000000000000000000000001000000100000ca9a3b0000000000800000000010006400000000000000e803000000000000a02e6300000000000000000000000000a08601000000000000000000000000000075120000000000f401
+```
+
+- `ChainIdentity { network_id: 0x01, chain_id: 1001, genesis_hash: 035b…f1ef }`。
+- 复现：`decode_genesis_bytes(GOLDEN_BYTES)` → `validate_genesis` → 相同 `ChainIdentity`。
+- 由 `nova-crypto/tests/identity_vectors.rs::golden_chain_identity_mainnet` 强制断言。
