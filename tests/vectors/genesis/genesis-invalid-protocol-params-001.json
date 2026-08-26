@@ -1,0 +1,54 @@
+{
+  "category": "genesis",
+  "chain_id": 1001,
+  "economics_parameters": {
+    "fee_burn_bps": 500,
+    "min_validator_stake": "100000",
+    "total_supply": "6500000",
+    "unbonding_period_seconds": 1209600
+  },
+  "expected": "INVALID",
+  "expected_error": "InvalidProtocolParams",
+  "expected_genesis_hash": "",
+  "genesis_timestamp": 1750000000,
+  "id": "genesis-invalid-protocol-params-001",
+  "initial_accounts": [
+    {
+      "address": "nova1qyqszd34al7gjxfhuhqgumx4rkl58syucu4ug87vhxzltlm92mhzegdzcplf6l",
+      "liquid_balance": "1500000"
+    },
+    {
+      "address": "nova1qyqszlpxauxwsuamhm5htylzgkajl7dkjlek83ffmpa4csne5f32genanuqwnl",
+      "liquid_balance": "3000000"
+    },
+    {
+      "address": "nova1qyqsrrw5xwl5pxnkv8scwpdgfz0mp30ecn5a4v99mpsfpe28p7j8ujfgck65ug",
+      "liquid_balance": "2000000"
+    }
+  ],
+  "initial_validator_set": [
+    {
+      "account_address": "nova1qyqszd34al7gjxfhuhqgumx4rkl58syucu4ug87vhxzltlm92mhzegdzcplf6l",
+      "bonded_stake": "800000",
+      "commission_bps": 800,
+      "consensus_public_key": "87aced6f78ab956039c1b8f9e435962bdfa38846505aebf999b02eead45deb34"
+    },
+    {
+      "account_address": "nova1qyqsrrw5xwl5pxnkv8scwpdgfz0mp30ecn5a4v99mpsfpe28p7j8ujfgck65ug",
+      "bonded_stake": "1000000",
+      "commission_bps": 1000,
+      "consensus_public_key": "38c034a3562ed5a66eb5bb9c7113c0af305e40df5a4aa227a4b48afba4b0de91"
+    }
+  ],
+  "network_id": 1,
+  "note": "max_block_bytes < max_tx_bytes",
+  "protocol_parameters": {
+    "epoch_length_blocks": 100,
+    "max_block_bytes": 1024,
+    "max_contract_code_bytes": 32768,
+    "max_contract_storage_bytes": 1048576,
+    "max_gas_per_block": 1000000000,
+    "max_tx_bytes": 65536,
+    "snapshot_interval_blocks": 1000
+  }
+}

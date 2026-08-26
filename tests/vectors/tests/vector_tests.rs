@@ -252,16 +252,76 @@ fn address_vectors_validate() {
 }
 
 // ---------------------------------------------------------------------------
-// Genesis vectors（§15；genesis_hash → DEFERRED_VALIDATION）
+// Genesis vectors（STEP 6 schema 冻结；genesis_hash → DEFERRED_VALIDATION）
 // ---------------------------------------------------------------------------
 const GENESIS_VECTORS: &[(&str, &str)] = &[
     (
-        "genesis-mainnet-001",
-        include_str!("../genesis/genesis-mainnet-001.json"),
+        "genesis-mainnet-valid-001",
+        include_str!("../genesis/genesis-mainnet-valid-001.json"),
     ),
     (
-        "genesis-testnet-001",
-        include_str!("../genesis/genesis-testnet-001.json"),
+        "genesis-testnet-valid-001",
+        include_str!("../genesis/genesis-testnet-valid-001.json"),
+    ),
+    (
+        "genesis-devnet-valid-001",
+        include_str!("../genesis/genesis-devnet-valid-001.json"),
+    ),
+    (
+        "genesis-invalid-network-001",
+        include_str!("../genesis/genesis-invalid-network-001.json"),
+    ),
+    (
+        "genesis-invalid-chain-id-001",
+        include_str!("../genesis/genesis-invalid-chain-id-001.json"),
+    ),
+    (
+        "genesis-invalid-timestamp-001",
+        include_str!("../genesis/genesis-invalid-timestamp-001.json"),
+    ),
+    (
+        "genesis-duplicate-validator-001",
+        include_str!("../genesis/genesis-duplicate-validator-001.json"),
+    ),
+    (
+        "genesis-duplicate-account-001",
+        include_str!("../genesis/genesis-duplicate-account-001.json"),
+    ),
+    (
+        "genesis-invalid-stake-001",
+        include_str!("../genesis/genesis-invalid-stake-001.json"),
+    ),
+    (
+        "genesis-stake-exceeds-account-001",
+        include_str!("../genesis/genesis-stake-exceeds-account-001.json"),
+    ),
+    (
+        "genesis-invalid-protocol-params-001",
+        include_str!("../genesis/genesis-invalid-protocol-params-001.json"),
+    ),
+    (
+        "genesis-invalid-economics-001",
+        include_str!("../genesis/genesis-invalid-economics-001.json"),
+    ),
+    (
+        "genesis-wrong-validator-order-001",
+        include_str!("../genesis/genesis-wrong-validator-order-001.json"),
+    ),
+    (
+        "genesis-wrong-account-order-001",
+        include_str!("../genesis/genesis-wrong-account-order-001.json"),
+    ),
+    (
+        "genesis-tampered-genesis-001",
+        include_str!("../genesis/genesis-tampered-genesis-001.json"),
+    ),
+    (
+        "genesis-wrong-genesis-hash-001",
+        include_str!("../genesis/genesis-wrong-genesis-hash-001.json"),
+    ),
+    (
+        "genesis-supply-invariant-violation-001",
+        include_str!("../genesis/genesis-supply-invariant-violation-001.json"),
     ),
 ];
 
@@ -269,15 +329,38 @@ const GENESIS_VECTORS: &[(&str, &str)] = &[
 fn genesis_vectors_validate() {
     for (id, json) in GENESIS_VECTORS {
         let r = validate_genesis_vector(json);
-        assert!(
-            r.ok,
-            "VECTOR FAILED\nID: {id}\nFIELD: genesis schema\nEXPECTED: valid fixture\nACTUAL: {:?}\nSPEC: genesis-v1.md §1",
-            r.errors
-        );
+        let expected = vector_field(json, "expected");
+        let expected_error = vector_field(json, "expected_error");
+        // genesis_hash 计算未实现（canonical 层）：恒为 DEFERRED。
         assert!(
             r.hash_deferred,
             "VECTOR FAILED\nID: {id}\nFIELD: genesis_hash status\nEXPECTED: DEFERRED_VALIDATION\nACTUAL: not deferred"
         );
+        if expected == "VALID" {
+            assert!(
+                r.ok,
+                "VECTOR FAILED\nID: {id}\nFIELD: genesis schema (VALID)\nEXPECTED: ok\nACTUAL: {:?}\nSPEC: ADR-0014/0015/0016",
+                r.errors
+            );
+        } else if expected_error == "GenesisHashMismatch" {
+            // canonical 层验证（hash 计算未实现）：结构必须合法，hash 层留待 STEP 6 IMPLEMENTATION。
+            assert!(
+                r.ok,
+                "VECTOR FAILED\nID: {id}\nFIELD: genesis schema (GenesisHashMismatch, canonical layer)\nEXPECTED: structurally valid\nACTUAL: {:?}\nSPEC: genesis-v1.md §15",
+                r.errors
+            );
+        } else {
+            assert!(
+                !r.ok,
+                "VECTOR FAILED\nID: {id}\nFIELD: genesis schema (INVALID)\nEXPECTED: reject\nACTUAL: accepted\nSPEC: ADR-0014/0015/0016"
+            );
+            assert_eq!(
+                r.error_name.as_deref(),
+                Some(expected_error.as_str()),
+                "VECTOR FAILED\nID: {id}\nFIELD: error category\nEXPECTED: {expected_error}\nACTUAL: {:?}",
+                r.error_name
+            );
+        }
     }
-    assert_eq!(GENESIS_VECTORS.len(), 2);
+    assert_eq!(GENESIS_VECTORS.len(), 17);
 }

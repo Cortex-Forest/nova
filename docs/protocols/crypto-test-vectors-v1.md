@@ -73,3 +73,90 @@
 - 地址编码：官方 Bech32m test vectors + Nova 自定义 vectors（ADR-0004）。
 - Ed25519：RFC 8032 测试向量 + Nova 自定义（ADR-0002）。
 - 签名消息：Nova 自定义（本文件 §2/§3）。
+
+## 5. Genesis 向量（ADR-0014/0015/0016，`genesis-v1.md` §18）
+
+向量为 **fixture（JSON human-readable）**，非 Nova 协议编码；loader 做 **schema 层校验**
+（字段存在 / 类型 / 注册表 / 重复 / 排序 / 基本范围），**不**在测试基础设施中实现
+canonical 编码或 `genesis_hash` 计算（`expected_genesis_hash` 在 STEP 6 IMPLEMENTATION 后
+由生成器回填并启用重算）。
+
+### 5a. 向量字段
+
+```
+{
+  "id": string,
+  "category": "genesis",
+  "network_id": u8,                    // ADR-0011
+  "chain_id": u64,                     // > 0（Genesis 显式配置）
+  "genesis_timestamp": u64,            // > 0（Unix 秒）
+  "initial_validator_set": [
+    { "account_address": "bech32m", "consensus_public_key": "hex(32B)",
+      "bonded_stake": "u128-decimal-string", "commission_bps": u16 }
+  ],
+  "initial_accounts": [
+    { "address": "bech32m", "liquid_balance": "u128-decimal-string" }
+  ],
+  "protocol_parameters": {
+    "max_tx_bytes": u32, "max_block_bytes": u32, "max_gas_per_block": u64,
+    "max_contract_code_bytes": u32, "max_contract_storage_bytes": u32,
+    "epoch_length_blocks": u64, "snapshot_interval_blocks": u64
+  },
+  "economics_parameters": {
+    "total_supply": "u128-decimal-string", "min_validator_stake": "u128-decimal-string",
+    "unbonding_period_seconds": u64, "fee_burn_bps": u16
+  },
+  "expected": "VALID" | "INVALID",
+  "expected_error": "GenesisError 分类名" | null,
+  "expected_genesis_hash": ""          // DEFERRED（STEP 6 IMPLEMENTATION 后回填）
+}
+```
+
+- **`u128` 字段必须用十进制字符串**（JSON 数字无法安全表示 u128）。
+- 地址必须为真实 bech32m（`nova1`/`novat1`/`novad1`），网络必须匹配 `network_id`。
+- `validator_id = SHA-256(consensus_public_key)`（派生，不在 JSON 中存储）。
+
+### 5b. 向量分类
+
+**Valid（三网络）**：
+
+| 向量 | 断言 |
+|------|------|
+| genesis-mainnet-valid-001 | mainnet（`nova`），chain_id=1001 |
+| genesis-testnet-valid-001 | testnet（`novat`），chain_id=2002 |
+| genesis-devnet-valid-001 | devnet（`novad`），chain_id=3003 |
+
+**Invalid（各触发一种 `GenesisError` 分类）**：
+
+| 向量 | 触发 | 期望错误 |
+|------|------|----------|
+| genesis-invalid-network-001 | `network_id=0x04`（未注册） | `InvalidNetwork` |
+| genesis-invalid-chain-id-001 | `chain_id=0` | `InvalidChainId` |
+| genesis-invalid-timestamp-001 | `genesis_timestamp=0` | `InvalidTimestamp` |
+| genesis-duplicate-validator-001 | 同 `consensus_public_key` 两次 | `DuplicateValidator` |
+| genesis-duplicate-account-001 | 同 `address` 两次 | `DuplicateAccount` |
+| genesis-invalid-stake-001 | `bonded_stake=0` | `InvalidValidator` |
+| genesis-stake-exceeds-account-001 | `bonded_stake > 对应 liquid_balance` | `InvalidStake` |
+| genesis-invalid-protocol-params-001 | `max_block_bytes < max_tx_bytes` | `InvalidProtocolParams` |
+| genesis-invalid-economics-001 | `fee_burn_bps > 10_000` | `InvalidEconomicsParams` |
+| genesis-wrong-validator-order-001 | validator 列表非 `validator_id` 升序 | `NonCanonicalOrdering` |
+| genesis-wrong-account-order-001 | account 列表非 payload bytes 升序 | `NonCanonicalOrdering` |
+| genesis-tampered-genesis-001 | 篡改某字段（如 timestamp）导致 hash 不匹配 | `GenesisHashMismatch`（若提供期望 hash） |
+| genesis-wrong-genesis-hash-001 | 提供错误 `expected_genesis_hash` | `GenesisHashMismatch` |
+| genesis-supply-invariant-violation-001 | `total_supply != Σ liquid_balance` | `SupplyInvariantViolation` |
+
+- 空 validator set / 空 account set / 超上限：由 structural validation 拒绝
+  （`InvalidValidator` / `InvalidInitialState`）。
+
+### 5c. 跨网 / 身份分离断言
+
+- 相同 genesis 数据、不同 `network_id` ⇒ 不同 ChainIdentity / validation 结果。
+- 相同 `network_id`、不同 `chain_id` ⇒ 不同 ChainIdentity。
+- 相同 `network_id` + `chain_id`、不同 genesis 内容 ⇒ `genesis_hash` 不同（链不同）。
+- 任一字段篡改 ⇒ `genesis_hash` 变化（tamper detection）。
+
+## 6. 来源（Genesis）
+
+- Schema / 校验：ADR-0014、`genesis-v1.md`。
+- Canonical 编码 / hash：ADR-0015、`crypto-serialization-v1.md` §11。
+- Accounting invariants：ADR-0016。

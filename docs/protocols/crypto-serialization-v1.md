@@ -60,7 +60,7 @@
 | Ed25519 签名 | `R(32) \|\| S(32)` | 64 B |
 | secp256k1 公钥（Reserved） | 压缩点 `0x02/0x03 \|\| x` | 33 B |
 | secp256k1 签名（Reserved） | `r(32) \|\| s(32)`（归一化 `s`） | 64 B |
-| 地址 | Bech32m-derived 文本（ADR-0004） | 文本 |
+| 地址 | Bech32m-derived 文本（ADR-0004）；canonical **字节**表示 = 35B payload `version‖type‖network‖key_hash`（ADR-0015） | 文本 / 35 B |
 | `domain_id` | `u8`（ADR-0005） | 1 B |
 | `algorithm_id` | `u8`（ADR-0012） | 1 B |
 | `chain_id` | `u64` LE（Genesis 明确配置固定值，非派生；ADR-0010、`genesis-v1.md`） | 8 B |
@@ -114,3 +114,14 @@ verify_message_hash(...)       -> Result<(), CryptoError>
 - **`chain_id` 必须来自 Genesis 明确配置的固定值**（`genesis-v1.md`）；**不得从**
   `genesis_hash` / `block_hash` / `address` / `network_id` **派生**。
 - 禁止使用未定义长度的字符串直接拼接。
+
+## 11. Genesis Canonical Encoding（ADR-0015）
+
+Genesis 顶层与嵌套类型（`ValidatorInit`/`AccountInit`/`ProtocolParamsV1`/`EconomicsParamsV1`）
+的 canonical 字节布局、列表排序规则与 `genesis_hash` 定义见 **ADR-0015** 与 `genesis-v1.md` §9–§10。
+
+要点（继承本文件 §1–§8）：
+- 整数 LE；长度 `u32` LE；定长 bytes 无前缀；Struct 固定顺序；
+- 地址 canonical 字节表示 = **35B payload raw bytes**（非 bech32m 文本）；
+- 列表顺序属于 Genesis 身份（validator 按 `validator_id` 升序、account 按 payload bytes 升序；非序 ⇒ 拒绝）；
+- `genesis_hash = SHA-256(canonical_genesis_bytes)`（hash-over-preimage，hash 不进入被 hash 内容）。

@@ -1,14 +1,19 @@
 # Genesis 测试向量
 
-- **source**: Nova Chain 协议（`docs/protocols/genesis-v1.md`）
-- **specification**: genesis-v1.md（Genesis canonical data、genesis_hash、ValidateGenesis）
-- **encoding**: JSON（human-readable 向量格式）；`chain_id` 为 u64 整数；`genesis_timestamp` 为 u64 秒
+- **source**: Nova Chain 协议（`docs/protocols/genesis-v1.md`、ADR-0014/0015/0016）
+- **specification**: genesis-v1.md（GenesisV1 schema、嵌套类型、canonical 编码、genesis_hash、ValidateGenesis）
+- **encoding**: JSON（human-readable 向量格式，**非 Nova 协议编码**）；
+  `chain_id`/`genesis_timestamp` 为 u64 整数；**u128 字段（`bonded_stake`/`liquid_balance`/
+  `total_supply`/`min_validator_stake`）用十进制字符串**（JSON 数字无法安全表示 u128）。
 - **expected behavior**:
-  - fixture 必须包含 genesis-v1.md §1 的 7 个顶层字段：
-    `network_id / chain_id / genesis_timestamp / initial_validator_set / initial_accounts /
-     protocol_parameters / economics_parameters`。
-  - `expected_genesis_hash`: 记录预期（**DEFERRED_VALIDATION**——genesis canonical 子结构在
-    对应 Phase 定稿，PHASE 7 启用重算；本阶段不伪造 PASS）。
-  - loader 本阶段验证：字段存在 + 类型（数组/对象/整数）。
+  - fixture 包含 genesis-v1.md §1 的 7 个顶层字段 + 完整嵌套类型
+    （ValidatorInit/AccountInit/ProtocolParamsV1/EconomicsParamsV1，ADR-0014）。
+  - 地址为真实 bech32m，网络必须匹配 `network_id`（ADR-0011/0004）。
+  - validator 列表按 `validator_id`（=SHA-256(pubkey)）升序；account 列表按地址 payload bytes 升序
+    （ADR-0015；非序 ⇒ `NonCanonicalOrdering`）。
+  - loader（schema 层）校验：嵌套类型 / 注册表 / 重复 / 排序 / 基本范围 / stake accounting /
+    supply invariant（ADR-0016）。
+  - `expected_genesis_hash`: **DEFERRED_VALIDATION**（canonical 实现 = STEP 6 IMPLEMENTATION
+    落地后由 `nova_crypto::identity` 计算并回填；本阶段不伪造 PASS）。
 
 **注意**：Genesis fixture 必须遵循 genesis-v1.md；禁止在测试向量中自行重新设计 Genesis 编码。

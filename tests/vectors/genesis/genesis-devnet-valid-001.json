@@ -1,0 +1,54 @@
+{
+  "category": "genesis",
+  "chain_id": 3003,
+  "economics_parameters": {
+    "fee_burn_bps": 500,
+    "min_validator_stake": "30000",
+    "total_supply": "2000000",
+    "unbonding_period_seconds": 86400
+  },
+  "expected": "VALID",
+  "expected_error": null,
+  "expected_genesis_hash": "",
+  "genesis_timestamp": 1750000200,
+  "id": "genesis-devnet-valid-001",
+  "initial_accounts": [
+    {
+      "address": "novad1qyqsx7ydku27v9hkswf6uu83fez5ey96pnyarx0m5xpsutulj5x320epq7ve45",
+      "liquid_balance": "700000"
+    },
+    {
+      "address": "novad1qyqs8gkzu7amkjxegdxgyhcplc7ujw8vnr5ffmuagq58exhflhmt7pq2p8qg6x",
+      "liquid_balance": "800000"
+    },
+    {
+      "address": "novad1qyqs85q3s8ljudc6ushygaajj22u9jhd0adswafqerr0zm0g5e5d8zt8l2n5z2",
+      "liquid_balance": "500000"
+    }
+  ],
+  "initial_validator_set": [
+    {
+      "account_address": "novad1qyqsx7ydku27v9hkswf6uu83fez5ey96pnyarx0m5xpsutulj5x320epq7ve45",
+      "bonded_stake": "300000",
+      "commission_bps": 1000,
+      "consensus_public_key": "410de89872daaa37182170521e326990008df1571bd6017fb8735e212bd52f42"
+    },
+    {
+      "account_address": "novad1qyqs85q3s8ljudc6ushygaajj22u9jhd0adswafqerr0zm0g5e5d8zt8l2n5z2",
+      "bonded_stake": "200000",
+      "commission_bps": 800,
+      "consensus_public_key": "fab5303e8e2295d88420de1cae2dea20d68c8cafa6a93bbb8ad63822ac4cd208"
+    }
+  ],
+  "network_id": 3,
+  "note": "devnet valid genesis (novad1, chain_id=3003)",
+  "protocol_parameters": {
+    "epoch_length_blocks": 100,
+    "max_block_bytes": 1048576,
+    "max_contract_code_bytes": 32768,
+    "max_contract_storage_bytes": 1048576,
+    "max_gas_per_block": 1000000000,
+    "max_tx_bytes": 65536,
+    "snapshot_interval_blocks": 1000
+  }
+}
