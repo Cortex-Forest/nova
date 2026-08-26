@@ -270,6 +270,8 @@ computed_genesis_hash == configured_genesis_hash // 否则拒绝启动
 ## 18. 测试向量
 
 - 向量 schema / 分类见 `crypto-test-vectors-v1.md` §5（valid 三网络 + invalid 分类）。
-- 向量为 **fixture（JSON human-readable）**，非 Nova 协议编码；`expected_genesis_hash` 在
-  canonical 实现（STEP 6 IMPLEMENTATION）落地后由生成器回填并启用重算。
+- 向量为 **fixture（JSON human-readable）**，非 Nova 协议编码。
+- **STEP 6A 起**：`expected_genesis_hash` 已由回填器（`gen_genesis_hashes`）用
+  `nova_crypto::identity::compute_genesis_hash` 回填；测试真正调用 `nova_crypto::identity`
+  （computed == configured 断言）。
 - 禁止在测试基础设施中自行重新设计 Genesis 编码（本文件纪律）。

@@ -9,7 +9,7 @@
   },
   "expected": "INVALID",
   "expected_error": "GenesisHashMismatch",
-  "expected_genesis_hash": "",
+  "expected_genesis_hash": "035b369237201feae92a271897ad1405d8905573ba21d7f1970551f0d49bf1ef",
   "genesis_timestamp": 1999999999,
   "id": "genesis-tampered-genesis-001",
   "initial_accounts": [
@@ -41,7 +41,7 @@
     }
   ],
   "network_id": 1,
-  "note": "篡改 genesis_timestamp ⇒ 结构合法但 canonical genesis_hash 不匹配（canonical 层，DEFERRED）",
+  "note": "篡改 genesis_timestamp ⇒ 结构合法但 canonical genesis_hash 不匹配（canonical 层，DEFERRED）; expected=mainnet 原 hash（篡改后不匹配）",
   "protocol_parameters": {
     "epoch_length_blocks": 100,
     "max_block_bytes": 1048576,

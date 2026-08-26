@@ -8,8 +8,11 @@
 
 use crate::hex;
 use crate::json;
-use nova_crypto::address::{NetworkId, NovaAddress};
+use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
 use nova_crypto::hash::protocol_hash;
+use nova_crypto::identity::{
+    AccountInit, EconomicsParamsV1, GenesisError, GenesisV1, ProtocolParamsV1, ValidatorInit,
+};
 use nova_crypto::signature::VerifyingKey;
 use serde_json::Value;
 
@@ -31,12 +34,10 @@ const MAX_FEE_BURN_BPS: u16 = 10_000;
 pub struct GenesisValidation {
     /// 向量 id。
     pub id: String,
-    /// 整体是否通过（schema 层与期望一致）。
+    /// 整体是否通过（schema + canonical/hash 与期望一致）。
     pub ok: bool,
     /// 错误列表。
     pub errors: Vec<String>,
-    /// `genesis_hash` 计算是否延迟（canonical 未实现 ⇒ 恒为 true）。
-    pub hash_deferred: bool,
     /// 首个错误分类名（与向量 `expected_error` 对应）。
     pub error_name: Option<String>,
 }
@@ -82,7 +83,6 @@ pub fn validate_genesis_vector(input: &str) -> GenesisValidation {
                 id: "<parse-error>".into(),
                 ok: false,
                 errors: vec![format!("parse: {e}")],
-                hash_deferred: true,
                 error_name: None,
             };
         }
@@ -386,16 +386,46 @@ pub fn validate_genesis_vector(input: &str) -> GenesisValidation {
         }
     }
 
+    // ---- canonical 层（STEP 6A）：构造 GenesisV1 + 计算 hash + 对比 ----
+    if ec.has() {
+        return finish(&id, ec);
+    }
+    match genesis_from_json(input) {
+        Ok(g) => match nova_crypto::identity::compute_genesis_hash(&g) {
+            Ok(computed) => {
+                let expected = value
+                    .get("expected_genesis_hash")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !expected.is_empty() && expected != hex::encode_lower_hex(&computed) {
+                    ec.push(
+                        "GenesisHashMismatch",
+                        format!(
+                            "computed {} != configured {expected}",
+                            hex::encode_lower_hex(&computed)
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                ec.push(
+                    genesis_error_name(&e),
+                    format!("canonical encoding rejected: {e}"),
+                );
+            }
+        },
+        Err(e) => ec.push("Structural", format!("genesis_from_json: {e}")),
+    }
+
     finish(&id, ec)
 }
 
-/// 组装结果：hash 计算始终 DEFERRED（canonical 未实现）。
+/// 组装结果（hash 计算已实现，不再 DEFERRED）。
 fn finish(id: &str, ec: ErrCtx) -> GenesisValidation {
     GenesisValidation {
         id: id.to_string(),
         ok: !ec.has(),
         errors: ec.errors,
-        hash_deferred: true,
         error_name: ec.first,
     }
 }
@@ -528,4 +558,230 @@ fn get_u8(v: &Value, key: &str) -> Option<u8> {
     v.get(key)
         .and_then(Value::as_u64)
         .and_then(|n| u8::try_from(n).ok())
+}
+
+/// 将 `GenesisError` 映射为规范错误名（与向量 `expected_error` 一致）。
+pub fn genesis_error_name(e: &GenesisError) -> &'static str {
+    match e {
+        GenesisError::InvalidNetwork => "InvalidNetwork",
+        GenesisError::InvalidChainId => "InvalidChainId",
+        GenesisError::InvalidTimestamp => "InvalidTimestamp",
+        GenesisError::InvalidValidator => "InvalidValidator",
+        GenesisError::DuplicateValidator => "DuplicateValidator",
+        GenesisError::DuplicateAccount => "DuplicateAccount",
+        GenesisError::InvalidStake => "InvalidStake",
+        GenesisError::InvalidInitialState => "InvalidInitialState",
+        GenesisError::InvalidProtocolParams => "InvalidProtocolParams",
+        GenesisError::InvalidEconomicsParams => "InvalidEconomicsParams",
+        GenesisError::NonCanonicalOrdering => "NonCanonicalOrdering",
+        GenesisError::NonCanonicalEncoding => "NonCanonicalEncoding",
+        GenesisError::GenesisHashMismatch => "GenesisHashMismatch",
+        GenesisError::SupplyInvariantViolation => "SupplyInvariantViolation",
+        GenesisError::InvalidAddress => "InvalidAddress",
+        GenesisError::InvalidPublicKey => "InvalidPublicKey",
+        GenesisError::EncodingOverflow => "EncodingOverflow",
+        GenesisError::CollectionTooLarge => "CollectionTooLarge",
+    }
+}
+
+/// 从 JSON 向量构造 `GenesisV1`（仅解析；语义校验由 loader 负责）。
+///
+/// 供 loader（STEP 6A canonical 层）与回填生成器复用，确保测试**真正调用** `nova_crypto::identity`。
+pub fn genesis_from_json(input: &str) -> Result<GenesisV1, String> {
+    let value = json::parse(input).map_err(|e| format!("parse: {e}"))?;
+    let net = value["network_id"].as_u64().ok_or("network_id")? as u8;
+    let network_id = nova_crypto::address::NetworkId::try_from(net)
+        .map_err(|_| format!("invalid network_id {net:#04x}"))?;
+    let chain_id = value["chain_id"].as_u64().ok_or("chain_id")?;
+    let genesis_timestamp = value["genesis_timestamp"]
+        .as_u64()
+        .ok_or("genesis_timestamp")?;
+
+    let mut initial_validator_set = Vec::new();
+    let varr = value["initial_validator_set"]
+        .as_array()
+        .ok_or("initial_validator_set")?;
+    for (i, item) in varr.iter().enumerate() {
+        let tag = format!("validator[{i}]");
+        let addr_s = item
+            .get("account_address")
+            .and_then(Value::as_str)
+            .ok_or(format!("{tag} account_address"))?;
+        let account_address =
+            NovaAddress::decode(addr_s).map_err(|_| format!("{tag} address decode"))?;
+        let pk_hex = item
+            .get("consensus_public_key")
+            .and_then(Value::as_str)
+            .ok_or(format!("{tag} consensus_public_key"))?;
+        let pk = hex::decode_strict_lower_hex(pk_hex).map_err(|_| format!("{tag} pubkey hex"))?;
+        let mut consensus_public_key = [0u8; 32];
+        if pk.len() != 32 {
+            return Err(format!("{tag} pubkey not 32B"));
+        }
+        consensus_public_key.copy_from_slice(&pk);
+        let bonded_stake =
+            value_u128(item.get("bonded_stake")).ok_or(format!("{tag} bonded_stake"))?;
+        let commission_bps = item["commission_bps"]
+            .as_u64()
+            .ok_or(format!("{tag} commission_bps"))? as u16;
+        initial_validator_set.push(ValidatorInit {
+            account_address,
+            consensus_public_key,
+            bonded_stake,
+            commission_bps,
+        });
+    }
+
+    let mut initial_accounts = Vec::new();
+    let aarr = value["initial_accounts"]
+        .as_array()
+        .ok_or("initial_accounts")?;
+    for (i, item) in aarr.iter().enumerate() {
+        let tag = format!("account[{i}]");
+        let addr_s = item
+            .get("address")
+            .and_then(Value::as_str)
+            .ok_or(format!("{tag} address"))?;
+        let address = NovaAddress::decode(addr_s).map_err(|_| format!("{tag} address decode"))?;
+        let liquid_balance =
+            value_u128(item.get("liquid_balance")).ok_or(format!("{tag} liquid_balance"))?;
+        initial_accounts.push(AccountInit {
+            address,
+            liquid_balance,
+        });
+    }
+
+    let pp = &value["protocol_parameters"];
+    let protocol_parameters = ProtocolParamsV1 {
+        max_tx_bytes: pp["max_tx_bytes"].as_u64().ok_or("max_tx_bytes")? as u32,
+        max_block_bytes: pp["max_block_bytes"].as_u64().ok_or("max_block_bytes")? as u32,
+        max_gas_per_block: pp["max_gas_per_block"]
+            .as_u64()
+            .ok_or("max_gas_per_block")?,
+        max_contract_code_bytes: pp["max_contract_code_bytes"]
+            .as_u64()
+            .ok_or("max_contract_code_bytes")? as u32,
+        max_contract_storage_bytes: pp["max_contract_storage_bytes"]
+            .as_u64()
+            .ok_or("max_contract_storage_bytes")? as u32,
+        epoch_length_blocks: pp["epoch_length_blocks"]
+            .as_u64()
+            .ok_or("epoch_length_blocks")?,
+        snapshot_interval_blocks: pp["snapshot_interval_blocks"]
+            .as_u64()
+            .ok_or("snapshot_interval_blocks")?,
+    };
+
+    let ep = &value["economics_parameters"];
+    let economics_parameters = EconomicsParamsV1 {
+        total_supply: value_u128(ep.get("total_supply")).ok_or("total_supply")?,
+        min_validator_stake: value_u128(ep.get("min_validator_stake"))
+            .ok_or("min_validator_stake")?,
+        unbonding_period_seconds: ep["unbonding_period_seconds"]
+            .as_u64()
+            .ok_or("unbonding_period_seconds")?,
+        fee_burn_bps: ep["fee_burn_bps"].as_u64().ok_or("fee_burn_bps")? as u16,
+    };
+
+    Ok(GenesisV1 {
+        network_id,
+        chain_id,
+        genesis_timestamp,
+        initial_validator_set,
+        initial_accounts,
+        protocol_parameters,
+        economics_parameters,
+    })
+}
+
+/// 从任意 bytes 构造 `GenesisV1`（fuzz 共享解析器；bounded、no-panic、确定性）。
+///
+/// - 输入不足 / 非法 network ⇒ `None`（不 panic）。
+/// - 条目数由输入限制（≤ 8 条），避免 unbounded allocation。
+/// - 供 `fuzz/genesis_canonicalize` 与 stable fuzz-like 测试复用（单一来源）。
+pub fn genesis_from_bytes(data: &[u8]) -> Option<GenesisV1> {
+    if data.len() < 3 {
+        return None;
+    }
+    let mut pos = 0;
+    let net_id = data[pos] % 4;
+    pos += 1;
+    let network_id = NetworkId::try_from(net_id).ok()?;
+    let n_val = (data[pos] % 8) as usize;
+    pos += 1;
+    let n_acc = (data[pos] % 8) as usize;
+    pos += 1;
+
+    // 总字节需求（含 chain_id 8B）。
+    let need = n_val * (32 + 32 + 16 + 2) + n_acc * (32 + 16) + 8;
+    if data.len() < pos + need {
+        return None;
+    }
+
+    let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
+        if data.len() < *pos + n {
+            return None;
+        }
+        let s = &data[*pos..*pos + n];
+        *pos += n;
+        Some(s)
+    };
+
+    let mut initial_validator_set = Vec::with_capacity(n_val);
+    for _ in 0..n_val {
+        let kh: [u8; 32] = take(&mut pos, 32)?.try_into().ok()?;
+        let pk: [u8; 32] = take(&mut pos, 32)?.try_into().ok()?;
+        let stake = u128::from_le_bytes(take(&mut pos, 16)?.try_into().ok()?);
+        let comm = u16::from_le_bytes(take(&mut pos, 2)?.try_into().ok()?);
+        initial_validator_set.push(ValidatorInit {
+            account_address: NovaAddress::from_payload(NovaAddressPayload {
+                address_version: 1,
+                address_type: AddressType::UserAccount,
+                network_id,
+                key_hash: kh,
+            }),
+            consensus_public_key: pk,
+            bonded_stake: stake,
+            commission_bps: comm,
+        });
+    }
+
+    let mut initial_accounts = Vec::with_capacity(n_acc);
+    for _ in 0..n_acc {
+        let kh: [u8; 32] = take(&mut pos, 32)?.try_into().ok()?;
+        let liq = u128::from_le_bytes(take(&mut pos, 16)?.try_into().ok()?);
+        initial_accounts.push(AccountInit {
+            address: NovaAddress::from_payload(NovaAddressPayload {
+                address_version: 1,
+                address_type: AddressType::UserAccount,
+                network_id,
+                key_hash: kh,
+            }),
+            liquid_balance: liq,
+        });
+    }
+
+    let chain_id = u64::from_le_bytes(take(&mut pos, 8)?.try_into().ok()?);
+    Some(GenesisV1 {
+        network_id,
+        chain_id,
+        genesis_timestamp: 1,
+        initial_validator_set,
+        initial_accounts,
+        protocol_parameters: ProtocolParamsV1 {
+            max_tx_bytes: 65_536,
+            max_block_bytes: 1_048_576,
+            max_gas_per_block: 1_000_000_000,
+            max_contract_code_bytes: 32_768,
+            max_contract_storage_bytes: 1_048_576,
+            epoch_length_blocks: 100,
+            snapshot_interval_blocks: 1_000,
+        },
+        economics_parameters: EconomicsParamsV1 {
+            total_supply: 6_500_000,
+            min_validator_stake: 100_000,
+            unbonding_period_seconds: 1_209_600,
+            fee_burn_bps: 500,
+        },
+    })
 }

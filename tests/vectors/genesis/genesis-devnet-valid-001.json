@@ -9,7 +9,7 @@
   },
   "expected": "VALID",
   "expected_error": null,
-  "expected_genesis_hash": "",
+  "expected_genesis_hash": "31bd9640934cefbeadd47c4f543da75e43a9c414a8ac385772f016a1b9d807a5",
   "genesis_timestamp": 1750000200,
   "id": "genesis-devnet-valid-001",
   "initial_accounts": [
@@ -41,7 +41,7 @@
     }
   ],
   "network_id": 3,
-  "note": "devnet valid genesis (novad1, chain_id=3003)",
+  "note": "devnet valid genesis (novad1, chain_id=3003); expected_genesis_hash 已回填（nova_crypto::identity）; expected_genesis_hash 已回填（nova_crypto::identity）; expected_genesis_hash 已回填（nova_crypto::identity）",
   "protocol_parameters": {
     "epoch_length_blocks": 100,
     "max_block_bytes": 1048576,

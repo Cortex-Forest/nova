@@ -11,9 +11,8 @@
   - 地址为真实 bech32m，网络必须匹配 `network_id`（ADR-0011/0004）。
   - validator 列表按 `validator_id`（=SHA-256(pubkey)）升序；account 列表按地址 payload bytes 升序
     （ADR-0015；非序 ⇒ `NonCanonicalOrdering`）。
-  - loader（schema 层）校验：嵌套类型 / 注册表 / 重复 / 排序 / 基本范围 / stake accounting /
-    supply invariant（ADR-0016）。
-  - `expected_genesis_hash`: **DEFERRED_VALIDATION**（canonical 实现 = STEP 6 IMPLEMENTATION
-    落地后由 `nova_crypto::identity` 计算并回填；本阶段不伪造 PASS）。
+  - loader 先做 schema 层校验（嵌套类型 / 注册表 / 重复 / 排序 / 基本范围 / stake accounting /
+    supply invariant，ADR-0016），通过后用 `nova_crypto::identity` 计算 canonical `genesis_hash`
+    并断言 computed == `expected_genesis_hash`（STEP 6A：真正调用生产实现，不再 DEFERRED）。
 
 **注意**：Genesis fixture 必须遵循 genesis-v1.md；禁止在测试向量中自行重新设计 Genesis 编码。

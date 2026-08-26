@@ -331,28 +331,17 @@ fn genesis_vectors_validate() {
         let r = validate_genesis_vector(json);
         let expected = vector_field(json, "expected");
         let expected_error = vector_field(json, "expected_error");
-        // genesis_hash 计算未实现（canonical 层）：恒为 DEFERRED。
-        assert!(
-            r.hash_deferred,
-            "VECTOR FAILED\nID: {id}\nFIELD: genesis_hash status\nEXPECTED: DEFERRED_VALIDATION\nACTUAL: not deferred"
-        );
         if expected == "VALID" {
+            // schema + canonical/hash 全部通过。
             assert!(
                 r.ok,
-                "VECTOR FAILED\nID: {id}\nFIELD: genesis schema (VALID)\nEXPECTED: ok\nACTUAL: {:?}\nSPEC: ADR-0014/0015/0016",
-                r.errors
-            );
-        } else if expected_error == "GenesisHashMismatch" {
-            // canonical 层验证（hash 计算未实现）：结构必须合法，hash 层留待 STEP 6 IMPLEMENTATION。
-            assert!(
-                r.ok,
-                "VECTOR FAILED\nID: {id}\nFIELD: genesis schema (GenesisHashMismatch, canonical layer)\nEXPECTED: structurally valid\nACTUAL: {:?}\nSPEC: genesis-v1.md §15",
+                "VECTOR FAILED\nID: {id}\nFIELD: genesis schema + canonical hash\nEXPECTED: valid\nACTUAL: {:?}\nSPEC: ADR-0014/0015/0016",
                 r.errors
             );
         } else {
             assert!(
                 !r.ok,
-                "VECTOR FAILED\nID: {id}\nFIELD: genesis schema (INVALID)\nEXPECTED: reject\nACTUAL: accepted\nSPEC: ADR-0014/0015/0016"
+                "VECTOR FAILED\nID: {id}\nFIELD: genesis (INVALID)\nEXPECTED: reject\nACTUAL: accepted\nSPEC: ADR-0014/0015/0016"
             );
             assert_eq!(
                 r.error_name.as_deref(),

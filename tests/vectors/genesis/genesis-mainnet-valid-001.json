@@ -9,7 +9,7 @@
   },
   "expected": "VALID",
   "expected_error": null,
-  "expected_genesis_hash": "",
+  "expected_genesis_hash": "035b369237201feae92a271897ad1405d8905573ba21d7f1970551f0d49bf1ef",
   "genesis_timestamp": 1750000000,
   "id": "genesis-mainnet-valid-001",
   "initial_accounts": [
@@ -41,7 +41,7 @@
     }
   ],
   "network_id": 1,
-  "note": "mainnet valid genesis (nova1, chain_id=1001)",
+  "note": "mainnet valid genesis (nova1, chain_id=1001); expected_genesis_hash 已回填（nova_crypto::identity）",
   "protocol_parameters": {
     "epoch_length_blocks": 100,
     "max_block_bytes": 1048576,

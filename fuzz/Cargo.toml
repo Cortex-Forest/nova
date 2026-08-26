@@ -13,6 +13,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 nova-crypto = { path = "../crates/crypto" }
+# genesis_canonicalize 复用 stable 解析器（bounded/no-panic），保持 fuzz 核心逻辑单一来源
+nova-test-vectors = { path = "../tests/vectors" }
 
 [[bin]]
 name = "signature_decode"
@@ -21,3 +23,7 @@ path = "fuzz_targets/signature_decode.rs"
 [[bin]]
 name = "domain_message_decode"
 path = "fuzz_targets/domain_message_decode.rs"
+
+[[bin]]
+name = "genesis_canonicalize"
+path = "fuzz_targets/genesis_canonicalize.rs"

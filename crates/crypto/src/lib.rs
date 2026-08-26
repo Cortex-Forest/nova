@@ -10,6 +10,8 @@
 //! - [`key`]：**STEP 4 已实现**——`KeyPair` 生成（OS CSPRNG 无 fallback）与密钥材料生命周期保护。
 //! - [`address`]：**STEP 5 已实现**——`NovaAddressPayload`（Bech32m-derived 编码，ADR-0004），
 //!   `from_verifying_key` 从公钥派生 `key_hash`（防任意 hash 当账户）。
+//! - [`identity`]：**STEP 6A 已实现**——`GenesisV1` canonical 编码（ADR-0014/0015/0016）与
+//!   `compute_genesis_hash`（SHA-256(canonical)）；完整 `validate_genesis` 在 STEP 6B。
 //!
 //! # 纪律（Master Prompt §15/§16）
 //! - **禁止自研任何密码学算法**；必须使用经过长期审查的成熟密码库。
@@ -19,5 +21,6 @@
 pub mod address;
 pub mod domain;
 pub mod hash;
+pub mod identity;
 pub mod key;
 pub mod signature;

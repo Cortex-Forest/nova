@@ -9,7 +9,7 @@
   },
   "expected": "INVALID",
   "expected_error": "GenesisHashMismatch",
-  "expected_genesis_hash": "",
+  "expected_genesis_hash": "0000000000000000000000000000000000000000000000000000000000000000",
   "genesis_timestamp": 1750000000,
   "id": "genesis-wrong-genesis-hash-001",
   "initial_accounts": [
