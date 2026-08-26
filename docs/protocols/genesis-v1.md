@@ -72,7 +72,9 @@ AccountInit {
 }
 ```
 
-- **V0.1 implicit defaults（不写入 Genesis）**：`nonce = 0`、`code = empty`、`storage = empty`。
+- **V0.1 implicit defaults（不写入 Genesis；与 ADR-0017 Account Model 一致）**：
+  `nonce = 0`、`code_hash = EMPTY_CODE_HASH`（= SHA-256(empty)，ADR-0018 §3）、
+  `storage_root = EMPTY_STORAGE_ROOT`（协议预留常量，数值 DEFERRED TO STEP 8，ADR-0018 §4）。
 
 ### 校验规则
 

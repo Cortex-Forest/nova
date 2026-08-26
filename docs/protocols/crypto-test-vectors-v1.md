@@ -160,3 +160,22 @@ canonical 编码或 `genesis_hash` 计算（`expected_genesis_hash` 在 STEP 6 I
 - Schema / 校验：ADR-0014、`genesis-v1.md`。
 - Canonical 编码 / hash：ADR-0015、`crypto-serialization-v1.md` §11。
 - Accounting invariants：ADR-0016。
+
+## 7. Account 向量（预留，STEP 7H 启用）
+
+- 账户 value 序列化 / 承诺规范见 **ADR-0017 / ADR-0018**、`crypto-serialization-v1.md` §12。
+- **预留分类**（待 STEP 7H Transaction Test Vectors 实现后生成 fixture）：
+  - account canonical encoding（88B：balance/nonce/code_hash/storage_root）
+  - `account_commitment = SHA-256(canonical_account_bytes)`
+  - `EMPTY_CODE_HASH`（= SHA-256(empty)）
+  - `EMPTY_STORAGE_ROOT`（**DEFERRED TO STEP 8**，不生成 fixture）
+  - implicit default / 账户创建（positive value + valid execution）
+  - nonce 语义（invalid tx 不改 nonce）
+  - balance checked 运算（overflow / underflow）
+  - zero-balance 保留 / 删除禁止
+- 当前阶段（STEP 7A 架构）不生成 Account 向量 fixture（避免在 trie/空根未冻结前固化易错值）。
+
+## 8. 来源（Account）
+
+- 账户模型：ADR-0017。
+- 账户承诺 / 序列化：ADR-0018、`crypto-serialization-v1.md` §12。

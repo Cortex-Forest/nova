@@ -125,3 +125,23 @@ Genesis 顶层与嵌套类型（`ValidatorInit`/`AccountInit`/`ProtocolParamsV1`
 - 地址 canonical 字节表示 = **35B payload raw bytes**（非 bech32m 文本）；
 - 列表顺序属于 Genesis 身份（validator 按 `validator_id` 升序、account 按 payload bytes 升序；非序 ⇒ 拒绝）；
 - `genesis_hash = SHA-256(canonical_genesis_bytes)`（hash-over-preimage，hash 不进入被 hash 内容）。
+
+## 12. Account State Canonical Serialization（ADR-0018）
+
+账户 value 序列化（**account value 仅此 88B；不含 address / account_type**）：
+
+```
+canonical_account_bytes =
+    balance(16B LE)
+  ‖ nonce(8B LE)
+  ‖ code_hash(32B)
+  ‖ storage_root(32B)
+  = 88 B
+```
+
+- `account_commitment = SHA-256(canonical_account_bytes)`（32B）。
+- `EMPTY_CODE_HASH = SHA-256(empty bytes)`（User Account 默认 code_hash）。
+- `EMPTY_STORAGE_ROOT`：协议预留常量，数值 **DEFERRED TO STEP 8**（禁止当前实现自行定义）。
+- Trie key = `NovaAddressPayload` raw bytes（35B）；value 与 key 绑定构成完整账户状态
+  （ADR-0018 安全不变量）。
+- State Root 聚合 / trie 结构 / 空根 / proof / 持久化：**STEP 8（Storage）** 冻结。
