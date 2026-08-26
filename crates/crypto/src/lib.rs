@@ -12,8 +12,9 @@
 //!   `from_verifying_key` 从公钥派生 `key_hash`（防任意 hash 当账户）。
 //! - [`identity`]：**STEP 6A/6B 已实现**——`GenesisV1` canonical 编码、`decode_genesis_bytes`、
 //!   `validate_genesis`、`ChainIdentity`（ADR-0014/0015/0016）。
-//! - [`transaction`]：**STEP 7C 已实现**——`TransactionV1` canonical serialization / txid /
-//!   decode（ADR-0019/0020，crypto-serialization §13）；签名验证在 STEP 7D。
+//! - [`transaction`]：**STEP 7C/7D 已实现**——`TransactionV1` canonical serialization / txid /
+//!   decode（ADR-0019/0020，crypto-serialization §13）+ 签名集成（`sign_transaction` /
+//!   `verify_transaction_signature`，唯一 `SigningMessageHash` 签名/验证路径）。
 //!
 //! # 纪律（Master Prompt §15/§16）
 //! - **禁止自研任何密码学算法**；必须使用经过长期审查的成熟密码库。

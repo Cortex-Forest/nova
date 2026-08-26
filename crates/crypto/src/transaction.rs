@@ -1,4 +1,4 @@
-//! Nova Chain 交易 Canonical Serialization（STEP 7C）。
+//! Nova Chain 交易 Canonical Serialization + Signature Integration（STEP 7C/7D）。
 //!
 //! 严格依据冻结规范：**ADR-0019**（Transaction Schema V1）、**ADR-0020**（TransactionType
 //! Registry）、`crypto-serialization-v1.md` §13、ADR-0005/0012（signed_bytes）、ADR-0009（签名覆盖）。
@@ -9,15 +9,22 @@
 //!   → canonical_tx_payload（不含 signature）
 //!   → tx_signed_bytes（algorithm ‖ domain(0x01 Transaction) ‖ chain_id ‖ len ‖ payload）
 //!   → tx_message_hash（SHA-256 → SigningMessageHash）
+//!   → Ed25519 sign / verify（唯一 SigningMessageHash 路径；7D）
 //!   → canonical_transaction_bytes（payload ‖ signature(64B)）
 //!   → compute_txid（SHA-256）
 //! ```
 //!
-//! # 本 STEP 边界
-//! - 只做 canonical 编码 / 解码 / txid；**不实现**：Mempool / 执行 / 扣费 / State Transition
-//!   （后续 STEP）、签名验证（STEP 7D）。
+//! # 本模块边界
+//! - **7C**：canonical 编码 / 解码 / txid。
+//! - **7D**：签名生成 / 验证（[`sign_transaction`] / [`verify_transaction_signature`]），
+//!   唯一走 [`SigningMessageHash`] API（`tx_message_hash` → `sign_message_hash` /
+//!   `verify_message_hash`，**无第二条签名路径**）。
+//! - **不实现**：Mempool / 执行 / 扣费 / State Transition（后续 STEP）。
+//! - **`decode success ≠ valid transaction`**：格式正确性 ≠ 有效性（nonce / 签名 / 余额 /
+//!   过期 / chain_id 语义在 7D/7E+）。
 //! - `signature` **不进入** canonical_tx_payload；`signature` **进入** txid（ADR-0019 §4）。
-//! - `chain_id` 双绑：payload 内 `chain_id` 与 signed_bytes 头部 `chain_id` 必须一致（§3）。
+//! - `chain_id` 双绑：payload 内 `chain_id` 与 signed_bytes 头部 `chain_id` 必须一致（§3）；
+//!   篡改 chain_id ⇒ message_hash 变 ⇒ 签名验证失败。
 
 use crate::address::NovaAddress;
 use crate::domain::{
@@ -25,6 +32,9 @@ use crate::domain::{
 };
 use crate::hash::protocol_hash;
 use crate::identity::{address_payload_bytes, decode_addr_payload};
+use crate::signature::{
+    Signature, SigningKey, VerifyingKey, sign_message_hash, verify_message_hash,
+};
 use core::fmt;
 
 /// 交易类型注册表（ADR-0020）：`0x01 Transfer`；`0x02–0xFF` Reserved ⇒ 拒绝，禁 fallback。
@@ -66,6 +76,10 @@ pub enum TransactionError {
     InvalidAddress,
     /// 签名长度非法（≠ 64B）。
     InvalidSignature,
+    /// 签名验证失败（Ed25519 verify_strict 拒绝；7D）。
+    SignatureVerificationFailed,
+    /// 提供的 sender 公钥与 sender 地址 key_hash 不匹配（身份绑定；7D）。
+    SenderKeyMismatch,
     /// 编码长度溢出（u32 长度前缀 / payload 超限）。
     EncodingOverflow,
     /// chain_id 双绑不一致（payload 内 chain_id ≠ signed_bytes 头部 chain_id）。
@@ -80,6 +94,10 @@ impl fmt::Display for TransactionError {
             Self::TrailingBytes => write!(f, "trailing bytes"),
             Self::InvalidAddress => write!(f, "invalid address payload"),
             Self::InvalidSignature => write!(f, "invalid signature length"),
+            Self::SignatureVerificationFailed => write!(f, "signature verification failed"),
+            Self::SenderKeyMismatch => {
+                write!(f, "sender key does not match sender address key_hash")
+            }
             Self::EncodingOverflow => write!(f, "encoding overflow"),
             Self::ChainIdMismatch => write!(f, "chain_id binding mismatch"),
         }
@@ -177,6 +195,53 @@ pub fn check_chain_id_binding(tx: &TransactionV1) -> Result<(), TransactionError
         return Err(TransactionError::ChainIdMismatch);
     }
     Ok(())
+}
+
+// =====================================================================
+// STEP 7D — Transaction Signature Integration
+// =====================================================================
+
+/// 用 sender 私钥对交易签名（**唯一签名路径**，7D）。
+///
+/// `tx.signature = sign_message_hash(tx_message_hash(tx))`。
+/// - message_hash 经 `tx_signed_bytes`（[`AlgorithmId::Ed25519`] / [`DomainId::Transaction`] /
+///   chain_id 双绑）构造，签名输入是 [`SigningMessageHash`]（ADR-0013，禁任意字节签名）。
+/// - `canonical_tx_payload` 不含 signature，故签名不进入 message hash（ADR-0019 §3）。
+pub fn sign_transaction(
+    signing: &SigningKey,
+    tx: &mut TransactionV1,
+) -> Result<(), TransactionError> {
+    let mh = tx_message_hash(tx)?;
+    let sig = sign_message_hash(signing, &mh);
+    tx.signature = sig.to_bytes();
+    Ok(())
+}
+
+/// 验证交易签名 + sender 公钥绑定（**唯一验证路径**，7D）。
+///
+/// 顺序：
+/// 1. **身份绑定**：`sender_vk` 的 `SHA-256(canonical_pubkey)` 必须等于 `tx.sender` 的
+///    `key_hash`（防“用不匹配地址的公钥验证”；ADR-0004/0008）。
+/// 2. **message hash**：`tx_message_hash(tx)`（篡改任意字段 ⇒ hash 变）。
+/// 3. **签名**：`verify_message_hash(sender_vk, &mh, &sig)`（verify_strict；SigningMessageHash API）。
+///
+/// **decode success ≠ valid**：本函数只验签名/身份；nonce / 余额 / 过期等 admission 语义在 7E+。
+pub fn verify_transaction_signature(
+    tx: &TransactionV1,
+    sender_vk: &VerifyingKey,
+) -> Result<(), TransactionError> {
+    // 1) 身份绑定：sender 地址 key_hash 必须来自该公钥（SHA-256(canonical_pubkey)）。
+    let key_hash = protocol_hash(&sender_vk.to_bytes());
+    if tx.sender.payload().key_hash != key_hash {
+        return Err(TransactionError::SenderKeyMismatch);
+    }
+    // 2) 唯一 message hash 路径（篡改任意字段 ⇒ hash 变 ⇒ 验证失败）。
+    let mh = tx_message_hash(tx)?;
+    // 3) 唯一验证路径（SigningMessageHash → verify_strict）。
+    let sig =
+        Signature::from_bytes(&tx.signature).map_err(|_| TransactionError::InvalidSignature)?;
+    verify_message_hash(sender_vk, &mh, &sig)
+        .map_err(|_| TransactionError::SignatureVerificationFailed)
 }
 
 /// 解码完整交易（canonical roundtrip）。
@@ -440,5 +505,173 @@ mod tests {
         assert_eq!(sb[0], 0x01, "algorithm_id Ed25519");
         assert_eq!(sb[1], 0x01, "domain_id Transaction");
         assert_eq!(&sb[2..10], &tx.chain_id.to_le_bytes(), "chain_id LE");
+    }
+
+    // =====================================================================
+    // STEP 7D — Signature Integration
+    // =====================================================================
+    use crate::signature::SigningKey as Sk;
+
+    /// 构造签名完成、sender 地址与密钥绑定的交易。
+    fn signed_tx() -> (Sk, VerifyingKey, TransactionV1) {
+        let signing = Sk::from_seed([0x42u8; 32]);
+        let vk = signing.verifying_key();
+        let mut tx = sample();
+        tx.sender =
+            NovaAddress::from_verifying_key(&vk, AddressType::UserAccount, NetworkId::Mainnet)
+                .unwrap();
+        sign_transaction(&signing, &mut tx).unwrap();
+        (signing, vk, tx)
+    }
+
+    #[test]
+    fn sign_then_verify_ok() {
+        let (_, vk, tx) = signed_tx();
+        assert!(tx.signature.iter().any(|b| *b != 0), "signature set");
+        assert_eq!(verify_transaction_signature(&tx, &vk), Ok(()));
+    }
+
+    #[test]
+    fn signature_not_in_message_hash() {
+        // 签名不进入 canonical_tx_payload ⇒ message_hash 与签名无关（ADR-0019 §3）
+        let (_, vk, tx) = signed_tx();
+        let mh_signed = tx_message_hash(&tx).unwrap();
+        let mut tx2 = tx.clone();
+        tx2.signature = [0u8; 64];
+        let mh_unsigned = tx_message_hash(&tx2).unwrap();
+        assert_eq!(
+            mh_signed, mh_unsigned,
+            "signature must not enter message_hash"
+        );
+        assert_eq!(verify_transaction_signature(&tx, &vk), Ok(()));
+    }
+
+    // 篡改任意字段 ⇒ 签名验证失败（改 hash 或改 signature）
+    #[test]
+    fn tamper_amount_fails() {
+        let (_, vk, mut tx) = signed_tx();
+        tx.amount += 1;
+        assert_eq!(
+            verify_transaction_signature(&tx, &vk),
+            Err(TransactionError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn tamper_receiver_fails() {
+        let (_, vk, mut tx) = signed_tx();
+        tx.receiver = addr([0x33; 32], NetworkId::Mainnet);
+        assert_eq!(
+            verify_transaction_signature(&tx, &vk),
+            Err(TransactionError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn tamper_nonce_fails() {
+        let (_, vk, mut tx) = signed_tx();
+        tx.nonce += 1;
+        assert_eq!(
+            verify_transaction_signature(&tx, &vk),
+            Err(TransactionError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn tamper_chain_id_fails() {
+        let (_, vk, mut tx) = signed_tx();
+        tx.chain_id += 1;
+        assert_eq!(
+            verify_transaction_signature(&tx, &vk),
+            Err(TransactionError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn tamper_payload_fails() {
+        let (_, vk, mut tx) = signed_tx();
+        tx.payload = vec![0xde, 0xad];
+        assert_eq!(
+            verify_transaction_signature(&tx, &vk),
+            Err(TransactionError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn tamper_expiration_fails() {
+        let (_, vk, mut tx) = signed_tx();
+        tx.expiration += 1;
+        assert_eq!(
+            verify_transaction_signature(&tx, &vk),
+            Err(TransactionError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn tamper_gas_price_fails() {
+        let (_, vk, mut tx) = signed_tx();
+        tx.gas_price += 1;
+        assert_eq!(
+            verify_transaction_signature(&tx, &vk),
+            Err(TransactionError::SignatureVerificationFailed)
+        );
+    }
+
+    #[test]
+    fn tamper_signature_fails() {
+        let (_, vk, mut tx) = signed_tx();
+        tx.signature[0] ^= 0xff;
+        assert_eq!(
+            verify_transaction_signature(&tx, &vk),
+            Err(TransactionError::SignatureVerificationFailed)
+        );
+    }
+
+    // transaction_type 只有 Transfer(0x01)；未知值在 decode 层拒绝（ADR-0020 注册表）
+    #[test]
+    fn tamper_transaction_type_rejected_at_decode() {
+        let (_, _, tx) = signed_tx();
+        let mut bytes = canonical_transaction_bytes(&tx).unwrap();
+        bytes[127] = 0x02; // transaction_type
+        assert_eq!(
+            decode_transaction(&bytes),
+            Err(TransactionError::UnknownTransactionType(0x02))
+        );
+    }
+
+    // 身份绑定：换 sender 公钥 / 换 sender 地址 ⇒ 拒绝
+    #[test]
+    fn wrong_sender_key_fails() {
+        let (_, _, tx) = signed_tx();
+        let other = Sk::from_seed([0x99u8; 32]).verifying_key();
+        assert_eq!(
+            verify_transaction_signature(&tx, &other),
+            Err(TransactionError::SenderKeyMismatch),
+            "other key must not match sender key_hash"
+        );
+    }
+
+    #[test]
+    fn sender_address_tamper_rejected() {
+        let (_, vk, mut tx) = signed_tx();
+        tx.sender = addr([0x11; 32], NetworkId::Mainnet);
+        assert_eq!(
+            verify_transaction_signature(&tx, &vk),
+            Err(TransactionError::SenderKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn receiver_key_not_sender() {
+        // 用 receiver 的公钥冒充 sender 公钥 ⇒ key_hash 不匹配 ⇒ 拒绝
+        let (_, _, mut tx) = signed_tx();
+        let rk = Sk::from_seed([0x77u8; 32]).verifying_key();
+        tx.receiver =
+            NovaAddress::from_verifying_key(&rk, AddressType::UserAccount, NetworkId::Mainnet)
+                .unwrap();
+        assert_eq!(
+            verify_transaction_signature(&tx, &rk),
+            Err(TransactionError::SenderKeyMismatch)
+        );
     }
 }

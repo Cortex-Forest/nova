@@ -4,9 +4,10 @@
 //! mutation changes txid、signature 进入 txid、chain_id 篡改检测。
 
 use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
+use nova_crypto::key::KeyPair;
 use nova_crypto::transaction::{
     TransactionType, TransactionV1, canonical_transaction_bytes, canonical_tx_payload,
-    compute_txid, decode_transaction,
+    compute_txid, decode_transaction, sign_transaction, verify_transaction_signature,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -126,5 +127,72 @@ proptest! {
         tampered[1] ^= 0x01; // payload chain_id 低字节
         let dt = decode_transaction(&tampered).unwrap();
         prop_assert_ne!(compute_txid(&dt).unwrap(), compute_txid(&t).unwrap());
+    }
+}
+
+// =====================================================================
+// STEP 7D — Signature Integration（真实密钥：sign → verify）
+// =====================================================================
+
+/// 从公钥派生 sender 地址（key_hash = SHA-256(canonical_pubkey)）。
+fn sender_addr(vk: &nova_crypto::signature::VerifyingKey) -> NovaAddress {
+    NovaAddress::from_verifying_key(vk, AddressType::UserAccount, NetworkId::Mainnet).unwrap()
+}
+
+proptest! {
+    // 签名 → 验证通过；篡改任意字段 ⇒ 验证失败；换 sender 公钥 ⇒ 失败（身份绑定）
+    #[test]
+    fn sign_verify_roundtrip_and_mutation(
+        chain_id in any::<u64>(),
+        nonce in any::<u64>(),
+        amount in any::<u128>(),
+        gas_limit in any::<u64>(),
+        gas_price in any::<u128>(),
+        payload in vec(any::<u8>(), 0..64),
+        expiration in any::<u64>(),
+    ) {
+        let kp = KeyPair::generate().unwrap();
+        let mut tx = TransactionV1 {
+            version: 0x01,
+            chain_id,
+            nonce,
+            sender: sender_addr(kp.verifying_key()),
+            receiver: addr([0x22; 32]),
+            amount,
+            gas_limit,
+            gas_price,
+            transaction_type: TransactionType::Transfer,
+            payload,
+            expiration,
+            signature: [0u8; 64],
+        };
+        // sign → verify OK
+        sign_transaction(kp.signing_key(), &mut tx).unwrap();
+        prop_assert!(verify_transaction_signature(&tx, kp.verifying_key()).is_ok());
+
+        // 篡改任意字段 ⇒ 验证失败
+        let mut m = tx.clone(); m.amount = m.amount.wrapping_add(1);
+        prop_assert!(verify_transaction_signature(&m, kp.verifying_key()).is_err(), "amount");
+        let mut m = tx.clone(); m.nonce = m.nonce.wrapping_add(1);
+        prop_assert!(verify_transaction_signature(&m, kp.verifying_key()).is_err(), "nonce");
+        let mut m = tx.clone(); m.chain_id = m.chain_id.wrapping_add(1);
+        prop_assert!(verify_transaction_signature(&m, kp.verifying_key()).is_err(), "chain_id");
+        let mut m = tx.clone(); m.receiver = addr([0x33; 32]);
+        prop_assert!(verify_transaction_signature(&m, kp.verifying_key()).is_err(), "receiver");
+        let mut m = tx.clone(); m.expiration = m.expiration.wrapping_add(1);
+        prop_assert!(verify_transaction_signature(&m, kp.verifying_key()).is_err(), "expiration");
+        let mut m = tx.clone(); m.gas_price = m.gas_price.wrapping_add(1);
+        prop_assert!(verify_transaction_signature(&m, kp.verifying_key()).is_err(), "gas_price");
+        let mut m = tx.clone(); m.payload.push(0x00);
+        prop_assert!(verify_transaction_signature(&m, kp.verifying_key()).is_err(), "payload");
+        let mut m = tx.clone(); m.signature[0] ^= 0xff;
+        prop_assert!(verify_transaction_signature(&m, kp.verifying_key()).is_err(), "signature");
+
+        // 换 sender 公钥 ⇒ 身份绑定拒绝
+        let other = KeyPair::generate().unwrap();
+        prop_assert!(
+            verify_transaction_signature(&tx, other.verifying_key()).is_err(),
+            "wrong sender key"
+        );
     }
 }
