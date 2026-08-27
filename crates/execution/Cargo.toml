@@ -10,5 +10,10 @@ description = "Nova Chain WASM execution layer (PHASE 1 placeholder)"
 workspace = true
 
 [dependencies]
-# PHASE 1：零第三方运行时依赖。
-# WASM 运行时（Wasmtime 或评审等价）与确定性策略待 ADR-0010 评审后引入。
+# STEP 7G：状态转换引用协议类型（nova-core）与协议规则（nova-crypto：TransactionV1 / VerifyingKey）
+nova-core = { path = "../core" }
+nova-crypto = { path = "../crypto" }
+
+[dev-dependencies]
+# STEP 7G property tests：成功路径不变量 / 失败无副作用
+proptest = "1"

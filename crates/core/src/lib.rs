@@ -9,6 +9,8 @@
 //!   - `replay`：`ReplayError` / `check_replay_context`（chain_id / network_id / expiration）；
 //!   - `gas_fee`：`GasFeeError` / fee_max / required / actual_fee / burn / balance sufficiency
 //!     / gas 参数校验（F1–F10，`TRANSFER_INTRINSIC_GAS = 21_000`）。
+//! - [`state`]：**STEP 7G 协议类型**——`AccountState` / `AccountChange` / `TransactionReceipt` /
+//!   `StateTransition` / `EMPTY_CODE_HASH`（ADR-0017/0018/0023；执行逻辑在 `nova-execution`）。
 //! - [`error`]：分层错误模型骨架（`NovaError` 根接口 / `ErrorKind` 分类）。
 //!
 //! # 纪律（Master Prompt §9/§23/§54）
@@ -65,6 +67,7 @@ pub mod error {
     }
 }
 
-// 未来承载：交易执行（7G）、区块（STEP 10）、状态（STEP 8）等；每步先 ADR。
+// 未来承载：区块（STEP 10）、状态存储（STEP 8）等；每步先 ADR。
 
+pub mod state;
 pub mod transaction;

@@ -549,6 +549,11 @@ dependencies = [
 [[package]]
 name = "nova-execution"
 version = "0.1.0"
+dependencies = [
+ "nova-core",
+ "nova-crypto",
+ "proptest",
+]
 
 [[package]]
 name = "nova-network"
