@@ -1,11 +1,17 @@
-//! Nova Chain 核心协议类型（PHASE 1 占位）。
+//! Nova Chain 核心协议类型与规则。
 //!
-//! 本 crate 未来承载：交易、状态、区块等核心协议类型。
-//! 当前仅定义**协议版本**常量；协议类型的设计需先经 ADR 批准（Master Prompt §9/§23）。
+//! 本 crate 承载：交易有效性 / nonce / replay 等核心协议语义（PHASE 3）。
 //!
-//! # 版本概念
-//! 协议版本（Protocol）与软件版本（Software）、数据库版本（Database）、
-//! API 版本（API）四者相互独立，禁止混用（Master Prompt §10 / ADR-0001）。
+//! # 模块
+//! - [`transaction`]：**STEP 7E 已实现**——Nonce / Replay Protection（ADR-0021）：
+//!   - `nonce`：`NonceClass` / `classify_nonce`（consensus 中立纯函数）、
+//!     `NonceError` / `checked_next_nonce`（N15 exhaustion 边界）；
+//!   - `replay`：`ReplayError` / `check_replay_context`（chain_id / network_id / expiration）。
+//! - [`error`]：分层错误模型骨架（`NovaError` 根接口 / `ErrorKind` 分类）。
+//!
+//! # 纪律（Master Prompt §9/§23/§54）
+//! - 协议类型/规则的设计先经 ADR 批准（ADR-0021 冻结 7E）。
+//! - Consensus 规则与本地 Mempool Policy 严格分离；本 crate **不持有**任何 policy 阈值。
 
 /// Nova Chain 协议版本（Protocol Version）。
 ///
@@ -57,4 +63,6 @@ pub mod error {
     }
 }
 
-// 注意：本阶段禁止实现任何核心协议逻辑（交易/状态/区块）。
+// 未来承载：交易执行（7G）、区块（STEP 10）、状态（STEP 8）等；每步先 ADR。
+
+pub mod transaction;

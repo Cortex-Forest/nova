@@ -10,4 +10,9 @@ description = "Nova Chain core protocol types (PHASE 1 placeholder)"
 workspace = true
 
 [dependencies]
-# PHASE 1：零第三方运行时依赖
+# STEP 7E：nonce/replay 规则引用 nova-crypto 协议类型（TransactionV1 / ChainIdentity / NetworkId）
+nova-crypto = { path = "../crypto" }
+
+[dev-dependencies]
+# STEP 7E property tests：nonce 分类 / replay 篡改一致性
+proptest = "1"
