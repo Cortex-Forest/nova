@@ -576,7 +576,9 @@ name = "nova-test-vectors"
 version = "0.1.0"
 dependencies = [
  "bech32",
+ "nova-core",
  "nova-crypto",
+ "nova-execution",
  "serde_json",
 ]
 

@@ -13,6 +13,10 @@ workspace = true
 serde_json.workspace = true
 # STEP 3：domain 重算委托 nova_crypto::domain（消除重复协议定义）
 nova-crypto = { path = "../../crates/crypto" }
+# STEP 7H：transaction loader 委托 nova-core（7E/7F 规则）与 nova-execution（7G apply_transaction）
+# 依赖方向：tests/vectors → {nova-core, nova-execution, nova-crypto}（禁止反向）
+nova-core = { path = "../../crates/core" }
+nova-execution = { path = "../../crates/execution" }
 # STEP 5：地址向量生成器用 bech32 构造破坏/越权情形（仅 bin；本 crate 为 dev-only）
 bech32.workspace = true
 

@@ -9,6 +9,7 @@ use nova_test_vectors::address::validate_address_vector;
 use nova_test_vectors::domain::validate_domain_vector;
 use nova_test_vectors::genesis::validate_genesis_vector;
 use nova_test_vectors::signature::validate_signature_vector;
+use nova_test_vectors::transaction::validate_transaction_vector;
 
 // ---------------------------------------------------------------------------
 // Domain vectors（§10/§11/§13）
@@ -352,4 +353,115 @@ fn genesis_vectors_validate() {
         }
     }
     assert_eq!(GENESIS_VECTORS.len(), 17);
+}
+
+// ---------------------------------------------------------------------------
+// Transaction vectors（ADR-0024 / STEP 7H）
+// ---------------------------------------------------------------------------
+const TRANSACTION_VECTORS: &[(&str, &str)] = &[
+    (
+        "tx-normal-transfer-001",
+        include_str!("../transaction/tx-normal-transfer-001.json"),
+    ),
+    (
+        "tx-zero-amount-001",
+        include_str!("../transaction/tx-zero-amount-001.json"),
+    ),
+    (
+        "tx-self-transfer-001",
+        include_str!("../transaction/tx-self-transfer-001.json"),
+    ),
+    (
+        "tx-nonce-current-001",
+        include_str!("../transaction/tx-nonce-current-001.json"),
+    ),
+    (
+        "tx-nonce-too-low-001",
+        include_str!("../transaction/tx-nonce-too-low-001.json"),
+    ),
+    (
+        "tx-nonce-future-001",
+        include_str!("../transaction/tx-nonce-future-001.json"),
+    ),
+    (
+        "tx-nonce-max-001",
+        include_str!("../transaction/tx-nonce-max-001.json"),
+    ),
+    (
+        "tx-fee-normal-001",
+        include_str!("../transaction/tx-fee-normal-001.json"),
+    ),
+    (
+        "tx-fee-overflow-001",
+        include_str!("../transaction/tx-fee-overflow-001.json"),
+    ),
+    (
+        "tx-required-overflow-001",
+        include_str!("../transaction/tx-required-overflow-001.json"),
+    ),
+    (
+        "tx-gas-limit-invalid-001",
+        include_str!("../transaction/tx-gas-limit-invalid-001.json"),
+    ),
+    (
+        "tx-gas-price-invalid-001",
+        include_str!("../transaction/tx-gas-price-invalid-001.json"),
+    ),
+    (
+        "tx-wrong-chain-001",
+        include_str!("../transaction/tx-wrong-chain-001.json"),
+    ),
+    (
+        "tx-wrong-network-001",
+        include_str!("../transaction/tx-wrong-network-001.json"),
+    ),
+    (
+        "tx-expired-001",
+        include_str!("../transaction/tx-expired-001.json"),
+    ),
+    (
+        "tx-receiver-created-001",
+        include_str!("../transaction/tx-receiver-created-001.json"),
+    ),
+    (
+        "tx-receiver-existing-001",
+        include_str!("../transaction/tx-receiver-existing-001.json"),
+    ),
+    (
+        "tx-zero-value-no-create-001",
+        include_str!("../transaction/tx-zero-value-no-create-001.json"),
+    ),
+    (
+        "tx-signature-valid-001",
+        include_str!("../transaction/tx-signature-valid-001.json"),
+    ),
+    (
+        "tx-modified-payload-001",
+        include_str!("../transaction/tx-modified-payload-001.json"),
+    ),
+    (
+        "tx-modified-signature-001",
+        include_str!("../transaction/tx-modified-signature-001.json"),
+    ),
+    (
+        "tx-success-transition-001",
+        include_str!("../transaction/tx-success-transition-001.json"),
+    ),
+    (
+        "tx-failed-no-mutation-001",
+        include_str!("../transaction/tx-failed-no-mutation-001.json"),
+    ),
+];
+
+#[test]
+fn transaction_vectors_validate() {
+    for (id, json) in TRANSACTION_VECTORS {
+        let r = validate_transaction_vector(json);
+        assert!(
+            r.ok,
+            "VECTOR FAILED\nID: {id}\nEXPECTED: result/phase/error + six-layer recompute\nACTUAL: {:?}\nSPEC: ADR-0024",
+            r.errors
+        );
+    }
+    assert_eq!(TRANSACTION_VECTORS.len(), 23);
 }

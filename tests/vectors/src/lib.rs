@@ -22,3 +22,4 @@ pub mod genesis;
 pub mod hex;
 pub mod json;
 pub mod signature;
+pub mod transaction;

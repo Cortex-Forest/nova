@@ -1,0 +1,44 @@
+{
+  "account_receiver": {
+    "balance": "0",
+    "nonce": 0
+  },
+  "account_sender": {
+    "balance": "1000000",
+    "nonce": 0
+  },
+  "category": "transaction",
+  "chain_id": 1001,
+  "current_height": 1000,
+  "expected": {
+    "canonical_transaction_bytes": "01e9030000000000000000000000000000010101e4a2886b44a6515193772a03d4427bd75811cb2bdfc84d1c86ff92a06bb851840101012222222222222222222222222222222222222222222222222222222222222222e8030000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff010000000080841e00000000007ad9cd412415ac89590f6f6ae6ca385b49aedc130ba0eee4288e71b12ccfcf060724137a328c2f582e336e62b1a1d633895c64cde78bd29be9e8c7955416a905",
+    "canonical_tx_payload": "01e9030000000000000000000000000000010101e4a2886b44a6515193772a03d4427bd75811cb2bdfc84d1c86ff92a06bb851840101012222222222222222222222222222222222222222222222222222222222222222e8030000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff010000000080841e0000000000",
+    "error": "FeeMaxOverflow",
+    "message_hash": "51da087251798bbe3e913889c965039ca08316abd285092b51464a9d1ce48a76",
+    "phase": "gas",
+    "result": "invalid",
+    "signature": "7ad9cd412415ac89590f6f6ae6ca385b49aedc130ba0eee4288e71b12ccfcf060724137a328c2f582e336e62b1a1d633895c64cde78bd29be9e8c7955416a905",
+    "signed_bytes": "0101e9030000000000008c00000001e9030000000000000000000000000000010101e4a2886b44a6515193772a03d4427bd75811cb2bdfc84d1c86ff92a06bb851840101012222222222222222222222222222222222222222222222222222222222222222e8030000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffff010000000080841e0000000000",
+    "txid": "505512c5a12397182161afd3e2bd48f8ae51fa18da79d870e612b3861509c029"
+  },
+  "fee_burn_bps": 1000,
+  "id": "tx-fee-overflow-001",
+  "network_id": 1,
+  "note": "fee overflow (gas_limit * gas_price overflows u128) => FeeMaxOverflow",
+  "schema_version": "transaction-vector-v1",
+  "sender_public_key": "de25d87e5eb0bef697e73535ff9b953fcd1585fd3990c0c2248e5ae4e9b4a037",
+  "transaction": {
+    "amount": "1000",
+    "chain_id": 1001,
+    "expiration": 2000000,
+    "gas_limit": 18446744073709551615,
+    "gas_price": "340282366920938463463374607431768211455",
+    "nonce": 0,
+    "payload_hex": "",
+    "receiver": "nova1qyqszg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3z2yuspj",
+    "sender": "nova1qyqsre9z3p45ffj32xfhw2sr63p8h46cz89jhh7gf5wgdluj5p4ms5vye7sqlf",
+    "signature_hex": "7ad9cd412415ac89590f6f6ae6ca385b49aedc130ba0eee4288e71b12ccfcf060724137a328c2f582e336e62b1a1d633895c64cde78bd29be9e8c7955416a905",
+    "transaction_type": 1,
+    "version": 1
+  }
+}

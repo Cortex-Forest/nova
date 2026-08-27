@@ -180,10 +180,10 @@ canonical 编码或 `genesis_hash` 计算（`expected_genesis_hash` 在 STEP 6 I
 - 账户模型：ADR-0017。
 - 账户承诺 / 序列化：ADR-0018、`crypto-serialization-v1.md` §12。
 
-## 9. Transaction 向量需求（预留，STEP 7H 启用）
+## 9. Transaction 向量需求（STEP 7H 已实现，ADR-0024）
 
 交易 Schema / 编码 / 签名 / txid 规范见 **ADR-0019 / ADR-0020**、`crypto-serialization-v1.md` §13。
-**预留向量分类**（STEP 7H Transaction Test Vectors 实现后生成 fixture）：
+**已实现向量分类**（STEP 7H / ADR-0024，23 个 fixture 于 `tests/vectors/transaction/`）：
 
 | 类别 | 断言 |
 |------|------|
@@ -208,6 +208,8 @@ canonical 编码或 `genesis_hash` 计算（`expected_genesis_hash` 在 STEP 6 I
 - Mempool policy 类（nonce-gap / lifetime / anti-spam）为**节点本地策略**，**不进入 consensus
   state**；向量仅验证协议层语义，policy 值（`MAX_FUTURE_NONCE_GAP=64`、`MAX_TX_LIFETIME=100_000`）
   在节点实现文档标注。
+- 六层确定性链（`canonical_tx_payload → signed_bytes → message_hash → signature →
+  canonical_transaction_bytes → txid`）逐层重算比对，见 ADR-0024。
 
 ## 10. 来源（Transaction）
 
