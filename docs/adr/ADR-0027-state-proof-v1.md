@@ -39,15 +39,26 @@ State Root 已冻结（8B-3）。本 ADR 冻结 **Merkle Proof 格式**（inclus
   Inclusion: 0x01 ‖ key(35) ‖ value_hash(32) ‖ siblings(280×32B)
   Exclusion: 0x02 ‖ key(35) ‖ empty_depth(u16 LE) ‖ siblings(empty_depth×32B)
   ```
+  **Inclusion 总长度 = `1 + 35 + 32 + 280×32 = 9028B`**；Exclusion = `1 + 35 + 2 + empty_depth×32`。
   域前缀防 proof type confusion；`empty_depth` 0..=280 用 u16 LE（280 > u8::MAX）。
 - **测试层 JSON fixture**：`schema_version: "state-proof-v1"`（hex 字段 + expected root；生成器/loader 模式同 7H / 8B-3 golden）。
 
 ### P-4 — Verification API（冻结）
 
 ```rust
-pub fn verify_proof(proof: &SparseMerkleProof, root: &NodeHash) -> bool;
+pub fn verify_proof(proof: &SparseMerkleProof, root: &NodeHash) -> Result<(), ProofError>;
 ```
 
+- **返回 `Result` 而非 `bool`**：区分失败原因（RPC / light client / consensus 需要明确错误）。
+- `ProofError` 冻结为四类：
+  ```rust
+  pub enum ProofError {
+      InvalidProofType,     // 未知 proof type（decode）
+      InvalidSiblingLength, // sibling 数量/长度不符
+      InvalidDepth,         // empty_depth 越界（0..=280）
+      RootMismatch,         // 重算 root ≠ 给定 root
+  }
+  ```
 - 归属：`nova-storage::proof`。
 - **必须**：pure function / no storage access / no backend dependency / independent recomputation。
 - **禁止** `verify(root, database)`——proof 验证可脱离节点独立运行。
@@ -55,9 +66,21 @@ pub fn verify_proof(proof: &SparseMerkleProof, root: &NodeHash) -> bool;
 ### P-5 — empty_depth 语义（冻结）
 
 - `empty_depth` = 路径上**第一个空子树深度**（0..=280）。
+- **类型冻结为 `u16`**（非 usize——协议禁止平台相关类型；跨语言稳定）。
 - 空树：`empty_depth=0`，`siblings=[]`，验证 `EMPTY_NODE_HASH == root`。
 - 非空树路径不存在（如 depth 73 遇 EMPTY）：`empty_depth=73`，从 `EMPTY_NODE_HASH` 向上恢复至 root。
 - **与固定深度 SMT 一致**：无 path compression / branch collapse / variable depth proof；proof 永远对应 280-bit path。
+
+### P-6 — Proof Type Encoding（冻结，新增）
+
+- `PROOF_INCLUSION=0x01` / `PROOF_EXCLUSION=0x02` **只用于 proof 编码**，防 proof type confusion。
+- **不是 hash domain**：不影响 `STATE_EMPTY/STATE_LEAF/STATE_BRANCH`（ADR-0026 T-4）。
+- Node hash ≠ Proof encoding——两者域完全分离。
+
+### P-7 — 禁止压缩进入 V0.1（冻结，新增）
+
+- V0.1 **禁止** proof 压缩（省略 sibling / depth bitmap / 多叉 / 聚合）。
+- 未来压缩方案 ⇒ 必须新增独立 ADR（`compressed-state-proof`），不得修改当前格式。
 
 ### Decision Log
 
@@ -65,9 +88,11 @@ pub fn verify_proof(proof: &SparseMerkleProof, root: &NodeHash) -> bool;
 |---|------|------|
 | P-1 | 固定 280 sibling（`[NodeHash; 280]`），不压缩 | 冻结 |
 | P-2 | proof 自包含 key / value_hash | 冻结 |
-| P-3 | 二进制 canonical（0x01/0x02 域前缀）+ JSON fixture | 冻结 |
-| P-4 | `verify_proof(proof, root) -> bool` 纯函数（nova-storage::proof） | 冻结 |
-| P-5 | `empty_depth` = 首个空子树深度（0..=280；u16 LE 编码） | 冻结 |
+| P-3 | 二进制 canonical（0x01/0x02 域前缀）+ JSON fixture（Inclusion 9028B） | 冻结 |
+| P-4 | `verify_proof(proof, root) -> Result<(), ProofError>` 纯函数 + 四类错误 | 冻结 |
+| P-5 | `empty_depth: u16` = 首个空子树深度（0..=280；u16 LE 编码） | 冻结 |
+| P-6 | proof type 只用于编码，非 hash domain | 冻结 |
+| P-7 | 禁止 proof 压缩进入 V0.1 | 冻结 |
 
 ## Alternatives（已评估）
 
@@ -76,6 +101,8 @@ pub fn verify_proof(proof: &SparseMerkleProof, root: &NodeHash) -> bool;
 | 压缩 sibling | 省略规则/编码歧义；V0.1 确定性 > 压缩效率；未来新 ADR |
 | verify 依赖 storage | 破坏脱离节点独立验证（P-4 必须） |
 | empty_depth 用 u8 | 280 > 255 溢出；须 u16 |
+| verify 返回 bool | 无法区分失败原因（sibling 数量/hash/depth/type）；Result 提供明确错误（P-4） |
+| empty_depth 用 usize | 平台相关类型，跨语言不稳定；u16 足够（P-5） |
 
 ## Consequences
 
@@ -85,6 +112,7 @@ pub fn verify_proof(proof: &SparseMerkleProof, root: &NodeHash) -> bool;
 
 ## Security Impact
 
-- 防 proof type confusion：域前缀（P-3）。
+- 防 proof type confusion：域前缀 `0x01/0x02`（P-3/P-6），且不混入 node hash domain。
 - 防 sibling 篡改：验证者独立重算，不信任 sibling（P-4）。
-- 防歧义：固定 280 sibling 无省略规则（P-1）。
+- 防歧义：固定 280 sibling 无省略规则（P-1/P-7）。
+- 明确错误归因：Result + 四类 `ProofError`（P-4）供 RPC / light client / consensus 区分失败。

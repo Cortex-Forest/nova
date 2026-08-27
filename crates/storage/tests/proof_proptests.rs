@@ -40,20 +40,32 @@ proptest! {
         let root = smt.root();
         for (k, expected_v) in &items {
             let proof = smt.prove_inclusion(k).expect("present key has proof");
-            prop_assert!(verify_proof(&proof, &root), "inclusion must verify");
+            prop_assert!(
+                verify_proof(&proof, &root).is_ok(),
+                "inclusion must verify"
+            );
             if let SparseMerkleProof::Inclusion { value_hash, .. } = &proof {
                 prop_assert_eq!(value_hash, expected_v, "proof carries exact value");
             }
             let decoded = SparseMerkleProof::decode(&proof.encode()).unwrap();
             prop_assert_eq!(&decoded, &proof, "encode/decode roundtrip");
-            prop_assert!(verify_proof(&decoded, &root), "decoded proof must verify");
+            prop_assert!(
+                verify_proof(&decoded, &root).is_ok(),
+                "decoded proof must verify"
+            );
         }
         // 与集合不同的 key ⇒ exclusion proof 验证通过（含 roundtrip）
         if !items.iter().any(|(k, _)| *k == absent) {
             let eproof = smt.prove_exclusion(&absent).expect("absent key has proof");
-            prop_assert!(verify_proof(&eproof, &root), "exclusion must verify");
+            prop_assert!(
+                verify_proof(&eproof, &root).is_ok(),
+                "exclusion must verify"
+            );
             let edecoded = SparseMerkleProof::decode(&eproof.encode()).unwrap();
-            prop_assert!(verify_proof(&edecoded, &root), "decoded exclusion must verify");
+            prop_assert!(
+                verify_proof(&edecoded, &root).is_ok(),
+                "decoded exclusion must verify"
+            );
         }
     }
 
@@ -74,7 +86,10 @@ proptest! {
             arr[byte] ^= 0x01; // 必定改变
             siblings[idx] = NodeHash::from_bytes(arr);
         }
-        prop_assert!(!verify_proof(&proof, &root), "tampered sibling must fail");
+        prop_assert!(
+            verify_proof(&proof, &root).is_err(),
+            "tampered sibling must fail"
+        );
     }
 
     // 篡改 value_hash ⇒ 验证失败
@@ -91,7 +106,10 @@ proptest! {
         if let SparseMerkleProof::Inclusion { value_hash, .. } = &mut proof {
             value_hash[byte] ^= 0x01;
         }
-        prop_assert!(!verify_proof(&proof, &root), "tampered value must fail");
+        prop_assert!(
+            verify_proof(&proof, &root).is_err(),
+            "tampered value must fail"
+        );
     }
 
     // 篡改 key（inclusion）⇒ 验证失败
@@ -108,6 +126,9 @@ proptest! {
         if let SparseMerkleProof::Inclusion { key, .. } = &mut proof {
             key[byte] ^= 0x01;
         }
-        prop_assert!(!verify_proof(&proof, &root), "tampered key must fail");
+        prop_assert!(
+            verify_proof(&proof, &root).is_err(),
+            "tampered key must fail"
+        );
     }
 }

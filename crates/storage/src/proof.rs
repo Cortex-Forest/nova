@@ -1,10 +1,10 @@
 //! State Merkle Proof（STEP 8B-4 — ADR-0027）。
 //!
-//! # 冻结（ADR-0027 P-1~P-5）
-//! - **Inclusion**：`key(35B) + value_hash(32B) + [NodeHash; 280]`（固定 sibling，不压缩）。
-//! - **Exclusion**：`key(35B) + empty_depth + siblings`（首个空子树深度 0..=280）。
-//! - 验证：**纯函数**，独立重算（leaf_hash → 280 次 branch → root），不信任 sibling / 不读存储。
-//! - 序列化：`PROOF_INCLUSION=0x01` / `PROOF_EXCLUSION=0x02` 域前缀；`empty_depth` u16 LE。
+//! # 冻结（ADR-0027 P-1~P-7）
+//! - **Inclusion**：`key(35B) + value_hash(32B) + [NodeHash; 280]`（固定 sibling，不压缩 P-1/P-7）。
+//! - **Exclusion**：`key(35B) + empty_depth(u16) + siblings`（首个空子树深度 0..=280，P-5）。
+//! - 验证：**纯函数**，返回 `Result<(), ProofError>`（P-4），独立重算，不信任 sibling / 不读存储。
+//! - 序列化：`PROOF_INCLUSION=0x01` / `PROOF_EXCLUSION=0x02` 域前缀（只用于编码，非 hash domain，P-6）。
 //! - **不实现**：light client / RPC / network / state sync / fraud proof protocol。
 
 use crate::hashing::{EMPTY_NODE_HASH, branch_node_hash, leaf_node_hash};
@@ -31,32 +31,35 @@ pub enum SparseMerkleProof {
     /// 证明 `key` 不存在于 root 下。
     Exclusion {
         key: TrieKey,
-        /// 路径上第一个空子树深度（0..=280；P-5）。
-        empty_depth: usize,
+        /// 路径上第一个空子树深度（0..=280；P-5；**u16**，非平台相关类型）。
+        empty_depth: u16,
         /// 到 `empty_depth` 的 sibling（`len == empty_depth`）。
         siblings: Vec<NodeHash>,
     },
 }
 
-/// Proof 解码错误。
+/// Proof 错误（P-4：四类，统一覆盖 decode 与 verify）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofError {
-    /// 未知 type 字节（非 0x01 / 0x02）。
-    UnknownType(u8),
-    /// 长度与类型不符。
-    InvalidLength { expected: usize, actual: usize },
-    /// `empty_depth` 超出 0..=280。
-    InvalidEmptyDepth(usize),
+    /// 未知 proof type（decode；非 0x01 / 0x02）。
+    InvalidProofType,
+    /// sibling 数量/长度不符（decode 长度不符 / verify sibling 数量错误）。
+    InvalidSiblingLength,
+    /// `empty_depth` 越界（非 0..=280）。
+    InvalidDepth,
+    /// 重算 root ≠ 给定 root（verify 失败）。
+    RootMismatch,
 }
 
 impl fmt::Display for ProofError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownType(t) => write!(f, "unknown proof type byte: {t:#04x}"),
-            Self::InvalidLength { expected, actual } => {
-                write!(f, "invalid proof length: expected {expected}, got {actual}")
+            Self::InvalidProofType => write!(f, "invalid proof type byte"),
+            Self::InvalidSiblingLength => write!(f, "invalid sibling length"),
+            Self::InvalidDepth => {
+                write!(f, "invalid empty_depth (must be 0..=280)")
             }
-            Self::InvalidEmptyDepth(d) => write!(f, "invalid empty_depth: {d}"),
+            Self::RootMismatch => write!(f, "recomputed root does not match"),
         }
     }
 }
@@ -78,12 +81,13 @@ fn combine(h: NodeHash, sib: NodeHash, bit: u8) -> NodeHash {
     }
 }
 
-/// 验证 proof 对给定 root 成立（**纯函数**；P-4）。
+/// 验证 proof 对给定 root 成立（**纯函数**；P-4，返回 `Result` 区分失败原因）。
 ///
 /// - Inclusion：从 `leaf_hash(key, value)` 沿 280 位向上组合 sibling → 比对 root。
 /// - Exclusion：从 `empty_depth` 的 `EMPTY_NODE_HASH` 向上组合 sibling → 比对 root。
+/// - 错误：`InvalidDepth`（empty_depth 越界）/ `InvalidSiblingLength`（数量不符）/ `RootMismatch`（重算不符）。
 /// - 不信任 sibling 内容（只按位置组合）；不读存储。
-pub fn verify_proof(proof: &SparseMerkleProof, root: &NodeHash) -> bool {
+pub fn verify_proof(proof: &SparseMerkleProof, root: &NodeHash) -> Result<(), ProofError> {
     match proof {
         SparseMerkleProof::Inclusion {
             key,
@@ -94,21 +98,33 @@ pub fn verify_proof(proof: &SparseMerkleProof, root: &NodeHash) -> bool {
             for depth in (0..SMT_DEPTH).rev() {
                 h = combine(h, siblings[depth], bit_at(key, depth));
             }
-            &h == root
+            if &h == root {
+                Ok(())
+            } else {
+                Err(ProofError::RootMismatch)
+            }
         }
         SparseMerkleProof::Exclusion {
             key,
             empty_depth,
             siblings,
         } => {
-            if *empty_depth > SMT_DEPTH || siblings.len() != *empty_depth {
-                return false;
+            let d = *empty_depth as usize;
+            if d > SMT_DEPTH {
+                return Err(ProofError::InvalidDepth);
+            }
+            if siblings.len() != d {
+                return Err(ProofError::InvalidSiblingLength);
             }
             let mut h = NodeHash::from_bytes(EMPTY_NODE_HASH);
-            for depth in (0..*empty_depth).rev() {
+            for depth in (0..d).rev() {
                 h = combine(h, siblings[depth], bit_at(key, depth));
             }
-            &h == root
+            if &h == root {
+                Ok(())
+            } else {
+                Err(ProofError::RootMismatch)
+            }
         }
     }
 }
@@ -144,7 +160,7 @@ impl SparseMerkleProof {
                 let mut out = Vec::with_capacity(1 + 35 + 2 + siblings.len() * 32);
                 out.push(PROOF_EXCLUSION);
                 out.extend_from_slice(key);
-                out.extend_from_slice(&(*empty_depth as u16).to_le_bytes());
+                out.extend_from_slice(&empty_depth.to_le_bytes());
                 for s in siblings {
                     out.extend_from_slice(s.as_bytes());
                 }
@@ -156,16 +172,13 @@ impl SparseMerkleProof {
     /// canonical 解码（拒绝未知 type / 长度不符 / 非法 empty_depth）。
     pub fn decode(bytes: &[u8]) -> Result<Self, ProofError> {
         if bytes.is_empty() {
-            return Err(ProofError::UnknownType(0));
+            return Err(ProofError::InvalidProofType);
         }
         match bytes[0] {
             PROOF_INCLUSION => {
                 let total = 1 + 35 + 32 + SMT_DEPTH * 32;
                 if bytes.len() != total {
-                    return Err(ProofError::InvalidLength {
-                        expected: total,
-                        actual: bytes.len(),
-                    });
+                    return Err(ProofError::InvalidSiblingLength);
                 }
                 let mut key = [0u8; 35];
                 key.copy_from_slice(&bytes[1..36]);
@@ -186,26 +199,21 @@ impl SparseMerkleProof {
             }
             PROOF_EXCLUSION => {
                 if bytes.len() < 1 + 35 + 2 {
-                    return Err(ProofError::InvalidLength {
-                        expected: 1 + 35 + 2,
-                        actual: bytes.len(),
-                    });
+                    return Err(ProofError::InvalidSiblingLength);
                 }
                 let mut key = [0u8; 35];
                 key.copy_from_slice(&bytes[1..36]);
-                let depth = u16::from_le_bytes([bytes[36], bytes[37]]) as usize;
-                if depth > SMT_DEPTH {
-                    return Err(ProofError::InvalidEmptyDepth(depth));
+                let depth = u16::from_le_bytes([bytes[36], bytes[37]]);
+                let d = depth as usize;
+                if d > SMT_DEPTH {
+                    return Err(ProofError::InvalidDepth);
                 }
-                let expected = 1 + 35 + 2 + depth * 32;
+                let expected = 1 + 35 + 2 + d * 32;
                 if bytes.len() != expected {
-                    return Err(ProofError::InvalidLength {
-                        expected,
-                        actual: bytes.len(),
-                    });
+                    return Err(ProofError::InvalidSiblingLength);
                 }
-                let mut siblings = Vec::with_capacity(depth);
-                for i in 0..depth {
+                let mut siblings = Vec::with_capacity(d);
+                for i in 0..d {
                     let off = 1 + 35 + 2 + i * 32;
                     let mut arr = [0u8; 32];
                     arr.copy_from_slice(&bytes[off..off + 32]);
@@ -217,7 +225,7 @@ impl SparseMerkleProof {
                     siblings,
                 })
             }
-            other => Err(ProofError::UnknownType(other)),
+            _ => Err(ProofError::InvalidProofType),
         }
     }
 }
@@ -238,10 +246,10 @@ mod tests {
         smt.insert(&key, &v(0xaa));
         let root = smt.root();
         let proof = smt.prove_inclusion(&key).unwrap();
-        assert!(verify_proof(&proof, &root), "inclusion must verify");
-        // 错误 root ⇒ 失败
+        assert_eq!(verify_proof(&proof, &root), Ok(()), "inclusion must verify");
+        // 错误 root ⇒ RootMismatch
         let wrong = NodeHash::from_bytes(EMPTY_NODE_HASH);
-        assert!(!verify_proof(&proof, &wrong));
+        assert_eq!(verify_proof(&proof, &wrong), Err(ProofError::RootMismatch));
     }
 
     #[test]
@@ -255,7 +263,11 @@ mod tests {
         if let SparseMerkleProof::Inclusion { value_hash, .. } = &mut proof {
             value_hash[0] ^= 0xff;
         }
-        assert!(!verify_proof(&proof, &root), "tampered value must fail");
+        assert_eq!(
+            verify_proof(&proof, &root),
+            Err(ProofError::RootMismatch),
+            "tampered value must fail"
+        );
         // 篡改 sibling（替换整个 NodeHash）
         let mut proof2 = smt.prove_inclusion(&key).unwrap();
         if let SparseMerkleProof::Inclusion { siblings, .. } = &mut proof2 {
@@ -263,7 +275,11 @@ mod tests {
             arr[0] ^= 0xff;
             siblings[0] = NodeHash::from_bytes(arr);
         }
-        assert!(!verify_proof(&proof2, &root), "tampered sibling must fail");
+        assert_eq!(
+            verify_proof(&proof2, &root),
+            Err(ProofError::RootMismatch),
+            "tampered sibling must fail"
+        );
     }
 
     #[test]
@@ -274,14 +290,14 @@ mod tests {
         // 不存在的 key（不同路径）
         let absent = [0x22u8; 35];
         let proof = smt.prove_exclusion(&absent).unwrap();
-        assert!(verify_proof(&proof, &root), "exclusion must verify");
+        assert_eq!(verify_proof(&proof, &root), Ok(()), "exclusion must verify");
         // 空树 exclusion：empty_depth=0 ⇒ root == EMPTY
         let empty_smt = SparseMerkleTree::new();
         let proof_e = empty_smt.prove_exclusion(&absent).unwrap();
-        assert!(verify_proof(
-            &proof_e,
-            &NodeHash::from_bytes(EMPTY_NODE_HASH)
-        ));
+        assert_eq!(
+            verify_proof(&proof_e, &NodeHash::from_bytes(EMPTY_NODE_HASH)),
+            Ok(())
+        );
     }
 
     #[test]
@@ -316,22 +332,46 @@ mod tests {
     fn decode_rejects_unknown_type_and_length() {
         assert_eq!(
             SparseMerkleProof::decode(&[0x03]),
-            Err(ProofError::UnknownType(0x03))
+            Err(ProofError::InvalidProofType)
         );
         // inclusion 长度不足
         let mut short = vec![PROOF_INCLUSION];
         short.extend_from_slice(&[0u8; 10]);
-        assert!(matches!(
+        assert_eq!(
             SparseMerkleProof::decode(&short),
-            Err(ProofError::InvalidLength { .. })
-        ));
+            Err(ProofError::InvalidSiblingLength)
+        );
         // exclusion empty_depth > 280
         let mut bad = vec![PROOF_EXCLUSION];
         bad.extend_from_slice(&[0u8; 35]);
         bad.extend_from_slice(&281u16.to_le_bytes());
-        assert!(matches!(
+        assert_eq!(
             SparseMerkleProof::decode(&bad),
-            Err(ProofError::InvalidEmptyDepth(281))
-        ));
+            Err(ProofError::InvalidDepth)
+        );
+    }
+
+    #[test]
+    fn verify_rejects_bad_exclusion_structure() {
+        let mut smt = SparseMerkleTree::new();
+        smt.insert(&[0x11u8; 35], &v(0xaa));
+        let root = smt.root();
+        let absent = [0x22u8; 35];
+        // siblings.len() != empty_depth ⇒ InvalidSiblingLength
+        let mut proof = smt.prove_exclusion(&absent).unwrap();
+        if let SparseMerkleProof::Exclusion { siblings, .. } = &mut proof {
+            siblings.pop(); // 长度错配
+        }
+        assert_eq!(
+            verify_proof(&proof, &root),
+            Err(ProofError::InvalidSiblingLength)
+        );
+        // empty_depth > 280 ⇒ InvalidDepth
+        let bad = SparseMerkleProof::Exclusion {
+            key: absent,
+            empty_depth: 281,
+            siblings: vec![NodeHash::from_bytes(EMPTY_NODE_HASH); 281],
+        };
+        assert_eq!(verify_proof(&bad, &root), Err(ProofError::InvalidDepth));
     }
 }

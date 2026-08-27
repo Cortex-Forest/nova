@@ -118,7 +118,7 @@ impl SparseMerkleTree {
                 debug_assert_eq!(siblings.len(), empty_depth);
                 Some(SparseMerkleProof::Exclusion {
                     key: *key,
-                    empty_depth,
+                    empty_depth: empty_depth as u16,
                     siblings,
                 })
             }
