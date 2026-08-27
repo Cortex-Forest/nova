@@ -10,5 +10,9 @@ description = "Nova Chain consensus layer: PoS + DAG + BFT (PHASE 1 placeholder)
 workspace = true
 
 [dependencies]
+# STEP 10（ADR-0033 C-1）：consensus → core（协议类型）/ consensus → crypto（签名/哈希/validator_id）
+# 禁止 consensus → execution / storage / network（纯计算边界）
+nova-core = { path = "../core" }
+nova-crypto = { path = "../crypto" }
 # PHASE 1：零第三方运行时依赖。
 # 共识协议必须先形成 Consensus Specification（ADR-0008/0009）再实现（Master Prompt §7）。

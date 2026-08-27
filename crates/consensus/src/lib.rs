@@ -1,13 +1,16 @@
-//! Nova Chain 共识层（PHASE 1 占位）。
+//! Nova Chain 共识层（STEP 10 — Consensus；ADR-0033/0034/0035）。
 //!
-//! 未来承载：PoS Validator Set、DAG 交易传播、BFT Finality。
+//! # 模块
+//! - [`validator`]：**STEP 10-2**——`ValidatorId`/`ValidatorInfo`/`ValidatorSet`（ADR-0034 V-1~V-3）。
+//! - [`vote`]：**STEP 10-2**——`ValidatorVote` + `verify_vote`（ADR-0034 V-4/V-5）。
+//! - [`dag`]：**STEP 10-3**——`BlockReference`/`Dag`/`causal_order`（ADR-0035 D-1~D-3）。
 //!
-//! # 纪律（Master Prompt §5/§7/§6）
-//! - DAG 只负责并行传播与交易组织，**不等于最终共识**。
-//! - BFT 负责最终排序与状态一致。
-//! - 禁止未经 Consensus Specification 批准的任何共识变更。
-//! - 共识安全模型（Byzantine 上限 / Quorum / Slashing 等）必须先数学化定义（ADR-0009）。
-//!
-//! 本阶段**不实现任何共识逻辑**。
+//! # 边界（ADR-0033 C-1 / C-3）
+//! - 依赖：`consensus → core/crypto`；**禁止** `consensus → execution/storage/network`（纯计算）。
+//! - **DAG ≠ Finality**：DAG 只负责传播/因果/候选排序输入；BFT/finality 归 10-5/10-6。
+//! - 未实现：Random Witness（10-4）/ BFT Round（10-5）/ Finality（10-6）/ Checkpoint（10-7）。
 
-// 注意：本阶段禁止实现任何共识逻辑。
+pub mod dag;
+pub mod error;
+pub mod validator;
+pub mod vote;
