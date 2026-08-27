@@ -93,6 +93,14 @@ state_root = SMT_root({ (trie_key(35B) → account_commitment(32B)) 对全部显
 - 空 state（无账户）⇒ `EMPTY_STATE_ROOT`。
 - `apply(AccountChange[])` → 更新 trie → 算新 `state_root`（ADR-0025 S-C 衔接；8C 实现）。
 
+#### 6a. Fixed-Depth SMT（8B-3 实现冻结，补充）
+
+- **固定深度 = 280 层**：leaf 只存在于 `depth == SMT_DEPTH`；空子树用 `EMPTY_NODE_HASH` 表示。
+- **分支不折叠单侧**：删除后 branch 若仅一侧非空，**保留 branch**（空侧为 Empty），
+  **不提升子树**——避免深度漂移导致 leaf 路径位失配。
+- 由此保证**唯一表示**：同 key 集合 ⇒ 同 root（与操作历史/插入顺序无关）。
+- 此规则影响 state root 数值（单账户 root 为 280 层链 hash）；golden 依此固化。
+
 ### 7. Proof Boundary（T-6 / 8B-4 冻结范围）
 
 - **Inclusion Proof**：leaf + ≤280 sibling hashes（root → 280 levels → leaf）。

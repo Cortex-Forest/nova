@@ -22,6 +22,15 @@ pub const EMPTY_CODE_HASH: [u8; 32] = [
     0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
 ];
 
+/// 空存储根：`SHA-256(0x00)`（ADR-0026 T-5 / ADR-0025 S-2）。
+///
+/// V0.1 账户内部 storage trie **未实现**；`AccountState.storage_root` 默认 =
+/// `EMPTY_STORAGE_ROOT`（= `EMPTY_STATE_ROOT` = `EMPTY_NODE_HASH`）。
+pub const EMPTY_STORAGE_ROOT: [u8; 32] = [
+    0x6e, 0x34, 0x0b, 0x9c, 0xff, 0xb3, 0x7a, 0x98, 0x9c, 0xa5, 0x44, 0xe6, 0xbb, 0x78, 0x0a, 0x2c,
+    0x78, 0x90, 0x1d, 0x3f, 0xb3, 0x37, 0x38, 0x76, 0x85, 0x11, 0xa3, 0x06, 0x17, 0xaf, 0xa0, 0x1d,
+];
+
 /// 账户状态（ADR-0017 §2；协议数据结构；**不包含** address / account_type）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccountState {
@@ -107,5 +116,14 @@ mod tests {
             0x78, 0x52, 0xb8, 0x55,
         ];
         assert_eq!(EMPTY_CODE_HASH, expected);
+    }
+
+    #[test]
+    fn empty_storage_root_matches_sha256_zero_byte() {
+        // EMPTY_STORAGE_ROOT = SHA-256(0x00)（ADR-0026 T-5；algorithm-derived）
+        assert_eq!(
+            EMPTY_STORAGE_ROOT,
+            nova_crypto::hash::protocol_hash(&[0x00])
+        );
     }
 }

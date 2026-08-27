@@ -4,10 +4,11 @@
 //! - [`hashing`]：**STEP 8B-2**——域分离哈希（`STATE_EMPTY/LEAF/BRANCH`、`EMPTY_NODE_HASH`）。
 //! - [`node`]：**STEP 8B-2**——SMT 节点（`Empty`/`Leaf`/`Branch`）+ encode/decode + `NodeHash`
 //!   （ADR-0026 T-3/T-4/T-7）。
+//! - [`trie`]：**STEP 8B-3**——`SparseMerkleTree`（insert/update/get/delete/root，ADR-0026 T-6）。
 //!
 //! # 边界（ADR-0025/0026）
-//! - 本阶段只实现**节点层**；trie update / StateStore apply / 持久化 / proof / block state root
-//!   分别由 8B-3 / 8C / 8E / 8D 冻结。
+//! - 本阶段只实现节点层与树算法；StateStore.apply / 持久化 / proof / block state root
+//!   分别由 8C / 8E / 8B-4 / 8D 冻结。
 //! - **不引入数据库依赖**（8E 之前）。
 //! - 版本概念：数据库版本与软件/协议/API 版本独立（ADR-0001）。
 
@@ -18,5 +19,6 @@ pub const DATABASE_VERSION: u32 = 1;
 
 pub mod hashing;
 pub mod node;
+pub mod trie;
 
-// 注意：本阶段不实现 trie update / apply / 持久化。
+// 注意：本阶段不实现 StateStore.apply / 持久化 / proof。
