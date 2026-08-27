@@ -33,6 +33,18 @@ pub struct AccountState {
     pub storage_root: [u8; 32],
 }
 
+/// 账户状态视图接口（ADR-0025 S-A；**迁移自 nova-execution**）。
+///
+/// - **协议层接口**：`nova-core` 定义；`nova-execution` 消费（`apply_transaction`）；
+///   `nova-storage` 实现（`StateStore`）。
+/// - `None` = 账户不存在（逻辑默认：balance=0, nonce=0, code_hash=EMPTY_CODE_HASH,
+///   storage_root=EMPTY_STORAGE_ROOT）。
+/// - 依赖方向：core → storage / core → execution；**禁止** storage → execution。
+pub trait AccountStateView {
+    /// 读取账户；`None` 表示不存在。
+    fn account(&self, addr: &NovaAddress) -> Option<AccountState>;
+}
+
 /// 单个账户的确定性变更（成功交易产生；供 STEP 8 trie 化）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountChange {

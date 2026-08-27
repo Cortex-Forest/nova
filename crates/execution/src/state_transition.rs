@@ -15,30 +15,20 @@
 //! - **不实现**：storage / trie / state root（STEP 8）、区块 gas 聚合（Block STEP）、WASM。
 
 use core::fmt;
-use nova_core::state::{
-    AccountChange, AccountState, StateTransition, TransactionReceipt, TxStatus,
-};
+use nova_core::state::{AccountChange, StateTransition, TransactionReceipt, TxStatus};
+// ADR-0025 S-A：AccountStateView 上移 nova-core；此处 re-export 保持对外路径兼容。
+pub use nova_core::state::AccountStateView;
 use nova_core::transaction::gas_fee::{
     TRANSFER_INTRINSIC_GAS, check_balance_sufficient, check_gas_params, compute_actual_fee,
     compute_burn, compute_fee_max, compute_required,
 };
 use nova_core::transaction::nonce::{NonceClass, checked_next_nonce, classify_nonce};
 use nova_core::transaction::replay::{ReplayError, check_replay_context};
-use nova_crypto::address::NovaAddress;
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::signature::VerifyingKey;
 use nova_crypto::transaction::{
     TransactionError, TransactionV1, compute_txid, verify_transaction_signature,
 };
-
-/// 状态视图（STEP 8 实现 storage；7G 只定义接口）。
-///
-/// `None` = 账户不存在（逻辑默认：balance=0, nonce=0, code_hash=EMPTY_CODE_HASH,
-/// storage_root=EMPTY_STORAGE_ROOT）。
-pub trait AccountStateView {
-    /// 读取账户；`None` 表示不存在。
-    fn account(&self, addr: &NovaAddress) -> Option<AccountState>;
-}
 
 /// 执行上下文（**只读**；禁止写入）。
 #[derive(Debug, Clone, Copy)]
@@ -205,7 +195,7 @@ pub fn apply_transaction<S: AccountStateView>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_core::state::EMPTY_CODE_HASH;
+    use nova_core::state::{AccountState, EMPTY_CODE_HASH};
     use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
     use nova_crypto::key::KeyPair;
     use nova_crypto::transaction::{TransactionType, sign_transaction};
