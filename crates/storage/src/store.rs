@@ -7,9 +7,13 @@
 //! - **8C-2 不实现 `apply`**（D-4 两阶段内部事务在 8C-3）。
 
 use crate::backend::StorageBackend;
-use crate::node::{NodeHash, TrieKey};
+use crate::error::StorageError;
+use crate::node::{NodeHash, TrieKey, ValueHash};
 use crate::trie::SparseMerkleTree;
-use nova_core::state::{AccountState, AccountStateView, decode_account_bytes};
+use nova_core::state::{
+    AccountChange, AccountState, AccountStateView, EMPTY_CODE_HASH, EMPTY_STORAGE_ROOT,
+    account_commitment, canonical_account_bytes, decode_account_bytes,
+};
 use nova_crypto::address::NovaAddress;
 
 /// 区块级快照（trie + backend；D-5）。
@@ -39,6 +43,13 @@ impl<B: StorageBackend> StateStore<B> {
         self.trie.root()
     }
 
+    /// 查询 `addr` 在 trie 中的 account_commitment（backend/trie 一致性验证、未来 proof 用；
+    /// **非完整状态**——trie 只存 commitment，禁止从 trie decode state，D-2）。
+    pub fn commitment(&self, addr: &NovaAddress) -> Option<ValueHash> {
+        let key: TrieKey = addr.payload().to_bytes();
+        self.trie.get(&key)
+    }
+
     /// 快照当前状态（区块级事务回滚基线；D-5）。
     pub fn snapshot(&self) -> StateSnapshot<B::Snapshot> {
         StateSnapshot {
@@ -57,6 +68,53 @@ impl<B: StorageBackend> StateStore<B> {
         self.trie = snapshot.trie;
         self.backend.restore(&snapshot.backend);
     }
+
+    /// 原子应用一批账户变更（ADR-0028 D-4；**两阶段内部事务**，8C-3）。
+    ///
+    /// - **phase 1 prepare**：validate 全部变更、构造新 `AccountState`、canonical 编码、
+    ///   计算 commitment（**零副作用**；任一失败 ⇒ `Err`，状态不变）。
+    /// - **phase 2 snapshot**：保存当前 trie + backend。
+    /// - **phase 3 commit**：write backend（`put`）→ update trie（`insert`）。
+    /// - 任一失败 ⇒ **rollback** 恢复快照；成功 ⇒ 保留（新 state_root 就位）。
+    ///
+    /// - **顺序保持**：`changes` 按传入顺序处理（ADR-0023 G-J sender→receiver；**禁止排序**）。
+    /// - 只 upsert 不 delete（ADR-0017 V0.1 禁删账户）。
+    /// - 本方法为 storage 原子保护，非链级共识事务（D-4）。
+    pub fn apply(&mut self, changes: &[AccountChange]) -> Result<(), StorageError> {
+        // phase 1: prepare（validate + calculate，零副作用）
+        let mut prepared = Vec::with_capacity(changes.len());
+        for c in changes {
+            let key: TrieKey = c.address.payload().to_bytes();
+            let state = account_state(c);
+            prepared.push((
+                key,
+                canonical_account_bytes(&state).to_vec(),
+                account_commitment(&state),
+            ));
+        }
+        // phase 2: snapshot
+        let snap = self.snapshot();
+        // phase 3: commit（backend → trie）
+        for (key, canonical, commitment) in &prepared {
+            if let Err(e) = self.backend.put(*key, canonical.clone()) {
+                self.rollback(snap);
+                return Err(e);
+            }
+            self.trie.insert(key, commitment);
+        }
+        drop(snap);
+        Ok(())
+    }
+}
+
+/// `AccountChange` → 目标 `AccountState`（ADR-0028 D-3：code_hash/storage_root 固定常量）。
+fn account_state(c: &AccountChange) -> AccountState {
+    AccountState {
+        balance: c.new_balance,
+        nonce: c.new_nonce,
+        code_hash: EMPTY_CODE_HASH,
+        storage_root: EMPTY_STORAGE_ROOT,
+    }
 }
 
 impl<B: StorageBackend> AccountStateView for StateStore<B> {
@@ -71,7 +129,8 @@ impl<B: StorageBackend> AccountStateView for StateStore<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::MemoryBackend;
+    use crate::error::StorageError;
+    use crate::memory::{MemoryBackend, MemorySnapshot};
     use nova_core::state::{EMPTY_CODE_HASH, EMPTY_STORAGE_ROOT};
     use nova_crypto::address::{ADDRESS_VERSION, AddressType, NetworkId, NovaAddressPayload};
 
@@ -130,21 +189,29 @@ mod tests {
     fn store_account_roundtrip_and_rollback() {
         let a = addr([0xaa; 32]);
         let mut store = StateStore::new(MemoryBackend::new());
-        // 骨架阶段无 apply：手工写 backend + trie 以测 account()/rollback
+        let change = AccountChange {
+            address: a,
+            new_balance: 100,
+            new_nonce: 1,
+            created: true,
+        };
+        store.apply(std::slice::from_ref(&change)).unwrap();
+        assert_eq!(store.account(&a), Some(acc(100, 1)));
         let snap = store.snapshot();
         store
-            .backend
-            .put(
-                a.payload().to_bytes(),
-                nova_core::state::canonical_account_bytes(&acc(100, 1)).to_vec(),
-            )
+            .apply(&[AccountChange {
+                address: a,
+                new_balance: 200,
+                new_nonce: 2,
+                created: false,
+            }])
             .unwrap();
-        assert_eq!(store.account(&a), Some(acc(100, 1)));
+        assert_eq!(store.account(&a), Some(acc(200, 2)));
         store.rollback(snap);
         assert_eq!(
             store.account(&a),
-            None,
-            "rollback must restore block-before state"
+            Some(acc(100, 1)),
+            "rollback restores prior state"
         );
     }
 
@@ -154,5 +221,148 @@ mod tests {
         let snap = store.snapshot();
         store.commit(snap); // drop：确认当前状态，不 mutate
         assert_eq!(store.state_root(), NodeHash::from_bytes(EMPTY_STORAGE_ROOT));
+    }
+
+    // ---- apply（8C-3，两阶段事务）----
+    #[test]
+    fn apply_empty_is_noop() {
+        let mut store = StateStore::new(MemoryBackend::new());
+        let root = store.state_root();
+        store.apply(&[]).unwrap();
+        assert_eq!(store.state_root(), root);
+    }
+
+    #[test]
+    fn apply_single_creates_account_and_root_changes() {
+        let a = addr([0xaa; 32]);
+        let mut store = StateStore::new(MemoryBackend::new());
+        let empty_root = store.state_root();
+        store
+            .apply(&[AccountChange {
+                address: a,
+                new_balance: 1000,
+                new_nonce: 0,
+                created: true,
+            }])
+            .unwrap();
+        assert_eq!(store.account(&a), Some(acc(1000, 0)));
+        assert_ne!(store.state_root(), empty_root, "create must change root");
+    }
+
+    #[test]
+    fn apply_preserves_change_order_upsert() {
+        // 同 address 连续两 change：后者覆盖（若排序则结果相反）
+        let a = addr([0xaa; 32]);
+        let mut store = StateStore::new(MemoryBackend::new());
+        store
+            .apply(&[
+                AccountChange {
+                    address: a,
+                    new_balance: 100,
+                    new_nonce: 1,
+                    created: true,
+                },
+                AccountChange {
+                    address: a,
+                    new_balance: 50,
+                    new_nonce: 2,
+                    created: false,
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            store.account(&a),
+            Some(acc(50, 2)),
+            "later change wins (order preserved)"
+        );
+    }
+
+    #[test]
+    fn apply_multiple_changes_all_land() {
+        let a = addr([0xaa; 32]);
+        let b = addr([0xbb; 32]);
+        let mut store = StateStore::new(MemoryBackend::new());
+        store
+            .apply(&[
+                AccountChange {
+                    address: a,
+                    new_balance: 100,
+                    new_nonce: 1,
+                    created: true,
+                },
+                AccountChange {
+                    address: b,
+                    new_balance: 50,
+                    new_nonce: 0,
+                    created: true,
+                },
+            ])
+            .unwrap();
+        assert_eq!(store.account(&a), Some(acc(100, 1)));
+        assert_eq!(store.account(&b), Some(acc(50, 0)));
+    }
+
+    /// 在指定 key 上 `put` 失败的 backend（原子性测试注入；仅测试用）。
+    struct FailingBackend {
+        inner: MemoryBackend,
+        fail_key: TrieKey,
+    }
+
+    impl StorageBackend for FailingBackend {
+        type Snapshot = MemorySnapshot;
+
+        fn get(&self, key: &TrieKey) -> Option<Vec<u8>> {
+            self.inner.get(key)
+        }
+
+        fn put(&mut self, key: TrieKey, value: Vec<u8>) -> Result<(), StorageError> {
+            if key == self.fail_key {
+                return Err(StorageError::BackendFailure);
+            }
+            self.inner.put(key, value)
+        }
+
+        fn delete(&mut self, key: &TrieKey) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn snapshot(&self) -> MemorySnapshot {
+            self.inner.snapshot()
+        }
+
+        fn restore(&mut self, snap: &MemorySnapshot) {
+            self.inner.restore(snap)
+        }
+    }
+
+    #[test]
+    fn apply_failure_rolls_back_atomically() {
+        // D-7 必测 1（Atomicity）：change[0] 成功 + change[1] 失败 ⇒ root/account 不变
+        let a = addr([0xaa; 32]);
+        let b = addr([0xbb; 32]);
+        let failing = FailingBackend {
+            inner: MemoryBackend::new(),
+            fail_key: b.payload().to_bytes(),
+        };
+        let mut store = StateStore::new(failing);
+        let root_before = store.state_root();
+        let changes = vec![
+            AccountChange {
+                address: a,
+                new_balance: 100,
+                new_nonce: 1,
+                created: true,
+            },
+            AccountChange {
+                address: b,
+                new_balance: 200,
+                new_nonce: 1,
+                created: true,
+            },
+        ];
+        assert_eq!(store.apply(&changes), Err(StorageError::BackendFailure));
+        assert_eq!(store.state_root(), root_before, "root must roll back");
+        assert_eq!(store.account(&a), None, "change[0] must roll back");
+        assert_eq!(store.account(&b), None);
     }
 }

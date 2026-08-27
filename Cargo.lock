@@ -584,6 +584,7 @@ dependencies = [
  "nova-core",
  "nova-crypto",
  "nova-execution",
+ "nova-storage",
  "serde_json",
 ]
 

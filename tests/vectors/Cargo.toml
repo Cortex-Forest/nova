@@ -17,6 +17,8 @@ nova-crypto = { path = "../../crates/crypto" }
 # 依赖方向：tests/vectors → {nova-core, nova-execution, nova-crypto}（禁止反向）
 nova-core = { path = "../../crates/core" }
 nova-execution = { path = "../../crates/execution" }
+# STEP 8C-3：7H 向量在 StateStore（nova-storage）上验证完整执行链（seed → apply_transaction → StateStore::apply）
+nova-storage = { path = "../../crates/storage" }
 # STEP 5：地址向量生成器用 bech32 构造破坏/越权情形（仅 bin；本 crate 为 dev-only）
 bech32.workspace = true
 

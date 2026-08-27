@@ -9,7 +9,9 @@ use nova_test_vectors::address::validate_address_vector;
 use nova_test_vectors::domain::validate_domain_vector;
 use nova_test_vectors::genesis::validate_genesis_vector;
 use nova_test_vectors::signature::validate_signature_vector;
-use nova_test_vectors::transaction::validate_transaction_vector;
+use nova_test_vectors::transaction::{
+    validate_transaction_vector, validate_transaction_vector_on_store,
+};
 
 // ---------------------------------------------------------------------------
 // Domain vectors（§10/§11/§13）
@@ -464,4 +466,18 @@ fn transaction_vectors_validate() {
         );
     }
     assert_eq!(TRANSACTION_VECTORS.len(), 23);
+}
+
+/// 8C-3：同一批 7H 向量在真实 `StateStore` 上验证完整执行链
+/// （seed → apply_transaction → StateStore::apply）。
+#[test]
+fn transaction_vectors_state_store_validate() {
+    for (id, json) in TRANSACTION_VECTORS {
+        let r = validate_transaction_vector_on_store(json);
+        assert!(
+            r.ok,
+            "VECTOR FAILED\nID: {id}\nEXPECTED: StateStore execution chain (seed → apply_transaction → StateStore::apply)\nACTUAL: {:?}\nSPEC: ADR-0028 D-6",
+            r.errors
+        );
+    }
 }

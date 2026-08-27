@@ -11,7 +11,7 @@
 
 use crate::hex;
 use crate::json;
-use nova_core::state::AccountState;
+use nova_core::state::{AccountChange, AccountState};
 use nova_core::transaction::gas_fee::TRANSFER_INTRINSIC_GAS;
 use nova_crypto::address::{NetworkId, NovaAddress};
 use nova_crypto::identity::ChainIdentity;
@@ -23,6 +23,8 @@ use nova_crypto::transaction::{
 use nova_execution::state_transition::{
     AccountStateView, ExecutionContext, ExecutionError, apply_transaction,
 };
+use nova_storage::memory::MemoryBackend;
+use nova_storage::store::StateStore;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -412,4 +414,181 @@ fn expected_verifying_key(value: &Value) -> Result<VerifyingKey, String> {
     let pk =
         hex::decode_strict_lower_hex(pk_hex).map_err(|e| format!("sender_public_key hex: {e}"))?;
     VerifyingKey::from_bytes(&pk).map_err(|e| format!("sender_public_key invalid: {e:?}"))
+}
+
+/// 8C-3：在 `StateStore` 上验证完整执行链（`apply_transaction` → `StateStore::apply`）。
+///
+/// 与 [`validate_transaction_vector`] 不同，本函数以真实 `StateStore`（backend + SMT 双写）
+/// 承载执行：
+/// - 以 `account_sender`/`account_receiver`（交易前状态）seed store。
+/// - **valid**：`apply_transaction` 成功 → `store.apply(changes)` → 每个 change 的 `account()`
+///   反映其声明的最终状态、`state_root()` 变化。
+/// - **invalid**：`apply_transaction` 返回 `Err` ⇒ store（root/account）不变（失败无副作用）。
+/// - 验证 `StateStore` 是确定性承诺：7G 计算结果 → storage 提交 → 状态可读、root 可验证
+///   （ADR-0028 D-6）。
+pub fn validate_transaction_vector_on_store(input: &str) -> TransactionValidation {
+    let value = match json::parse(input) {
+        Ok(v) => v,
+        Err(e) => {
+            return TransactionValidation {
+                id: "<parse-error>".into(),
+                ok: false,
+                errors: vec![format!("parse: {e}")],
+            };
+        }
+    };
+    let id = get_str(&value, "id").unwrap_or("<missing-id>").to_string();
+    let mut errors: Vec<String> = Vec::new();
+
+    let tx = match build_tx(&value) {
+        Ok(t) => t,
+        Err(e) => {
+            errors.push(e);
+            return TransactionValidation {
+                id,
+                ok: errors.is_empty(),
+                errors,
+            };
+        }
+    };
+    let ctx = ExecutionContext {
+        chain: ChainIdentity {
+            network_id: value
+                .get("network_id")
+                .and_then(Value::as_u64)
+                .map(|n| NetworkId::try_from(n as u8).unwrap_or(NetworkId::Mainnet))
+                .unwrap_or(NetworkId::Mainnet),
+            chain_id: value.get("chain_id").and_then(Value::as_u64).unwrap_or(0),
+            genesis_hash: [0u8; 32],
+        },
+        current_height: value
+            .get("current_height")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        fee_burn_bps: value
+            .get("fee_burn_bps")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u16,
+    };
+    let sender_vk = match expected_verifying_key(&value) {
+        Ok(vk) => vk,
+        Err(e) => {
+            errors.push(e);
+            return TransactionValidation {
+                id,
+                ok: errors.is_empty(),
+                errors,
+            };
+        }
+    };
+
+    // 以交易前账户状态 seed store（backend + trie 双写）
+    let mut store = StateStore::new(MemoryBackend::new());
+    let mut seed: Vec<AccountChange> = Vec::new();
+    for (addr_key, acc_key) in [
+        ("sender", "account_sender"),
+        ("receiver", "account_receiver"),
+    ] {
+        match value.get(acc_key) {
+            Some(Value::Null) | None => {}
+            Some(acc) => {
+                let addr = if addr_key == "sender" {
+                    tx.sender
+                } else {
+                    tx.receiver
+                };
+                match parse_account(acc) {
+                    Ok((balance, nonce)) => seed.push(AccountChange {
+                        address: addr,
+                        new_balance: balance,
+                        new_nonce: nonce,
+                        created: false,
+                    }),
+                    Err(e) => errors.push(e),
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return TransactionValidation {
+            id,
+            ok: false,
+            errors,
+        };
+    }
+    if let Err(e) = store.apply(&seed) {
+        errors.push(format!("seed apply: {e}"));
+        return TransactionValidation {
+            id,
+            ok: false,
+            errors,
+        };
+    }
+
+    let expected_result = value
+        .get("expected")
+        .and_then(|e| e.get("result"))
+        .and_then(Value::as_str);
+    let root_before = store.state_root();
+    let sender_before = store.account(&tx.sender);
+    let receiver_before = store.account(&tx.receiver);
+
+    match apply_transaction(&store, &tx, &sender_vk, &ctx) {
+        Ok(transition) => {
+            if expected_result != Some("valid") {
+                errors.push("expected result=valid, got execution success".into());
+            }
+            if let Err(e) = store.apply(&transition.changes) {
+                errors.push(format!("store.apply: {e}"));
+            }
+            // valid：每个 change 应用后 account() 反映其声明状态
+            for c in &transition.changes {
+                match store.account(&c.address) {
+                    Some(acc) => {
+                        if acc.balance != c.new_balance {
+                            errors.push(format!(
+                                "account {:?} balance {} != change new_balance {}",
+                                c.address, acc.balance, c.new_balance
+                            ));
+                        }
+                        if acc.nonce != c.new_nonce {
+                            errors.push(format!(
+                                "account {:?} nonce {} != change new_nonce {}",
+                                c.address, acc.nonce, c.new_nonce
+                            ));
+                        }
+                    }
+                    None => errors.push(format!(
+                        "change account {:?} missing after apply",
+                        c.address
+                    )),
+                }
+            }
+            // root 变化（valid 执行必有 sender change：nonce+1 / fee）
+            if root_before == store.state_root() {
+                errors.push("valid tx must change state root".into());
+            }
+        }
+        Err(_err) => {
+            if expected_result != Some("invalid") {
+                errors.push("expected result=invalid, got execution error".into());
+            }
+            // 失败无副作用：root 与账户均不变
+            if store.state_root() != root_before {
+                errors.push("invalid tx must not change state root".into());
+            }
+            if store.account(&tx.sender) != sender_before {
+                errors.push("invalid tx must not change sender account".into());
+            }
+            if store.account(&tx.receiver) != receiver_before {
+                errors.push("invalid tx must not change receiver account".into());
+            }
+        }
+    }
+
+    TransactionValidation {
+        id,
+        ok: errors.is_empty(),
+        errors,
+    }
 }
