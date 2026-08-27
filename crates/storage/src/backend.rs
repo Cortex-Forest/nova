@@ -29,4 +29,12 @@ pub trait StorageBackend {
 
     /// 恢复快照（rollback；覆盖当前状态）。
     fn restore(&mut self, snap: &Self::Snapshot);
+
+    /// 确保所有未持久化写入已 durable（WAL fsync；ADR-0031 E-2）。
+    /// `MemoryBackend` = `Ok(())`（内存天然 durable）。
+    fn flush(&mut self) -> Result<(), StorageError>;
+
+    /// 全量枚举当前键值（**state reload** 用；ADR-0031 E-5）。
+    /// `StateStore::load` 借此重建 trie（E-6：trie 不落盘，确定性重建）。
+    fn entries(&self) -> Vec<(TrieKey, Vec<u8>)>;
 }

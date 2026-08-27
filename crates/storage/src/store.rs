@@ -39,6 +39,23 @@ impl<B: StorageBackend> StateStore<B> {
         }
     }
 
+    /// 从 backend 全量重建 StateStore（**state reload**；ADR-0031 E-5/E-6）。
+    ///
+    /// trie 由 backend 账户 commitment 重建（固定深度 SMT 确定性，ADR-0026）；
+    /// backend 即 truth storage（D-2）。
+    pub fn load(backend: B) -> Result<Self, StorageError> {
+        let mut trie = SparseMerkleTree::new();
+        for (key, bytes) in backend.entries() {
+            let arr: [u8; 88] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| StorageError::CorruptedState)?;
+            let state = decode_account_bytes(&arr);
+            trie.insert(&key, &account_commitment(&state));
+        }
+        Ok(Self { backend, trie })
+    }
+
     /// 当前 state root（空 = `EMPTY_STATE_ROOT`；ADR-0026 T-6）。
     pub fn state_root(&self) -> NodeHash {
         self.trie.root()
@@ -80,6 +97,7 @@ impl<B: StorageBackend> StateStore<B> {
             return Err(e);
         }
         drop(snap);
+        self.backend.flush()?; // 持久化点（8E；MemoryBackend = no-op）
         Ok(())
     }
 
@@ -97,6 +115,7 @@ impl<B: StorageBackend> StateStore<B> {
             return Err(e);
         }
         drop(snap);
+        self.backend.flush()?; // 区块级持久化点（8E；MemoryBackend = no-op）
         Ok(self.state_root())
     }
 
@@ -358,6 +377,14 @@ mod tests {
 
         fn restore(&mut self, snap: &MemorySnapshot) {
             self.inner.restore(snap)
+        }
+
+        fn flush(&mut self) -> Result<(), StorageError> {
+            self.inner.flush()
+        }
+
+        fn entries(&self) -> Vec<(TrieKey, Vec<u8>)> {
+            self.inner.entries()
         }
     }
 

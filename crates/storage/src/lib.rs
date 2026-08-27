@@ -25,6 +25,7 @@ pub mod error;
 pub mod hashing;
 pub mod memory;
 pub mod node;
+pub mod persistent;
 pub mod proof;
 pub mod state_root;
 pub mod store;

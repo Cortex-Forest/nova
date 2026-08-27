@@ -69,4 +69,12 @@ impl StorageBackend for MemoryBackend {
     fn restore(&mut self, snap: &Self::Snapshot) {
         self.map = snap.map.clone();
     }
+
+    fn flush(&mut self) -> Result<(), StorageError> {
+        Ok(()) // 内存天然 durable
+    }
+
+    fn entries(&self) -> Vec<(TrieKey, Vec<u8>)> {
+        self.map.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
 }

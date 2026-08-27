@@ -17,3 +17,5 @@ nova-crypto = { path = "../crypto" }
 [dev-dependencies]
 # STEP 8B-2 property tests：node roundtrip / hash 一致性
 proptest = "1"
+# STEP 8E persistence tests：临时目录
+tempfile = "3"
