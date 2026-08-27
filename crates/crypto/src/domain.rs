@@ -52,6 +52,8 @@ pub enum DomainId {
     Governance = 0x04,
     /// 地址派生（key_hash 计算）。
     Address = 0x05,
+    /// Witness availability proof（ADR-0036 W-5；10-4）。
+    Witness = 0x06,
 }
 
 impl DomainId {
@@ -71,6 +73,7 @@ impl TryFrom<u8> for DomainId {
             0x03 => Ok(Self::Block),
             0x04 => Ok(Self::Governance),
             0x05 => Ok(Self::Address),
+            0x06 => Ok(Self::Witness),
             _ => Err(DomainError::UnknownDomainId(v)),
         }
     }
@@ -236,6 +239,7 @@ mod tests {
             DomainId::Block,
             DomainId::Governance,
             DomainId::Address,
+            DomainId::Witness,
         ] {
             let s = build_signed_bytes(AlgorithmId::Ed25519, other, 7, payload).unwrap();
             assert_ne!(base, s, "domain must change signed_bytes");
@@ -277,8 +281,8 @@ mod tests {
             Err(DomainError::UnknownDomainId(0x00))
         );
         assert_eq!(
-            DomainId::try_from(0x06),
-            Err(DomainError::UnknownDomainId(0x06))
+            DomainId::try_from(0x07),
+            Err(DomainError::UnknownDomainId(0x07))
         );
         assert_eq!(
             DomainId::try_from(0xff),
@@ -287,6 +291,7 @@ mod tests {
         // 已注册值必须接受
         assert_eq!(DomainId::try_from(0x01), Ok(DomainId::Transaction));
         assert_eq!(DomainId::try_from(0x05), Ok(DomainId::Address));
+        assert_eq!(DomainId::try_from(0x06), Ok(DomainId::Witness));
     }
 
     #[test]

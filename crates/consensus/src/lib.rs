@@ -4,6 +4,8 @@
 //! - [`validator`]：**STEP 10-2**——`ValidatorId`/`ValidatorInfo`/`ValidatorSet`（ADR-0034 V-1~V-3）。
 //! - [`vote`]：**STEP 10-2**——`ValidatorVote` + `verify_vote`（ADR-0034 V-4/V-5）。
 //! - [`dag`]：**STEP 10-3**——`BlockReference`/`Dag`/`causal_order`（ADR-0035 D-1~D-3）。
+//! - [`witness`]：**STEP 10-4**——`WitnessSeed`/`deterministic_select`/`WitnessProof`/`verify_witness_proof`
+//!   （ADR-0036 W-1~W-6）。
 //!
 //! # 边界（ADR-0033 C-1 / C-3）
 //! - 依赖：`consensus → core/crypto`；**禁止** `consensus → execution/storage/network`（纯计算）。
@@ -14,3 +16,4 @@ pub mod dag;
 pub mod error;
 pub mod validator;
 pub mod vote;
+pub mod witness;

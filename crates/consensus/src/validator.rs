@@ -122,6 +122,11 @@ impl ValidatorSet {
         self.validators.len()
     }
 
+    /// 全部验证者信息（按 validator_id 升序；deterministic_select 用，W-2）。
+    pub fn validators(&self) -> &[ValidatorInfo] {
+        &self.validators
+    }
+
     /// 是否为空。
     pub fn is_empty(&self) -> bool {
         self.validators.is_empty()
