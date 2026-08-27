@@ -10,5 +10,10 @@ description = "Nova Chain storage layer (PHASE 1 placeholder)"
 workspace = true
 
 [dependencies]
-# PHASE 1：零第三方运行时依赖。
-# RocksDB 选型与 schema 设计待 ADR-0007 评审后引入。
+# STEP 8B-2：node encoding / domain-separated hashing 引用协议类型与 protocol_hash
+nova-core = { path = "../core" }
+nova-crypto = { path = "../crypto" }
+
+[dev-dependencies]
+# STEP 8B-2 property tests：node roundtrip / hash 一致性
+proptest = "1"
