@@ -158,6 +158,15 @@ pub struct NovaAddressPayload {
     pub key_hash: [u8; 32],
 }
 
+impl NovaAddressPayload {
+    /// 35 字节 raw 表示（`version ‖ type ‖ network ‖ key_hash`；ADR-0004 / ADR-0028 D-3）。
+    ///
+    /// 协议层统一入口（trie key / 地址 canonical bytes）；**禁止 storage 自行 enum→bytes**。
+    pub fn to_bytes(&self) -> [u8; 35] {
+        payload_to_bytes(self)
+    }
+}
+
 /// Nova 地址（Bech32m-derived 文本的规范表示）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NovaAddress {

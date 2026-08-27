@@ -48,6 +48,7 @@ impl Tree {
 }
 
 /// Sparse Merkle Tree（V0.1 内存结构；持久化见 8E）。
+#[derive(Clone)]
 pub struct SparseMerkleTree {
     root: Tree,
 }

@@ -42,6 +42,42 @@ pub struct AccountState {
     pub storage_root: [u8; 32],
 }
 
+/// 账户 canonical 序列化（ADR-0018 §12 / ADR-0028 D-3）。
+///
+/// 88B 固定长度：`balance(16B LE) ‖ nonce(8B LE) ‖ code_hash(32B) ‖ storage_root(32B)`。
+/// **不包含** address / account_type（ADR-0018）。
+pub fn canonical_account_bytes(state: &AccountState) -> [u8; 88] {
+    let mut out = [0u8; 88];
+    out[0..16].copy_from_slice(&state.balance.to_le_bytes());
+    out[16..24].copy_from_slice(&state.nonce.to_le_bytes());
+    out[24..56].copy_from_slice(&state.code_hash);
+    out[56..88].copy_from_slice(&state.storage_root);
+    out
+}
+
+/// 账户承诺：`SHA-256(canonical_account_bytes)`（ADR-0018 §12 / ADR-0028 D-3）。
+pub fn account_commitment(state: &AccountState) -> [u8; 32] {
+    nova_crypto::hash::protocol_hash(&canonical_account_bytes(state))
+}
+
+/// 从 88B canonical 还原账户（storage 层 `account()` 读取；ADR-0028 D-3）。
+pub fn decode_account_bytes(bytes: &[u8; 88]) -> AccountState {
+    let mut balance = [0u8; 16];
+    balance.copy_from_slice(&bytes[0..16]);
+    let mut nonce = [0u8; 8];
+    nonce.copy_from_slice(&bytes[16..24]);
+    let mut code_hash = [0u8; 32];
+    code_hash.copy_from_slice(&bytes[24..56]);
+    let mut storage_root = [0u8; 32];
+    storage_root.copy_from_slice(&bytes[56..88]);
+    AccountState {
+        balance: u128::from_le_bytes(balance),
+        nonce: u64::from_le_bytes(nonce),
+        code_hash,
+        storage_root,
+    }
+}
+
 /// 账户状态视图接口（ADR-0025 S-A；**迁移自 nova-execution**）。
 ///
 /// - **协议层接口**：`nova-core` 定义；`nova-execution` 消费（`apply_transaction`）；
@@ -124,6 +160,72 @@ mod tests {
         assert_eq!(
             EMPTY_STORAGE_ROOT,
             nova_crypto::hash::protocol_hash(&[0x00])
+        );
+    }
+
+    #[test]
+    fn canonical_account_bytes_layout_and_roundtrip() {
+        let acc = AccountState {
+            balance: 0x0102030405060708_090a0b0c0d0e0f10u128,
+            nonce: 0x1122334455667788u64,
+            code_hash: [0xaa; 32],
+            storage_root: [0xbb; 32],
+        };
+        let bytes = canonical_account_bytes(&acc);
+        assert_eq!(bytes.len(), 88);
+        let mut bal = [0u8; 16];
+        bal.copy_from_slice(&bytes[0..16]);
+        assert_eq!(u128::from_le_bytes(bal), acc.balance, "balance LE 16B");
+        let mut nonce = [0u8; 8];
+        nonce.copy_from_slice(&bytes[16..24]);
+        assert_eq!(u64::from_le_bytes(nonce), acc.nonce, "nonce LE 8B");
+        assert_eq!(&bytes[24..56], &acc.code_hash, "code_hash 32B");
+        assert_eq!(&bytes[56..88], &acc.storage_root, "storage_root 32B");
+        assert_eq!(decode_account_bytes(&bytes), acc, "roundtrip");
+    }
+
+    #[test]
+    fn account_commitment_is_sha256_of_canonical() {
+        let acc = AccountState {
+            balance: 123,
+            nonce: 1,
+            code_hash: EMPTY_CODE_HASH,
+            storage_root: EMPTY_STORAGE_ROOT,
+        };
+        let c = canonical_account_bytes(&acc);
+        assert_eq!(
+            account_commitment(&acc),
+            nova_crypto::hash::protocol_hash(&c)
+        );
+    }
+
+    #[test]
+    fn account_commitment_mutation_sensitive() {
+        let base = AccountState {
+            balance: 100,
+            nonce: 1,
+            code_hash: EMPTY_CODE_HASH,
+            storage_root: EMPTY_STORAGE_ROOT,
+        };
+        let mut b = base;
+        b.balance += 1;
+        assert_ne!(account_commitment(&base), account_commitment(&b), "balance");
+        let mut c = base;
+        c.nonce += 1;
+        assert_ne!(account_commitment(&base), account_commitment(&c), "nonce");
+        let mut d = base;
+        d.code_hash[0] ^= 0xff;
+        assert_ne!(
+            account_commitment(&base),
+            account_commitment(&d),
+            "code_hash"
+        );
+        let mut e = base;
+        e.storage_root[0] ^= 0xff;
+        assert_ne!(
+            account_commitment(&base),
+            account_commitment(&e),
+            "storage_root"
         );
     }
 }
