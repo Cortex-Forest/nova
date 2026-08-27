@@ -67,7 +67,8 @@ pub mod error {
     }
 }
 
-// 未来承载：区块（STEP 10）、状态存储（STEP 8）等；每步先 ADR。
+// 未来承载：完整区块格式（PHASE 7）、共识（STEP 10+）等；每步先 ADR。
 
+pub mod block;
 pub mod state;
 pub mod transaction;

@@ -47,17 +47,17 @@ impl AccountStateView for FixtureState {
     }
 }
 
-fn get_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+pub(crate) fn get_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }
 
-fn parse_u128(s: &str) -> Result<u128, String> {
+pub(crate) fn parse_u128(s: &str) -> Result<u128, String> {
     s.parse::<u128>()
         .map_err(|_| format!("invalid u128 decimal: {s}"))
 }
 
 /// 从 JSON `transaction` 对象构建 TransactionV1。
-fn build_tx(value: &Value) -> Result<TransactionV1, String> {
+pub(crate) fn build_tx(value: &Value) -> Result<TransactionV1, String> {
     let t = value
         .get("transaction")
         .ok_or_else(|| "missing field: transaction".to_string())?;
@@ -131,7 +131,7 @@ fn build_tx(value: &Value) -> Result<TransactionV1, String> {
 }
 
 /// 解析账户字段（balance 十进制 / nonce）。
-fn parse_account(value: &Value) -> Result<(u128, u64), String> {
+pub(crate) fn parse_account(value: &Value) -> Result<(u128, u64), String> {
     let balance =
         parse_u128(get_str(value, "balance").ok_or_else(|| "account.balance".to_string())?)?;
     let nonce = value

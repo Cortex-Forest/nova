@@ -1,0 +1,59 @@
+{
+  "chain_id": 1001,
+  "current_height": 0,
+  "expected": {
+    "error": null,
+    "result": "valid",
+    "state_root": "840eda55ccb1f2c0f4e114d68932cdfa5bc50e79e85d63b0a6bae55a830ccb53"
+  },
+  "fee_burn_bps": 0,
+  "id": "block-multi-transfer-001",
+  "initial_state": {
+    "accounts": {
+      "nova1qyqsrme2kggz624zd5e4jznckcn8srcsu3efk4yesdhs324mfpalwuvar7e3y9": {
+        "balance": "1000000",
+        "nonce": 0
+      }
+    }
+  },
+  "max_gas_per_block": 100000000000,
+  "network_id": 1,
+  "note": "two txs, same sender, nonce 0 then 1",
+  "schema_version": "block-state-root-v1",
+  "transactions": [
+    {
+      "sender_public_key": "63caad4ba05319f756b3fee6462412798905cbab90f055f6490bc305318ec1f0",
+      "transaction": {
+        "amount": "100",
+        "chain_id": 1001,
+        "expiration": 0,
+        "gas_limit": 100000,
+        "gas_price": "1",
+        "nonce": 0,
+        "payload_hex": "",
+        "receiver": "nova1qyqszvf3xycnzvf3xycnzvf3xycnzvf3xycnzvf3xycnzvf3xycnzvf3grz2rr",
+        "sender": "nova1qyqsrme2kggz624zd5e4jznckcn8srcsu3efk4yesdhs324mfpalwuvar7e3y9",
+        "signature_hex": "6326d97d1cc88285abf06b1c885ecfd0800e3613d90b90a7804b8a37028a6fd65bde6072bf3102b7bcd97622b75c32974a33d3735e6d7311e5c3eb16b37d600f",
+        "transaction_type": 1,
+        "version": 1
+      }
+    },
+    {
+      "sender_public_key": "63caad4ba05319f756b3fee6462412798905cbab90f055f6490bc305318ec1f0",
+      "transaction": {
+        "amount": "200",
+        "chain_id": 1001,
+        "expiration": 0,
+        "gas_limit": 100000,
+        "gas_price": "1",
+        "nonce": 1,
+        "payload_hex": "",
+        "receiver": "nova1qyqszv3jxgeryv3jxgeryv3jxgeryv3jxgeryv3jxgeryv3jxgeryv3j0k92hs",
+        "sender": "nova1qyqsrme2kggz624zd5e4jznckcn8srcsu3efk4yesdhs324mfpalwuvar7e3y9",
+        "signature_hex": "dd69b835dac83770ffdee14ee478001777999b6427a935be5dd9d5e71e80ae4f9ba09c07ccd375e73365714ba300d80e8a75330c1b1ae459738e02d2a16d4e00",
+        "transaction_type": 1,
+        "version": 1
+      }
+    }
+  ]
+}

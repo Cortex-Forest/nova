@@ -24,6 +24,7 @@ pub struct StateSnapshot<S> {
 }
 
 /// State store（ADR-0028 D-2）。
+#[derive(Clone)]
 pub struct StateStore<B: StorageBackend> {
     backend: B,
     trie: SparseMerkleTree,
@@ -69,19 +70,40 @@ impl<B: StorageBackend> StateStore<B> {
         self.backend.restore(&snapshot.backend);
     }
 
-    /// 原子应用一批账户变更（ADR-0028 D-4；**两阶段内部事务**，8C-3）。
+    /// 原子应用一批账户变更（ADR-0028 D-4；**两阶段内部事务**）。
     ///
-    /// - **phase 1 prepare**：validate 全部变更、构造新 `AccountState`、canonical 编码、
-    ///   计算 commitment（**零副作用**；任一失败 ⇒ `Err`，状态不变）。
-    /// - **phase 2 snapshot**：保存当前 trie + backend。
-    /// - **phase 3 commit**：write backend（`put`）→ update trie（`insert`）。
-    /// - 任一失败 ⇒ **rollback** 恢复快照；成功 ⇒ 保留（新 state_root 就位）。
-    ///
-    /// - **顺序保持**：`changes` 按传入顺序处理（ADR-0023 G-J sender→receiver；**禁止排序**）。
-    /// - 只 upsert 不 delete（ADR-0017 V0.1 禁删账户）。
-    /// - 本方法为 storage 原子保护，非链级共识事务（D-4）。
+    /// - snapshot → [`Self::apply_changes_inner`] → 成功保留；失败 rollback。
     pub fn apply(&mut self, changes: &[AccountChange]) -> Result<(), StorageError> {
-        // phase 1: prepare（validate + calculate，零副作用）
+        let snap = self.snapshot();
+        if let Err(e) = self.apply_changes_inner(changes) {
+            self.rollback(snap);
+            return Err(e);
+        }
+        drop(snap);
+        Ok(())
+    }
+
+    /// 区块级原子提交（ADR-0029 D-4）：snapshot → 逐成功 tx changes → final root；失败整块回滚。
+    ///
+    /// `tx_changes` 外层 = block 内成功 tx 顺序；内层 = 单 tx 的 changes（sender→receiver）。
+    /// **不排序、不合并**（ADR-0030 C-4）。空区块 ⇒ root 不变（C-5）。
+    pub fn apply_block(
+        &mut self,
+        tx_changes: &[&[AccountChange]],
+    ) -> Result<NodeHash, StorageError> {
+        let snap = self.snapshot();
+        if let Err(e) = self.commit_changes(tx_changes) {
+            self.rollback(snap);
+            return Err(e);
+        }
+        drop(snap);
+        Ok(self.state_root())
+    }
+
+    /// 两阶段内部核心（**不负责 snapshot/rollback**；ADR-0030 C-3 单源）。
+    ///
+    /// phase 1 prepare（validate + calculate，零副作用）→ phase 2 commit（backend → trie）。
+    fn apply_changes_inner(&mut self, changes: &[AccountChange]) -> Result<(), StorageError> {
         let mut prepared = Vec::with_capacity(changes.len());
         for c in changes {
             let key: TrieKey = c.address.payload().to_bytes();
@@ -92,17 +114,21 @@ impl<B: StorageBackend> StateStore<B> {
                 account_commitment(&state),
             ));
         }
-        // phase 2: snapshot
-        let snap = self.snapshot();
-        // phase 3: commit（backend → trie）
         for (key, canonical, commitment) in &prepared {
-            if let Err(e) = self.backend.put(*key, canonical.clone()) {
-                self.rollback(snap);
-                return Err(e);
-            }
+            self.backend.put(*key, canonical.clone())?;
             self.trie.insert(key, commitment);
         }
-        drop(snap);
+        Ok(())
+    }
+
+    /// 逐 tx 应用（ADR-0030 C-3；`apply_block` 与 `calculate_state_root` 共享核心）。
+    pub(crate) fn commit_changes(
+        &mut self,
+        tx_changes: &[&[AccountChange]],
+    ) -> Result<(), StorageError> {
+        for changes in tx_changes {
+            self.apply_changes_inner(changes)?;
+        }
         Ok(())
     }
 }
@@ -363,6 +389,64 @@ mod tests {
         assert_eq!(store.apply(&changes), Err(StorageError::BackendFailure));
         assert_eq!(store.state_root(), root_before, "root must roll back");
         assert_eq!(store.account(&a), None, "change[0] must roll back");
+        assert_eq!(store.account(&b), None);
+    }
+
+    // ---- apply_block（8D，区块级原子；ADR-0029 D-4）----
+    #[test]
+    fn apply_block_multiple_and_empty() {
+        let a = addr([0xaa; 32]);
+        let b = addr([0xbb; 32]);
+        let mut store = StateStore::new(MemoryBackend::new());
+        // 空区块 ⇒ root 不变（ADR-0030 C-5）
+        let root0 = store.state_root();
+        assert_eq!(store.apply_block(&[]).unwrap(), root0);
+        // 两个 tx 的 changes
+        let tx1 = vec![AccountChange {
+            address: a,
+            new_balance: 100,
+            new_nonce: 1,
+            created: true,
+        }];
+        let tx2 = vec![AccountChange {
+            address: b,
+            new_balance: 50,
+            new_nonce: 0,
+            created: true,
+        }];
+        let refs: Vec<&[AccountChange]> = vec![&tx1, &tx2];
+        let root = store.apply_block(&refs).unwrap();
+        assert_ne!(root, root0);
+        assert_eq!(store.account(&a), Some(acc(100, 1)));
+        assert_eq!(store.account(&b), Some(acc(50, 0)));
+    }
+
+    #[test]
+    fn apply_block_failure_rolls_back_atomically() {
+        let a = addr([0xaa; 32]);
+        let b = addr([0xbb; 32]);
+        let failing = FailingBackend {
+            inner: MemoryBackend::new(),
+            fail_key: b.payload().to_bytes(),
+        };
+        let mut store = StateStore::new(failing);
+        let root_before = store.state_root();
+        let tx1 = vec![AccountChange {
+            address: a,
+            new_balance: 100,
+            new_nonce: 1,
+            created: true,
+        }];
+        let tx2 = vec![AccountChange {
+            address: b,
+            new_balance: 50,
+            new_nonce: 0,
+            created: true,
+        }];
+        let refs: Vec<&[AccountChange]> = vec![&tx1, &tx2];
+        assert_eq!(store.apply_block(&refs), Err(StorageError::BackendFailure));
+        assert_eq!(store.state_root(), root_before, "block must roll back");
+        assert_eq!(store.account(&a), None, "tx1 must roll back");
         assert_eq!(store.account(&b), None);
     }
 }

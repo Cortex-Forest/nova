@@ -26,7 +26,8 @@ pub mod hashing;
 pub mod memory;
 pub mod node;
 pub mod proof;
+pub mod state_root;
 pub mod store;
 pub mod trie;
 
-// 注意：本阶段不实现 StateStore.apply（8C-3）/ 持久化后端（8E）/ block state root（8D）。
+// 注意：本阶段不实现持久化后端（8E）/ 完整区块格式（PHASE 7）。

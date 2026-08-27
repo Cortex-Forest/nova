@@ -1,0 +1,63 @@
+{
+  "chain_id": 1001,
+  "current_height": 0,
+  "expected": {
+    "error": null,
+    "result": "valid",
+    "state_root": "38bbede850591bbf9ab5be153bf40b91da3d1cd40fdba546b7d1b30eba42a193"
+  },
+  "fee_burn_bps": 0,
+  "id": "block-skip-failed-001",
+  "initial_state": {
+    "accounts": {
+      "nova1qyqsz0v2cl479ka8my4u3dhmucy56x60l9emr3k48frkcdjm7360hfd5ffymvr": {
+        "balance": "1000000",
+        "nonce": 0
+      },
+      "nova1qyqsz3zukk4a8hmy87fzwfwsxxrxp8ygcl9wdjgdt5vpagae4y48wfzay3tg7t": {
+        "balance": "10",
+        "nonce": 0
+      }
+    }
+  },
+  "max_gas_per_block": 100000000000,
+  "network_id": 1,
+  "note": "second tx insufficient balance => skipped",
+  "schema_version": "block-state-root-v1",
+  "transactions": [
+    {
+      "sender_public_key": "0ab46d9fec690bea346344318829786ddffe308f97f2ac393c896e84b8b19c24",
+      "transaction": {
+        "amount": "100",
+        "chain_id": 1001,
+        "expiration": 0,
+        "gas_limit": 100000,
+        "gas_price": "1",
+        "nonce": 0,
+        "payload_hex": "",
+        "receiver": "nova1qyqszs6rgdp5xs6rgdp5xs6rgdp5xs6rgdp5xs6rgdp5xs6rgdp5xs6rss5d8k",
+        "sender": "nova1qyqsz0v2cl479ka8my4u3dhmucy56x60l9emr3k48frkcdjm7360hfd5ffymvr",
+        "signature_hex": "e59ee53f0bcedae7cc1b9d003600c25dff66e6f950e296bd068ca921eb12d9467c82f4167a3fa308cacc5ad3b3bbb9fdf2390260a5e7da0e32f72913c11c1102",
+        "transaction_type": 1,
+        "version": 1
+      }
+    },
+    {
+      "sender_public_key": "e5409b6dc9c56f49be3d4b3e4065ed41f409dff37784a16a7e324ac3e216bbf5",
+      "transaction": {
+        "amount": "1000000",
+        "chain_id": 1001,
+        "expiration": 0,
+        "gas_limit": 100000,
+        "gas_price": "1",
+        "nonce": 0,
+        "payload_hex": "",
+        "receiver": "nova1qyqszs6rgdp5xs6rgdp5xs6rgdp5xs6rgdp5xs6rgdp5xs6rgdp5xs6rss5d8k",
+        "sender": "nova1qyqsz3zukk4a8hmy87fzwfwsxxrxp8ygcl9wdjgdt5vpagae4y48wfzay3tg7t",
+        "signature_hex": "07e550b23d3c6d103d18cf682b8b65a5607ff53ad554cf3f25a6de408976412dae375deb15a800fa9ebe3846c69458b18cef3499923b3c2c18fa3f5c4d897c04",
+        "transaction_type": 1,
+        "version": 1
+      }
+    }
+  ]
+}

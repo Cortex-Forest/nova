@@ -6,6 +6,7 @@
 //! 报告：失败断言携带 vector id、类别、字段期望/实际与规范章节（§17）。
 
 use nova_test_vectors::address::validate_address_vector;
+use nova_test_vectors::block::validate_block_vector;
 use nova_test_vectors::domain::validate_domain_vector;
 use nova_test_vectors::genesis::validate_genesis_vector;
 use nova_test_vectors::signature::validate_signature_vector;
@@ -480,4 +481,44 @@ fn transaction_vectors_state_store_validate() {
             r.errors
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Block vectors（ADR-0029/ADR-0030 / STEP 8D-5；schema block-state-root-v1）
+// ---------------------------------------------------------------------------
+const BLOCK_VECTORS: &[(&str, &str)] = &[
+    (
+        "block-single-transfer-001",
+        include_str!("../block/block-single-transfer-001.json"),
+    ),
+    (
+        "block-multi-transfer-001",
+        include_str!("../block/block-multi-transfer-001.json"),
+    ),
+    (
+        "block-skip-failed-001",
+        include_str!("../block/block-skip-failed-001.json"),
+    ),
+    (
+        "block-nonce-conflict-001",
+        include_str!("../block/block-nonce-conflict-001.json"),
+    ),
+    (
+        "block-gas-over-limit-001",
+        include_str!("../block/block-gas-over-limit-001.json"),
+    ),
+];
+
+/// 8D-5：block 向量在真实 StateStore 上验证区块执行 → state root → verify 链路。
+#[test]
+fn block_vectors_state_root_validate() {
+    for (id, json) in BLOCK_VECTORS {
+        let r = validate_block_vector(json);
+        assert!(
+            r.ok,
+            "BLOCK VECTOR FAILED\nID: {id}\nEXPECTED: execute_block → apply_block → state_root → verify\nACTUAL: {:?}\nSPEC: ADR-0029/ADR-0030",
+            r.errors
+        );
+    }
+    assert_eq!(BLOCK_VECTORS.len(), 5);
 }

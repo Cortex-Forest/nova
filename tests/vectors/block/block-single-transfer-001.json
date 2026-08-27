@@ -1,0 +1,42 @@
+{
+  "chain_id": 1001,
+  "current_height": 0,
+  "expected": {
+    "error": null,
+    "result": "valid",
+    "state_root": "7e5255e2eaeb85f97cb5e46e8d6e3e752db42e25d4a571c59ef69dca67903cd1"
+  },
+  "fee_burn_bps": 0,
+  "id": "block-single-transfer-001",
+  "initial_state": {
+    "accounts": {
+      "nova1qyqsz6ur2rtxngh0ml3n9anntpkrrl2ygaffzcvzfgwmr2eanzru6n7uxsvz0v": {
+        "balance": "1000000",
+        "nonce": 0
+      }
+    }
+  },
+  "max_gas_per_block": 100000000000,
+  "network_id": 1,
+  "note": "single successful transfer",
+  "schema_version": "block-state-root-v1",
+  "transactions": [
+    {
+      "sender_public_key": "8e1741698cd332bc462efa77e5c89e6ba1e12c29bb0dcfa0385de03154013578",
+      "transaction": {
+        "amount": "100",
+        "chain_id": 1001,
+        "expiration": 0,
+        "gas_limit": 100000,
+        "gas_price": "1",
+        "nonce": 0,
+        "payload_hex": "",
+        "receiver": "nova1qyqszg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3z2yuspj",
+        "sender": "nova1qyqsz6ur2rtxngh0ml3n9anntpkrrl2ygaffzcvzfgwmr2eanzru6n7uxsvz0v",
+        "signature_hex": "44ac5fa35775d6e1748939bce6b309723b698f464bf27cf79f20ada9d8fdaac78391da5e75e75ce935336be0380215b0fdc6802e7d33bffc2d6a1d5e6d233105",
+        "transaction_type": 1,
+        "version": 1
+      }
+    }
+  ]
+}

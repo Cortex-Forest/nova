@@ -17,6 +17,7 @@
 //! - JSON 只是 Human-readable Test Vector Format，**不是 Nova 协议编码**（§3）。
 
 pub mod address;
+pub mod block;
 pub mod domain;
 pub mod genesis;
 pub mod hex;

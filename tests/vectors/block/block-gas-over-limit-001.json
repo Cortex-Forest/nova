@@ -1,0 +1,42 @@
+{
+  "chain_id": 1001,
+  "current_height": 0,
+  "expected": {
+    "error": "GasLimitExceeded",
+    "result": "invalid",
+    "state_root": null
+  },
+  "fee_burn_bps": 0,
+  "id": "block-gas-over-limit-001",
+  "initial_state": {
+    "accounts": {
+      "nova1qyqsryzjqvd5u4a9fvtarkuqk4lm0uh7qrummyxs77hzm35u32pz2xgv95j4uy": {
+        "balance": "1000000",
+        "nonce": 0
+      }
+    }
+  },
+  "max_gas_per_block": 100,
+  "network_id": 1,
+  "note": "tx gas (21000) > max_gas_per_block (100)",
+  "schema_version": "block-state-root-v1",
+  "transactions": [
+    {
+      "sender_public_key": "d0b0aa733c98000157bd18532cf7c8ad5c1987f3b6d296ab0e3d058fc266e930",
+      "transaction": {
+        "amount": "100",
+        "chain_id": 1001,
+        "expiration": 0,
+        "gas_limit": 100000,
+        "gas_price": "1",
+        "nonce": 0,
+        "payload_hex": "",
+        "receiver": "nova1qyqszenxvenxvenxvenxvenxvenxvenxvenxvenxvenxvenxvenxvenx7fdhda",
+        "sender": "nova1qyqsryzjqvd5u4a9fvtarkuqk4lm0uh7qrummyxs77hzm35u32pz2xgv95j4uy",
+        "signature_hex": "776eee02c43d185c4e41f13582f66eda965073b99f7f46a544ca3bdba63f9226fa9ff5cfc4e23fcff0247c59061ddf7b1bb5e3a79d59040f03866e50ac365c05",
+        "transaction_type": 1,
+        "version": 1
+      }
+    }
+  ]
+}

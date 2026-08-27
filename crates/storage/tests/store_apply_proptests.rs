@@ -14,6 +14,7 @@ use nova_crypto::address::{
     ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
 };
 use nova_storage::memory::MemoryBackend;
+use nova_storage::state_root::calculate_state_root;
 use nova_storage::store::StateStore;
 use proptest::prelude::*;
 use std::collections::HashMap;
@@ -128,5 +129,43 @@ proptest! {
         let rev: Vec<AccountChange> = changes.iter().rev().cloned().collect();
         b.apply(&rev).unwrap();
         prop_assert_eq!(a.state_root(), b.state_root(), "SMT is set commitment");
+    }
+
+    // ADR-0030 C-7：calculate_state_root 只读 + 与 apply_block 等价
+    #[test]
+    fn calculate_equals_apply_block_and_read_only(
+        seed in prop::collection::vec(
+            (any::<[u8; 32]>(), any::<u128>(), any::<u64>()),
+            0..8,
+        ),
+        more in prop::collection::vec(
+            (any::<[u8; 32]>(), any::<u128>(), any::<u64>()),
+            0..8,
+        ),
+    ) {
+        let mut store = StateStore::new(MemoryBackend::new());
+        let seed_changes: Vec<AccountChange> = seed
+            .iter()
+            .map(|(kh, b, n)| change(*kh, *b, *n))
+            .collect();
+        store.apply(&seed_changes).unwrap();
+        let root_before = store.state_root();
+
+        let more_changes: Vec<AccountChange> = more
+            .iter()
+            .map(|(kh, b, n)| change(*kh, *b, *n))
+            .collect();
+        let tx_changes: Vec<Vec<AccountChange>> = more_changes
+            .iter()
+            .map(|c| vec![c.clone()])
+            .collect();
+        let refs: Vec<&[AccountChange]> = tx_changes.iter().map(|v| v.as_slice()).collect();
+
+        // 只读：calculate 前后 store 不变
+        let calc = calculate_state_root(&store, &refs).unwrap();
+        prop_assert_eq!(store.state_root(), root_before, "calculate must not mutate");
+        // 等价：apply_block 返回同一 root
+        let applied = store.apply_block(&refs).unwrap();
+        prop_assert_eq!(calc, applied, "calculate == apply_block");
     }
 }
