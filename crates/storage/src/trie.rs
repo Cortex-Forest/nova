@@ -6,11 +6,13 @@
 //! - **可交换性**：SMT 是**集合承诺**（key→value 映射），非插入序列承诺；同集合 ⇒ 同 root。
 //! - [`SparseMerkleTree::delete`] 为**数据结构原语**；协议层 V0.1 禁止账户删除
 //!   （ADR-0017 §6），`AccountChange` 不产生 delete。
-//! - **不实现**：StateStore.apply / backend / persistence / proof / block state root
-//!   （8C / 8E / 8B-4 / 8D）。
+//! - **实现**：[`SparseMerkleTree::prove_inclusion`] / [`SparseMerkleTree::prove_exclusion`]
+//!   （8B-4 proof，ADR-0027）。
+//! - **不实现**：StateStore.apply / backend / persistence / block state root（8C / 8E / 8D）。
 
 use crate::hashing::branch_node_hash;
 use crate::node::{Node, NodeHash, TrieKey, ValueHash};
+use crate::proof::{SMT_DEPTH, SparseMerkleProof, bit_at};
 
 /// 空状态根：`EMPTY_STATE_ROOT = EMPTY_NODE_HASH = SHA-256(0x00)`（ADR-0026 T-5）。
 pub const EMPTY_STATE_ROOT: [u8; 32] = crate::hashing::EMPTY_NODE_HASH;
@@ -83,17 +85,50 @@ impl SparseMerkleTree {
         let old = std::mem::replace(&mut self.root, Tree::Empty);
         self.root = delete_impl(old, key, 0);
     }
+
+    /// 生成 `key` 的 inclusion proof（key 不存在 ⇒ `None`；ADR-0027 P-1/P-2）。
+    ///
+    /// - siblings 固定 280 个（`[NodeHash; 280]`），沿 280-bit 路径收集每层 sibling。
+    /// - 验证用 [`crate::proof::verify_proof`]（纯函数，可脱离节点独立执行）。
+    pub fn prove_inclusion(&self, key: &TrieKey) -> Option<SparseMerkleProof> {
+        let mut siblings = Vec::with_capacity(SMT_DEPTH);
+        if collect_inclusion(&self.root, key, 0, &mut siblings) {
+            debug_assert_eq!(siblings.len(), SMT_DEPTH);
+            let mut arr = [NodeHash::from_bytes([0u8; 32]); SMT_DEPTH];
+            for (i, s) in siblings.into_iter().enumerate() {
+                arr[i] = s;
+            }
+            Some(SparseMerkleProof::Inclusion {
+                key: *key,
+                value_hash: self.get(key)?, // collect 成功 ⇒ key 必存在
+                siblings: Box::new(arr),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// 生成 `key` 的 exclusion proof（key 存在 ⇒ `None`；ADR-0027 P-2/P-5）。
+    ///
+    /// - `empty_depth` = 路径上首个空子树深度（0..=280）；siblings 到该层（len == empty_depth）。
+    pub fn prove_exclusion(&self, key: &TrieKey) -> Option<SparseMerkleProof> {
+        let mut siblings = Vec::new();
+        match collect_exclusion(&self.root, key, 0, &mut siblings) {
+            Some(empty_depth) => {
+                debug_assert_eq!(siblings.len(), empty_depth);
+                Some(SparseMerkleProof::Exclusion {
+                    key: *key,
+                    empty_depth,
+                    siblings,
+                })
+            }
+            None => None,
+        }
+    }
 }
 
-/// SMT 固定深度：key 为 35B ⇒ 280 bit 路径（ADR-0026 T-2）。
-const SMT_DEPTH: usize = 280;
-
-/// 取 key 在 depth 位的 bit（depth 0 = key[0] 最高位；bit 1 => right，bit 0 => left）。
-fn bit_at(key: &TrieKey, depth: usize) -> u8 {
-    debug_assert!(depth < SMT_DEPTH, "SMT path depth out of range");
-    (key[depth / 8] >> (7 - (depth % 8))) & 1
-}
-
+// `SMT_DEPTH`（= 280）与 `bit_at` 定义于 `crate::proof`（ADR-0027 P-1），
+// 本文件复用，避免两处漂移。
 fn recompute_branch_hash(left: &Tree, right: &Tree) -> NodeHash {
     NodeHash::from_bytes(branch_node_hash(
         left.hash().as_bytes(),
@@ -218,6 +253,56 @@ fn fold_branch(left: Box<Tree>, right: Box<Tree>) -> Tree {
         _ => {
             let hash = recompute_branch_hash(&left, &right);
             Tree::Branch { left, right, hash }
+        }
+    }
+}
+
+/// 收集 inclusion siblings；返回 key 是否存在（沿 280-bit 路径；8B-4）。
+fn collect_inclusion(
+    tree: &Tree,
+    key: &TrieKey,
+    depth: usize,
+    siblings: &mut Vec<NodeHash>,
+) -> bool {
+    match tree {
+        Tree::Empty => false,
+        Tree::Leaf { key: k, .. } => {
+            debug_assert_eq!(depth, SMT_DEPTH, "fixed-depth SMT: leaf at non-base depth");
+            k == key
+        }
+        Tree::Branch { left, right, .. } => {
+            let (mine, sib) = if bit_at(key, depth) == 1 {
+                (right, left.hash())
+            } else {
+                (left, right.hash())
+            };
+            siblings.push(sib);
+            collect_inclusion(mine, key, depth + 1, siblings)
+        }
+    }
+}
+
+/// 收集 exclusion siblings；返回 `Some(empty_depth)`（key 不存在）或 `None`（key 存在）。
+fn collect_exclusion(
+    tree: &Tree,
+    key: &TrieKey,
+    depth: usize,
+    siblings: &mut Vec<NodeHash>,
+) -> Option<usize> {
+    match tree {
+        Tree::Empty => Some(depth),
+        Tree::Leaf { key: k, .. } => {
+            debug_assert_eq!(depth, SMT_DEPTH, "fixed-depth SMT: leaf at non-base depth");
+            if k == key { None } else { Some(depth) } // 防御：固定深度下 280-bit 路径唯一
+        }
+        Tree::Branch { left, right, .. } => {
+            let (mine, sib) = if bit_at(key, depth) == 1 {
+                (right, left.hash())
+            } else {
+                (left, right.hash())
+            };
+            siblings.push(sib);
+            collect_exclusion(mine, key, depth + 1, siblings)
         }
     }
 }
