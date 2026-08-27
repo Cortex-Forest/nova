@@ -10,5 +10,7 @@ description = "Nova Chain P2P network layer (PHASE 1 placeholder)"
 workspace = true
 
 [dependencies]
-# PHASE 1：零第三方运行时依赖。
-# rust-libp2p 选型与网络安全设计待对应 PHASE（PHASE 8）+ ADR 评审后引入。
+# STEP 9-2（ADR-0032 N-1）：network → core（协议类型）/ network → crypto（签名/哈希）
+# 禁止 network → execution / network → storage（消息层不执行状态转换）
+nova-core = { path = "../core" }
+nova-crypto = { path = "../crypto" }

@@ -558,6 +558,10 @@ dependencies = [
 [[package]]
 name = "nova-network"
 version = "0.1.0"
+dependencies = [
+ "nova-core",
+ "nova-crypto",
+]
 
 [[package]]
 name = "nova-node"
