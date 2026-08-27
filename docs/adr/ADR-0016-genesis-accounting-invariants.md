@@ -1,10 +1,11 @@
 # ADR-0016: Genesis Accounting Invariants
 
 - **Status**: Proposed（待批准）
-- **Date**: 2026-08-26
+- **Date**: 2026-08-26（2026-08-27 STEP 7F 修订：§4 供应上限/cap 语义澄清，关联 ADR-0022）
 - **Deciders**: Nova Chain 架构组
 - **Scope**: PHASE 2 — Cryptography（Genesis canonical data）
-- 关联：ADR-0014（Genesis Schema V1）、ADR-0015（canonical 编码）、`genesis-v1.md`
+- 关联：ADR-0014（Genesis Schema V1）、ADR-0015（canonical 编码）、ADR-0022（Gas/Fee，STEP 7F）、
+  `genesis-v1.md`
 
 ## Context
 
@@ -54,11 +55,20 @@ total_initial_account_balances = Σ AccountInit.liquid_balance
 - 若未来引入未分配供应（treasury/unallocated），**必须**经 ADR 修订并**明确剩余供应去向**；
   绝对不允许"总量已定但 Genesis 未出现、去向不明"。
 
-### 4. 无通胀 / 无销毁
+### 4. 供应语义：Genesis 初始化不创造/不销毁；total_supply 为供应上限（cap）
 
 - Genesis 初始化**不创造、不销毁**供应量。
-- `total_supply` 是协议承诺的供应上限；Genesis 后状态必须满足：
+- `total_supply` 是协议承诺的**供应上限（cap）**；Genesis 后初始状态必须满足：
   `Σ final_liquid_balance + Σ bonded_stake == total_supply`。
+- **运行时 fee burn（ADR-0022 F7）不改变 `total_supply` 常量**（Genesis 承诺不可变；
+  **不改 genesis hash**）。销毁量计入 `burned_supply` 累计（STEP 7G state）。持续不变量：
+
+  ```
+  Σ liquid_balance + Σ bonded_stake + burned_supply <= total_supply
+  ```
+
+- burn 只降低流通量，不使 `total_supply` 递减（cap 语义）；V0.1 无增发机制（无通胀）。
+- 修订范围仅限供应不变量**措辞**：字段 / 编码 / genesis hash **均不变**。
 
 ### 5. 溢出防护
 

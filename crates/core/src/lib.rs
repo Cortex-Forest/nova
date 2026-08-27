@@ -3,10 +3,12 @@
 //! 本 crate 承载：交易有效性 / nonce / replay 等核心协议语义（PHASE 3）。
 //!
 //! # 模块
-//! - [`transaction`]：**STEP 7E 已实现**——Nonce / Replay Protection（ADR-0021）：
+//! - [`transaction`]：**STEP 7E/7F 已实现**——协议有效性规则（ADR-0021/0022）：
 //!   - `nonce`：`NonceClass` / `classify_nonce`（consensus 中立纯函数）、
 //!     `NonceError` / `checked_next_nonce`（N15 exhaustion 边界）；
-//!   - `replay`：`ReplayError` / `check_replay_context`（chain_id / network_id / expiration）。
+//!   - `replay`：`ReplayError` / `check_replay_context`（chain_id / network_id / expiration）；
+//!   - `gas_fee`：`GasFeeError` / fee_max / required / actual_fee / burn / balance sufficiency
+//!     / gas 参数校验（F1–F10，`TRANSFER_INTRINSIC_GAS = 21_000`）。
 //! - [`error`]：分层错误模型骨架（`NovaError` 根接口 / `ErrorKind` 分类）。
 //!
 //! # 纪律（Master Prompt §9/§23/§54）
