@@ -147,14 +147,20 @@ fn take<const N: usize>(b: &[u8], off: &mut usize) -> Result<[u8; N], Checkpoint
 /// Checkpoint canonical 编码（设计文档 §6.1）：
 /// `chain_id(8 LE) ‖ finalized_block_hash(32) ‖ height(8 LE) ‖ round(8 LE) ‖
 /// qc_len(4 LE) ‖ qc_bytes[qc_len]`（qc_bytes = encode_qc(precommit_qc)）。
+///
+/// **H-1（hardening）**：`qc_len` 用 `u32::try_from`（非 `as u32`）——消除静默截断；
+/// `qc_bytes.len() > u32::MAX` 在现实中不可达（由 `encode_qc` 的内存/validator 数约束保证），
+/// `expect` 为不可达断言，非攻击者可控输入。
 pub fn encode_checkpoint(cp: &Checkpoint) -> Vec<u8> {
     let qc_bytes = encode_qc(&cp.precommit_qc);
+    let qc_len = u32::try_from(qc_bytes.len())
+        .expect("encoded QC length must fit u32; >4GiB QC is impossible in practice");
     let mut out = Vec::with_capacity(60 + qc_bytes.len());
     out.extend_from_slice(&cp.chain_id.to_le_bytes());
     out.extend_from_slice(&cp.finalized_block_hash);
     out.extend_from_slice(&cp.height.to_le_bytes());
     out.extend_from_slice(&cp.round.to_le_bytes());
-    out.extend_from_slice(&(qc_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&qc_len.to_le_bytes());
     out.extend_from_slice(&qc_bytes);
     out
 }
@@ -394,6 +400,62 @@ mod tests {
         let bytes = encode_checkpoint(&cp);
         let decoded = decode_checkpoint(&bytes).expect("decode ok");
         assert_eq!(decoded, cp);
+    }
+
+    // ---- H-2（hardening）：decode → encode canonical uniqueness ----
+    // decode(bytes) = Ok(cp) ⇒ encode(cp) == bytes（无多余/丢失字节的 canonical 唯一性）
+    #[test]
+    fn decode_ok_implies_encode_roundtrips_exactly() {
+        let ctx = test_ctx(3, 100);
+        // 多组对象：正常 / 空 evidence / Prevote QC / 单 evidence 最小
+        let precommit = valid_checkpoint(&ctx);
+        let cases: Vec<Checkpoint> = vec![
+            precommit.clone(),
+            {
+                // 空 evidence 的 Precommit QC
+                let qc_empty = QuorumCertificate {
+                    context: precommit.precommit_qc.context,
+                    target: precommit.finalized_block_hash,
+                    validator_set_id: GENESIS_HASH,
+                    evidence: Vec::new(),
+                };
+                Checkpoint {
+                    chain_id: CHAIN_ID,
+                    finalized_block_hash: precommit.finalized_block_hash,
+                    height: precommit.height,
+                    round: precommit.round,
+                    precommit_qc: qc_empty,
+                }
+            },
+            {
+                // 单 evidence 最小合法 Precommit QC
+                let ctx1 = test_ctx(1, 100);
+                let qc_min = make_qc(&ctx1, &[0], TARGET, 0, 1, VoteType::Precommit, ZERO, 100);
+                Checkpoint {
+                    chain_id: CHAIN_ID,
+                    finalized_block_hash: TARGET,
+                    height: 1,
+                    round: 0,
+                    precommit_qc: qc_min,
+                }
+            },
+        ];
+        for cp in cases {
+            let bytes = encode_checkpoint(&cp);
+            let decoded = decode_checkpoint(&bytes).expect("decode ok");
+            assert_eq!(decoded, cp);
+            assert_eq!(encode_checkpoint(&decoded), bytes, "canonical 唯一性");
+        }
+        // 非 canonical 输入（多余/截断）不得被 decode 接受（已在 T11 覆盖，此处复核）
+        let good = encode_checkpoint(&valid_checkpoint(&ctx));
+        assert!(decode_checkpoint(&good).is_ok());
+        let mut trailing = good.clone();
+        trailing.push(0x00);
+        assert!(decode_checkpoint(&trailing).is_err(), "多余字节必须拒绝");
+        assert!(
+            decode_checkpoint(&good[..good.len() - 1]).is_err(),
+            "截断必须拒绝"
+        );
     }
 
     // ---- T3：derive_checkpoint(X, QC(Y)) → None（CP-4 / CP-MF-4 核心）----
