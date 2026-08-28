@@ -78,6 +78,8 @@ pub enum FinalityError {
     InsufficientQuorum,
     /// evidence 层错误（映射现有 `ConsensusError`）。
     Evidence(ConsensusError),
+    /// 只有 PrecommitQC 能进入 Lock/Finality transition（MF-10-6.2-1）。
+    NotPrecommitQc,
 }
 
 impl fmt::Display for FinalityError {
@@ -89,6 +91,7 @@ impl fmt::Display for FinalityError {
             Self::UnknownTarget => write!(f, "QC target not in DAG"),
             Self::InsufficientQuorum => write!(f, "insufficient quorum weight"),
             Self::Evidence(e) => write!(f, "QC evidence error: {e}"),
+            Self::NotPrecommitQc => write!(f, "only PrecommitQC enters lock/finality transition"),
         }
     }
 }
@@ -171,7 +174,11 @@ pub fn decode_qc(bytes: &[u8]) -> Result<QuorumCertificate, FinalityError> {
     let ev_bytes = count
         .checked_mul(136)
         .ok_or(FinalityError::InvalidQcStructure)?;
-    if bytes.len() != off + ev_bytes {
+    // MF-10-6.2-2：attacker-controlled offset/length 用 checked arithmetic。
+    let total = off
+        .checked_add(ev_bytes)
+        .ok_or(FinalityError::InvalidQcStructure)?;
+    if bytes.len() != total {
         return Err(FinalityError::InvalidQcStructure);
     }
     let mut evidence = Vec::with_capacity(count);
@@ -333,24 +340,35 @@ pub fn check_finality_applicability(
     }
 }
 
-/// Lock transition（MF-10-6.1-4/F-7）：**valid PrecommitQC → Lock**。
+/// Lock transition（MF-10-6.1-4/F-7 + **MF-10-6.2-1**）：**valid PrecommitQC → Lock**。
 ///
-/// 前置契约：调用方已 `verify_qc` Ok 且 `qc.context.vote_type == Precommit`；
-/// **本函数不重复执行完整 QC 验证**，只做 `LockedState::lock(qc.target, qc.context.round)`。
-pub fn acquire_lock(lock: &mut LockedState, qc: &QuorumCertificate) {
+/// - **Precommit-only 强制（代码级）**：`qc.context.vote_type != Precommit` ⇒ `Err(NotPrecommitQc)`，
+///   lock **不改变**（从调用方前置契约升级为代码强制）。
+/// - 不重复执行完整 QC 验证（Validity 仍由调用方先 `verify_qc`）；本函数只做
+///   `LockedState::lock(qc.target, qc.context.round)`。
+pub fn acquire_lock(lock: &mut LockedState, qc: &QuorumCertificate) -> Result<(), FinalityError> {
+    if qc.context.vote_type != VoteType::Precommit {
+        return Err(FinalityError::NotPrecommitQc);
+    }
     lock.lock(qc.target, qc.context.round);
+    Ok(())
 }
 
-/// Finality state transition（F-6c/MF-10-6.1-6）。
+/// Finality state transition（F-6c/MF-10-6.1-6 + **MF-10-6.2-1**）。
 ///
+/// - **Precommit-only 强制（代码级）**：`qc.context.vote_type != Precommit` ⇒ `Err(NotPrecommitQc)`，
+///   FinalityState **不改变**。
 /// - `Advance`：更新 `state.finalized_reference = Some(qc.target)`。
 /// - `Idempotent` / `Stale` / `Conflict`：**不改变状态**。
-/// - **`Conflict` 不是错误**：返回 `Ok(())`，evidence 由调用方保留。
+/// - **`Conflict` 不是错误**：对 Valid PrecommitQC 返回 `Ok(())`，evidence 由调用方保留。
 pub fn update_finalized_reference(
     state: &mut FinalityState,
     qc: &QuorumCertificate,
     applicability: Applicability,
 ) -> Result<(), FinalityError> {
+    if qc.context.vote_type != VoteType::Precommit {
+        return Err(FinalityError::NotPrecommitQc);
+    }
     match applicability {
         Applicability::Applicable {
             mode: UpdateMode::Advance,
@@ -876,7 +894,7 @@ mod tests {
             100,
         );
         let mut lock = LockedState::new();
-        acquire_lock(&mut lock, &qc);
+        assert_eq!(acquire_lock(&mut lock, &qc), Ok(()));
         assert!(lock.is_locked());
         assert_eq!(lock.locked_block_hash, Some(TARGET_B));
         assert_eq!(lock.locked_round, Some(0));
@@ -924,6 +942,72 @@ mod tests {
         // 两个 QC 各自独立合法（不因 equivocation 丢弃）
         assert_eq!(verify_qc(&qc_a, &ctx.set, &GENESIS_HASH, &dag), Ok(()));
         assert_eq!(verify_qc(&qc_b, &ctx.set, &GENESIS_HASH, &dag), Ok(()));
+    }
+
+    // ---- T16（MF-10-6.2-1）：valid PrevoteQC → acquire_lock 拒绝，lock 不改变 ----
+    #[test]
+    fn acquire_lock_rejects_prevote_qc() {
+        let ctx = test_ctx(3, 100);
+        // valid PrevoteQC（Validity 语义不变：它仍是 Valid QC）
+        let qc = make_qc(&ctx, &[0, 1, 2], TARGET, 0, 1, VoteType::Prevote, ZERO, 100);
+        assert_eq!(
+            verify_qc(&qc, &ctx.set, &GENESIS_HASH, &build_dag()),
+            Ok(())
+        );
+        let mut lock = LockedState::new();
+        assert_eq!(
+            acquire_lock(&mut lock, &qc),
+            Err(FinalityError::NotPrecommitQc)
+        );
+        assert!(!lock.is_locked(), "lock 不得改变");
+        assert_eq!(lock.locked_block_hash, None);
+        assert_eq!(lock.locked_round, None);
+    }
+
+    // ---- T17（MF-10-6.2-1）：valid PrevoteQC → update_finalized_reference 拒绝，FinalityState 不改变 ----
+    #[test]
+    fn update_finalized_reference_rejects_prevote_qc() {
+        let ctx = test_ctx(3, 100);
+        let qc = make_qc(&ctx, &[0, 1, 2], TARGET, 0, 1, VoteType::Prevote, ZERO, 100);
+        let mut fs = FinalityState::default();
+        assert_eq!(
+            update_finalized_reference(
+                &mut fs,
+                &qc,
+                Applicability::Applicable {
+                    mode: UpdateMode::Advance
+                }
+            ),
+            Err(FinalityError::NotPrecommitQc)
+        );
+        assert_eq!(fs.finalized_reference, None, "FinalityState 不得改变");
+    }
+
+    // ---- T18（MF-10-6.2-2）：count=0 / empty evidence 边界 ----
+    #[test]
+    fn decode_verify_empty_evidence_boundary() {
+        let ctx = test_ctx(3, 100);
+        let dag = build_dag();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CHAIN_ID.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // height
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // round
+        bytes.push(VoteType::Precommit.as_u8());
+        bytes.extend_from_slice(&TARGET);
+        bytes.extend_from_slice(&GENESIS_HASH);
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // count = 0
+        let qc = decode_qc(&bytes).expect("count=0 decode Ok");
+        assert_eq!(qc.evidence.len(), 0);
+        assert_eq!(encode_qc(&qc), bytes, "roundtrip 保持");
+        // 空 evidence：verify 必 InsufficientQuorum（T>0 ⇒ quorum>0）
+        assert_eq!(
+            verify_qc(&qc, &ctx.set, &GENESIS_HASH, &dag),
+            Err(FinalityError::InsufficientQuorum)
+        );
+        // 长度不匹配（count=0 但多余 1B）⇒ InvalidQcStructure
+        let mut bad = bytes.clone();
+        bad.push(0x00);
+        assert_eq!(decode_qc(&bad), Err(FinalityError::InvalidQcStructure));
     }
 
     // ---- T15：decode 拒坏结构 ----

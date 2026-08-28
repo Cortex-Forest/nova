@@ -157,17 +157,17 @@ pub fn check_finality_applicability(
   descendant → Advance；ancestor → Stale；unrelated → Conflict。
 - **Valid-but-inapplicable ≠ Invalid**（F-9/MF-3）：返回枚举值而非 Err。
 
-### 2.4 `acquire_lock`（Lock transition；MF-10-6.1-4）
+### 2.4 `acquire_lock`（Lock transition；MF-10-6.1-4 + **MF-10-6.2-1**）
 
 ```rust
-pub fn acquire_lock(lock: &mut LockedState, qc: &QuorumCertificate);
+pub fn acquire_lock(lock: &mut LockedState, qc: &QuorumCertificate) -> Result<(), FinalityError>;
 ```
-- **前置契约**：调用方已 `verify_qc` Ok 且 `qc.context.vote_type == Precommit`。
+- **Precommit-only 强制（代码级）**：`qc.context.vote_type != Precommit` ⇒ `Err(NotPrecommitQc)`，lock **不改变**。
 - **不重复执行完整 QC verification**（MF-10-6.1-4）：`acquire_lock` 只做 Lock transition
   （`lock.lock(qc.target, qc.context.round)`，B-5）。
 - **禁止**把 `verify QC + check Precommit + lock + finalize` 揉进 `acquire_lock`。
 
-### 2.5 `update_finalized_reference`（Finality state transition；MF-10-6.1-6）
+### 2.5 `update_finalized_reference`（Finality state transition；MF-10-6.1-6 + **MF-10-6.2-1**）
 
 ```rust
 pub fn update_finalized_reference(
@@ -185,7 +185,9 @@ pub fn update_finalized_reference(
 | `Stale` | 不改变状态 |
 | `Conflict` | **不改变状态**（evidence 保留） |
 
-- **`Conflict ≠ Error`**（MF-3/F-9）：`Conflict` 不产生 Err，仅不更新。
+- **Precommit-only 强制（代码级）**：`qc.context.vote_type != Precommit` ⇒ `Err(NotPrecommitQc)`，
+  FinalityState **不改变**。
+- **`Conflict ≠ Error`**（MF-3/F-9）：`Conflict` 对 **Valid PrecommitQC** 不产生 Err，仅不更新。
 - **单调不变量（MF-10-6.1-5）**：
   > **`finalized_reference` only advances according to verified DAG ancestry; numeric height/round
   > MUST NOT determine advancement.**
@@ -286,6 +288,10 @@ FORBIDDEN:
 9. Do not re-verify full QC inside acquire_lock().                   (MF-10-6.1-4)
 10. Do not let numeric height/round drive finalized advancement.     (MF-10-6.1-5)
 11. Do not treat Conflict as an error.                                (MF-10-6.1-6)
+12. acquire_lock / update_finalized_reference MUST reject non-PrecommitQC
+    (NotPrecommitQc; lock/FinalityState unchanged).                   (MF-10-6.2-1)
+13. decode_qc MUST use checked arithmetic for all attacker-controlled
+    offset/length (off + ev_bytes → checked_add).                    (MF-10-6.2-2)
 ```
 
 ---
@@ -295,3 +301,4 @@ FORBIDDEN:
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-28 | 初稿：10-6.1 实现设计 + 6 Micro-Freeze（MF-10-6.1-1~6）成文 | 10-6.1 Design Review APPROVED WITH 6 MICRO-FREEZES |
+| 2026-08-28 | 补充 Precommit-only transition 代码强制（acquire_lock/update 拒绝非 PrecommitQC）+ decode checked arithmetic | MF-10-6.2-1/2（Security Review PASS WITH MICRO-FIXES） |
