@@ -16,3 +16,7 @@ nova-core = { path = "../core" }
 nova-crypto = { path = "../crypto" }
 # PHASE 1：零第三方运行时依赖。
 # 共识协议必须先形成 Consensus Specification（ADR-0008/0009）再实现（Master Prompt §7）。
+
+[dev-dependencies]
+# STEP 10-6.2：QC decode 唯一性 / quorum 边界 property tests（finality.rs，测试专用）
+proptest = "1"

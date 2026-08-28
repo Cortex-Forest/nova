@@ -525,6 +525,7 @@ version = "0.1.0"
 dependencies = [
  "nova-core",
  "nova-crypto",
+ "proptest",
 ]
 
 [[package]]
