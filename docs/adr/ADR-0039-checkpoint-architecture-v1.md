@@ -1,13 +1,14 @@
-# ADR-0039: Checkpoint Architecture V1（Draft）
+# ADR-0039: Checkpoint Architecture V1（FINAL）
 
-- **Status**: Draft（STEP 10-7；待 Review 后冻结）
+- **Status**: **Frozen**（STEP 10-7；ADR-0039 FINAL FREEZE，2026-08-28）
 - **Date**: 2026-08-28
 - **Deciders**: Nova Chain 架构组
 - **Scope**: STEP 10 — Consensus（Checkpoint，10-7）
 - 关联：ADR-0033（C-1 纯计算边界 / C-7 Checkpoint=Finalized Reference）、ADR-0038（F-1/F-6/F-15，
   Finality/QC）、ADR-0036（W-3 WitnessSeed 用 previous_finality_reference）、ADR-0035（DAG relation）、
   `docs/protocols/finality-implementation-design-v1.md`
-- 前置：STEP 10-7 Design Review **APPROVED**（D5 裁决 = 选项 A；CP-MF-1 / CP-MF-2 必须冻结）
+- 前置：STEP 10-7 Design Review **APPROVED**（D5 裁决 = 选项 A；CP-MF-1 / CP-MF-2 必须冻结）；
+  ADR-0039 Review **APPROVED WITH 3 MICRO-FREEZES**（CP-MF-3/4/5）；最终裁决 **READY TO FREEZE**
 - **本 ADR 不修改** ADR-0038 / ADR-0033 / 任何既有冻结 ADR 或代码；仅定义 checkpoint 层不变量。
 
 ## Context
@@ -203,15 +204,15 @@ CheckpointChainIdMismatch       —— checkpoint.chain_id != QC.context.chain_i
 
 | # | 决策 | 状态 |
 |---|------|------|
-| D5 | 每次 finalized-reference advancement MAY 派生最新 Checkpoint；无 interval gating（选项 A） | Draft 冻结候选 |
-| CP-1 | `finalized_block_hash == precommit_qc.target` | Draft 冻结候选 |
-| CP-2 | `precommit_qc.vote_type == Precommit` | Draft 冻结候选 |
-| CP-3 | `height/round` 与 QC context 一致 | Draft 冻结候选 |
-| CP-4 | proof 必须精确对应 finalized_reference；不得用 highest_precommit_qc 充当（CP-MF-1） | Draft 冻结候选 |
-| CP-5 | Checkpoint 非独立 Finality 来源；验证不得执行 FinalityState transition（CP-MF-2） | Draft 冻结候选 |
-| CP-6 | `snapshot_interval_blocks` 不参与 checkpoint/finality/QC validity | Draft 冻结候选 |
-| CP-7 | `checkpoint.chain_id == QC.context.chain_id`（CP-MF-3） | Draft 冻结候选 |
-| CP-8 | `height`/`round` 仅 metadata，不得推断 finality/ancestry/applicability/ordering（CP-MF-5） | Draft 冻结候选 |
+| D5 | 每次 finalized-reference advancement MAY 派生最新 Checkpoint；无 interval gating（选项 A） | **冻结** |
+| CP-1 | `finalized_block_hash == precommit_qc.target` | **冻结** |
+| CP-2 | `precommit_qc.vote_type == Precommit` | **冻结** |
+| CP-3 | `height/round` 与 QC context 一致 | **冻结** |
+| CP-4 | proof 必须精确对应 finalized_reference；不得用 highest_precommit_qc 充当（CP-MF-1） | **冻结** |
+| CP-5 | Checkpoint 非独立 Finality 来源；验证不得执行 FinalityState transition（CP-MF-2） | **冻结** |
+| CP-6 | `snapshot_interval_blocks` 不参与 checkpoint/finality/QC validity | **冻结** |
+| CP-7 | `checkpoint.chain_id == QC.context.chain_id`（CP-MF-3） | **冻结** |
+| CP-8 | `height`/`round` 仅 metadata，不得推断 finality/ancestry/applicability/ordering（CP-MF-5） | **冻结** |
 
 ## Alternatives（已评估）
 
@@ -242,3 +243,4 @@ CheckpointChainIdMismatch       —— checkpoint.chain_id != QC.context.chain_i
 |---|---|---|
 | 2026-08-28 | 初稿：10-7 Checkpoint 设计 + D5（选项 A）+ CP-MF-1/CP-MF-2 + CP-1~CP-6 不变量 | STEP 10-7 Design Review APPROVED（D5 裁决 A；CP-MF-1/CP-MF-2 冻结） |
 | 2026-08-28 | 落实 CP-MF-3（CP-7 chain_id 一致性）/ CP-MF-4（derive_checkpoint 禁 fallback）/ CP-MF-5（CP-8 height/round metadata-only）+ `CheckpointChainIdMismatch` | ADR-0039 Review APPROVED WITH 3 MICRO-FREEZES |
+| 2026-08-28 | **FINAL FREEZE**：Status → Frozen；Decision Log 全部冻结 | 最终裁决 READY TO FREEZE |
