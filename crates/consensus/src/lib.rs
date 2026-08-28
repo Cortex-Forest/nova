@@ -12,7 +12,7 @@
 //! # 边界（ADR-0033 C-1 / C-3）
 //! - 依赖：`consensus → core/crypto`；**禁止** `consensus → execution/storage/network`（纯计算）。
 //! - **DAG ≠ Finality**：DAG 只负责传播/因果/候选排序输入；BFT/finality 归 10-5/10-6。
-//! - 未实现：Random Witness（10-4）/ BFT Round（10-5）/ Finality（10-6）/ Checkpoint（10-7）。
+//! - 未实现：Finality（10-6）/ Checkpoint（10-7）/ 完整 Block 格式（PHASE 7）。
 
 pub mod dag;
 pub mod error;

@@ -18,9 +18,15 @@
 | `genesis-v1.md` | Frozen | GenesisV1 schema、嵌套类型、校验规则、`genesis_hash`、链身份三职责分离 |
 | `crypto-test-vectors-v1.md` | Frozen | Address / Domain / Signature / Genesis 向量规范 |
 
+## 草稿协议规范（Draft）
+
+| 规范 | 状态 | 内容 |
+|------|------|------|
+| `consensus-spec-v1.md` | Draft | BFT Round 当前规则（height/round/proposal/prevote/precommit/quorum/finalization boundary）、Byzantine model、honest validator assumption、safety argument、liveness 边界、scope boundary（STEP 10-5.1 创建） |
+
 ## 未来协议规范（每项须先成规范再实现）
 
-- Consensus Specification（PoS 安全模型 / DAG↔BFT 桥接 / Finality 条件）。
+- Consensus Specification（PoS 安全模型 / DAG↔BFT 桥接 / Finality 条件）→ 草稿已建，见 `consensus-spec-v1.md`
 - Transaction Spec（字段/编码/签名范围/hash 范围，Master Prompt §9）。
 - Block Spec（Block Hash 生成方式，Master Prompt §23）。
 - Network Protocol Spec（Message ID/Version/Encoding/Max Size/Timeout，Master Prompt §21）。

@@ -109,6 +109,10 @@ impl RoundState {
 
 /// 处理**已验证** vote：聚合权重 → quorum 判定 → 推进 step（B-2；纯计算）。
 ///
+/// - **上下文守卫（10-5.1 修复 A）**：`vote` 必须属于当前 `(height, round)` context；
+///   否则**忽略**——不进入 accumulator、不计入 quorum、不改任何状态/transition。
+/// - **终态守卫（10-5.1 修复 B）**：`RoundStep::Finalized` 之后任何 vote **忽略**——
+///   不 record、不产生 `precommit_quorum` / `finalized_target` 推进事件（状态稳定）。
 /// - 只推进与当前 proposal.target 匹配的 quorum。
 /// - `quorum` = `ValidatorSet::quorum()`（≥2/3 weighted，C-5）。
 /// - **不**验证交易 / 执行 block / 修改 state root。
@@ -119,6 +123,14 @@ pub fn process_vote(
     quorum: u128,
 ) -> RoundTransition {
     let mut t = RoundTransition::default();
+    // 修复 A：vote 必须绑定当前 (height, round) context；否则忽略（防跨 round/height 重放）。
+    if vote.height != state.height || vote.round != state.round {
+        return t;
+    }
+    // 修复 B：Finalized 之后任何 vote 不得改变共识状态（无重复推进事件）。
+    if state.step == RoundStep::Finalized {
+        return t;
+    }
     match vote.vote_type {
         VoteType::Prevote => {
             let total = state
@@ -338,5 +350,132 @@ mod tests {
             proposer: vid(2)
         }));
         assert_eq!(state.proposal.as_ref().unwrap().block_hash, [0x01; 32]);
+    }
+
+    // ---- 10-5.1 修复 A：vote 必须绑定当前 (height, round) context ----
+
+    #[test]
+    fn process_vote_accepts_same_height_and_round() {
+        let mut state = RoundState::new(1, 0);
+        state.set_proposal(ProposalRef {
+            block_hash: [0x01; 32],
+            proposer: vid(1),
+        });
+        let quorum = 200u128;
+        // 同 height=1 / round=0 ⇒ accepted（prevote 达 quorum → Precommit）
+        let t = process_vote(&mut state, &vote(0x01, VoteType::Prevote, 1), 200, quorum);
+        assert!(t.prevote_quorum);
+        assert_eq!(state.step, RoundStep::Precommit);
+        assert_eq!(state.prevotes.weight_of(&[0x01; 32]), 200);
+    }
+
+    #[test]
+    fn process_vote_ignores_wrong_height() {
+        let mut state = RoundState::new(1, 0);
+        state.set_proposal(ProposalRef {
+            block_hash: [0x01; 32],
+            proposer: vid(1),
+        });
+        let quorum = 200u128;
+        // wrong height（vote.height=99 ≠ state.height=1）⇒ 忽略：不进 accumulator、不推进
+        let mut v = vote(0x01, VoteType::Prevote, 1);
+        v.height = 99;
+        let t = process_vote(&mut state, &v, 200, quorum);
+        assert!(!t.prevote_quorum);
+        assert_eq!(state.step, RoundStep::Prevote);
+        assert_eq!(
+            state.prevotes.weight_of(&[0x01; 32]),
+            0,
+            "不得进入 accumulator"
+        );
+    }
+
+    #[test]
+    fn process_vote_ignores_wrong_round() {
+        let mut state = RoundState::new(1, 0);
+        state.set_proposal(ProposalRef {
+            block_hash: [0x01; 32],
+            proposer: vid(1),
+        });
+        let quorum = 200u128;
+        // wrong round（vote.round=7 ≠ state.round=0）⇒ 忽略
+        let mut v = vote(0x01, VoteType::Prevote, 1);
+        v.round = 7;
+        let t = process_vote(&mut state, &v, 200, quorum);
+        assert!(!t.prevote_quorum);
+        assert_eq!(state.step, RoundStep::Prevote);
+        assert_eq!(state.prevotes.weight_of(&[0x01; 32]), 0);
+    }
+
+    #[test]
+    fn process_vote_old_round_vote_cannot_affect_quorum() {
+        let mut state = RoundState::new(1, 1);
+        state.set_proposal(ProposalRef {
+            block_hash: [0x01; 32],
+            proposer: vid(1),
+        });
+        let quorum = 200u128;
+        // 旧 round（vote.round=0 < state.round=1）⇒ 不能帮助达 quorum
+        let mut old = vote(0x01, VoteType::Prevote, 1);
+        old.round = 0;
+        let t = process_vote(&mut state, &old, 200, quorum);
+        assert!(!t.prevote_quorum);
+        assert_eq!(state.prevotes.weight_of(&[0x01; 32]), 0);
+        // 正确的当前 round vote 仍有效
+        let mut cur = vote(0x01, VoteType::Prevote, 1);
+        cur.round = 1;
+        let t2 = process_vote(&mut state, &cur, 200, quorum);
+        assert!(t2.prevote_quorum);
+    }
+
+    #[test]
+    fn process_vote_future_round_vote_cannot_affect_quorum() {
+        let mut state = RoundState::new(1, 0);
+        state.set_proposal(ProposalRef {
+            block_hash: [0x01; 32],
+            proposer: vid(1),
+        });
+        let quorum = 200u128;
+        // future round（vote.round=5 > state.round=0）⇒ 忽略
+        let mut f = vote(0x01, VoteType::Prevote, 1);
+        f.round = 5;
+        let t = process_vote(&mut state, &f, 200, quorum);
+        assert!(!t.prevote_quorum);
+        assert_eq!(state.prevotes.weight_of(&[0x01; 32]), 0);
+        assert_eq!(state.step, RoundStep::Prevote);
+    }
+
+    // ---- 10-5.1 修复 B：Finalized 之后状态稳定 ----
+
+    #[test]
+    fn process_vote_finalized_state_stays_stable() {
+        let mut state = RoundState::new(1, 0);
+        state.set_proposal(ProposalRef {
+            block_hash: [0x01; 32],
+            proposer: vid(1),
+        });
+        let quorum = 200u128;
+        // 正常流程：prevote quorum → Precommit；precommit quorum → Finalized
+        process_vote(&mut state, &vote(0x01, VoteType::Prevote, 1), 100, quorum);
+        process_vote(&mut state, &vote(0x01, VoteType::Prevote, 2), 100, quorum);
+        assert_eq!(state.step, RoundStep::Precommit);
+        process_vote(&mut state, &vote(0x01, VoteType::Precommit, 1), 100, quorum);
+        let t2 = process_vote(&mut state, &vote(0x01, VoteType::Precommit, 2), 100, quorum);
+        assert_eq!(state.step, RoundStep::Finalized);
+        assert_eq!(t2.finalized_target, Some([0x01; 32]));
+        // Finalized 后新 precommit ⇒ 忽略：无新事件、无重复 finalized_target、不 record
+        let t3 = process_vote(&mut state, &vote(0x01, VoteType::Precommit, 3), 100, quorum);
+        assert!(!t3.precommit_quorum);
+        assert_eq!(t3.finalized_target, None);
+        assert_eq!(state.step, RoundStep::Finalized);
+        assert_eq!(
+            state.precommits.weight_of(&[0x01; 32]),
+            200,
+            "Finalized 后不得再 record"
+        );
+        // Finalized 后 prevote 同样忽略
+        let t4 = process_vote(&mut state, &vote(0x01, VoteType::Prevote, 3), 100, quorum);
+        assert!(!t4.prevote_quorum);
+        assert_eq!(state.prevotes.weight_of(&[0x01; 32]), 200);
     }
 }
