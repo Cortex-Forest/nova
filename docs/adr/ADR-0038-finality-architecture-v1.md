@@ -20,9 +20,18 @@ vote / round 实现。**Checkpoint（10-7）、slashing、epoch、validator rota
 
 ## Decision（冻结）
 
-### F-1 — Finality Object（冻结）
+### F-1 — Finality Object（冻结；**措辞修订——三概念严格分离**）
 
-- **Finality Object = `Finalized Reference`**（block hash [u8;32] + 其 PrecommitQC 证明；C-7）。
+**（10-6.1 前锁死：`Finalized Reference` 不是密码学证明对象）**
+
+| 概念 | 定义 | 角色 |
+|---|---|---|
+| **Cryptographic Finality Proof** | **`PrecommitQC`**（vote 签名集合） | **唯一密码学证明** |
+| **Finalized Block** | **`QC.target`**（被证明的单个 block hash） | 证明对象 |
+| **Finalized Reference** | consensus state 追踪的 **latest finalized block** | 状态对象（非证明） |
+
+- **`Finalized Reference` IS NOT a cryptographic proof**：它只是最新已 final block 的追踪引用，
+  不携带/替代 `PrecommitQC` 证明（证明由 QC 单独承载）。
 - **Finality ≠ Execution ≠ Storage Commit ≠ Snapshot ≠ Checkpoint**（C-7 五者分离）。
 - `PrecommitQC → FinalizedReference` **不自动推导** `StateStore::commit_changes`（storage commit 是
   node 协调层行为，非共识推导）。
@@ -227,7 +236,10 @@ ConflictingQC             —— 检测到冲突 QC（equivocation 输入，FOLL
 - (H1) `Byzantine < 1/3`，`Honest ≥ 2/3`（C-5/V-3 派生）；
 - (H2) honest single-vote（同 (height, round, vote_type) 不投冲突 target）；
 - (H3) honest 遵守 lock（B-5）——**ASSUMPTION，状态机未强制**；
-- (A-prop) honest 最终接收并验证 PrecommitQC（传播假设，Liveness 层）——**ASSUMPTION，未实现**。
+- (A-prop) honest **最终**接收并验证 PrecommitQC —— **liveness / propagation 假设**（ASSUMPTION，未实现）；
+  注意：`eventually` 对 safety **不足**；cross-round safety 需"在投与 X 冲突的后续 vote 之前已获知并验证
+  X 的 finality 信息"的**同步边界**（`A-sync-before-conflicting-vote`），该边界属 **10-6.1 SAFETY
+  BOUNDARY**（本 ADR 不新增规则）。
 
 *Same-context QC*：`QC(X)`+`QC(Y)`（同 context，X≠Y）各需 ≥2/3 ⇒ 权重和 ≥4/3；但 honest 单投
 （H2）使 `h_X+h_Y ≤ H ≤ 1`，byzantine `b_X+b_Y ≤ B < 1/3` ⇒ 和 ≤ H+B = 1 < 4/3。**矛盾 ⇒ 不可能。** ∎
