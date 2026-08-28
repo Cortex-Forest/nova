@@ -48,3 +48,5 @@ Thumbs.db
 # --- 日志（结构化日志不应入库） ---
 *.log
 logs/
+# --- Nova Web (independent repo, do not track) ---
+nova-web/
