@@ -65,8 +65,12 @@ checkpoint.round  == checkpoint.precommit_qc.context.round
       finalized_qc: &QuorumCertificate,   // 前置：finalized_qc.target == finalized_reference（CP-4）
   ) -> Option<Checkpoint>
   ```
-- 若无对应 QC（`target == finalized_reference` 的 Valid PrecommitQC 不存在）：**`derive_checkpoint` 必须
-  返回 `None`**；**绝不能**拿 `target != finalized_reference` 的 QC 凑 checkpoint。
+- **绝对不变量（CP-MF-4）**：
+  > **`derive_checkpoint()` MUST NOT select, search, substitute, or infer a QC from
+  > `FinalityState.highest_precommit_qc` when the supplied finalized-reference proof is absent.**
+- 没有对应 QC（`target == finalized_reference` 的 Valid PrecommitQC 不存在）：**`derive_checkpoint` 必须
+  返回 `None`**；**绝不能**拿 `target != finalized_reference` 的 QC 凑 checkpoint（含**禁止 fallback** 到
+  `highest_precommit_qc`——ADR-0038 已明确其 ≠ finalized_reference 对应 QC）。
 - `FinalityState.highest_precommit_qc` 的恢复语义**保持 ADR-0038 不变**（本 ADR 不修改，仅声明其
   **MUST NOT** 被假定为对应 `finalized_reference` 的 proof）。
 
@@ -96,6 +100,34 @@ snapshot_interval_blocks 不得决定：
 ```
 （D5 的延伸：无 interval gating。）
 
+### CP-7 — Chain Identity Consistency（不变量；**CP-MF-3 新增冻结**）
+
+```
+Checkpoint.chain_id
+        ==
+Checkpoint.precommit_qc.context.chain_id
+```
+
+- `verify_checkpoint()` 必须拒绝不一致对象（`Checkpoint.chain_id != QC.context.chain_id` ⇒ Err）。
+- `chain_id` **仍不能**通过 `genesis_hash` 推导（遵守 ADR-0010 冻结规则）。
+- 防对象自洽性缺口：`Checkpoint.chain_id = A` 但 `QC.context.chain_id = B` 的错配对象必须拒绝。
+
+### CP-8 — Height/Round Metadata-Only（不变量；**CP-MF-5 新增冻结**）
+
+```
+Checkpoint.height / Checkpoint.round
+MUST NOT be used to infer:
+  - finality
+  - ancestry
+  - checkpoint applicability
+  - checkpoint ordering
+```
+
+- 与 10-6 原则一致：**DAG ancestry = parent relation，不能通过 height/round 推导**；
+  Checkpoint 不得成为绕过该禁令的新入口。
+- 禁止：`cp.height > current.height ⇒ descendant`；`cp.round > old.round ⇒ newer finality`。
+- `height`/`round` 仅作 metadata（CP-3 自洽性），不承载语义推断。
+
 ---
 
 ## Checkpoint Object（冻结候选）
@@ -122,6 +154,7 @@ pub struct Checkpoint {
     ② CP-2（Precommit-only）
     ③ CP-1（target == finalized_block_hash）
     ④ CP-3（height/round 与 QC context 一致）
+    ⑤ CP-7（chain_id == QC.context.chain_id）
   ```
   **`verify_checkpoint` 不得执行 FinalityState transition（CP-5）。**
 - **Layer 2 — Applicability（与当前 Finality 关系，node/状态层）**：
@@ -146,6 +179,7 @@ InvalidCheckpointStructure      —— 结构/编码非法
 NotPrecommitQc                  —— 证明非 Precommit（CP-2）
 CheckpointTargetMismatch        —— precommit_qc.target != finalized_block_hash（CP-1）
 CheckpointContextMismatch       —— height/round 与 QC context 不一致（CP-3）
+CheckpointChainIdMismatch       —— checkpoint.chain_id != QC.context.chain_id（CP-7）
 （evidence 层复用 FinalityError::Evidence / ConsensusError）
 ```
 
@@ -176,6 +210,8 @@ CheckpointContextMismatch       —— height/round 与 QC context 不一致（C
 | CP-4 | proof 必须精确对应 finalized_reference；不得用 highest_precommit_qc 充当（CP-MF-1） | Draft 冻结候选 |
 | CP-5 | Checkpoint 非独立 Finality 来源；验证不得执行 FinalityState transition（CP-MF-2） | Draft 冻结候选 |
 | CP-6 | `snapshot_interval_blocks` 不参与 checkpoint/finality/QC validity | Draft 冻结候选 |
+| CP-7 | `checkpoint.chain_id == QC.context.chain_id`（CP-MF-3） | Draft 冻结候选 |
+| CP-8 | `height`/`round` 仅 metadata，不得推断 finality/ancestry/applicability/ordering（CP-MF-5） | Draft 冻结候选 |
 
 ## Alternatives（已评估）
 
@@ -205,3 +241,4 @@ CheckpointContextMismatch       —— height/round 与 QC context 不一致（C
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-28 | 初稿：10-7 Checkpoint 设计 + D5（选项 A）+ CP-MF-1/CP-MF-2 + CP-1~CP-6 不变量 | STEP 10-7 Design Review APPROVED（D5 裁决 A；CP-MF-1/CP-MF-2 冻结） |
+| 2026-08-28 | 落实 CP-MF-3（CP-7 chain_id 一致性）/ CP-MF-4（derive_checkpoint 禁 fallback）/ CP-MF-5（CP-8 height/round metadata-only）+ `CheckpointChainIdMismatch` | ADR-0039 Review APPROVED WITH 3 MICRO-FREEZES |
