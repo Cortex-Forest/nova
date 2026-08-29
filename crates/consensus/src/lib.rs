@@ -13,6 +13,8 @@
 //! - [`checkpoint`]：**STEP 10-7.2**——Checkpoint（`derive_checkpoint`/`verify_checkpoint`/
 //!   `encode_checkpoint`/`decode_checkpoint`，ADR-0039 CP-1~CP-8）。
 //! - [`fork_choice`]：**STEP 10-8.2**——Fork Choice（`fork_choice`，ADR-0040 FC-1~FC-14）。
+//! - [`integration`]：**STEP 10-9.3**——Consensus State Machine Integration（`ConsensusState`/
+//!   `IntegrationContext`/`transition`/`QcRegistry`/`RoundEvidence`，10-9.2 FROZEN）。
 //!
 //! # 边界（ADR-0033 C-1 / C-3）
 //! - 依赖：`consensus → core/crypto`；**禁止** `consensus → execution/storage/network`（纯计算）。
@@ -24,6 +26,7 @@ pub mod dag;
 pub mod error;
 pub mod finality;
 pub mod fork_choice;
+pub mod integration;
 pub mod round;
 pub mod validator;
 pub mod vote;
