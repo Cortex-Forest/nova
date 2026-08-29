@@ -1,7 +1,7 @@
 # Nova Chain — Consensus Integration Implementation Design V2（10-9.2）
 
-- **Status**: **FROZEN**（STEP 10-9.2；MF-10/MF-11/MF-12 CLOSED，T20~T23 PASS，N=64 FREEZE，
-  Design Freeze 🟢 AUTHORIZED 2026-08-29）
+- **Status**: **FROZEN**（STEP 10-9.2 DESIGN FREEZE + **STEP 10-9.3 IMPLEMENTATION
+  FINAL FREEZE**，2026-08-29；MF-10/MF-11/MF-12 CLOSED，T20~T23 PASS，N=64 FREEZE）
 - **Date**: 2026-08-29
 - **Scope**: 将 10-9.1（FROZEN，`consensus-integration-implementation-design-v1.md`）冻结契约落实为
   **可直接编码的层面**：精确类型签名、`QcRegistry` canonical rank 计算、N 冻结值、`encode_qc`
@@ -539,3 +539,4 @@ pub fn checked_successor(r: u64) -> Option<u64> { r.checked_add(1) }
 | 2026-08-29 | 落实 MF-10（registry 截断语义安全 S1/S2/S3 + N=64 语义理由）/ MF-11（RoundEvidence ephemeral boundary）/ Review-4：registry=PrevoteQC-only、PrecommitQC 不经 registry / T20（identity completeness）/ T21（registry adversarial 混合类型+permutation）/ T22（截断安全） | 10-9.2 Review 🟡 APPROVED WITH REQUIRED MF-10/MF-11/T20 |
 | 2026-08-29 | 落实 **MF-12**（IntegrationContext Determinism：三元组契约 + 六条确定性规则 + replay 重建语义）/ T23（Context Determinism / Replay）/ 并入 H-3（QcRegistry rebuildable derived cache）与 H-4（N=64 ACCEPT） | 10-9.2 Final Review 🟡 APPROVED WITH 1 REQUIRED MICRO-FREEZE — MF-12 |
 | 2026-08-29 | **DESIGN FREEZE（10-9.2）**：Status Draft→FROZEN。Final Review 🟢 APPROVED：MF-10/11/12 CLOSED、T20~T23 PASS、N=64 ACCEPT/FREEZE、PrevoteQC-only registry、QcRegistry rebuildable non-canonical、Ignored/Rejected 原子性、新增 consensus primitive 0、protocol violation 0、blocker 0。10-9.3 Implementation 未启动（HARD STOP） | 用户最终裁决 🟢 APPROVED FOR DESIGN FREEZE |
+| 2026-08-29 | **IMPLEMENTATION FINAL FREEZE（10-9.3）**：`crates/consensus/src/integration.rs`（commit `92ef8c5`）+ `lib.rs` 模块注册；T1~T23（含 T7/T11/T13/T15/T17/T18/T20/T21/T22/T23）全 PASS；四项 Gate（fmt/check/test/clippy -D warnings）PASS；源码级 Security/Protocol Review APPROVED（无 verify_vote/acquire_lock/LockedState；PrevoteQC-only registry；finalized_advance 仅 Advance；原子性；无新 primitive；0 BLOCKER / 0 MUST-FIX）；工作区 clean | 用户授权 STEP 10-9 FINAL FREEZE — **STEP 10-9 CLOSED** |
