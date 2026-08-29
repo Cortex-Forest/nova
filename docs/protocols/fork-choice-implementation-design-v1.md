@@ -1,10 +1,12 @@
 # Nova Chain — Fork Choice Implementation Design V1（10-8.1）
 
-- **Status**: Draft（STEP 10-8.1；**APPROVED WITH 2 REQUIRED MICRO-FREEZES**，待最终 Review）
+- **Status**: **Frozen**（STEP 10-8.1；**DESIGN FREEZE**，2026-08-29）
 - **Date**: 2026-08-29
 - **Scope**: Fork Choice 的**实现设计**（API、语义分层、maximal anchor、frontier、测试计划）。
 - **依据**：ADR-0040 FC-1~FC-14（FROZEN）、ADR-0038 F-2/F-6a（verify_qc/QC Validity）、
   ADR-0035 D-1~D-4（DAG）。
+- 前置：10-8.1 Review APPROVED WITH 2 REQUIRED MICRO-FREEZES（FC-MF-9/FC-MF-10 + T17/T18 + Frontier 数学化）→
+  **FINAL REVIEW APPROVED / READY TO FREEZE**
 - **本文件是设计契约，不是代码实现**。实现（10-8.2）必须严格遵循本契约。
 
 ---
@@ -216,3 +218,4 @@ FORBIDDEN:
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-29 | 初稿：10-8.1 Fork Choice 实现设计 + FC-MF-9（QC validity/applicability boundary）+ FC-MF-10（Maximal Justified Anchor determinism）+ T17/T18 + frontier 数学化 | 10-8.1 Review APPROVED WITH 2 REQUIRED MICRO-FREEZES |
+| 2026-08-29 | **DESIGN FREEZE**：Status → Frozen（10-8.1） | FINAL REVIEW APPROVED / READY TO FREEZE |
