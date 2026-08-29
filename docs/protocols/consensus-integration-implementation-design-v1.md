@@ -1,6 +1,7 @@
 # Nova Chain — Consensus Integration Implementation Design V1（10-9.1）
 
-- **Status**: Draft（STEP 10-9.1；**APPROVED WITH 5 REQUIRED MICRO-FREEZES**，待最终 Review）
+- **Status**: **FROZEN**（STEP 10-9.1；MF-1~MF-9 全部 CLOSED，O-1~O-4 RESOLVED，API Audit PASS，
+  T1~T19 COVERED，Design Freeze 🟢 AUTHORIZED 2026-08-29）
 - **Date**: 2026-08-29
 - **Scope**: Consensus State Machine Integration 的**实现设计**（ConsensusState / ConsensusEvent /
   Atomic Transition / Snapshot / Timeout / 边界）。
@@ -235,3 +236,4 @@ FORBIDDEN:
 | 2026-08-29 | 初稿：10-9.1 Consensus Integration 实现设计 + MF-1~MF-5（QC registry 有界/VerifiedVote/原子 transition/snapshot/timeout）+ O-1~O-4 裁决 + T11~T16 + acquire_lock 范围修正 | 10-9.1 Review APPROVED WITH 5 REQUIRED MICRO-FREEZES |
 | 2026-08-29 | 落实 MF-6（QcRegistry identity/capacity/rejection）/ MF-7（TransitionResult 统一语义）/ MF-8（QC construction 只组装）+ T17~T19 + API existence audit（VerifiedVote 不存在→硬 precondition；无独立 QC construction API→结构组装） | 10-9.1 Final Review APPROVED WITH 3 REQUIRED MICRO-FREEZES |
 | 2026-08-29 | 落实 **MF-9**：QcRegistry 改为 canonical bounded set（方案 A：deterministic replacement by rank，permutation invariant）；T17 升级为 permutation invariance；禁令同步 | 10-9.1 Final Review NOT YET FROZEN — MF-9（唯一协议级阻塞点） |
+| 2026-08-29 | **DESIGN FREEZE（10-9.1）**：Status Draft→FROZEN。Final Review 🟢 APPROVED：MF-1~MF-9 CLOSED、O-1~O-4 RESOLVED、API Audit PASS、T1~T19 COVERED、protocol/security/determinism blocker 0。QcRegistry 保持 integration context（非 ConsensusState 字段，无协议升级）。10-9.2 Implementation 未启动（HARD STOP） | 用户最终裁决 APPROVED — READY FOR DESIGN FREEZE |
