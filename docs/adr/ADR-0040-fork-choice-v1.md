@@ -1,13 +1,14 @@
-# ADR-0040: Fork Choice V1（Draft）
+# ADR-0040: Fork Choice V1（FINAL）
 
-- **Status**: Draft（STEP 10-8；待 Review 后冻结）
+- **Status**: **Frozen**（STEP 10-8；ADR-0040 FINAL FREEZE，2026-08-29）
 - **Date**: 2026-08-29
 - **Deciders**: Nova Chain 架构组
 - **Scope**: STEP 10 — Consensus（Fork Choice，10-8）
 - 关联：ADR-0033（C-6 Finality-first fork choice）、ADR-0035（D-1~D-4 DAG）、ADR-0038（F-1 FinalityState /
   F-4 PrevoteQC=justification）、ADR-0036（W-6 Witness ≠ finality authority）、ADR-0039（CP-1~CP-8 Checkpoint）
 - 前置：STEP 10-8 Design Review **APPROVED WITH REQUIRED MICRO-FREEZES**（FC-MF-1~FC-MF-5；
-  O-1/O-2/O-3 裁决）
+  O-1/O-2/O-3 裁决）→ ADR-0040 Review **APPROVED WITH 3 MICRO-FREEZES**（FC-MF-6/7/8）→
+  **FINAL REVIEW READY TO FREEZE**
 - **本 ADR 不修改**任何既有冻结 ADR 或代码。
 
 ## Context
@@ -153,21 +154,21 @@ pub fn fork_choice(
 
 | # | 决策 | 状态 |
 |---|------|------|
-| FC-1 | finality-first（final wins） | Draft 冻结候选 |
-| FC-2 | 确定性 | Draft 冻结候选 |
-| FC-3 | 仅 DAG relation | Draft 冻结候选 |
-| FC-4 | Justified Definition + 方案 A 自验证（FC-MF-1） | Draft 冻结候选 |
-| FC-5 | Highest = DAG causal（FC-MF-2） | Draft 冻结候选 |
-| FC-6 | 禁 longest-chain/highest-block-count | Draft 冻结候选 |
-| FC-7 | 返回值 ∈ DAG | Draft 冻结候选 |
-| FC-8 | block_hash 字典序 tie-break | Draft 冻结候选 |
-| FC-9 | Head = anchor descendant tip（FC-MF-3） | Draft 冻结候选 |
-| FC-10 | Finalized Reference Integrity（FC-MF-4） | Draft 冻结候选 |
-| FC-11 | Witness Exclusion（FC-MF-5） | Draft 冻结候选 |
-| FC-12 | Finality Dominance（FC-MF-6） | Draft 冻结候选 |
-| FC-13 | Justification DAG Membership（FC-MF-7） | Draft 冻结候选 |
-| FC-14 | Anchor-Scoped Head Selection（FC-MF-8） | Draft 冻结候选 |
-| O-1/O-2/O-3 | 按裁决表冻结 | Draft 冻结候选 |
+| FC-1 | finality-first（final wins） | **冻结** |
+| FC-2 | 确定性 | **冻结** |
+| FC-3 | 仅 DAG relation | **冻结** |
+| FC-4 | Justified Definition + 方案 A 自验证（FC-MF-1） | **冻结** |
+| FC-5 | Highest = DAG causal（FC-MF-2） | **冻结** |
+| FC-6 | 禁 longest-chain/highest-block-count | **冻结** |
+| FC-7 | 返回值 ∈ DAG | **冻结** |
+| FC-8 | block_hash 字典序 tie-break | **冻结** |
+| FC-9 | Head = anchor descendant tip（FC-MF-3） | **冻结** |
+| FC-10 | Finalized Reference Integrity（FC-MF-4） | **冻结** |
+| FC-11 | Witness Exclusion（FC-MF-5） | **冻结** |
+| FC-12 | Finality Dominance（FC-MF-6） | **冻结** |
+| FC-13 | Justification DAG Membership（FC-MF-7） | **冻结** |
+| FC-14 | Anchor-Scoped Head Selection（FC-MF-8） | **冻结** |
+| O-1/O-2/O-3 | 按裁决表冻结 | **冻结** |
 
 ## Alternatives（已评估）
 
@@ -201,3 +202,4 @@ pub fn fork_choice(
 |---|---|---|
 | 2026-08-29 | 初稿：10-8 Fork Choice 设计 + FC-MF-1~5 + O-1/O-2/O-3 裁决 + FC-1~FC-11 不变量 | STEP 10-8 Review APPROVED WITH REQUIRED MICRO-FREEZES |
 | 2026-08-29 | 落实 FC-MF-6（FC-12 Finality Dominance）/ FC-MF-7（FC-13 Justification DAG Membership）/ FC-MF-8（FC-14 Anchor-Scoped Head）+ T13~T16 + empty DAG→None + frontier 术语/确定性 tie-break | ADR-0040 Review APPROVED WITH 3 MICRO-FREEZES |
+| 2026-08-29 | **FINAL FREEZE**：Status → Frozen；Decision Log 全部冻结（FC-1~FC-14 + O-1/O-2/O-3） | 最终裁决 READY TO FREEZE |
