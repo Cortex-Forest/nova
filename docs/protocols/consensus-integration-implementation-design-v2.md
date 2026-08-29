@@ -140,7 +140,7 @@ pub struct IntegrationContext {
 pub const MAX_QC_REGISTRY_ENTRIES: usize = 64;
 ```
 
-- **N = 64（建议冻结值）**。候选备选（若 Review 否决）：32 / 128；原则是**冻结常量、非推导**。
+- **N = 64（Review-4 H-4 ACCEPT，可冻结）**。候选备选 32/128 已放弃；原则是**冻结常量、非推导**。
 
 ### 3.2 QC identity = canonical bytes（复用冻结 `encode_qc`）
 
@@ -353,8 +353,9 @@ impl RoundEvidence {
 ### 5.1 签名
 
 ```rust
-/// 原子 consensus transition（纯计算，无部分更新）。
-/// `state` 只读；成功 ⇒ 完整 `next_state`；Ignored/Rejected ⇒ 原状态不变 **且 context 不变**。
+/// 原子 consensus transition（纯计算，无部分更新；**MF-12 三元组契约**）。
+/// `state` 只读；成功 ⇒ 完整 `next_state` + 确定性 `context` 更新；Ignored/Rejected ⇒
+/// 原状态不变 **且 context 不变**（MF-12 契约 3）。
 /// `chain_id` = 域绑定（QC context / vote 域分离），由调用方传入（冻结不变）。
 pub fn transition(
     state: &ConsensusState,
@@ -413,6 +414,31 @@ ConsensusEvent
   genesis binding（`expected_genesis_hash`）。
 - **ForkChoice 单向下游**（边界 6）：`fork_choice` 返回值不反向影响 next_state。
 
+### 5.3 MF-12 — IntegrationContext Determinism（Review-5 冻结）
+
+> **冻结**：consensus transition 的完整契约是**三元组映射**：
+> ```
+> (ConsensusState, IntegrationContext, ConsensusEvent)
+>     → (ConsensusState', IntegrationContext', TransitionResult)
+> ```
+> 必须满足六条确定性契约。
+
+1. **同输入同输出**：相同 `state + context + event` ⇒ 相同 `(next_state, next_context, result)`。
+2. **容器/顺序无关**：相同**逻辑** context（不同内部容器/insertion order）⇒ 相同结果
+   （QcRegistry 用 BTreeMap 全序 key、RoundEvidence 用 BTreeMap 升序 evidence ⇒ 结构性保证）。
+3. **Ignored/Rejected ⇒ state 与 context 均不变**（T18/T23）。
+4. **Applied ⇒ context 变化完全由 canonical admission / evidence rules 决定**
+   （PrevoteQC → canonical lowest-N admit；evidence → 按 validator_id 升序 record），无任意/顺序依赖。
+5. **QcRegistry 不依赖 arrival order**（MF-9 禁例 + BTreeMap 全序）。
+6. **replay 语义**：`ConsensusState{round, finality}` 是 replay 比对对象；`IntegrationContext` 为
+   **可重建 derived cache（H-3）**——replay 必须**同时重建 context**（由同一事件流按相同规则
+   record/admit），或 context 被定义为可由事件流重放的 derived cache；两者等价。
+
+**H-3（非阻塞建议，已并入 MF-12 契约 6）**：
+> `QcRegistry` is a bounded, **rebuildable** integration context/cache; it is **not** canonical
+> consensus state. **丢失 `QcRegistry` ≠ consensus-state corruption**；恢复节点若缺历史
+> PrevoteQC，必须通过 replay/rebuild 路径重新获得相同 context（由事件流按 canonical rules 重建）。
+
 ## 6. timeout / MAX_ROUND / checked_successor（MF-5）
 
 ```rust
@@ -456,10 +482,10 @@ pub fn checked_successor(r: u64) -> Option<u64> { r.checked_add(1) }
 
 | 常量 | 值 | 依据 |
 |---|---|---|
-| `MAX_QC_REGISTRY_ENTRIES` | **64** | PrevoteQC-only registry（§3.0）；无 finality 阶段单 (h,r) 至多 1 PrevoteQC；正常 justified 窗口 ≪64；截断语义安全由 MF-10 S1/S2/S3 保证；≥1 |
+| `MAX_QC_REGISTRY_ENTRIES` | **64** | PrevoteQC-only registry（§3.0）；无 finality 阶段单 (h,r) 至多 1 PrevoteQC；正常 justified 窗口 ≪64；截断语义安全由 MF-10 S1/S2/S3 保证；≥1；Review-4 H-4 ACCEPT |
 | `MAX_ROUND` | `u64::MAX` | 类型上界；`checked_add` 语义；不 wrap（MF-5） |
 
-## 9. T1~T22 落点（integration.rs `#[cfg(test)]`）
+## 9. T1~T23 落点（integration.rs `#[cfg(test)]`）
 
 | # | 落点/断言 |
 |---|---|
@@ -485,6 +511,7 @@ pub fn checked_successor(r: u64) -> Option<u64> { r.checked_add(1) }
 | T20 | **QC Identity Completeness（Review-4）**：对影响 QC validity/semantic 的每个字段 mutate ⇒ `encode_qc` 不同（injective canonical coverage）。字段：`vote_type`/`target`/`height`/`round`/`genesis_hash(validator_set_id)`/`evidence`（`validator_id`/`source_block_hash`/`timestamp`/`signature`）。依据：ADR-0038 冻结 `encode_qc`（QuorumCertificate{context{chain_id,height,round,vote_type},target,validator_set_id,evidence[]}，evidence=QcEvidence{validator_id,source_block_hash,timestamp,signature} 全字段无遗漏） |
 | T21 | **Registry adversarial（Review-4）**：N unique QCs（混合 Prevote + Precommit）+ 不同 permutation ⇒ registry canonical content 相同；PrecommitQC **不进入** registry（§3.0）⇒ ForkChoice 只消费 PrevoteQC（`precommit_qcs` 不构成 anchor）；Finality 只消费对应 PrecommitQC（不经 registry） |
 | T22 | **MF-10 截断安全**：`finalized_reference ∈ DAG` 时 registry 截断（含极端超 N）不改变 `fork_choice_head`（恒 == finalized_reference，FC-12 S2）；registry 截断不改变 finality/checkpoint 结果（S1） |
+| T23 | **Context Determinism / Replay（MF-12）**：同一 logical history 以不同 insertion/事件顺序构造 context（C1+E1,E2,E3 vs C2+E3,E1,E2）⇒ `ConsensusState'1==ConsensusState'2`、`IntegrationContext'1==IntegrationContext'2`（QcRegistry + RoundEvidence 一致）、`Derived'1==Derived'2`（含 fork_choice_head）；Ignored/Rejected ⇒ state **且 context** 均不变 |
 
 ## 10. 边界确认
 
@@ -494,6 +521,9 @@ pub fn checked_successor(r: u64) -> Option<u64> { r.checked_add(1) }
   截断只改变 ForkChoice 输入子集，不改变 finality/checkpoint 或已 final 的 head（MF-10 S1/S2）。
 - **RoundEvidence 不升级为隐式 consensus state**（MF-11）：绑定 (height,round)、round 推进即
   reset；唯一用途 QC construction；arrival-order independent。
+- **IntegrationContext 是 rebuildable derived cache（MF-12/H-3）**：transition 契约 =
+  (state, context, event) → (state', context', result)；丢失 context ≠ consensus-state corruption；
+  replay 必须同时重建 context（canonical rules）。
 - **不扩大成 node**：无 network/storage/persistence/execution/mempool/P2P/调度。
 - **LockedState / acquire_lock 不进入 pipeline**（O-4 / 范围修正）。
 - **不改冻结文件 / ADR**；依赖方向单向。
@@ -506,3 +536,4 @@ pub fn checked_successor(r: u64) -> Option<u64> { r.checked_add(1) }
 |---|---|---|
 | 2026-08-29 | 初稿：10-9.2 实现级设计（类型落点 / QcRegistry canonical rank+N=64+encode_qc identity / RoundEvidence / transition pipeline / MAX_ROUND / API 签名核对 / T1~T19 落点） | 10-9.1 Design Freeze（aa433d3）后进入 10-9.2 |
 | 2026-08-29 | 落实 MF-10（registry 截断语义安全 S1/S2/S3 + N=64 语义理由）/ MF-11（RoundEvidence ephemeral boundary）/ Review-4：registry=PrevoteQC-only、PrecommitQC 不经 registry / T20（identity completeness）/ T21（registry adversarial 混合类型+permutation）/ T22（截断安全） | 10-9.2 Review 🟡 APPROVED WITH REQUIRED MF-10/MF-11/T20 |
+| 2026-08-29 | 落实 **MF-12**（IntegrationContext Determinism：三元组契约 + 六条确定性规则 + replay 重建语义）/ T23（Context Determinism / Replay）/ 并入 H-3（QcRegistry rebuildable derived cache）与 H-4（N=64 ACCEPT） | 10-9.2 Final Review 🟡 APPROVED WITH 1 REQUIRED MICRO-FREEZE — MF-12 |
