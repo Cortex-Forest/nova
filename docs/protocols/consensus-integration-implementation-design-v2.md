@@ -1,10 +1,11 @@
 # Nova Chain — Consensus Integration Implementation Design V2（10-9.2）
 
-- **Status**: Draft（STEP 10-9.2；**实现级设计核对**，待 Review → Micro-Freeze → Design Freeze）
+- **Status**: **FROZEN**（STEP 10-9.2；MF-10/MF-11/MF-12 CLOSED，T20~T23 PASS，N=64 FREEZE，
+  Design Freeze 🟢 AUTHORIZED 2026-08-29）
 - **Date**: 2026-08-29
 - **Scope**: 将 10-9.1（FROZEN，`consensus-integration-implementation-design-v1.md`）冻结契约落实为
   **可直接编码的层面**：精确类型签名、`QcRegistry` canonical rank 计算、N 冻结值、`encode_qc`
-  identity 复用、`transition` 原子 pipeline、T1~T19 落点、现有冻结 API 签名兼容性核对。
+  identity 复用、`transition` 原子 pipeline、T1~T23 落点、现有冻结 API 签名兼容性核对。
 - **本文件不改变 10-9.1 契约、不修改任何冻结 ADR/代码**；只补充 10-9.2 需要的实现级细节。
 - **依据**：10-9.1（FROZEN）MF-1~MF-9、ADR-0033~0040（FROZEN）、既有实现
   `round.rs`/`finality.rs`/`checkpoint.rs`/`fork_choice.rs`/`vote.rs`/`dag.rs`/`validator.rs`。
@@ -537,3 +538,4 @@ pub fn checked_successor(r: u64) -> Option<u64> { r.checked_add(1) }
 | 2026-08-29 | 初稿：10-9.2 实现级设计（类型落点 / QcRegistry canonical rank+N=64+encode_qc identity / RoundEvidence / transition pipeline / MAX_ROUND / API 签名核对 / T1~T19 落点） | 10-9.1 Design Freeze（aa433d3）后进入 10-9.2 |
 | 2026-08-29 | 落实 MF-10（registry 截断语义安全 S1/S2/S3 + N=64 语义理由）/ MF-11（RoundEvidence ephemeral boundary）/ Review-4：registry=PrevoteQC-only、PrecommitQC 不经 registry / T20（identity completeness）/ T21（registry adversarial 混合类型+permutation）/ T22（截断安全） | 10-9.2 Review 🟡 APPROVED WITH REQUIRED MF-10/MF-11/T20 |
 | 2026-08-29 | 落实 **MF-12**（IntegrationContext Determinism：三元组契约 + 六条确定性规则 + replay 重建语义）/ T23（Context Determinism / Replay）/ 并入 H-3（QcRegistry rebuildable derived cache）与 H-4（N=64 ACCEPT） | 10-9.2 Final Review 🟡 APPROVED WITH 1 REQUIRED MICRO-FREEZE — MF-12 |
+| 2026-08-29 | **DESIGN FREEZE（10-9.2）**：Status Draft→FROZEN。Final Review 🟢 APPROVED：MF-10/11/12 CLOSED、T20~T23 PASS、N=64 ACCEPT/FREEZE、PrevoteQC-only registry、QcRegistry rebuildable non-canonical、Ignored/Rejected 原子性、新增 consensus primitive 0、protocol violation 0、blocker 0。10-9.3 Implementation 未启动（HARD STOP） | 用户最终裁决 🟢 APPROVED FOR DESIGN FREEZE |
