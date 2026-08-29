@@ -88,6 +88,9 @@ X 的 DAG descendants / tips → fork-choice head
 | FC-9 | Head = selected justified anchor 的 descendant DAG tip（FC-MF-3） |
 | FC-10 | Finalized Reference Integrity（FC-MF-4） |
 | FC-11 | Witness MUST NOT affect output（FC-MF-5） |
+| FC-12 | **Finality Dominance（FC-MF-6）**：valid supplied `finalized_reference`（∈ DAG）**无条件支配**所有非 final 候选；Fork Choice **不得比较** finalized 与非 finalized 候选 |
+| FC-13 | **Justification DAG Membership（FC-MF-7）**：PrevoteQC 构成 anchor 仅当 ① `verify_qc Ok` ② `vote_type == Prevote` ③ `target ∈ DAG`（**QC validity ≠ DAG applicability**） |
+| FC-14 | **Anchor-Scoped Head Selection（FC-MF-8）**：head 只能从选中 anchor 的 **causal-descendant frontier** 中确定性选择（含 anchor 自身）；subtree 外 block 不得竞争；禁 height/round/block_count/insertion/iteration order |
 
 ## Fork Choice 规则（冻结候选）
 
@@ -104,14 +107,19 @@ pub fn fork_choice(
 
 **规则流**：
 ```
-① finalized 存在：
-     ├─ finalized ∈ DAG ⇒ Some(finalized)（FC-1）
+① finalized 存在（**绝对短路，FC-MF-6/FC-12**）：
+     ├─ finalized ∈ DAG ⇒ 立即 Some(finalized)，不比较任何非 final 候选
      └─ 否则 ⇒ None（deterministic invalid-input，FC-10；不创造 Finality）
-② 收集 justified anchors：对每个 prevote_qc，verify_qc Ok 且 target ∈ DAG ⇒ anchor（FC-4）
-③ 无 anchor ⇒ Some(DAG root)（root = zero-parent block；多 root ⇒ block_hash 字典序最小，O-3/A）
+② 收集 justified anchors（**FC-MF-7/FC-13**）：对每个 prevote_qc，仅当
+     ① verify_qc Ok ② vote_type == Prevote ③ target ∈ DAG
+     ⇒ target 为 anchor；任一条件不满足 ⇒ 不作 anchor（QC validity ≠ DAG applicability）
+③ 无 anchor ⇒（FC-7/O-3）：
+     ├─ DAG 非空 ⇒ Some(root)（root = zero-parent block；多 root ⇒ block_hash 字典序最小）
+     └─ DAG 为空 ⇒ None（不 panic、不构造 synthetic genesis）
 ④ 选最高 anchor：higher(A,B) iff A causal descendant of B（FC-5）；incomparable ⇒ FC-8 tie-break
-⑤ candidate heads = 该 anchor 的 descendant DAG tips（含 anchor 自身若为 tip）（FC-9）
-⑥ 返回 head：多个 ⇒ FC-8 tie-break（block_hash 字典序最小）
+⑤ candidate head = 选中 anchor 的 **causal-descendant frontier** 中的 DAG tip（含 anchor 自身若为 tip）
+   （**FC-MF-8/FC-14**：subtree 外 block 不得竞争；禁 height/round/block_count/insertion/iteration order）
+⑥ 返回 head：多个 frontier tip ⇒ FC-8 tie-break（block_hash 字典序最小）
 ```
 
 ## 边界
@@ -136,6 +144,10 @@ pub fn fork_choice(
 | T10 | 返回值 ∈ DAG（FC-7） |
 | T11 | Witness 不改变输出（FC-11；API 无 witness 参数，结构保证） |
 | T12 | proptest：随机 DAG + QC ⇒ 确定性 + ∈ DAG |
+| T13 | **Finality dominance（FC-MF-6/FC-12）**：finalized=A + QC(B)+QC(C)（B/C 更深 descendants）⇒ 返回 A |
+| T14 | **QC target ∉ DAG（FC-MF-7/FC-13）**：valid PrevoteQC(X) 且 X ∉ DAG ⇒ X 不作 justified |
+| T15 | **Anchor-scoped head（FC-MF-8/FC-14）**：`A←B←C`、`B↘D`、QC(B) ⇒ 仅 C/D/B 竞争，其他 branch 不得入选 |
+| T16 | **Empty DAG（O-3 边界）**：dag=∅ + finalized=None + prevote_qcs=[] ⇒ None（不 panic、不构造 synthetic genesis） |
 
 ## Decision Log
 
@@ -152,6 +164,9 @@ pub fn fork_choice(
 | FC-9 | Head = anchor descendant tip（FC-MF-3） | Draft 冻结候选 |
 | FC-10 | Finalized Reference Integrity（FC-MF-4） | Draft 冻结候选 |
 | FC-11 | Witness Exclusion（FC-MF-5） | Draft 冻结候选 |
+| FC-12 | Finality Dominance（FC-MF-6） | Draft 冻结候选 |
+| FC-13 | Justification DAG Membership（FC-MF-7） | Draft 冻结候选 |
+| FC-14 | Anchor-Scoped Head Selection（FC-MF-8） | Draft 冻结候选 |
 | O-1/O-2/O-3 | 按裁决表冻结 | Draft 冻结候选 |
 
 ## Alternatives（已评估）
@@ -172,10 +187,11 @@ pub fn fork_choice(
 
 ## Security Impact
 
-- 防实现分歧：FC-MF-1~5 + O-1~O-3 消除语义歧义。
-- 防第二套 Finality：FC-10 不创造 Finality。
+- 防实现分歧：FC-MF-1~5 + O-1~O-3 消除语义歧义；FC-MF-6~8 封死 finality 支配 / DAG membership / anchor 作用域。
+- 防第二套 Finality：FC-10 不创造 Finality；FC-12 finality 绝对支配。
 - 防 Witness 污染共识：FC-11。
-- 防 height 冒充 ancestry：FC-3/FC-MF-2。
+- 防 height 冒充 ancestry：FC-3/FC-MF-2/FC-14。
+- 防空 DAG 异常：empty DAG ⇒ None（不 panic）。
 
 ---
 
@@ -184,3 +200,4 @@ pub fn fork_choice(
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-29 | 初稿：10-8 Fork Choice 设计 + FC-MF-1~5 + O-1/O-2/O-3 裁决 + FC-1~FC-11 不变量 | STEP 10-8 Review APPROVED WITH REQUIRED MICRO-FREEZES |
+| 2026-08-29 | 落实 FC-MF-6（FC-12 Finality Dominance）/ FC-MF-7（FC-13 Justification DAG Membership）/ FC-MF-8（FC-14 Anchor-Scoped Head）+ T13~T16 + empty DAG→None + frontier 术语/确定性 tie-break | ADR-0040 Review APPROVED WITH 3 MICRO-FREEZES |
