@@ -169,22 +169,35 @@ ConsensusEvent
 | T14 | **Timeout 不产生证据（MF-5）**：round 前进；PrevoteQC=None / PrecommitQC=None / Finality 不变 / Checkpoint=None |
 | T15 | **Round overflow（MF-5）**：MAX_ROUND + timeout ⇒ `Rejected{RoundOverflow}`，不 wrap |
 | T16 | **QC registry bounded（MF-1）**：同 QC 同逻辑 identity ⇒ 无重复累积；不造成 fork_choice input-order dependency |
-| T17 | **Registry capacity determinism（MF-6）**：same QC repeated ⇒ 无重复；capacity exceeded ⇒ deterministic rejection；same QC sequence permuted ⇒ 同一 canonical registry content |
+| T17 | **QcRegistry canonical boundedness / permutation invariance（MF-6/MF-9）**：MAX=N；sequence S 与 permutations(S) ⇒ 相同 registry content；duplicate QC ⇒ one identity；capacity exceeded ⇒ 按 canonical rank 的 deterministic replacement/rejection（无 unspecified arrival-order policy）；`encode_qc` 集合字段确定性（same logical QC ⇒ same bytes） |
 | T18 | **Rejection semantics（MF-7）**：height/round mismatch / finalized-state violation / MAX_ROUND timeout ⇒ 状态不变；任何 rejected/ignored 不产生 partial mutation；RoundOverflow 确定性 disposition |
 | T19 | **Frozen QC construction boundary（MF-8）**：same RoundTransition ⇒ same QC；integration 不改变 quorum 阈值 / vote context / target / signer set / signature coverage / genesis binding |
 
-## 9a. QcRegistry Bounded Contract（MF-6）
+## 9a. QcRegistry Bounded Contract（MF-6 + **MF-9**）
+
+**MF-9 冻结（方案 A — canonical bounded set with deterministic replacement by rank）**。
+
+> `QcRegistry` 最终内容 = **见过（unique）QC 集合中按 canonical identity 排序的最低 N 个**；
+> **输入顺序无关（permutation invariant）**。
 
 ```
 QcRegistry = bounded input/context + deterministic retention + deterministic identity
+            + canonical admission
 ```
 
-1. **QC identity = cryptographic/content identity**：用 `encode_qc(qc)`（canonical bytes）作为
-   identity（evidence 升序 ⇒ 确定性）。**same QC submitted twice ⇒ same registry entry**。
+1. **QC identity = cryptographic/content identity**：`encode_qc(qc)`（canonical bytes；evidence 按
+   `validator_id` 升序 F-12 ⇒ 确定性）。**same QC ⇒ same identity ⇒ 单条目**。
    **禁用**：insertion index / Vec position / arrival time / pointer identity。
 2. **bounded 上限**：`MAX_QC_REGISTRY_ENTRIES`（冻结协议常量，V0.1 定值）。
-3. **超限行为**：capacity reached ⇒ **deterministic rejection**（非 evict-oldest / evict-newest /
-   truncate Vec）——不得因输入顺序产生不同最终 registry。
+3. **canonical admission（MF-9，解决 deterministic-rejection ≠ order-independence）**：
+   对每个候选 QC：
+   - 已在 registry（same identity）⇒ **no-op（去重）**；
+   - registry 未满 ⇒ **插入**；
+   - registry 满 ⇒ 若候选 identity 的 canonical rank **优于**当前 worst（最大 identity）⇒
+     **deterministic replacement（替换 worst）**；否则 ⇒ **deterministic rejection**（不影响 registry）。
+   - 结果：registry = 见过 unique QC 的 canonical lowest-N（**permutation invariant**）。
+4. **禁止**：arrival-order eviction / evict-oldest / evict-newest / truncate Vec——仅允许按
+   canonical rank 的 **deterministic replacement**（这不是任意淘汰，是 canonical bounded set 语义）。
 
 ## 10. 边界 / 延期（10-9 不做）
 
@@ -202,7 +215,8 @@ FORBIDDEN:
 4. Do not partially update state; transition must be atomic (Applied/Ignored/Rejected). (MF-3/MF-7)
 5. Do not let ForkChoice consume mixed old/new snapshots.                     (MF-4)
 6. Do not let RoundTimeout create QC/finality/checkpoint; do not wrap round overflow.    (MF-5/MF-7)
-7. Do not let QcRegistry grow unbounded / use arrival-order identity / evict or truncate. (MF-6)
+7. Do not let QcRegistry grow unbounded / use arrival-order identity / evict or truncate;
+   admission = canonical lowest-N with deterministic replacement by rank (permutation invariant). (MF-6/MF-9)
 8. Do not introduce new quorum/signature/target/QC-validity rule; assemble frozen
    QuorumCertificate only.                                                     (MF-8)
 9. Do not introduce LockedState/acquire_lock into ConsensusState or pipeline.
@@ -220,3 +234,4 @@ FORBIDDEN:
 |---|---|---|
 | 2026-08-29 | 初稿：10-9.1 Consensus Integration 实现设计 + MF-1~MF-5（QC registry 有界/VerifiedVote/原子 transition/snapshot/timeout）+ O-1~O-4 裁决 + T11~T16 + acquire_lock 范围修正 | 10-9.1 Review APPROVED WITH 5 REQUIRED MICRO-FREEZES |
 | 2026-08-29 | 落实 MF-6（QcRegistry identity/capacity/rejection）/ MF-7（TransitionResult 统一语义）/ MF-8（QC construction 只组装）+ T17~T19 + API existence audit（VerifiedVote 不存在→硬 precondition；无独立 QC construction API→结构组装） | 10-9.1 Final Review APPROVED WITH 3 REQUIRED MICRO-FREEZES |
+| 2026-08-29 | 落实 **MF-9**：QcRegistry 改为 canonical bounded set（方案 A：deterministic replacement by rank，permutation invariant）；T17 升级为 permutation invariance；禁令同步 | 10-9.1 Final Review NOT YET FROZEN — MF-9（唯一协议级阻塞点） |
