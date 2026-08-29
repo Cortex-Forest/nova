@@ -38,7 +38,7 @@ pub struct ConsensusState {
 - 不含 `LockedState`（validator-local voting constraint/context，B-5/F-7，非共识状态；Integration
   不拥有、不凭空创造 cross-round lock enforcement）。
 
-## 2. ConsensusEvent / Verified Vote 边界（MF-2）
+## 2. ConsensusEvent / Verified Vote 边界（MF-2 + API audit）
 
 ```rust
 pub enum ConsensusEvent {
@@ -48,34 +48,39 @@ pub enum ConsensusEvent {
 }
 ```
 
-- **MF-2 冻结（方案 A + 硬 precondition）**：
-  - `ConsensusEvent::Vote` 接受 **`VerifiedVote`**（概念边界：`raw Vote → verify_vote（V-5）→ VerifiedVote → ConsensusEvent`）。
-  - 若现有类型体系暂不新增 wrapper，则 API contract 写死硬 precondition：
-    > **`ConsensusEvent::Vote` MUST contain a vote whose V-5 verification has already succeeded.**
-  - **Integration 不重新验证签名**，但**绝不把未经验证的 Vote 视为协议有效 Vote**（安全边界不依赖调用者自觉）。
-  - Integration 仍执行**上下文守卫**（`height/round` 与 `RoundState` 匹配，10-5.1 语义）。
+- **API existence audit 结果（10-9.1）**：当前仓库**不存在** `VerifiedVote` 类型（`vote.rs` 仅
+  `ValidatorVote` + `verify_vote(vote, sig, vk, chain_id, set)`）。**因此不创建新 primitive**——
+  `VerifiedVote` 是**概念边界**，落到 API contract 为**硬 precondition**：
+  > **`ConsensusEvent::Vote` MUST contain a vote whose V-5 verification has already succeeded.**
+  > Integration 不重新验证签名，但绝不把未经验证的 Vote 视为协议有效 Vote。
+- Integration 仍执行**上下文守卫**（`height/round` 与 `RoundState` 匹配，10-5.1 语义）。
 
-## 3. Atomic Transition（MF-3）
+## 3. Atomic Transition + Transition Result 语义（MF-3 + **MF-7**）
 
 > **任何一个 consensus transition 要么产生完整的新状态，要么保持旧状态不变。无部分更新。**
 
+**MF-7 冻结（统一 result contract，消除 `None` 多义）**——integration 为新模块，无既有 `Option`
+错误模型约束，允许引入结构化结果枚举：
+
 ```rust
-pub struct ConsensusTransition {
-    pub next_state: Option<ConsensusState>,  // None = 拒绝/忽略（状态不变）
-    pub disposition: Disposition,            // Applied / Ignored{ContextMismatch} / Ignored{Terminal} / Rejected{RoundOverflow}
-    pub prevote_quorum: bool,                // observation（派生结果，非长期状态）
-    pub precommit_quorum: bool,
-    pub finalized_advance: Option<[u8; 32]>,
-    pub prevote_qc: Option<QuorumCertificate>,   // derived（交调用方维护 bounded registry）
-    pub checkpoint: Option<Checkpoint>,          // derived（非状态）
-    pub fork_choice_head: Option<[u8; 32]>,      // 消费 next_state snapshot（MF-4）
+pub enum TransitionResult {
+    Applied {
+        next_state: ConsensusState,
+        observation: TransitionObservation,   // prevote/precommit_quorum, finalized_advance（派生结果，非长期状态）
+        derived: TransitionDerived,           // prevote_qc, precommit_qc, checkpoint, fork_choice_head（同 snapshot）
+    },
+    Ignored { reason: IgnoreReason },          // state unchanged（ContextMismatch / Terminal）
+    Rejected { reason: RejectReason },         // state unchanged（RoundOverflow）
 }
 ```
 
-- **实现模式**：`transition(state, event, context) -> ConsensusTransition` 为**不可变纯计算**——
-  基于 `state` 计算完整 `next_state`；**任何一步失败/拒绝 ⇒ 返回 `next_state = None`（状态不变）**；
-  成功才产出完整 `next_state`。**禁止** `mutate round / mutate registry / mutate finality` 顺序变更。
-- `prevote_quorum`/`precommit_quorum` 是**本次 transition 的 observation**，不是长期 consensus state。
+- **`state unchanged` 是 `Ignored`/`Rejected` 的硬语义**：**任何 rejected/ignored event 不得产生
+  partial mutation**（T18 验证）。
+- **实现模式**：`transition(state, event, context)` 为**不可变纯计算**——成功 ⇒ `Applied{ next_state }`；
+  拒绝/忽略 ⇒ `Ignored`/`Rejected`（原状态不变）。**禁止** mutate round/registry/finality 顺序变更。
+- `prevote_quorum`/`precommit_quorum` 是 **observation**（本次 transition 的派生结果），非长期状态。
+- 兼容性：integration 内部调用 `fork_choice`（冻结 API 返回 `Option`）——其 `None` 映射为 derived
+  的 `fork_choice_head = None`（非 rejection），不改 10-8 冻结语义。
 
 ## 4. ForkChoice 同 Snapshot 消费（MF-4）
 
@@ -95,12 +100,12 @@ pub struct ConsensusTransition {
 
 - **Timeout 只能 advance local consensus round state**：
   ```
-  next_round = checked_successor(current_round)   // None ⇒ Rejected{RoundOverflow}
+  next_round = checked_successor(current_round)   // None ⇒ Rejected{RoundOverflow}（MF-7 语义）
   ```
 - **`timeout ≠ vote / QC / finality evidence / checkpoint`**：Timeout 事件**不得**产生
   PrevoteQC / PrecommitQC / 修改 FinalityState / 派生 Checkpoint / 改变 finalized reference。
-- **`MAX_ROUND + timeout` ⇒ 确定性拒绝（`Rejected{RoundOverflow}`，`next_state = None`）**——不 wrap、
-  不 panic、debug/release 行为一致。
+- **`MAX_ROUND + timeout` ⇒ `Rejected{ RoundOverflow }`（状态不变）**——不 wrap、不 panic、
+  debug/release 行为一致。
 
 ## 6. O-1 ~ O-4 裁决（冻结）
 
@@ -115,15 +120,29 @@ pub struct ConsensusTransition {
 
 ```
 ConsensusEvent
-  → VerifiedVote 边界 + 上下文守卫（不符 ⇒ Ignored）
+  → VerifiedVote 硬 precondition + 上下文守卫（不符 ⇒ Ignored）
   → process_vote(RoundState) → RoundTransition
-      ├─ prevote_quorum ⇒ 构造 PrevoteQC（derived output，交调用方 bounded registry）
-      └─ precommit_quorum ⇒ 构造 PrecommitQC → verify_qc（Validity）→ update_finalized_reference
+      ├─ prevote_quorum ⇒ 构造 PrevoteQC（MF-8：只组装，交调用方 bounded registry）
+      └─ precommit_quorum ⇒ 构造 PrecommitQC（MF-8：只组装）→ verify_qc（Validity）
+             → update_finalized_reference
   → 计算完整 NextState（原子，MF-3）
   → Checkpoint derivation（仅 finality Advance，CP-MF-4：显式对应 QC）
   → ForkChoice（消费 NextState 同一 snapshot，MF-4）
-  → 输出 ConsensusTransition（含 next_state / disposition / derived outputs）
+  → 输出 TransitionResult（Applied / Ignored / Rejected，MF-7）
 ```
+
+## 7a. MF-8 — QC Construction Boundary（只组装，不创造）
+
+- **API audit**：当前**无独立 QC construction API**（`QuorumCertificate` 为 pub 结构 +
+  `encode_qc`/`decode_qc`/`verify_qc`；构造靠**结构组装**，evidence 按 `validator_id` 升序）。
+- **冻结**：
+  > `process_vote`/`RoundTransition` 依 ADR-0037 决定 quorum observation；
+  > **QC construction MUST use only the already-frozen `QuorumCertificate` structure**（字段 +
+  > evidence 升序组装）；
+  > **Consensus Integration MUST NOT introduce a new quorum rule, signature rule,
+  > target-selection rule, or QC validity rule.**
+- integration 只：`consume frozen RoundTransition output + assemble already-defined QuorumCertificate`；
+  不重新决定 quorum 阈值 / vote context / target / signer set / signature coverage / genesis binding。
 
 ## 8. 状态持久化边界
 
@@ -148,8 +167,24 @@ ConsensusEvent
 | T12 | **Snapshot consistency（MF-4）**：fork_choice 输入 = 同一 transition snapshot（无 old/new 混合） |
 | T13 | **Verified Vote boundary（MF-2）**：unverified vote 不能进入 transition；verified 可进入 |
 | T14 | **Timeout 不产生证据（MF-5）**：round 前进；PrevoteQC=None / PrecommitQC=None / Finality 不变 / Checkpoint=None |
-| T15 | **Round overflow（MF-5）**：MAX_ROUND + timeout ⇒ 确定性 Rejected{RoundOverflow}，不 wrap |
+| T15 | **Round overflow（MF-5）**：MAX_ROUND + timeout ⇒ `Rejected{RoundOverflow}`，不 wrap |
 | T16 | **QC registry bounded（MF-1）**：同 QC 同逻辑 identity ⇒ 无重复累积；不造成 fork_choice input-order dependency |
+| T17 | **Registry capacity determinism（MF-6）**：same QC repeated ⇒ 无重复；capacity exceeded ⇒ deterministic rejection；same QC sequence permuted ⇒ 同一 canonical registry content |
+| T18 | **Rejection semantics（MF-7）**：height/round mismatch / finalized-state violation / MAX_ROUND timeout ⇒ 状态不变；任何 rejected/ignored 不产生 partial mutation；RoundOverflow 确定性 disposition |
+| T19 | **Frozen QC construction boundary（MF-8）**：same RoundTransition ⇒ same QC；integration 不改变 quorum 阈值 / vote context / target / signer set / signature coverage / genesis binding |
+
+## 9a. QcRegistry Bounded Contract（MF-6）
+
+```
+QcRegistry = bounded input/context + deterministic retention + deterministic identity
+```
+
+1. **QC identity = cryptographic/content identity**：用 `encode_qc(qc)`（canonical bytes）作为
+   identity（evidence 升序 ⇒ 确定性）。**same QC submitted twice ⇒ same registry entry**。
+   **禁用**：insertion index / Vec position / arrival time / pointer identity。
+2. **bounded 上限**：`MAX_QC_REGISTRY_ENTRIES`（冻结协议常量，V0.1 定值）。
+3. **超限行为**：capacity reached ⇒ **deterministic rejection**（非 evict-oldest / evict-newest /
+   truncate Vec）——不得因输入顺序产生不同最终 registry。
 
 ## 10. 边界 / 延期（10-9 不做）
 
@@ -162,15 +197,18 @@ P2P 类型、node 协调层。**`acquire_lock`/`LockedState` 不进入 Integrati
 ```
 FORBIDDEN:
 1. Do not re-design 10-1~10-8 (consume frozen APIs only).
-2. Do not put QcRegistry into ConsensusState as unbounded canonical state.   (MF-1)
-3. Do not treat an unverified vote as valid (VerifiedVote boundary / hard precondition). (MF-2)
-4. Do not partially update state; transition must be atomic (full next_state or None).  (MF-3)
+2. Do not put QcRegistry into ConsensusState as unbounded canonical state.   (MF-1/MF-6)
+3. Do not treat an unverified vote as valid (hard precondition; no VerifiedVote primitive). (MF-2)
+4. Do not partially update state; transition must be atomic (Applied/Ignored/Rejected). (MF-3/MF-7)
 5. Do not let ForkChoice consume mixed old/new snapshots.                     (MF-4)
-6. Do not let RoundTimeout create QC/finality/checkpoint; do not wrap round overflow.    (MF-5)
-7. Do not introduce LockedState/acquire_lock into ConsensusState or pipeline.
-8. Do not create new consensus state types / new finality rule.
-9. Do not add witness / serialization / storage / network / execution.
-10. Do not modify round.rs / finality.rs / checkpoint.rs / fork_choice.rs / vote.rs
+6. Do not let RoundTimeout create QC/finality/checkpoint; do not wrap round overflow.    (MF-5/MF-7)
+7. Do not let QcRegistry grow unbounded / use arrival-order identity / evict or truncate. (MF-6)
+8. Do not introduce new quorum/signature/target/QC-validity rule; assemble frozen
+   QuorumCertificate only.                                                     (MF-8)
+9. Do not introduce LockedState/acquire_lock into ConsensusState or pipeline.
+10. Do not create new consensus state types / new finality rule.
+11. Do not add witness / serialization / storage / network / execution.
+12. Do not modify round.rs / finality.rs / checkpoint.rs / fork_choice.rs / vote.rs
     / dag.rs / validator.rs / error.rs / any frozen ADR.
 ```
 
@@ -181,3 +219,4 @@ FORBIDDEN:
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-29 | 初稿：10-9.1 Consensus Integration 实现设计 + MF-1~MF-5（QC registry 有界/VerifiedVote/原子 transition/snapshot/timeout）+ O-1~O-4 裁决 + T11~T16 + acquire_lock 范围修正 | 10-9.1 Review APPROVED WITH 5 REQUIRED MICRO-FREEZES |
+| 2026-08-29 | 落实 MF-6（QcRegistry identity/capacity/rejection）/ MF-7（TransitionResult 统一语义）/ MF-8（QC construction 只组装）+ T17~T19 + API existence audit（VerifiedVote 不存在→硬 precondition；无独立 QC construction API→结构组装） | 10-9.1 Final Review APPROVED WITH 3 REQUIRED MICRO-FREEZES |
