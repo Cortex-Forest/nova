@@ -1,6 +1,6 @@
 # Nova Chain — Fork Choice Implementation Design V1（10-8.1）
 
-- **Status**: **Frozen**（STEP 10-8.1；**DESIGN FREEZE**，2026-08-29）
+- **Status**: **Frozen**（STEP 10-8.1 DESIGN FREEZE；**STEP 10-8.2 IMPLEMENTATION FINAL FREEZE**，2026-08-29）
 - **Date**: 2026-08-29
 - **Scope**: Fork Choice 的**实现设计**（API、语义分层、maximal anchor、frontier、测试计划）。
 - **依据**：ADR-0040 FC-1~FC-14（FROZEN）、ADR-0038 F-2/F-6a（verify_qc/QC Validity）、
@@ -219,3 +219,4 @@ FORBIDDEN:
 |---|---|---|
 | 2026-08-29 | 初稿：10-8.1 Fork Choice 实现设计 + FC-MF-9（QC validity/applicability boundary）+ FC-MF-10（Maximal Justified Anchor determinism）+ T17/T18 + frontier 数学化 | 10-8.1 Review APPROVED WITH 2 REQUIRED MICRO-FREEZES |
 | 2026-08-29 | **DESIGN FREEZE**：Status → Frozen（10-8.1） | FINAL REVIEW APPROVED / READY TO FREEZE |
+| 2026-08-29 | **IMPLEMENTATION FINAL FREEZE（10-8.2）**：`crates/consensus/src/fork_choice.rs`（commit `30bf98c`）+ `lib.rs` 注册；T1~T18 + A1~A4 + proptest 全 PASS；四项 Gate PASS；源码级 Security Review APPROVED（0 BLOCKER / 0 MUST-FIX） | Security / Protocol Review 最终裁决 APPROVED |
