@@ -99,15 +99,16 @@ pub enum RejectReason { RoundOverflow }
 
 - **`state unchanged` 是 `Ignored`/`Rejected` 的硬语义**；且 **context 也不变**（T18）：
   Ignored/Rejected 路径不 record evidence、不更新 registry、不 reset。
-- `prevote_qc`/`precommit_qc` 交调用方：`context.qc_registry.admit(...)` 由 integration 在
-  Applied 路径内完成（registry 是 context，由调用方持有、integration 更新）。
+- `prevote_qc` 交调用方：`context.qc_registry.admit(...)` 由 integration 在 Applied 路径内完成
+  （registry 是 context，Prevote-only，§3.0）；`precommit_qc` 作为 derived output 交调用方
+  （F-14 恢复事实等），**不经 registry**（MF-10 S1）。
 
 ### 2.4 IntegrationContext（派生累积器，非 ConsensusState）
 
 ```rust
 pub struct IntegrationContext {
-    pub qc_registry: QcRegistry,        // bounded canonical set（MF-6/MF-9；见 §3）
-    pub round_evidence: RoundEvidence,  // 当前 (height, round) 已验证证据（MF-2/MF-8；见 §4）
+    pub qc_registry: QcRegistry,        // bounded **Prevote**-QC canonical set（MF-6/MF-9/MF-10；§3）
+    pub round_evidence: RoundEvidence,  // 当前 (height, round) 已验证证据（MF-2/MF-8/MF-11；§4）
 }
 ```
 
@@ -115,14 +116,26 @@ pub struct IntegrationContext {
   context 是调用方维护的派生缓存。
 - `transition` 以 `&mut IntegrationContext` 传入；`ConsensusState` 以 `&` 只读（纯计算，无部分更新）。
 
-## 3. QcRegistry — 可编码规格（MF-6 / **MF-9** ★ 重点）
+## 3. QcRegistry — 可编码规格（MF-6 / **MF-9** / **MF-10** ★ 重点）
+
+### 3.0 类型范围（Review-4 冻结）：registry = **PrevoteQC-only**
+
+- **QcRegistry 只保存 PrevoteQC**（ForkChoice 的 justified-anchor 输入）。
+- **PrecommitQC 不进 registry**：pipeline ⑥ 直接组装 → `verify_qc` → finality/checkpoint，并作为
+  `derived.precommit_qc` 交付调用方（F-14 恢复事实等）；**与 registry 无数据流**（MF-10 S1）。
+- **ForkChoice 只消费 `registry.prevote_qcs()`（全为 Prevote）**；`fork_choice` 不重新解释 QC type
+  （FC-13 的 `vote_type==Prevote` 是防御性 guard；输入侧已保证 Prevote-only）。
+- pipeline 只在 prevote quorum 分支（⑤）调用 `admit`；precommit 分支（⑥）不调用 ⇒ 结构上
+  registry 恒为 Prevote-only。
 
 ### 3.1 冻结常量：N 的具体值（10-9.2 定值，待 Review）
 
 ```rust
-/// 冻结协议常量（V0.1）。bounded integration context 容量。
-/// 理由：单个 (height, round) 最多产生 1 个 PrevoteQC + 1 个 PrecommitQC；
-/// 64 覆盖多 height 的 justified 窗口且保持内存有界、审计可读。
+/// 冻结协议常量（V0.1）。bounded **Prevote**-QC registry 容量（MF-10）。
+/// 语义理由（MF-10）：registry 只保存 PrevoteQC（§3.0）；无 finality 推进阶段
+/// 单 (height, round) 至多 1 个 PrevoteQC（B-2 quorum 语义）；正常 justified 窗口 ≪ 64；
+/// 64 提供该窗口内工程余量，使正常协议运行下 justified anchors 不被截断。
+/// 极端超限下的截断语义由 MF-10（§3.6 S1/S2/S3）保证不丢失冻结语义。
 /// 不随验证者数量推导（冻结常量，非运行时函数）。必须 >= 1。
 pub const MAX_QC_REGISTRY_ENTRIES: usize = 64;
 ```
@@ -178,7 +191,8 @@ impl QcRegistry {
         self.inner.contains_key(&qc_identity(qc))
     }
 
-    /// canonical bounded set admission（MF-9 方案 A）：
+    /// canonical bounded set admission（MF-9 方案 A；**Prevote-only，§3.0**）：
+    /// 调用方保证只对 PrevoteQC 调用（pipeline ⑤ 仅 prevote 分支调 admit）。
     /// ① same identity ⇒ Noop（去重）；
     /// ② 未满 ⇒ 插入；
     /// ③ 满 ⇒ 候选 rank 优于当前 worst（最大 key）⇒ 替换 worst；否则 ⇒ Rejected。
@@ -215,7 +229,39 @@ impl QcRegistry {
 - **禁止** 把 identity 建立在 insertion index / Vec position / arrival time / pointer 上。
 - **禁止** registry 无界增长；`len()` 恒 ≤ N。
 
-## 4. RoundEvidence — QC 组装证据（MF-2 / MF-8）
+### 3.6 MF-10 — Bounded Registry Semantic Safety
+
+> **冻结**：`QcRegistry` 的 bounded retention **不得改变任何在其输入语义要求下必须可观察的
+> ForkChoice/Finality 结果**。registry 的截断只是 deterministic 的输入子集变化，不是语义变化。
+
+**可观察范围**：registry 的唯一协议可观察输出 = `prevote_qcs()`（ForkChoice justified-anchor 输入）
++ `contains/len`（调试/断言）。**Finality/Checkpoint 不经 registry**（pipeline ⑥ 直接消费 transition
+内组装的 PrecommitQC）——registry 与 finality/checkpoint **无数据流**。
+
+**生命周期**：registry 由调用方持有；内容**不进入 `ConsensusState`**（replay 比对仅针对
+`ConsensusState{round, finality}`）；registry = "当前可见 justified 上下文的 bounded 摘要"。
+
+**语义安全不变量**：
+- **S1 — Finality/Checkpoint 截断无关**：PrecommitQC 永不进入 registry（§3.0）⇒ registry 截断
+  **不可能**改变 finality 或 checkpoint 结果（数据流分离）。**T22 验证**。
+- **S2 — 有 finality 时 head 截断无关**：一旦 `finalized_reference ∈ DAG`，FC-12 绝对短路 ⇒
+  `fork_choice_head ≡ finalized_reference`，**与 registry 内容无关**。**T22 验证**。
+- **S3 — 无 finality 时 head 是确定性建议**：无 finality 时 head 由 justified anchors（registry 的
+  PrevoteQC ∩ FC-13）或 root fallback 决定。registry 截断（canonical lowest-N）只改变**输入集**，
+  不改 `fork_choice` 函数行为；head 变化 = 确定性建议变化（同输入 ⇒ 同 registry ⇒ 同 head；
+  replay 可复现），**不构成最终性/安全承诺丢失**（无 finality 时 head 非共识安全状态）。
+
+**为什么 64 / 不足时会发生什么 / 截断后 ForkChoice 仍符合冻结语义**：
+1. **为什么 64**：registry 只含 PrevoteQC；无 finality 推进阶段单 (height,round) 至多 1 个
+   PrevoteQC（B-2）；正常 justified 窗口 ≪ 64 ⇒ 正常协议运行下 anchors 不被截断。
+2. **64 不足时**：按 canonical rank 淘汰 worst；`prevote_qcs()` 少一些 anchor；无 finality 时 head
+   变为剩余 maximal anchor 的 frontier 或 root fallback——**确定性**（同输入同输出），且
+   S1/S2 保证 finality/checkpoint 与有 finality 时的 head 不受影响。
+3. **截断后仍符合冻结语义**：10-8 冻结的 "ForkChoice 语义" = **函数行为**（deterministic、
+   finality-dominant、input-order-independent），非特定 head 值；对任何 registry 输入子集，
+   `fork_choice` 均产生确定性、finality-dominant、input-order-independent 的结果（T21/T22 验证）。
+
+## 4. RoundEvidence — QC 组装证据（MF-2 / MF-8 / **MF-11**）
 
 - `VoteAccumulator`（RoundState 内）只存权重 + voter id（**不存 signature**）。QC 组装
   （evidence.signature / source_block_hash / timestamp）需要每票详情 ⇒ integration 维护伴随证据。
@@ -285,6 +331,23 @@ impl RoundEvidence {
 - **F-12 升序由构造保证**（BTreeMap<ValidatorId,..> 迭代天然升序），无运行时排序、无排序依赖。
 - **bound 守卫**：`record`/`assemble_qc` 隐含绑定 (height,round)；timeout reset 保持确定性。
 
+### 4.1 MF-11 — RoundEvidence Ephemeral Boundary
+
+> **冻结**：`RoundEvidence` 仅用于当前 round 上下文的 **QC construction**；**不得成为
+> `ConsensusState`、不得参与 replay 之外的隐式状态、不得通过 arrival order 或历史事件累积
+> 产生协议语义。**
+
+1. **非 ConsensusState**：`RoundEvidence` 是 integration context 派生缓存，不是 `ConsensusState`
+   字段；**replay 比对仅针对 `ConsensusState{round, finality}`**（T4 排除 evidence）。
+2. **绑定 + reset**：`RoundEvidence` 绑定当前 (height, round)；timeout 推进时确定性 `reset` 为空 ⇒
+   **不跨 round 累积、不无限增长**。
+3. **唯一协议用途 = QC construction**（MF-8 组装冻结 `QuorumCertificate`）；不参与 vote validity
+   判定（V-5 硬 precondition 由调用方）、不改 quorum、不改 finality、不改 checkpoint。
+4. **arrival-order independence**：QC 组装按 `validator_id` 升序（BTreeMap 迭代），与提交顺序无关
+   ⇒ **不通过 arrival order / 历史事件累积产生非确定性协议语义**。
+5. **实现约束**：transition Vote 分支**仅在 Applied 路径** `record`（T18）；`RoundEvidence` 存活
+   范围 = 当前 round 的 transitions 序列，round 推进即消亡（reset）。
+
 ## 5. transition — 原子 pipeline（MF-3 / MF-4 / MF-7 / MF-8）
 
 ### 5.1 签名
@@ -323,16 +386,16 @@ ConsensusEvent
        ④ round 副本 process_vote(vote, weight=set.weight_of(vid), quorum=set.quorum()) → RoundTransition t
        ⑤ if t.prevote_quorum:
              derived.prevote_qc = round_evidence.assemble_qc(chain_id, genesis, target, Prevote, h, r)
-             if Some(qc): context.qc_registry.admit(qc)（bounded，MF-9）
+             if Some(qc): context.qc_registry.admit(qc)（仅 Prevote 入 registry，§3.0/MF-10 S1）
        ⑥ if t.precommit_quorum:
              derived.precommit_qc = round_evidence.assemble_qc(chain_id, genesis,
                                                                t.finalized_target, Precommit, h, r)
              if Some(qc):
+                // PrecommitQC 不经 registry（§3.0/MF-10 S1）：直接驱动 finality/checkpoint。
                 if verify_qc(qc, set, genesis, dag).is_ok():      // Validity（F-6a）
                    app = check_finality_applicability(qc, finality.finalized_reference, dag)
                    update_finalized_reference(&mut finality', qc, app)   // Advance 才更新
                    finalized_advance = matches!(app, Applicable{Advance})
-                   context.qc_registry.admit(qc)
                    if finalized_advance:                            // checkpoint 仅 Advance（CP-MF-4）
                       derived.checkpoint = derive_checkpoint(finality'.finalized_reference?, qc)
        ⑦ next_state = ConsensusState { round', finality' }
@@ -393,10 +456,10 @@ pub fn checked_successor(r: u64) -> Option<u64> { r.checked_add(1) }
 
 | 常量 | 值 | 依据 |
 |---|---|---|
-| `MAX_QC_REGISTRY_ENTRIES` | **64** | 单 (height,round) 最多 2 QC；覆盖多 height justified 窗口；内存有界；≥1 |
+| `MAX_QC_REGISTRY_ENTRIES` | **64** | PrevoteQC-only registry（§3.0）；无 finality 阶段单 (h,r) 至多 1 PrevoteQC；正常 justified 窗口 ≪64；截断语义安全由 MF-10 S1/S2/S3 保证；≥1 |
 | `MAX_ROUND` | `u64::MAX` | 类型上界；`checked_add` 语义；不 wrap（MF-5） |
 
-## 9. T1~T19 落点（integration.rs `#[cfg(test)]`）
+## 9. T1~T22 落点（integration.rs `#[cfg(test)]`）
 
 | # | 落点/断言 |
 |---|---|
@@ -415,16 +478,22 @@ pub fn checked_successor(r: u64) -> Option<u64> { r.checked_add(1) }
 | T13 | VerifiedVote 边界：integration 不调用 `verify_vote`（审查断言）；已验证票可进入 |
 | T14 | timeout：round 前进；PrevoteQC/PrecommitQC=None、Finality 不变、Checkpoint=None |
 | T15 | `state.round.round == u64::MAX` + RoundTimeout ⇒ `Rejected{RoundOverflow}`；不 wrap（round 保持 u64::MAX） |
-| T16 | registry bounded：admit >N unique QC ⇒ `len() <= N`；same QC 重复 ⇒ 单条目（`Noop`） |
-| T17 | **permutation invariance**：MAX=N；S 与 permutations(S) ⇒ registry content 相等；duplicate ⇒ one identity；capacity exceeded ⇒ lowest-N（deterministic replacement/rejection）；`encode_qc` 集合字段确定性 |
+| T16 | registry bounded（Prevote-only）：admit >N unique PrevoteQC ⇒ `len() <= N`；same QC 重复 ⇒ 单条目（`Noop`） |
+| T17 | **permutation invariance**：MAX=N；S（全部 PrevoteQC）与 permutations(S) ⇒ registry content 相等；duplicate ⇒ one identity；capacity exceeded ⇒ lowest-N（deterministic replacement/rejection）；`encode_qc` 集合字段确定性 |
 | T18 | Rejection semantics：height/round mismatch / Finalized 违例 / MAX_ROUND timeout ⇒ state 不变 + `round_evidence` 无记录 + registry 无变化 |
 | T19 | Frozen QC construction：same RoundTransition ⇒ same QC；不改 quorum 阈值/vote context/target/signer set/signature coverage/genesis binding |
+| T20 | **QC Identity Completeness（Review-4）**：对影响 QC validity/semantic 的每个字段 mutate ⇒ `encode_qc` 不同（injective canonical coverage）。字段：`vote_type`/`target`/`height`/`round`/`genesis_hash(validator_set_id)`/`evidence`（`validator_id`/`source_block_hash`/`timestamp`/`signature`）。依据：ADR-0038 冻结 `encode_qc`（QuorumCertificate{context{chain_id,height,round,vote_type},target,validator_set_id,evidence[]}，evidence=QcEvidence{validator_id,source_block_hash,timestamp,signature} 全字段无遗漏） |
+| T21 | **Registry adversarial（Review-4）**：N unique QCs（混合 Prevote + Precommit）+ 不同 permutation ⇒ registry canonical content 相同；PrecommitQC **不进入** registry（§3.0）⇒ ForkChoice 只消费 PrevoteQC（`precommit_qcs` 不构成 anchor）；Finality 只消费对应 PrecommitQC（不经 registry） |
+| T22 | **MF-10 截断安全**：`finalized_reference ∈ DAG` 时 registry 截断（含极端超 N）不改变 `fork_choice_head`（恒 == finalized_reference，FC-12 S2）；registry 截断不改变 finality/checkpoint 结果（S1） |
 
 ## 10. 边界确认
 
 - **不新增 consensus primitive**：`QcRegistry`/`RoundEvidence`/`TransitionResult` 是 integration
   层派生结构，非协议权威类型；不产生新 finality/quorum/QC-validity 规则（MF-8）。
-- **QcRegistry 不升级为 ConsensusState**（MF-1/MF-9）：仍是 bounded integration context。
+- **QcRegistry 不升级为 ConsensusState**（MF-1/MF-9/MF-10）：仍是 bounded integration context；
+  截断只改变 ForkChoice 输入子集，不改变 finality/checkpoint 或已 final 的 head（MF-10 S1/S2）。
+- **RoundEvidence 不升级为隐式 consensus state**（MF-11）：绑定 (height,round)、round 推进即
+  reset；唯一用途 QC construction；arrival-order independent。
 - **不扩大成 node**：无 network/storage/persistence/execution/mempool/P2P/调度。
 - **LockedState / acquire_lock 不进入 pipeline**（O-4 / 范围修正）。
 - **不改冻结文件 / ADR**；依赖方向单向。
@@ -436,3 +505,4 @@ pub fn checked_successor(r: u64) -> Option<u64> { r.checked_add(1) }
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-29 | 初稿：10-9.2 实现级设计（类型落点 / QcRegistry canonical rank+N=64+encode_qc identity / RoundEvidence / transition pipeline / MAX_ROUND / API 签名核对 / T1~T19 落点） | 10-9.1 Design Freeze（aa433d3）后进入 10-9.2 |
+| 2026-08-29 | 落实 MF-10（registry 截断语义安全 S1/S2/S3 + N=64 语义理由）/ MF-11（RoundEvidence ephemeral boundary）/ Review-4：registry=PrevoteQC-only、PrecommitQC 不经 registry / T20（identity completeness）/ T21（registry adversarial 混合类型+permutation）/ T22（截断安全） | 10-9.2 Review 🟡 APPROVED WITH REQUIRED MF-10/MF-11/T20 |
