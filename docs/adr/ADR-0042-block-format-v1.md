@@ -1,6 +1,6 @@
 # ADR-0042: Block Format V1
 
-- **Status**: Proposed（待批准；P7-1 Block Format）
+- **Status**: **FROZEN（ACCEPTED）**（P7-1；Block Format V1 FINAL FREEZE，2026-08-31）
 - **Date**: 2026-08-31
 - **Deciders**: Nova Chain 架构组
 - **Scope**: P7-1 — 完整 Block 格式（Header / Body / block_hash / canonical / signature / validation）
@@ -144,3 +144,4 @@ block_hash = SHA-256( canonical_block_header(header) ‖ canonical_block_body(bo
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-31 | 初稿：ADR-0042 Block Format V1（单父 V0.1；Header/Body/block_hash/canonical/signature/validation/rejection + 冻结约束） | 用户授权创建 P7-1 Block Format ADR（仅写 ADR，不实现） |
+| 2026-08-31 | **FROZEN（ACCEPTED）**：P7-1 ADR Independent Review 10 项全 PASS（BlockHeader 顺序 / 单父 / BlockHash / Canonical / Signature / Validation Order / Commitment / Authority / Layer / Freeze Readiness）；Protocol Defect NO / Security Defect NO / 0 findings。冻结约束生效：未经新 ADR / Protocol Review 不得改变 field/order/encoding/hash coverage/signature coverage/validation semantics | 用户授权 P7-1 ADR Independent Review → PASS → ADR-0042 FROZEN（独立 documentation commit） |
