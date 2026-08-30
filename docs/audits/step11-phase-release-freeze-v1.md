@@ -37,8 +37,8 @@ Protocol Defect: NO · ADR 触发: 0（本阶段）
 ## 2. 独立后续 Track（不污染基线）
 
 ```
-STEP 11-8 QC Ingestion    🔒 DEFERRED — 独立 Track（先 verification boundary design → ADR 决策）
-A11 / proposer authority  🔒 DEFERRED — 独立 Track
+STEP 11-8 QC Boundary Design  🔒 FROZEN（QC-VB-1~5 + Review PASS）；External Ingestion DEFERRED
+A11 / proposer authority       🔒 DEFERRED — 独立 Track
 ```
 
 - **原则**：已冻结部分彻底封存；QC/A11 设计变化不得影响 Vote/Proposal/RoundTimeout 稳定基线。
@@ -57,3 +57,4 @@ A11 / proposer authority  🔒 DEFERRED — 独立 Track
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-30 | 初稿：STEP 11 阶段性 Release Freeze V1（固化 11-1~11-7 基线 + QC/A11 独立 Track 声明 + Release 状态） | 用户裁决 STEP 11 阶段性 Release Freeze |
+| 2026-08-30 | **全阶段收尾审计（11-1~11-7）**：一次性验收稳定基线——Wire / Envelope Verification / Node Assembly / RoundTimeout / Vote Verification / Proposal Serialization / Proposal Node Integration 全 FINAL FROZEN；QC Boundary Design FROZEN（External Ingestion DEFERRED）；四项 Gate 全 PASS（fmt/check/clippy 0；workspace 53 result 全 ok）；Git CLEAN（HEAD 5b973d1 后）；Security 0 findings；Protocol Defect NO。**已冻结内容不再反复打开** | 用户裁决 STEP 11 全阶段收尾审计 |

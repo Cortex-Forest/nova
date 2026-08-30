@@ -1,7 +1,7 @@
 # Nova Chain — QC Ingestion Boundary Design V1（11-8）
 
-- **Status**: Draft（STEP 11-8；QC Ingestion Boundary Design；待统一 Independent Review；
-  **只设计不实现**）
+- **Status**: **FROZEN**（STEP 11-8；QC Ingestion Boundary Design FINAL FREEZE，2026-08-30；
+  QC External Ingestion **DEFERRED**）
 - **Date**: 2026-08-30
 - **Scope**: 审计冻结 Consensus API 是否存在外部 QC 合法 ingestion 入口；定义 ingestion 边界。
 - **依据**（全部 READ-ONLY）：ADR-0038 F-2/F-6a + 11-1 §4/§12 + 10-11 L1 + integration.rs
@@ -77,3 +77,5 @@ pub fn ingest_qc_input(
 |---|---|---|
 | 2026-08-30 | 初稿：QC Ingestion Boundary Design V1（审计冻结 API → NOT FOUND → DEFERRED；未来路径 ADR 触发标记） | 用户授权并行 STEP 11-8（仅设计不实现） |
 | 2026-08-30 | 深化：QC Verification Boundary Design（QC-VB-1~5——verify_qc 唯一 Validity 门 / admit 不验证 / Node 不执行 verify_qc / 兜底≠绕过 / 不新增 event variant）。QC 独立 Track 保持 DEFERRED；仅设计不实现 | 用户裁决 STEP 11-8 独立 Track Design |
+| 2026-08-30 | **Independent Review PASS（11-8）**：8 项核验（verify_qc 全覆盖 F-6a / admit 仅接收 evidence 已验证 QC / 无外部绕过 / decode-verify 边界清晰 / Node 不拥有 QC verification / 需 ingest_qc_input facade（推进时）/ 不新增 ConsensusEvent::Qc / 推进触发 ADR）。无安全绕过（外部无 ingestion 路径；内部 derived cache 冻结 + 消费时 FC-13 兜底）。A=NOT FOUND → **方案 B**（推进需 facade + ADR） | 用户授权 Independent Review（只读）→ PASS |
+| 2026-08-30 | **DESIGN FREEZE（11-8）**：Status Draft→FROZEN。QC-VB-1~5 + Independent Review PASS 固化；**admit ≠ 外部 ingestion**；**verify_qc = 完整 validity 门**；未来 `ingest_qc_input` 必须 **ADR / Protocol Review**；`ConsensusEvent::Qc` **不新增**；Node `ConsensusQc → UnsupportedMessage` 保持；**QC External Ingestion DEFERRED**（方案 B 为推进路径）。仅设计；不实现 | 用户裁决 → QC Boundary Design Freeze（独立 documentation commit） |
