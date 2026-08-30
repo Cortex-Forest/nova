@@ -20,7 +20,7 @@ use nova_consensus::integration::{
 };
 use nova_consensus::round::RoundState;
 use nova_consensus::validator::ValidatorSet;
-use nova_consensus::vote::{ValidatorVote, decode_validator_vote};
+use nova_consensus::vote::{ValidatorVote, decode_validator_vote, verify_vote_input};
 use nova_crypto::signature::VerifyingKey;
 use nova_network::message::{
     MessageEnvelope, MessageType, NetworkError, validate_consensus_envelope,
@@ -42,6 +42,8 @@ pub enum NodeError {
     InvalidVotePayloadLength { expected: usize, actual: usize },
     /// Vote canonical payload 结构解析失败（Consensus 域）。
     VoteDecode(ConsensusError),
+    /// Vote 签名验证失败（Consensus 门面 V-5；MF-2 precondition 未满足）。
+    VoteVerification(ConsensusError),
 }
 
 /// 组装节点：持有 Consensus 状态 + 上下文 + 冻结参数。
@@ -119,9 +121,13 @@ impl ConsensusNode {
         result
     }
 
-    /// Vote 路径：decode wire payload → construct `ConsensusEvent::Vote` → `transition`。
+    /// Vote 路径：decode wire payload → Consensus 验证门面（MF-2）→ construct
+    /// `ConsensusEvent::Vote` → `transition`。
     fn handle_vote(&mut self, payload: &[u8]) -> Result<TransitionResult, NodeError> {
         let (vote, signature) = classify_vote_payload(payload)?;
+        // Consensus 验证门面（GAP-1 解决；MF-2 precondition）——Node 不拥有 V-5 语义。
+        verify_vote_input(&vote, &signature, self.chain_id, &self.set)
+            .map_err(NodeError::VoteVerification)?;
         let result = transition(
             &self.state,
             ConsensusEvent::Vote { vote, signature },
@@ -273,14 +279,48 @@ mod tests {
         envelope
     }
 
+    /// envelope 有效 + vote 签名无效（双层签名独立）：vote.validator_id 指向 set validator，
+    /// 但 vote 由非 validator key 签名 ⇒ Consensus 门面 V-5 拒（envelope 本身有效）。
+    fn invalid_vote_sig_envelope(
+        signer_kp: &KeyPair,
+        validator_kp: &KeyPair,
+        wrong_kp: &KeyPair,
+        round: u64,
+        height: u64,
+        chain_id: u64,
+    ) -> MessageEnvelope {
+        let vote = ValidatorVote {
+            round,
+            height,
+            target_block_hash: [0x11; 32],
+            vote_type: VoteType::Prevote,
+            source_block_hash: [0x00; 32],
+            validator_id: ValidatorId::from_consensus_public_key(
+                &validator_kp.verifying_key().to_bytes(),
+            ),
+            timestamp: 0,
+        };
+        let sig = vote_sig(wrong_kp.signing_key(), &vote, chain_id);
+        let mut payload = canonical_vote_payload(&vote);
+        payload.extend_from_slice(&sig);
+        let mut envelope = MessageEnvelope {
+            version: 1,
+            message_type: MessageType::ConsensusVote,
+            payload,
+            sender: NodeId::from_bytes([0u8; 32]),
+            signature: [0u8; 64],
+        };
+        sign_message(signer_kp.signing_key(), &mut envelope).unwrap();
+        envelope
+    }
+
     #[test]
     fn handle_valid_vote_envelope_applies() {
-        let (mut node, peer_kp, set, genesis_hash) = setup();
-        let node_kp = KeyPair::generate().unwrap();
-        // node 的 validator 也应在 set 中（weight 非 0 更真实；即使不在，context 匹配仍 Applied）
-        let envelope = vote_envelope(&peer_kp, &node_kp, 0, 0, 1001);
+        let (mut node, validator_kp, set, genesis_hash) = setup();
+        // vote validator = set 中 validator（门面 V-5 要求 validator 在 set 且签名有效）
+        let envelope = vote_envelope(&validator_kp, &validator_kp, 0, 0, 1001);
         let result = node
-            .handle_envelope(peer_kp.verifying_key(), &envelope, 64 * 1024)
+            .handle_envelope(validator_kp.verifying_key(), &envelope, 64 * 1024)
             .unwrap();
         assert!(matches!(result, TransitionResult::Applied { .. }));
         // 未达 quorum ⇒ observation 全 false
@@ -298,12 +338,11 @@ mod tests {
 
     #[test]
     fn handle_vote_wrong_context_ignored() {
-        let (mut node, peer_kp, set, genesis_hash) = setup();
-        let node_kp = KeyPair::generate().unwrap();
-        // height/round 不匹配 state(0,0)
-        let envelope = vote_envelope(&peer_kp, &node_kp, 5, 5, 1001);
+        let (mut node, validator_kp, set, genesis_hash) = setup();
+        // height/round 不匹配 state(0,0)（vote 签名有效 ⇒ 门面 Ok ⇒ transition guards 拒）
+        let envelope = vote_envelope(&validator_kp, &validator_kp, 5, 5, 1001);
         let result = node
-            .handle_envelope(peer_kp.verifying_key(), &envelope, 64 * 1024)
+            .handle_envelope(validator_kp.verifying_key(), &envelope, 64 * 1024)
             .unwrap();
         assert!(matches!(
             result,
@@ -327,17 +366,33 @@ mod tests {
 
     #[test]
     fn handle_envelope_rejects_bad_envelope_signature() {
-        let (mut node, peer_kp, set, genesis_hash) = setup();
-        let node_kp = KeyPair::generate().unwrap();
-        let mut envelope = vote_envelope(&peer_kp, &node_kp, 0, 0, 1001);
+        let (mut node, validator_kp, set, genesis_hash) = setup();
+        let mut envelope = vote_envelope(&validator_kp, &validator_kp, 0, 0, 1001);
         // 篡改 payload ⇒ envelope 签名失效（Network 域拒）
         envelope.payload[0] ^= 0xff;
         let err = node
-            .handle_envelope(peer_kp.verifying_key(), &envelope, 64 * 1024)
+            .handle_envelope(validator_kp.verifying_key(), &envelope, 64 * 1024)
             .unwrap_err();
         assert!(matches!(
             err,
             NodeError::InvalidEnvelope(nova_network::message::NetworkError::InvalidSignature)
+        ));
+        let _ = (set, genesis_hash);
+    }
+
+    #[test]
+    fn handle_envelope_rejects_invalid_vote_signature() {
+        // 双层签名独立闭合：envelope 有效 + vote 签名无效 ⇒ Node 拒（Consensus 门面 V-5）。
+        let (mut node, validator_kp, set, genesis_hash) = setup();
+        let wrong_kp = KeyPair::generate().unwrap();
+        let envelope =
+            invalid_vote_sig_envelope(&validator_kp, &validator_kp, &wrong_kp, 0, 0, 1001);
+        let err = node
+            .handle_envelope(validator_kp.verifying_key(), &envelope, 64 * 1024)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NodeError::VoteVerification(nova_consensus::error::ConsensusError::InvalidSignature)
         ));
         let _ = (set, genesis_hash);
     }

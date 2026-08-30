@@ -98,6 +98,26 @@ pub fn verify_vote(
     verify_message_hash(vk, &h, &sig).map_err(|_| ConsensusError::InvalidSignature)
 }
 
+/// Consensus 验证门面（GAP-1 解决；STEP 11-6）。V-5 验证入口，供 Node 在构造
+/// `ConsensusEvent::Vote` 前调用，强制 MF-2 precondition。
+///
+/// - **只委托既有 `verify_vote`（V-5），不复制验证逻辑**。
+/// - 从 `set` 按 `vote.validator_id` 解析共识公钥（**不信任 envelope sender / NodeId**，B5）；
+///   `set.info` 查无 ⇒ `UnknownValidator`；公钥畸形 ⇒ `ValidatorIdentityMismatch`（与 verify_qc 先例一致）。
+pub fn verify_vote_input(
+    vote: &ValidatorVote,
+    signature: &[u8; 64],
+    chain_id: u64,
+    set: &ValidatorSet,
+) -> Result<(), ConsensusError> {
+    let info = set
+        .info(&vote.validator_id)
+        .ok_or(ConsensusError::UnknownValidator)?;
+    let vk = VerifyingKey::from_bytes(&info.consensus_public_key)
+        .map_err(|_| ConsensusError::ValidatorIdentityMismatch)?;
+    verify_vote(vote, signature, &vk, chain_id, set)
+}
+
 /// 恢复冻结 roundtrip 契约（crypto-serialization §8）的 decode 侧（P0-B1）。
 ///
 /// 严格逆向冻结 121B canonical layout（ADR-0034 V-4 / ADR-0009 顺序）：
@@ -395,5 +415,112 @@ mod tests {
         bytes[81..113].copy_from_slice(&[0xee; 32]); // 任意 32B validator_id
         let d = decode_validator_vote(&bytes).unwrap();
         assert_eq!(d.validator_id, ValidatorId::from_bytes([0xee; 32]));
+    }
+
+    #[test]
+    fn verify_vote_input_ok() {
+        let kp = KeyPair::generate().unwrap();
+        let pk = kp.verifying_key().to_bytes();
+        let v = ValidatorInit {
+            account_address: addr([0xaa; 32]),
+            consensus_public_key: pk,
+            bonded_stake: 100,
+            commission_bps: 100,
+        };
+        let set = ValidatorSet::from_genesis(&genesis_with(v));
+        let vote = ValidatorVote {
+            round: 0,
+            height: 1,
+            target_block_hash: [0x11; 32],
+            vote_type: VoteType::Prevote,
+            source_block_hash: [0x00; 32],
+            validator_id: ValidatorId::from_consensus_public_key(&pk),
+            timestamp: 0,
+        };
+        let sig = sign_vote(kp.signing_key(), &vote, 1001);
+        assert_eq!(verify_vote_input(&vote, &sig, 1001, &set), Ok(()));
+    }
+
+    #[test]
+    fn verify_vote_input_rejects_bad_signature() {
+        let kp = KeyPair::generate().unwrap();
+        let pk = kp.verifying_key().to_bytes();
+        let v = ValidatorInit {
+            account_address: addr([0xaa; 32]),
+            consensus_public_key: pk,
+            bonded_stake: 100,
+            commission_bps: 100,
+        };
+        let set = ValidatorSet::from_genesis(&genesis_with(v));
+        let vote = ValidatorVote {
+            round: 0,
+            height: 1,
+            target_block_hash: [0x11; 32],
+            vote_type: VoteType::Prevote,
+            source_block_hash: [0x00; 32],
+            validator_id: ValidatorId::from_consensus_public_key(&pk),
+            timestamp: 0,
+        };
+        // 非 validator key 签名（validator_id 指向 set validator）⇒ 签名验证失败
+        let other = KeyPair::generate().unwrap();
+        let sig = sign_vote(other.signing_key(), &vote, 1001);
+        assert_eq!(
+            verify_vote_input(&vote, &sig, 1001, &set),
+            Err(ConsensusError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn verify_vote_input_rejects_unknown_validator() {
+        let kp = KeyPair::generate().unwrap();
+        let pk = kp.verifying_key().to_bytes();
+        let v = ValidatorInit {
+            account_address: addr([0xaa; 32]),
+            consensus_public_key: pk,
+            bonded_stake: 100,
+            commission_bps: 100,
+        };
+        let set = ValidatorSet::from_genesis(&genesis_with(v));
+        // validator_id 指向非 set 成员 ⇒ UnknownValidator（门面在委托前拒）
+        let vote = ValidatorVote {
+            round: 0,
+            height: 1,
+            target_block_hash: [0x11; 32],
+            vote_type: VoteType::Prevote,
+            source_block_hash: [0x00; 32],
+            validator_id: ValidatorId::from_consensus_public_key(&[0x99; 32]),
+            timestamp: 0,
+        };
+        assert_eq!(
+            verify_vote_input(&vote, &[0u8; 64], 1001, &set),
+            Err(ConsensusError::UnknownValidator)
+        );
+    }
+
+    #[test]
+    fn verify_vote_input_rejects_wrong_chain_id() {
+        let kp = KeyPair::generate().unwrap();
+        let pk = kp.verifying_key().to_bytes();
+        let v = ValidatorInit {
+            account_address: addr([0xaa; 32]),
+            consensus_public_key: pk,
+            bonded_stake: 100,
+            commission_bps: 100,
+        };
+        let set = ValidatorSet::from_genesis(&genesis_with(v));
+        let vote = ValidatorVote {
+            round: 0,
+            height: 1,
+            target_block_hash: [0x11; 32],
+            vote_type: VoteType::Prevote,
+            source_block_hash: [0x00; 32],
+            validator_id: ValidatorId::from_consensus_public_key(&pk),
+            timestamp: 0,
+        };
+        let sig = sign_vote(kp.signing_key(), &vote, 1001);
+        assert_eq!(
+            verify_vote_input(&vote, &sig, 9999, &set),
+            Err(ConsensusError::InvalidSignature)
+        );
     }
 }
