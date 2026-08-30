@@ -39,6 +39,15 @@
 - **#2（Proposal）** 依赖 ProposalRef wire encoding：**SPEC-NOT-FROZEN → DEFERRED**（11-1 §3）。
 - 上述两项在 Serialization Boundary 裁决前**不得实现**（11-4 Design Freeze 前置）。
 
+### ROUND 3 分类结论（B1 Deep Fact Audit）
+
+- **#1（Vote）**：`ValidatorVote` decode = **SPEC-FROZEN / API-MISSING**
+  （crypto-serialization §8 roundtrip 契约冻结 + ADR-0034 V-4 布局冻结；decode API 缺失实现，
+  无隐含实现；decode 属 `nova-consensus::vote` 对称 API）→ 形成 **Minimal API Restoration Proposal**
+  （等待授权，不写代码；Protocol change = NO / Consensus semantic = NO / Canonicalization = NO）。
+- **#2（Proposal）**：`ProposalRef` encoding = **SPEC-NOT-FROZEN → DEFERRED**（11-1 §3）。
+- 矩阵 #1/#2 标记 **BLOCKED**（不删除；待 Serialization Boundary 裁决后恢复）。
+
 ## 明确不做
 
 - 不实现任何测试（DESIGN only）。

@@ -29,12 +29,20 @@
 
 | 项 | 现状 | 分类 | 状态 |
 |---|---|---|---|
-| `ValidatorVote` decode | canonical 布局冻结（ADR-0034 V-4 / ADR-0009 / crypto-serialization §8）；**专门 decode API 未冻结/未实现** | **SPEC-FROZEN-BUT-API-MISSING（候选，待裁决）** | OPEN |
+| `ValidatorVote` decode | canonical 布局冻结（ADR-0034 V-4 / ADR-0009 / crypto-serialization §8）；**专门 decode API 未冻结/未实现** | **SPEC-FROZEN / API-MISSING**（ROUND 3 B1 结论：crypto-serialization §8 roundtrip 契约 + V-4 布局冻结；decode 缺失实现、无隐含实现、消费者全直接构造结构体） | OPEN（→ Minimal API Restoration Proposal 待授权） |
 | `ProposalRef` wire encoding | 11-1 §3 明确不定义；无 ADR/spec encoding | **SPEC-NOT-FROZEN** | **DEFERRED** |
 
 - 上述两项在 **Serialization Boundary 裁决** 前无合法实现路径；
   Node 不得复制 canonical layout（双重 canonicalization 风险）。
 - 若裁决需新增 Consensus API ⇒ **HARD STOP → ADR/Protocol Review**（不自行添加）。
+
+### ROUND 3 证据链（B1）
+
+- `ValidatorVote` 消费者（vote/round/checkpoint/fork_choice/integration）**全部直接构造结构体**
+  （字段 pub），无 decode 路径、无隐含 decode。
+- `verify_vote` 接受已构造 `&ValidatorVote`（不接收 bytes）——不隐含 decode。
+- crypto-serialization §8 冻结 roundtrip 契约（`decode(encode(payload)) == payload`）——
+  是通用要求；ValidatorVote 的 decode 侧未实现 ⇒ **API/Implementation Gap（非 Protocol Defect）**。
 
 ## 明确不做
 

@@ -45,6 +45,25 @@
 | proposer authenticity | Consensus | **A11 = DEFERRED**（envelope valid ≠ proposer authority） | — | Consensus | DEFERRED |
 | QC ingestion 越权路径 | Consensus | **QC ingestion = DEFERRED**（无合法入口不造 API） | 11-8 | Consensus | DEFERRED |
 
+## Serialization Security Boundary（ROUND 3 补充）
+
+| 责任 | 归属 | 依据 | 状态 |
+|---|---|---|---|
+| canonical encode（Vote/QC/Checkpoint） | Consensus（vote.rs / finality.rs / checkpoint.rs） | ADR-0034 V-4 / F-2 / CP-3 | ENFORCED |
+| canonical decode（QC/Checkpoint） | Consensus（decode_qc / decode_checkpoint） | F-2 / CP-MF-9 | ENFORCED |
+| canonical decode（ValidatorVote） | **SPEC-FROZEN / API-MISSING**（应属 consensus::vote 对称 API） | crypto-serialization §8 | **OPEN（待裁决）** |
+| Vote semantic validation | Consensus（verify_vote V-5） | ADR-0034 V-5 | ENFORCED |
+| Envelope signature / sender binding | Network（verify_message N-4） | ADR-0032 N-4 | ENFORCED |
+| Replay（语义） | Consensus（context guards） | 10-5.1 | ENFORCED |
+| Replay（网络去重） | Network（gossip dedup N-5） | ADR-0032 N-5 | ENFORCED |
+| Proposer authority | **A11 = DEFERRED**（不新增验证） | 11-1 §10 | DEFERRED |
+| QC validation / ingestion | Consensus verify_qc；**ingestion DEFERRED** | F-6a / 11-1 §12 | DEFERRED |
+
+- **威胁（Serialization）**：Node 手写 decode → 双重 canonicalization 风险（Node 第二套规则 vs
+  Consensus 规则）。缓解：decode 只归属 Consensus（不选 A）；不新增 consensus API 前不实现（不选 B）。
+- **Residual Risk**：`ValidatorVote` decode API 缺失期间，Vote wire → ConsensusEvent 集成路径不可达
+  （Vote 集成 = BLOCKED）。
+
 ## 标记（全局）
 
 - `A6 equivocation = ASSUMPTION`（不得自动加 slashing / detector）
