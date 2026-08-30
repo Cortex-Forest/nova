@@ -1,6 +1,6 @@
 # ADR-0042: Block Format V1
 
-- **Status**: **FROZEN（ACCEPTED）**（P7-1；Block Format V1 FINAL FREEZE，2026-08-31）
+- **Status**: **FROZEN（ACCEPTED）**（P7-1 Block Format V1 + P7-2 Signature Representation Amendment，2026-08-31）
 - **Date**: 2026-08-31
 - **Deciders**: Nova Chain 架构组
 - **Scope**: P7-1 — 完整 Block 格式（Header / Body / block_hash / canonical / signature / validation）
@@ -160,3 +160,4 @@ block_hash = SHA-256( canonical_block_header(header) ‖ canonical_block_body(bo
 | 2026-08-31 | 初稿：ADR-0042 Block Format V1（单父 V0.1；Header/Body/block_hash/canonical/signature/validation/rejection + 冻结约束） | 用户授权创建 P7-1 Block Format ADR（仅写 ADR，不实现） |
 | 2026-08-31 | **FROZEN（ACCEPTED）**：P7-1 ADR Independent Review 10 项全 PASS（BlockHeader 顺序 / 单父 / BlockHash / Canonical / Signature / Validation Order / Commitment / Authority / Layer / Freeze Readiness）；Protocol Defect NO / Security Defect NO / 0 findings。冻结约束生效：未经新 ADR / Protocol Review 不得改变 field/order/encoding/hash coverage/signature coverage/validation semantics | 用户授权 P7-1 ADR Independent Review → PASS → ADR-0042 FROZEN（独立 documentation commit） |
 | 2026-08-31 | **AMENDMENT（Option B）**：P7-2 Signature Representation Protocol Review（10 项）——Option A FAIL（非 self-contained）/ **Option B PASS**（Block = Header + Body + `proposer_signature`；∉ block_hash / ∉ canonical hash input）。冻结：`Block.proposer_signature` 承载字段、Block wire = header‖body‖signature(64B)、**hash exclusion**（signature 改不影响 block_hash）、Authority Boundary（verify 只证明 signature valid for proposer identity，不证明 membership/authority/eligibility；A11 DEFERRED）。**不修改代码** | 用户裁决采纳 Option B → ADR-0042 Amendment（仅文档） |
+| 2026-08-31 | **AMENDMENT FROZEN（P7-2 Signature Representation）**：Independent Review **10/10 PASS / 0 findings**；Option B **APPROVED**。冻结内容（不得改变除非新 ADR / Protocol Review）：`Block.proposer_signature`（Ed25519，恰好 64B）/ wire = `canonical_header ‖ canonical_body ‖ proposer_signature(64B)` / **hash exclusion**（`proposer_signature ∉ block_hash input`，`∉ canonical_header`，`∉ canonical_body`；signature A→B ⇒ `block_hash(A)==block_hash(B)`）/ signature coverage（9 个 header 承诺字段；不签 body/自身；无循环依赖）/ authority boundary（verify 只证 `signature valid for proposer identity`，不证 membership/authority/eligibility/validator status）/ **A11 = DEFERRED** / decode ≠ semantic（`decode_block` 不执行 signature/tx_root/state_root/height/authority/membership verification）。**不修改代码 / Block / encoding / block_hash** | 用户授权 ADR-0042 Amendment FROZEN（独立 documentation commit） |
