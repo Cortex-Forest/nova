@@ -3,8 +3,10 @@
 //! - [`BlockExecutionResult`]：`execute_block`（nova-execution）的产物；**不含** final state root
 //!   （由 nova-storage `apply_block` 计算——execution 无 SMT，ADR-0029 D-1/D-2 边界）。
 //! - [`BlockHeader`] / [`BlockBody`] / [`Block`] + canonical `encode`/`decode` + [`block_hash`]
-//!   （P7-2，ADR-0042 FROZEN）：单父 V0.1；`block_hash = SHA-256(canonical_header ‖ canonical_body)`
-//!   （**不含 signature / 自身**）；decode = structure only（semantic validation 归 P7-3）。
+//!   （P7-2，ADR-0042 FROZEN + Signature Representation Amendment）：单父 V0.1；
+//!   `Block = header + body + proposer_signature(64B)`；
+//!   `block_hash = SHA-256(canonical_header ‖ canonical_body)`（**不含 signature / 自身**）；
+//!   decode = structure only（semantic validation 归 P7-3）。
 
 use crate::state::StateTransition;
 use nova_crypto::hash::protocol_hash;
@@ -82,11 +84,16 @@ pub struct BlockBody {
     pub txs: Vec<TransactionV1>,
 }
 
-/// Block（ADR-0042；`block_hash` 只覆盖 header+body，不含 signature——signature 归 P7-3 验证层）。
+/// Block（ADR-0042 Option B Amendment；`block_hash` 只覆盖 header+body，不含 `proposer_signature`——
+/// signature 承载于 Block 但 ∉ hash input；signature verification 归 P7-3 验证层）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub header: BlockHeader,
     pub body: BlockBody,
+    /// proposer 签名（Ed25519，恰好 64B；Option B 承载字段）。
+    /// 冻结：`∉ block_hash input` / `∉ canonical_header` / `∉ canonical_body`；wire 位于 body 之后。
+    /// decode ≠ semantic：本字段只做 representation，verification 归 P7-3。
+    pub proposer_signature: [u8; 64],
 }
 
 /// Canonical BlockHeader（ADR-0042 §7）：
@@ -226,22 +233,26 @@ pub fn decode_block_body(bytes: &[u8]) -> Result<BlockBody, BlockCodecError> {
     Ok(BlockBody { txs })
 }
 
-/// Canonical Block = `canonical_header ‖ canonical_body`（ADR-0042 §7；不含 signature）。
+/// Canonical Block wire（ADR-0042 §7 Option B）：
+/// `canonical_header ‖ canonical_body ‖ proposer_signature(64B)`（signature 固定 64B，无长度前缀 / 无 tag）。
 pub fn encode_block(b: &Block) -> Result<Vec<u8>, BlockCodecError> {
     let h = encode_block_header(&b.header);
     let body = encode_block_body(&b.body)?;
-    let mut out = Vec::with_capacity(h.len() + body.len());
+    let mut out = Vec::with_capacity(h.len() + body.len() + 64);
     out.extend_from_slice(&h);
     out.extend_from_slice(&body);
+    out.extend_from_slice(&b.proposer_signature);
     Ok(out)
 }
 
-/// Decode Block（structure only；分割 header + body）。
+/// Decode Block（structure only；header + body + 恰好 64B signature；拒 missing/truncated/oversized/trailing）。
 pub fn decode_block(bytes: &[u8]) -> Result<Block, BlockCodecError> {
     const MIN_HEADER: usize = 154;
-    if bytes.len() < MIN_HEADER {
+    const SIGNATURE_LEN: usize = 64;
+    // 最小：header(154) + signature(64)；body 可为空（至少 4B count）。
+    if bytes.len() < MIN_HEADER + SIGNATURE_LEN {
         return Err(BlockCodecError::InvalidLength {
-            expected: MIN_HEADER,
+            expected: MIN_HEADER + SIGNATURE_LEN,
             actual: bytes.len(),
         });
     }
@@ -250,15 +261,24 @@ pub fn decode_block(bytes: &[u8]) -> Result<Block, BlockCodecError> {
         1 => 186,
         t => return Err(BlockCodecError::InvalidOptionTag(t)),
     };
-    if bytes.len() < header_len {
+    // 即使 tag=1（header 186B），也需为 signature 留足 64B。
+    if bytes.len() < header_len + SIGNATURE_LEN {
         return Err(BlockCodecError::InvalidLength {
-            expected: header_len,
+            expected: header_len + SIGNATURE_LEN,
             actual: bytes.len(),
         });
     }
     let header = decode_block_header(&bytes[..header_len])?;
-    let body = decode_block_body(&bytes[header_len..])?;
-    Ok(Block { header, body })
+    // signature 固定占尾部 64B；body = [header_len, len-64)。body 域内 trailing ⇒ 拒绝。
+    let body_end = bytes.len() - SIGNATURE_LEN;
+    let body = decode_block_body(&bytes[header_len..body_end])?;
+    let mut proposer_signature = [0u8; SIGNATURE_LEN];
+    proposer_signature.copy_from_slice(&bytes[body_end..]);
+    Ok(Block {
+        header,
+        body,
+        proposer_signature,
+    })
 }
 
 /// `block_hash = SHA-256( canonical_header ‖ canonical_body )`（ADR-0042 §6；**不含 signature / 自身**）。
@@ -323,6 +343,7 @@ mod tests {
         Block {
             header: mk_header(Some([0xbb; 32])),
             body: BlockBody { txs },
+            proposer_signature: [0xcc; 64],
         }
     }
 
@@ -446,7 +467,7 @@ mod tests {
 
     #[test]
     fn block_hash_covers_header_and_body_not_signature() {
-        // Block 无 signature 字段（P7-2）；block_hash 只覆盖 header+body。
+        // block_hash 只覆盖 header+body（Option B：signature ∉ hash input）。
         let b = mk_block(vec![mk_tx(0)]);
         let hash = block_hash(&b).unwrap();
         assert_ne!(hash, [0u8; 32]);
@@ -457,5 +478,91 @@ mod tests {
             hash,
             protocol_hash(&[h.as_slice(), body.as_slice()].concat())
         );
+    }
+
+    #[test]
+    fn signature_roundtrip_and_exact_64b() {
+        // 1. valid signature roundtrip；2. signature 恰好 64B。
+        let b = mk_block(vec![mk_tx(0), mk_tx(1)]);
+        let bytes = encode_block(&b).unwrap();
+        // wire 尾部 64B == proposer_signature，位于 body 之后、无前缀 / 无 tag。
+        assert_eq!(&bytes[bytes.len() - 64..], &b.proposer_signature);
+        let dec = decode_block(&bytes).unwrap();
+        assert_eq!(dec.proposer_signature, b.proposer_signature);
+        assert_eq!(dec.header, b.header);
+        assert_eq!(dec.body, b.body);
+    }
+
+    #[test]
+    fn signature_mutation_does_not_change_hash() {
+        // 强制安全回归：S1 != S2 且 block_hash(A) == block_hash(B)。
+        let a = mk_block(vec![mk_tx(0)]);
+        let mut b = mk_block(vec![mk_tx(0)]);
+        b.proposer_signature[0] ^= 0xff;
+        assert_ne!(a.proposer_signature, b.proposer_signature, "S1 != S2");
+        assert_eq!(
+            block_hash(&a).unwrap(),
+            block_hash(&b).unwrap(),
+            "signature mutation ⇒ block_hash unchanged (hash exclusion)"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_missing_signature() {
+        // header + body，无 signature ⇒ REJECT。
+        let b = mk_block(vec![mk_tx(0)]);
+        let bytes = encode_block(&b).unwrap();
+        let without_sig = &bytes[..bytes.len() - 64];
+        assert!(matches!(
+            decode_block(without_sig),
+            Err(BlockCodecError::InvalidLength { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_signature() {
+        // 63B signature ⇒ REJECT。
+        let b = mk_block(vec![mk_tx(0)]);
+        let bytes = encode_block(&b).unwrap();
+        assert!(matches!(
+            decode_block(&bytes[..bytes.len() - 1]),
+            Err(BlockCodecError::InvalidLength { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_signature() {
+        // 65B signature ⇒ REJECT（body 域多出 1B trailing ⇒ decode_block_body 拒）。
+        let b = mk_block(vec![mk_tx(0)]);
+        let bytes = encode_block(&b).unwrap();
+        let mut oversized = bytes.clone();
+        oversized.extend_from_slice(&[0x00]); // 使 signature 域 = 65B
+        assert!(matches!(
+            decode_block(&oversized),
+            Err(BlockCodecError::InvalidLength { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        // valid block + extra bytes ⇒ REJECT。
+        let b = mk_block(vec![mk_tx(0)]);
+        let bytes = encode_block(&b).unwrap();
+        let mut trailing = bytes.clone();
+        trailing.extend_from_slice(&[0xde, 0xad]);
+        assert!(matches!(
+            decode_block(&trailing),
+            Err(BlockCodecError::InvalidLength { .. })
+        ));
+    }
+
+    #[test]
+    fn canonical_encoding_deterministic_with_signature() {
+        // same Block → encode twice → byte-for-byte identical；decode(encode(block)) == block。
+        let b = mk_block(vec![mk_tx(0), mk_tx(7)]);
+        let e1 = encode_block(&b).unwrap();
+        let e2 = encode_block(&b).unwrap();
+        assert_eq!(e1, e2, "canonical encoding = deterministic");
+        assert_eq!(decode_block(&e1), Ok(b), "decode(encode(block)) == block");
     }
 }
