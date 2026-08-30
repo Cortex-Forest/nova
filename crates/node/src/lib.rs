@@ -1,7 +1,7 @@
-//! Nova Chain 节点组装层（PHASE 1 占位）。
+//! Nova Chain 节点组装层（PHASE 1 占位 + STEP 11-4 组装）。
 //!
 //! 未来承载：节点服务、配置系统、模块组装、启动流程。
-//! 本阶段仅建立**配置系统骨架**与 **feature flags 机制**占位。
+//! 本阶段建立**配置系统骨架**与 **STEP 11-4 Node 组装层**（Vote + RoundTimeout 路径）。
 
 /// 配置系统骨架（PHASE 1）。
 ///
@@ -27,4 +27,8 @@ pub mod config {
     }
 }
 
-// 注意：本阶段禁止实现任何节点/共识业务逻辑。
+/// Node 组装层（STEP 11-4）：Network envelope → classify → construct `ConsensusEvent` →
+/// `transition` → `TransitionResult` 路由。**不执行 Consensus verification**（归 Consensus）。
+pub mod assembly;
+
+// 注意：本阶段禁止实现任何节点/共识业务逻辑（除 STEP 11-4 已冻结的 Vote + RoundTimeout 路径）。

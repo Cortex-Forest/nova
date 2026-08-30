@@ -571,6 +571,11 @@ dependencies = [
 [[package]]
 name = "nova-node"
 version = "0.1.0"
+dependencies = [
+ "nova-consensus",
+ "nova-crypto",
+ "nova-network",
+]
 
 [[package]]
 name = "nova-rpc"

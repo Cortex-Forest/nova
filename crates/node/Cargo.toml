@@ -21,4 +21,8 @@ testnet = []
 mainnet = []
 
 [dependencies]
-# PHASE 1：零第三方运行时依赖
+# STEP 11-4（Node 组装层）：依赖 network（envelope）+ consensus（transition/状态）+
+# crypto（VerifyingKey）。方向 node → network/consensus/crypto，无循环；不依赖 execution/storage。
+nova-network = { path = "../network" }
+nova-consensus = { path = "../consensus" }
+nova-crypto = { path = "../crypto" }
