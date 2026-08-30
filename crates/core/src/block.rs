@@ -9,7 +9,9 @@
 //!   decode = structure only（semantic validation 归 P7-3）。
 
 use crate::state::StateTransition;
+use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
 use nova_crypto::hash::protocol_hash;
+use nova_crypto::signature::{Signature, VerifyingKey, verify_message_hash};
 use nova_crypto::transaction::{TransactionV1, canonical_transaction_bytes, decode_transaction};
 
 /// 区块执行结果（ADR-0029 D-1；协议类型）。
@@ -54,6 +56,38 @@ impl core::fmt::Display for BlockCodecError {
 }
 
 impl std::error::Error for BlockCodecError {}
+
+/// Block 语义验证错误（P7-3；**semantic 级**，区别于 [`BlockCodecError`] 结构级）。
+///
+/// - D5 裁决：新增错误仅把 ADR-0042 §10 rejection 分类编码，**不改变协议语义**；
+///   ADR impact review 通过 ⇒ 不修改 ADR-0042。
+/// - ④ state_root 复用 storage `BlockStateRootError`（8D），不在此重复。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockValidationError {
+    /// ② proposer 签名验证失败（verify_strict / 畸形签名）。
+    InvalidProposerSignature,
+    /// ③ 重算 transaction_root ≠ header.transaction_root。
+    TransactionRootMismatch,
+    /// ⑤ `block.header.height != parent_height + 1`。
+    InvalidHeightChain,
+    /// ⑤ `block.header.parent_hash != parent_hash`。
+    ParentHashMismatch,
+}
+
+impl core::fmt::Display for BlockValidationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidProposerSignature => write!(f, "invalid proposer signature"),
+            Self::TransactionRootMismatch => write!(f, "transaction root mismatch"),
+            Self::InvalidHeightChain => {
+                write!(f, "invalid height chain (height != parent_height + 1)")
+            }
+            Self::ParentHashMismatch => write!(f, "parent hash mismatch"),
+        }
+    }
+}
+
+impl std::error::Error for BlockValidationError {}
 
 /// BlockHeader（ADR-0042 §4；字段顺序 = ADR-0009 §3 签名字段顺序）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,12 +325,139 @@ pub fn block_hash(b: &Block) -> Result<[u8; 32], BlockCodecError> {
     Ok(protocol_hash(&input))
 }
 
+/// 交易集合承诺 merkle root（P7-3，D4 裁决冻结；ADR-0042 §11 承诺完整性）。
+///
+/// 域字节（与 state 域 0x00/0x01/0x02、crypto DomainId 0x01~0x06 均分离）：
+/// `TX_EMPTY = 0x20` / `TX_LEAF = 0x21` / `TX_BRANCH = 0x22`。
+///
+/// 规则（冻结，deterministic，无 alternate）：
+/// - 空集合 ⇒ `protocol_hash(0x20)`（TX_EMPTY_ROOT 常数）。
+/// - 非空：第 0 层 = `leaf(tx_i)`（block 内 tx 顺序）；自底向上两两配对；
+///   层内 `len == 1` ⇒ 该节点即 root（不再配对）；奇数最后一个节点复制自身配对。
+pub fn compute_transaction_root(body: &BlockBody) -> [u8; 32] {
+    const TX_EMPTY: u8 = 0x20;
+    const TX_LEAF: u8 = 0x21;
+    const TX_BRANCH: u8 = 0x22;
+
+    if body.txs.is_empty() {
+        return protocol_hash(&[TX_EMPTY]);
+    }
+
+    let mut layer: Vec<[u8; 32]> = body
+        .txs
+        .iter()
+        .map(|tx| {
+            let canonical = canonical_transaction_bytes(tx)
+                .expect("canonical transaction encoding cannot fail for a decoded TransactionV1");
+            let mut input = Vec::with_capacity(1 + canonical.len());
+            input.push(TX_LEAF);
+            input.extend_from_slice(&canonical);
+            protocol_hash(&input)
+        })
+        .collect();
+
+    while layer.len() > 1 {
+        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
+        let mut i = 0;
+        while i < layer.len() {
+            let left = layer[i];
+            let right = if i + 1 < layer.len() {
+                layer[i + 1]
+            } else {
+                left // 奇数：复制自身
+            };
+            let mut input = Vec::with_capacity(1 + 64);
+            input.push(TX_BRANCH);
+            input.extend_from_slice(&left);
+            input.extend_from_slice(&right);
+            next.push(protocol_hash(&input));
+            i += 2;
+        }
+        layer = next;
+    }
+    layer[0]
+}
+
+/// ③ transaction_root 验证（P7-3，D4 裁决；ADR-0042 §9 步骤③）。
+///
+/// 重算 `compute_transaction_root(body)` 并与 `header.transaction_root` 比对；不符 ⇒
+/// [`BlockValidationError::TransactionRootMismatch`]。
+pub fn verify_transaction_root(
+    expected: &[u8; 32],
+    body: &BlockBody,
+) -> Result<(), BlockValidationError> {
+    if *expected == compute_transaction_root(body) {
+        Ok(())
+    } else {
+        Err(BlockValidationError::TransactionRootMismatch)
+    }
+}
+
+/// ② proposer signature 验证（P7-3，D2/D3 裁决；ADR-0042 §8 + ADR-0009 §3）。
+///
+/// - **纯密码学验证**：只证 `signature valid for supplied proposer identity/key`；
+///   **不查询 ValidatorSet / 不做 membership / authority / eligibility**（A11 DEFERRED）。
+/// - payload = `canonical_header`（9 header 承诺字段）；`DomainId::Block = 0x03` 域分离；
+///   `verify_strict`。
+/// - 不签：block_hash / body / signature 自身。
+pub fn verify_block_signature(
+    block: &Block,
+    proposer_vk: &VerifyingKey,
+    chain_id: u64,
+) -> Result<(), BlockValidationError> {
+    let payload = encode_block_header(&block.header);
+    let signed = build_signed_bytes(AlgorithmId::Ed25519, DomainId::Block, chain_id, &payload)
+        .map_err(|_| BlockValidationError::InvalidProposerSignature)?;
+    let msg = hash_signing_message(&signed);
+    let sig = Signature::from_bytes(&block.proposer_signature)
+        .map_err(|_| BlockValidationError::InvalidProposerSignature)?;
+    verify_message_hash(proposer_vk, &msg, &sig)
+        .map_err(|_| BlockValidationError::InvalidProposerSignature)
+}
+
+/// ⑤ 父块上下文（P7-3，D6 裁决；外部提供，Block 不自含；单父 V0.1，无多父）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentContext {
+    /// 父块高度。
+    pub parent_height: u64,
+    /// 父块 block_hash。
+    pub parent_hash: [u8; 32],
+}
+
+/// ⑤ height/parent 链式验证（P7-3，D6 裁决；ADR-0042 §9/§10）。
+///
+/// 同时验证（缺一不可）：
+/// - `block.header.height == parent_height + 1`（height 链式）⇒ 否则
+///   [`BlockValidationError::InvalidHeightChain`]；
+/// - `block.header.parent_hash == parent_hash`（parent_hash 正确指向预期父块）⇒ 否则
+///   [`BlockValidationError::ParentHashMismatch`]。
+///
+/// 仅检查 height 而不检查 parent_hash，会允许“高度连续但父指向错误”的块。
+pub fn verify_height_parent(
+    block: &Block,
+    parent: &ParentContext,
+) -> Result<(), BlockValidationError> {
+    let expected_height = parent
+        .parent_height
+        .checked_add(1)
+        .ok_or(BlockValidationError::InvalidHeightChain)?;
+    if block.header.height != expected_height {
+        return Err(BlockValidationError::InvalidHeightChain);
+    }
+    if block.header.parent_hash != parent.parent_hash {
+        return Err(BlockValidationError::ParentHashMismatch);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nova_crypto::address::{
         ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
     };
+    use nova_crypto::key::KeyPair;
+    use nova_crypto::signature::sign_message_hash;
     use nova_crypto::transaction::TransactionType;
 
     fn addr(kh: [u8; 32]) -> NovaAddress {
@@ -564,5 +725,262 @@ mod tests {
         let e2 = encode_block(&b).unwrap();
         assert_eq!(e1, e2, "canonical encoding = deterministic");
         assert_eq!(decode_block(&e1), Ok(b), "decode(encode(block)) == block");
+    }
+
+    // ── P7-3 ③ transaction_root merkle 规则（D4 冻结） ──
+
+    fn tx_leaf_hash(tx: &TransactionV1) -> [u8; 32] {
+        let canonical = canonical_transaction_bytes(tx).expect("canonical tx");
+        let mut input = Vec::with_capacity(1 + canonical.len());
+        input.push(0x21); // TX_LEAF
+        input.extend_from_slice(&canonical);
+        protocol_hash(&input)
+    }
+
+    fn tx_branch_hash(l: &[u8; 32], r: &[u8; 32]) -> [u8; 32] {
+        let mut input = Vec::with_capacity(1 + 64);
+        input.push(0x22); // TX_BRANCH
+        input.extend_from_slice(l);
+        input.extend_from_slice(r);
+        protocol_hash(&input)
+    }
+
+    #[test]
+    fn transaction_root_empty_is_constant() {
+        // 空集合 ⇒ protocol_hash(0x20)（TX_EMPTY_ROOT 常数）。
+        let empty = BlockBody { txs: vec![] };
+        let root = compute_transaction_root(&empty);
+        assert_eq!(root, protocol_hash(&[0x20]));
+        assert_eq!(root, compute_transaction_root(&empty), "deterministic");
+    }
+
+    #[test]
+    fn transaction_root_single_is_leaf() {
+        // 单元素 ⇒ root = leaf（不冗余配对）。
+        let tx = mk_tx(0);
+        let body = BlockBody {
+            txs: vec![tx.clone()],
+        };
+        assert_eq!(compute_transaction_root(&body), tx_leaf_hash(&tx));
+    }
+
+    #[test]
+    fn transaction_root_pair_and_odd_rules() {
+        let t0 = mk_tx(0);
+        let t1 = mk_tx(1);
+        let t2 = mk_tx(2);
+        let t3 = mk_tx(3);
+        let l0 = tx_leaf_hash(&t0);
+        let l1 = tx_leaf_hash(&t1);
+        let l2 = tx_leaf_hash(&t2);
+        let l3 = tx_leaf_hash(&t3);
+
+        // 2 txs：root = branch(l0, l1)
+        let b2 = BlockBody {
+            txs: vec![t0.clone(), t1.clone()],
+        };
+        assert_eq!(compute_transaction_root(&b2), tx_branch_hash(&l0, &l1));
+
+        // 3 txs（奇数复制自身）：root = branch( branch(l0,l1), branch(l2,l2) )
+        let b3 = BlockBody {
+            txs: vec![t0.clone(), t1.clone(), t2.clone()],
+        };
+        let expected3 = tx_branch_hash(&tx_branch_hash(&l0, &l1), &tx_branch_hash(&l2, &l2));
+        assert_eq!(compute_transaction_root(&b3), expected3);
+
+        // 4 txs：root = branch( branch(l0,l1), branch(l2,l3) )
+        let b4 = BlockBody {
+            txs: vec![t0, t1, t2, t3],
+        };
+        let expected4 = tx_branch_hash(&tx_branch_hash(&l0, &l1), &tx_branch_hash(&l2, &l3));
+        assert_eq!(compute_transaction_root(&b4), expected4);
+    }
+
+    #[test]
+    fn transaction_root_order_sensitive() {
+        // tx 顺序改变 ⇒ root 变（顺序即 block body 顺序）。
+        let a = BlockBody {
+            txs: vec![mk_tx(0), mk_tx(1)],
+        };
+        let b = BlockBody {
+            txs: vec![mk_tx(1), mk_tx(0)],
+        };
+        assert_ne!(compute_transaction_root(&a), compute_transaction_root(&b));
+    }
+
+    #[test]
+    fn verify_transaction_root_ok_with_matching_header() {
+        // ③ ok：header.transaction_root 与重算一致。
+        let body = BlockBody {
+            txs: vec![mk_tx(0), mk_tx(1)],
+        };
+        let mut h = mk_header(Some([0xbb; 32]));
+        h.transaction_root = compute_transaction_root(&body);
+        let b = Block {
+            header: h,
+            body,
+            proposer_signature: [0xcc; 64],
+        };
+        assert_eq!(
+            verify_transaction_root(&b.header.transaction_root, &b.body),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn verify_transaction_root_mismatch() {
+        // ③ 不符 ⇒ TransactionRootMismatch。
+        let body = BlockBody {
+            txs: vec![mk_tx(0)],
+        };
+        assert_eq!(
+            verify_transaction_root(&[0u8; 32], &body),
+            Err(BlockValidationError::TransactionRootMismatch)
+        );
+    }
+
+    // ── P7-3 ② proposer signature（D2/D3 冻结） ──
+
+    fn sign_block_header(
+        signing: &nova_crypto::signature::SigningKey,
+        header: &BlockHeader,
+        chain_id: u64,
+        domain: DomainId,
+    ) -> [u8; 64] {
+        let payload = encode_block_header(header);
+        let signed = build_signed_bytes(AlgorithmId::Ed25519, domain, chain_id, &payload).unwrap();
+        let msg = hash_signing_message(&signed);
+        sign_message_hash(signing, &msg).to_bytes()
+    }
+
+    #[test]
+    fn block_signature_verify_ok() {
+        // ② ok：真实 Ed25519 签名（DomainId::Block）验证通过；纯签名，无 membership。
+        let kp = KeyPair::generate().unwrap();
+        let mut b = mk_block(vec![mk_tx(0)]);
+        b.proposer_signature =
+            sign_block_header(kp.signing_key(), &b.header, 1001, DomainId::Block);
+        assert_eq!(verify_block_signature(&b, kp.verifying_key(), 1001), Ok(()));
+    }
+
+    #[test]
+    fn block_signature_rejects_tampered_header() {
+        // ② 篡改 header（签名后）⇒ 签名失效。
+        let kp = KeyPair::generate().unwrap();
+        let mut b = mk_block(vec![mk_tx(0)]);
+        b.proposer_signature =
+            sign_block_header(kp.signing_key(), &b.header, 1001, DomainId::Block);
+        b.header.state_root[0] ^= 0xff;
+        assert_eq!(
+            verify_block_signature(&b, kp.verifying_key(), 1001),
+            Err(BlockValidationError::InvalidProposerSignature)
+        );
+    }
+
+    #[test]
+    fn block_signature_rejects_wrong_proposer_key() {
+        // ② 错误 proposer 公钥 ⇒ 失败。
+        let kp = KeyPair::generate().unwrap();
+        let other = KeyPair::generate().unwrap();
+        let mut b = mk_block(vec![mk_tx(0)]);
+        b.proposer_signature =
+            sign_block_header(kp.signing_key(), &b.header, 1001, DomainId::Block);
+        assert_eq!(
+            verify_block_signature(&b, other.verifying_key(), 1001),
+            Err(BlockValidationError::InvalidProposerSignature)
+        );
+    }
+
+    #[test]
+    fn block_signature_rejects_wrong_chain_id() {
+        // ② 错误 chain_id ⇒ 域分离失败。
+        let kp = KeyPair::generate().unwrap();
+        let mut b = mk_block(vec![mk_tx(0)]);
+        b.proposer_signature =
+            sign_block_header(kp.signing_key(), &b.header, 1001, DomainId::Block);
+        assert_eq!(
+            verify_block_signature(&b, kp.verifying_key(), 999),
+            Err(BlockValidationError::InvalidProposerSignature)
+        );
+    }
+
+    #[test]
+    fn block_signature_rejects_wrong_domain() {
+        // ② 错误 domain（0x02 ValidatorVote 而非 0x03 Block）⇒ 失败。
+        let kp = KeyPair::generate().unwrap();
+        let mut b = mk_block(vec![mk_tx(0)]);
+        b.proposer_signature =
+            sign_block_header(kp.signing_key(), &b.header, 1001, DomainId::ValidatorVote);
+        assert_eq!(
+            verify_block_signature(&b, kp.verifying_key(), 1001),
+            Err(BlockValidationError::InvalidProposerSignature)
+        );
+    }
+
+    #[test]
+    fn block_signature_rejects_invalid_signature_bytes() {
+        // ② 无效签名字节（全零，64B 合法长度但 verify_strict 失败）⇒ 失败。
+        let kp = KeyPair::generate().unwrap();
+        let mut b = mk_block(vec![mk_tx(0)]);
+        b.proposer_signature = [0u8; 64];
+        assert_eq!(
+            verify_block_signature(&b, kp.verifying_key(), 1001),
+            Err(BlockValidationError::InvalidProposerSignature)
+        );
+    }
+
+    // ── P7-3 ⑤ height/parent（D6 冻结） ──
+
+    #[test]
+    fn height_parent_verify_ok() {
+        // ⑤ ok：height == parent_height + 1 且 parent_hash 匹配（mk_block: height=1, parent=[0xaa;32]）。
+        let b = mk_block(vec![]);
+        let parent = ParentContext {
+            parent_height: 0,
+            parent_hash: [0xaa; 32],
+        };
+        assert_eq!(verify_height_parent(&b, &parent), Ok(()));
+    }
+
+    #[test]
+    fn height_parent_rejects_height_not_continuous() {
+        // ⑤ height 不连续 ⇒ InvalidHeightChain。
+        let b = mk_block(vec![]);
+        let parent = ParentContext {
+            parent_height: 2,
+            parent_hash: [0xaa; 32],
+        };
+        assert_eq!(
+            verify_height_parent(&b, &parent),
+            Err(BlockValidationError::InvalidHeightChain)
+        );
+    }
+
+    #[test]
+    fn height_parent_rejects_parent_hash_mismatch() {
+        // ⑤ parent_hash 不匹配 ⇒ ParentHashMismatch（证明“只查 height 漏 hash”被拒）。
+        let b = mk_block(vec![]);
+        let parent = ParentContext {
+            parent_height: 0,
+            parent_hash: [0x00; 32],
+        };
+        assert_eq!(
+            verify_height_parent(&b, &parent),
+            Err(BlockValidationError::ParentHashMismatch)
+        );
+    }
+
+    #[test]
+    fn height_parent_rejects_parent_height_overflow() {
+        // ⑤ parent_height = u64::MAX ⇒ checked_add 溢出 ⇒ InvalidHeightChain。
+        let b = mk_block(vec![]);
+        let parent = ParentContext {
+            parent_height: u64::MAX,
+            parent_hash: [0xaa; 32],
+        };
+        assert_eq!(
+            verify_height_parent(&b, &parent),
+            Err(BlockValidationError::InvalidHeightChain)
+        );
     }
 }
