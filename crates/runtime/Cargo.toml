@@ -1,0 +1,18 @@
+[package]
+name = "nova-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Nova Chain block lifecycle coordination layer (P7-4)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# P7-4（E1=A 冻结）：协调层同时依赖 core/crypto/execution/storage（上游消费方，ADR-0025 允许；
+# 仅禁 storage → execution 反向）。本阶段不引入 consensus 语义。
+nova-core = { path = "../core" }
+nova-crypto = { path = "../crypto" }
+nova-execution = { path = "../execution" }
+nova-storage = { path = "../storage" }

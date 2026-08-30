@@ -582,6 +582,16 @@ name = "nova-rpc"
 version = "0.1.0"
 
 [[package]]
+name = "nova-runtime"
+version = "0.1.0"
+dependencies = [
+ "nova-core",
+ "nova-crypto",
+ "nova-execution",
+ "nova-storage",
+]
+
+[[package]]
 name = "nova-storage"
 version = "0.1.0"
 dependencies = [
