@@ -1,6 +1,6 @@
 # Nova Chain — Serialization Boundary Minimal API Restoration Proposal V1（P0-B1）
 
-- **Status**: Draft（P0-B1；待 Review → 授权；**不写代码**）
+- **Status**: **FINAL FROZEN**（P0-B1；Serialization Boundary Minimal API Restoration FINAL FREEZE，2026-08-30）
 - **Date**: 2026-08-30
 - **Scope**: 恢复 `ValidatorVote` 的冻结 serialization contract 中缺失的 decode API
   （`SPEC-FROZEN / API-MISSING`）。**ProposalRef 不在此范围（SPEC-NOT-FROZEN → DEFERRED）。**
@@ -99,3 +99,6 @@ ADR review → explicit authorization。
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-30 | 初稿：Serialization Boundary Minimal API Restoration Proposal V1（20 问 + 最小 API 设计 + 影响面 + 裁决请求） | MASTER PARALLEL EXECUTION v4.0 — P0-B1 |
+| 2026-08-30 | **Independent Review PASS（阶段 1）**：6 点验证全 PASS（① 严格 121B layout 对称 ② 复用 `InvalidVoteEncoding` ③ `decode(encode(v))==v` 可证 ④ 拒截断/超长/非法 vote_type/非 canonical ⑤ 不改 verify_vote/签名/domain/transition ⑥ 无新协议语义）；证据：decode 模式已在 decode_qc 内部验证可行；构建块全部冻结可用。观察（INFO）：validator_id 不验证 membership（归 verify_vote ①） | 用户两阶段授权（阶段 1）→ Review PASS |
+| 2026-08-30 | **IMPLEMENTATION COMPLETE（阶段 2）**：`crates/consensus/src/vote.rs` 实现 `decode_validator_vote`（+135，仅该文件）；5 新测试（roundtrip / 拒截断 / 拒超长+trailing / 拒非法 vote_type / 字段精度 / 无 membership 检查——实际 5 个含 no_membership）；nova-consensus 113 passed；四项 Gate 全 PASS（fmt/check/clippy exit 0，workspace 53 result 全 ok）。Security/Protocol Review：0 Blocker / 0 Must-Fix / 0 Protocol Violation | 用户第二阶段明确授权 → commit `80570e0` |
+| 2026-08-30 | **FINAL FREEZE（P0-B1）**：Serialization Boundary Minimal API Restoration = **FINAL FROZEN**。仅文档变更记录更新；不修改实现代码。Protocol semantic change = 0；`ProposalRef` wire encoding **仍 DEFERRED**（SPEC-NOT-FROZEN）；QC ingestion DEFERRED；external.rs NOT CREATED | 用户裁决 → P0-B1 FINAL FREEZE（独立 documentation commit） |
