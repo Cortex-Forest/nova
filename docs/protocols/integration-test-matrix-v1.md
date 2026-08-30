@@ -1,6 +1,6 @@
 # Nova Chain — STEP 11-9 Integration Test Matrix Design V1
 
-- **Status**: Draft（STEP 11-9；待 Review → Freeze）
+- **Status**: **FROZEN**（STEP 11-9；Integration Test Matrix Design V1 FINAL FREEZE，2026-08-30）
 - **Date**: 2026-08-30
 - **Scope**: Network → Node → Consensus 端到端集成测试矩阵（**DESIGN only，不实现**）。
 - **依据**（全部 READ-ONLY）：STEP 11-1（FROZEN）/ 11-2（FROZEN）/ 11-3（FROZEN）+
@@ -61,3 +61,5 @@
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-30 | 初稿：STEP 11-9 Integration Test Matrix Design V1（20 项覆盖矩阵 + Serialization Boundary 影响 + 硬边界） | MASTER PARALLEL EXECUTION ROUND 2 — Track C |
+| 2026-08-30 | ROUND 3 补充：B1 分类结论（Vote=SPEC-FROZEN/API-MISSING；Proposal=SPEC-NOT-FROZEN/DEFERRED）；#1/#2 标记 BLOCKED | MASTER PARALLEL EXECUTION ROUND 3 — Track C |
+| 2026-08-30 | **DESIGN FREEZE（11-9）**：Status Draft→FROZEN。三态模型 READY/BLOCKED/DEFERRED 诚实保持——Vote integration = BLOCKED（serialization boundary）；Proposal integration = DEFERRED（ProposalRef wire encoding）；QC ingestion = DEFERRED。未将 BLOCKED 项伪装为 READY | MASTER PARALLEL EXECUTION v4.0 — P1 Track C |

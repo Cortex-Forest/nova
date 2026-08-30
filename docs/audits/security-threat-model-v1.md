@@ -1,6 +1,6 @@
 # Nova Chain — STEP 11-10 Security Threat Model V1
 
-- **Status**: Draft（STEP 11-10；待 Review → Freeze）
+- **Status**: **FROZEN**（STEP 11-10；Security Threat Model Design V1 FINAL FREEZE，2026-08-30）
 - **Date**: 2026-08-30
 - **Scope**: Network / Node / Consensus 三层攻击面威胁模型（**DESIGN only，不实现**）。
 - **依据**（全部 READ-ONLY）：STEP 11-1/11-2/11-3（FROZEN）+ 10-11（FROZEN）+
@@ -83,3 +83,5 @@
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-30 | 初稿：STEP 11-10 Security Threat Model V1（Network/Node/Consensus 三层威胁 → Trust Boundary → Mitigation → Test → Owner → Status + A6/A11/QC 标记） | MASTER PARALLEL EXECUTION ROUND 2 — Track D |
+| 2026-08-30 | ROUND 3 补充：Serialization Security Boundary（decode/语义验证/签名/sender binding/replay/proposer/QC 责任归属表 + Residual Risk） | MASTER PARALLEL EXECUTION ROUND 3 — Track D |
+| 2026-08-30 | **DESIGN FREEZE（11-10）**：Status Draft→FROZEN。责任边界（Network envelope/sender/discriminator/length/opaque；Node decode/classify/construct/route；Consensus verify/guards/replay/QC/transition）保持；5 个 ≠ 保持（Network sig≠Vote sig / Node decode≠semantic / Network replay≠Consensus replay / sender≠proposer / QC wire≠QC ingestion）；未创造新安全规则 | MASTER PARALLEL EXECUTION v4.0 — P1 Track D |

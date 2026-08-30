@@ -1,6 +1,6 @@
 # Nova Chain — STEP 11-13 Traceability Matrix V1
 
-- **Status**: Draft（STEP 11-13；待 Review → Freeze）
+- **Status**: **FROZEN**（STEP 11-13；Traceability Matrix Design V1 FINAL FREEZE，2026-08-30）
 - **Date**: 2026-08-30
 - **Scope**: `ADR → Protocol Spec → Design → Implementation → Test → Security Audit → Freeze`
   全链路映射（**文档 only**）。
@@ -56,3 +56,5 @@
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-30 | 初稿：STEP 11-13 Traceability Matrix V1（ADR→Spec→Design→Impl→Test→Security→Freeze 全链路 + SERIALIZATION BOUNDARY GAP 标记） | MASTER PARALLEL EXECUTION ROUND 2 — Track E |
+| 2026-08-30 | ROUND 3 补充：B1 证据链（消费者全直接构造 / verify_vote 不隐含 decode / §8 roundtrip 未实现） | MASTER PARALLEL EXECUTION ROUND 3 — Track E |
+| 2026-08-30 | **DESIGN FREEZE（11-13）**：Status Draft→FROZEN。Serialization Boundary GAP 诚实标记：ValidatorVote = SPEC-FROZEN / API-MISSING；ProposalRef = SPEC-NOT-FROZEN / DEFERRED。GAP 不隐藏、不猜测填补 | MASTER PARALLEL EXECUTION v4.0 — P1 Track E |
