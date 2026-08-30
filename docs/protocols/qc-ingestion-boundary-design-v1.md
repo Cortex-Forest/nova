@@ -29,11 +29,23 @@
 ⇒ 与 11-1 §12 一致：DEFERRED（无冻结合法入口，不造 API）。
 ```
 
-## 2. 未来推进路径（仅设计，触发 ADR）
+## 2. QC Verification Boundary Design（深化，独立 Track）
+
+> 原则：**`verify_qc → admit` 边界必须明确；不因"verify_qc 兜底"绕过 ingestion verification**。
+
+| # | 决策 | 内容 |
+|---|---|---|
+| **QC-VB-1** | Validity 唯一门 | `verify_qc`（F-6a：target∈DAG → vset → 升序 → duplicate → 逐条 verify_vote → quorum）是 QC 进入任何 consensus 状态（registry / checkpoint / finality）的**唯一 Validity 门** |
+| **QC-VB-2** | admit 不验证 | `QcRegistry::admit` 不含 F-6a——外部 QC 必须先过 `verify_qc` 才可 admit；**禁止未验证 QC 进 registry** |
+| **QC-VB-3** | Node 不执行 verify_qc | 11-1 §5——Node 不能自建 verify+admit 链路；外部 QC ingestion 须经 Consensus 侧门面（对比 11-6 `verify_vote_input`） |
+| **QC-VB-4** | 兜底 ≠ 绕过 | 消费点（fork_choice FC-13 / precommit 分支）的 `verify_qc` 是**兜底**，**不替代** ingestion 处的验证——不能因"消费时验证"而允许未验证 QC 进入 registry |
+| **QC-VB-5** | 不新增 event variant | `ConsensusEvent::Qc` 不新增（除非专门协议决策 + ADR；B3 禁止） |
+
+### 未来推进路径（仅设计，触发 ADR）
 
 若项目所有者决定推进 QC ingestion，候选 API 形状（**不实现、不预设 ADR**）：
 ```rust
-// Consensus 侧 QC ingestion 门面（对比 verify_vote_input）：
+// Consensus 侧 QC ingestion 门面（对比 verify_vote_input；QC-VB-1~4）：
 // verify_qc（F-6a）→ registry admit（Prevote-only）→ 返回 QcAdmission
 pub fn ingest_qc_input(
     qc: &QuorumCertificate,
@@ -64,3 +76,4 @@ pub fn ingest_qc_input(
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-30 | 初稿：QC Ingestion Boundary Design V1（审计冻结 API → NOT FOUND → DEFERRED；未来路径 ADR 触发标记） | 用户授权并行 STEP 11-8（仅设计不实现） |
+| 2026-08-30 | 深化：QC Verification Boundary Design（QC-VB-1~5——verify_qc 唯一 Validity 门 / admit 不验证 / Node 不执行 verify_qc / 兜底≠绕过 / 不新增 event variant）。QC 独立 Track 保持 DEFERRED；仅设计不实现 | 用户裁决 STEP 11-8 独立 Track Design |

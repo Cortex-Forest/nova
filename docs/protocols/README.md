@@ -10,7 +10,9 @@
     gossip / sync）。
   - Consensus（STEP 10）：**FINAL FROZEN** + 已实现（nova-consensus；ADR-0033~0040 +
     `consensus-spec-v1.md`）。
-  - STEP 11（Network ↔ Node ↔ Consensus 集成）：进行中（11-1 / 11-2 / 11-3 DESIGN FROZEN）。
+  - STEP 11（Network ↔ Node ↔ Consensus 集成）：**11-1~11-7 FINAL FROZEN**（Envelope 验证 / Node
+    组装 / RoundTimeout / Vote / Proposal 端到端可验证；`ADR-0041` ProposalRef serialization FROZEN）。
+    QC ingestion / A11：**DEFERRED**（独立后续 Track）。
 - RPC：`NOT IMPLEMENTED`（等各自 Phase）。
 - 完整 Block 格式 / block_hash：**PHASE 7 DEFERRED**。
 
