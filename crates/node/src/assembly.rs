@@ -18,7 +18,7 @@ use nova_consensus::finality::FinalityState;
 use nova_consensus::integration::{
     ConsensusEvent, ConsensusState, IntegrationContext, TransitionResult, transition,
 };
-use nova_consensus::round::RoundState;
+use nova_consensus::round::{RoundState, decode_proposal_ref};
 use nova_consensus::validator::ValidatorSet;
 use nova_consensus::vote::{ValidatorVote, decode_validator_vote, verify_vote_input};
 use nova_crypto::signature::VerifyingKey;
@@ -44,6 +44,8 @@ pub enum NodeError {
     VoteDecode(ConsensusError),
     /// Vote 签名验证失败（Consensus 门面 V-5；MF-2 precondition 未满足）。
     VoteVerification(ConsensusError),
+    /// ProposalRef canonical payload 结构解析失败（Consensus 域；ADR-0041）。
+    ProposalDecode(ConsensusError),
 }
 
 /// 组装节点：持有 Consensus 状态 + 上下文 + 冻结参数。
@@ -102,6 +104,7 @@ impl ConsensusNode {
             .map_err(NodeError::InvalidEnvelope)?;
         match mt {
             MessageType::ConsensusVote => self.handle_vote(&envelope.payload),
+            MessageType::ConsensusProposal => self.handle_proposal(&envelope.payload),
             other => Err(NodeError::UnsupportedMessage(other)),
         }
     }
@@ -141,6 +144,23 @@ impl ConsensusNode {
         Ok(result)
     }
 
+    /// Proposal 路径：decode wire payload（ADR-0041 64B）→ construct 既有
+    /// `ConsensusEvent::SetProposal` → `transition`（不修改）。阶段守卫归 transition。
+    fn handle_proposal(&mut self, payload: &[u8]) -> Result<TransitionResult, NodeError> {
+        let proposal_ref = decode_proposal_ref(payload).map_err(NodeError::ProposalDecode)?;
+        let result = transition(
+            &self.state,
+            ConsensusEvent::SetProposal(proposal_ref),
+            &mut self.context,
+            self.chain_id,
+            &self.set,
+            &self.genesis_hash,
+            &self.dag,
+        );
+        self.apply_result(&result);
+        Ok(result)
+    }
+
     /// `Applied` ⇒ 应用 `next_state`；`Ignored`/`Rejected` ⇒ 不变（MF-12 契约 3）。
     fn apply_result(&mut self, result: &TransitionResult) {
         if let TransitionResult::Applied { next_state, .. } = result {
@@ -170,6 +190,7 @@ fn classify_vote_payload(payload: &[u8]) -> Result<(ValidatorVote, [u8; 64]), No
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nova_consensus::round::{ProposalRef, RoundStep, encode_proposal_ref};
     use nova_consensus::validator::ValidatorId;
     use nova_consensus::vote::{VoteType, canonical_vote_payload};
     use nova_crypto::address::{
@@ -400,10 +421,10 @@ mod tests {
     #[test]
     fn handle_envelope_rejects_unsupported_message() {
         let (mut node, peer_kp, set, genesis_hash) = setup();
-        // ConsensusProposal wire（本轮不支持——Proposal DEFERRED）
+        // ConsensusQc wire（QC ingestion DEFERRED——仍不支持）
         let mut envelope = MessageEnvelope {
             version: 1,
-            message_type: MessageType::ConsensusProposal,
+            message_type: MessageType::ConsensusQc,
             payload: vec![0u8; 32],
             sender: NodeId::from_bytes([0u8; 32]),
             signature: [0u8; 64],
@@ -412,10 +433,7 @@ mod tests {
         let err = node
             .handle_envelope(peer_kp.verifying_key(), &envelope, 64 * 1024)
             .unwrap_err();
-        assert_eq!(
-            err,
-            NodeError::UnsupportedMessage(MessageType::ConsensusProposal)
-        );
+        assert_eq!(err, NodeError::UnsupportedMessage(MessageType::ConsensusQc));
         let _ = (set, genesis_hash);
     }
 
@@ -457,5 +475,95 @@ mod tests {
         let (v, s) = classify_vote_payload(&payload).unwrap();
         assert_eq!(v, vote);
         assert_eq!(s, sig);
+    }
+
+    fn proposal_envelope(
+        signer_kp: &KeyPair,
+        block_hash: [u8; 32],
+        proposer: ValidatorId,
+    ) -> MessageEnvelope {
+        let p = ProposalRef {
+            block_hash,
+            proposer,
+        };
+        let payload = encode_proposal_ref(&p);
+        let mut envelope = MessageEnvelope {
+            version: 1,
+            message_type: MessageType::ConsensusProposal,
+            payload,
+            sender: NodeId::from_bytes([0u8; 32]),
+            signature: [0u8; 64],
+        };
+        sign_message(signer_kp.signing_key(), &mut envelope).unwrap();
+        envelope
+    }
+
+    #[test]
+    fn handle_valid_proposal_envelope_applies() {
+        let (mut node, validator_kp, set, genesis_hash) = setup();
+        let envelope = proposal_envelope(
+            &validator_kp,
+            [0x22; 32],
+            ValidatorId::from_bytes([0x01; 32]),
+        );
+        let result = node
+            .handle_envelope(validator_kp.verifying_key(), &envelope, 64 * 1024)
+            .unwrap();
+        assert!(matches!(result, TransitionResult::Applied { .. }));
+        // step Propose → Prevote（set_proposal 成功，B-1）
+        assert_eq!(node.state().round.step, RoundStep::Prevote);
+        let _ = (set, genesis_hash);
+    }
+
+    #[test]
+    fn handle_proposal_rejects_bad_payload() {
+        let (mut node, validator_kp, set, genesis_hash) = setup();
+        let mut envelope = MessageEnvelope {
+            version: 1,
+            message_type: MessageType::ConsensusProposal,
+            payload: vec![0u8; 32], // 非 64B
+            sender: NodeId::from_bytes([0u8; 32]),
+            signature: [0u8; 64],
+        };
+        sign_message(validator_kp.signing_key(), &mut envelope).unwrap();
+        let err = node
+            .handle_envelope(validator_kp.verifying_key(), &envelope, 64 * 1024)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            NodeError::ProposalDecode(
+                nova_consensus::error::ConsensusError::InvalidProposalEncoding
+            )
+        ));
+        let _ = (set, genesis_hash);
+    }
+
+    #[test]
+    fn handle_proposal_wrong_phase_ignored() {
+        let (mut node, validator_kp, set, genesis_hash) = setup();
+        // 第一次 SetProposal（Propose→Prevote）
+        let e1 = proposal_envelope(
+            &validator_kp,
+            [0x22; 32],
+            ValidatorId::from_bytes([0x01; 32]),
+        );
+        node.handle_envelope(validator_kp.verifying_key(), &e1, 64 * 1024)
+            .unwrap();
+        // 第二次 SetProposal（Prevote 阶段）⇒ transition 守卫 Ignored{ContextMismatch}
+        let e2 = proposal_envelope(
+            &validator_kp,
+            [0x33; 32],
+            ValidatorId::from_bytes([0x02; 32]),
+        );
+        let result = node
+            .handle_envelope(validator_kp.verifying_key(), &e2, 64 * 1024)
+            .unwrap();
+        assert!(matches!(
+            result,
+            TransitionResult::Ignored {
+                reason: nova_consensus::integration::IgnoreReason::ContextMismatch
+            }
+        ));
+        let _ = (set, genesis_hash);
     }
 }
