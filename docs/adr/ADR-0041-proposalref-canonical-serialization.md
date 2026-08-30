@@ -92,3 +92,4 @@ canonical_proposal_ref = block_hash(32B) ‖ proposer(32B)   （total 64B，定�
 |---|---|---|
 | 2026-08-30 | 初稿：ADR-0041 ProposalRef Canonical Serialization（PR-1~PR-6 冻结） | 用户裁决新建 ADR-0041（不改 ADR-0037）；STEP 11-7 Design + ADR/Protocol Review PASS |
 | 2026-08-30 | **FROZEN（ACCEPTED）**：64B canonical + `InvalidProposalEncoding` 冻结。仅 ADR；**不实现**（编码实现归 11-7 Implementation 授权） | 用户裁决 → ADR-0041 ACCEPTED/FROZEN |
+| 2026-08-30 | **IMPLEMENTATION VERIFIED（11-7）**：`encode_proposal_ref` / `decode_proposal_ref` 实现于 `round.rs`，`InvalidProposalEncoding` 于 `error.rs`；nova-consensus 121 tests（roundtrip / 拒截断·超长·trailing / 字段精度 / 无 authority 检查）；四项 Gate 全 PASS；PR-1~PR-6 全部落实（canonical 唯一性 + roundtrip 成立；decode 无 semantic 泄漏） | STEP 11-7 Implementation commit `2adf10a` → 保持 FROZEN |

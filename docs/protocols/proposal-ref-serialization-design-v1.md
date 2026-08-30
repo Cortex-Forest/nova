@@ -54,3 +54,6 @@
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-30 | 初稿：ProposalRef Serialization Design V1（64B canonical 提案 + ADR 触发标记 + 硬边界） | 用户授权并行 STEP 11-7（仅设计不实现） |
+| 2026-08-30 | ADR/Protocol Review PASS + ADR-0041 FROZEN（新建 ADR-0041，不改 ADR-0037；64B canonical + `InvalidProposalEncoding`） | 用户裁决 + 11-7 ADR/Protocol Review |
+| 2026-08-30 | **IMPLEMENTATION COMPLETE（11-7）**：`error.rs` 加 `ConsensusError::InvalidProposalEncoding`；`round.rs` 实现 `encode_proposal_ref` / `decode_proposal_ref`（ADR-0041 PR-1~PR-6，64B 定长 / 严格长度 / 无 authority 验证）；nova-consensus 121 tests（4 新：roundtrip / 拒截断·超长·trailing·空 / 字段精度 / 无 authority 检查）；四项 Gate 全 PASS；Security/Protocol Review 0 Blocker/0 Must-Fix/0 Protocol Violation | 用户授权 STEP 11-7 Implementation → commit `2adf10a` |
+| 2026-08-30 | **FINAL FREEZE（11-7）**：STEP 11-7 全链封版（ADR-0041 FROZEN + IMPLEMENTATION COMPLETE）。仅文档变更记录更新；**不修改实现代码/不改变协议语义**。QC ingestion / A11 保持 DEFERRED；transition / ConsensusEvent 未触碰；external.rs NOT CREATED | 用户裁决 → STEP 11-7 FINAL FREEZE（独立 documentation commit） |
