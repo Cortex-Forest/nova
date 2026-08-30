@@ -98,6 +98,39 @@ pub fn verify_vote(
     verify_message_hash(vk, &h, &sig).map_err(|_| ConsensusError::InvalidSignature)
 }
 
+/// 恢复冻结 roundtrip 契约（crypto-serialization §8）的 decode 侧（P0-B1）。
+///
+/// 严格逆向冻结 121B canonical layout（ADR-0034 V-4 / ADR-0009 顺序）：
+/// `round(8LE) ‖ height(8LE) ‖ target(32) ‖ vote_type(1) ‖ source(32) ‖ validator_id(32) ‖ timestamp(8LE)`。
+/// 仅结构解析；**不做 semantic validation**（membership / signature / authority / domain / replay
+/// 均不验证——分别归 `verify_vote` / transition）。
+pub fn decode_validator_vote(bytes: &[u8]) -> Result<ValidatorVote, ConsensusError> {
+    const VOTE_LEN: usize = 121;
+    if bytes.len() != VOTE_LEN {
+        return Err(ConsensusError::InvalidVoteEncoding);
+    }
+    let round = u64::from_le_bytes(bytes[0..8].try_into().expect("len checked"));
+    let height = u64::from_le_bytes(bytes[8..16].try_into().expect("len checked"));
+    let mut target_block_hash = [0u8; 32];
+    target_block_hash.copy_from_slice(&bytes[16..48]);
+    let vote_type = VoteType::try_from(bytes[48])?;
+    let mut source_block_hash = [0u8; 32];
+    source_block_hash.copy_from_slice(&bytes[49..81]);
+    let mut vid = [0u8; 32];
+    vid.copy_from_slice(&bytes[81..113]);
+    let validator_id = ValidatorId::from_bytes(vid);
+    let timestamp = u64::from_le_bytes(bytes[113..121].try_into().expect("len checked"));
+    Ok(ValidatorVote {
+        round,
+        height,
+        target_block_hash,
+        vote_type,
+        source_block_hash,
+        validator_id,
+        timestamp,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +293,107 @@ mod tests {
 
     fn protocol_hash(b: &[u8]) -> [u8; 32] {
         nova_crypto::hash::protocol_hash(b)
+    }
+
+    #[test]
+    fn decode_validator_vote_roundtrip() {
+        let pk = [0x44; 32];
+        for vt in [VoteType::Prevote, VoteType::Precommit] {
+            let vote = ValidatorVote {
+                round: 7,
+                height: 3,
+                target_block_hash: [0x11; 32],
+                vote_type: vt,
+                source_block_hash: [0x22; 32],
+                validator_id: ValidatorId::from_consensus_public_key(&pk),
+                timestamp: 99,
+            };
+            let bytes = canonical_vote_payload(&vote);
+            assert_eq!(decode_validator_vote(&bytes), Ok(vote), "roundtrip");
+        }
+    }
+
+    #[test]
+    fn decode_validator_vote_rejects_bad_length() {
+        let pk = [0x44; 32];
+        let vote = ValidatorVote {
+            round: 0,
+            height: 1,
+            target_block_hash: [0x11; 32],
+            vote_type: VoteType::Prevote,
+            source_block_hash: [0x00; 32],
+            validator_id: ValidatorId::from_consensus_public_key(&pk),
+            timestamp: 0,
+        };
+        let bytes = canonical_vote_payload(&vote);
+        // 截断
+        assert_eq!(
+            decode_validator_vote(&bytes[..120]),
+            Err(ConsensusError::InvalidVoteEncoding)
+        );
+        // 超长 / trailing bytes
+        let mut long = bytes.clone();
+        long.push(0x00);
+        assert_eq!(
+            decode_validator_vote(&long),
+            Err(ConsensusError::InvalidVoteEncoding)
+        );
+        // 空
+        assert_eq!(
+            decode_validator_vote(&[]),
+            Err(ConsensusError::InvalidVoteEncoding)
+        );
+    }
+
+    #[test]
+    fn decode_validator_vote_rejects_invalid_vote_type() {
+        let pk = [0x44; 32];
+        let vote = ValidatorVote {
+            round: 0,
+            height: 1,
+            target_block_hash: [0x11; 32],
+            vote_type: VoteType::Prevote,
+            source_block_hash: [0x00; 32],
+            validator_id: ValidatorId::from_consensus_public_key(&pk),
+            timestamp: 0,
+        };
+        let mut bytes = canonical_vote_payload(&vote);
+        bytes[48] = 0x03; // 非 0x01/0x02 ⇒ 拒绝
+        assert_eq!(
+            decode_validator_vote(&bytes),
+            Err(ConsensusError::InvalidVoteEncoding)
+        );
+    }
+
+    #[test]
+    fn decode_validator_vote_field_accuracy() {
+        let pk = [0x77; 32];
+        let vote = ValidatorVote {
+            round: 1 << 40,
+            height: 999,
+            target_block_hash: [0xab; 32],
+            vote_type: VoteType::Precommit,
+            source_block_hash: [0xcd; 32],
+            validator_id: ValidatorId::from_consensus_public_key(&pk),
+            timestamp: u64::MAX,
+        };
+        let d = decode_validator_vote(&canonical_vote_payload(&vote)).unwrap();
+        assert_eq!(d.round, vote.round);
+        assert_eq!(d.height, vote.height);
+        assert_eq!(d.target_block_hash, vote.target_block_hash);
+        assert_eq!(d.vote_type, vote.vote_type);
+        assert_eq!(d.source_block_hash, vote.source_block_hash);
+        assert_eq!(d.validator_id, vote.validator_id);
+        assert_eq!(d.timestamp, vote.timestamp);
+    }
+
+    #[test]
+    fn decode_validator_vote_no_membership_check() {
+        // validator_id 只做字节恢复，不做 membership/authority 验证（归 verify_vote ①）。
+        let mut bytes = [0u8; 121];
+        bytes[48] = 0x01; // 有效 vote_type（Prevote）；其余字段任意
+        bytes[81..113].copy_from_slice(&[0xee; 32]); // 任意 32B validator_id
+        let d = decode_validator_vote(&bytes).unwrap();
+        assert_eq!(d.validator_id, ValidatorId::from_bytes([0xee; 32]));
     }
 }
