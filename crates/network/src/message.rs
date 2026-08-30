@@ -39,6 +39,8 @@ pub enum MessageType {
     ConsensusProposal = 0x09,
     /// 共识 QC wire discriminator（STEP 11-2；payload opaque；不代表存在可消费的 ingestion path）。
     ConsensusQc = 0x0A,
+    /// 区块 gossip（P7-5；payload = 完整 Block wire；仅 wire 注册值，Network 不解析语义）。
+    GossipBlock = 0x0B,
 }
 
 impl MessageType {
@@ -63,6 +65,7 @@ impl TryFrom<u8> for MessageType {
             0x08 => Ok(Self::ConsensusVote),
             0x09 => Ok(Self::ConsensusProposal),
             0x0a => Ok(Self::ConsensusQc),
+            0x0b => Ok(Self::GossipBlock),
             _ => Err(NetworkError::InvalidMessageType(v)),
         }
     }
@@ -79,6 +82,8 @@ pub enum NetworkError {
     InvalidSignature,
     /// sender NodeId 与公钥派生身份不符（身份绑定失败）。
     SenderMismatch,
+    /// Block 结构验证失败（decode_block 拒绝：length/version/tag/trailing；P7-5 F4）。
+    InvalidBlockStructure,
 }
 
 impl fmt::Display for NetworkError {
@@ -93,6 +98,7 @@ impl fmt::Display for NetworkError {
             }
             Self::InvalidSignature => write!(f, "invalid message signature"),
             Self::SenderMismatch => write!(f, "sender NodeId does not match public key"),
+            Self::InvalidBlockStructure => write!(f, "invalid block structure"),
         }
     }
 }
@@ -308,6 +314,7 @@ mod tests {
             MessageType::ConsensusVote,
             MessageType::ConsensusProposal,
             MessageType::ConsensusQc,
+            MessageType::GossipBlock,
         ] {
             let mut e = env(mt, vec![0xab; 17]);
             sign_message(kp.signing_key(), &mut e).unwrap();
@@ -318,11 +325,11 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_type_and_length() {
-        // 未知 type（0x08~0x0A 已定义；0x0B 未知）
-        let mut bad = vec![1u8, 0x0B];
+        // 未知 type（0x08~0x0B 已定义；0x0C 未知）
+        let mut bad = vec![1u8, 0x0C];
         bad.extend_from_slice(&0u32.to_le_bytes());
         bad.extend_from_slice(&[0u8; 32 + 64]);
-        assert_eq!(decode(&bad), Err(NetworkError::InvalidMessageType(0x0B)));
+        assert_eq!(decode(&bad), Err(NetworkError::InvalidMessageType(0x0C)));
         // 长度不符
         let short = vec![1u8, 0x01, 0, 0, 0, 0, 0]; // 太短
         assert!(matches!(
@@ -343,6 +350,8 @@ mod tests {
             Ok(MessageType::ConsensusProposal)
         );
         assert_eq!(MessageType::try_from(0x0a), Ok(MessageType::ConsensusQc));
+        assert_eq!(MessageType::GossipBlock.as_u8(), 0x0b);
+        assert_eq!(MessageType::try_from(0x0b), Ok(MessageType::GossipBlock));
     }
 
     #[test]

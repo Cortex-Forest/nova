@@ -5,7 +5,8 @@
 //! - **禁止** gossip 阶段执行交易（N-5：网络层不能影响执行确定性）。
 //! - V0.1 只冻结**验证 / 转发决策逻辑**（纯函数），不实现 Gossipsub 调度（N-3）。
 
-use crate::message::{MessageEnvelope, NetworkError, verify_message};
+use crate::message::{MessageEnvelope, MessageType, NetworkError, verify_message};
+use nova_core::block::{Block, decode_block};
 use nova_crypto::signature::VerifyingKey;
 use nova_crypto::transaction::{TransactionV1, decode_transaction};
 use std::collections::HashSet;
@@ -103,6 +104,33 @@ impl GossipValidator {
         decode_transaction(&envelope.payload).map_err(|_| NetworkError::InvalidSignature)
     }
 
+    /// 验证 gossip 区块信封 + Block 结构（P7-5 F3；**不执行**、不解析语义——N-5）。
+    ///
+    /// - 消息类型必须为 `GossipBlock`（否则 `InvalidMessageType`）。
+    /// - envelope 签名验证（N-4）。
+    /// - payload 大小（`max_msg_bytes`）。
+    /// - `decode_block` 结构验证（length/version/tag/trailing；P7-2）⇒ 失败 `InvalidBlockStructure`。
+    /// - **不验证** signature/tx_root/state_root/height/parent/authority（归消费方 nova-runtime）。
+    pub fn validate_gossip_block(
+        &self,
+        vk: &VerifyingKey,
+        envelope: &MessageEnvelope,
+    ) -> Result<Block, NetworkError> {
+        if envelope.message_type != MessageType::GossipBlock {
+            return Err(NetworkError::InvalidMessageType(
+                envelope.message_type.as_u8(),
+            ));
+        }
+        verify_message(vk, envelope)?;
+        if !self.check_size(envelope.payload.len()) {
+            return Err(NetworkError::InvalidLength {
+                expected: self.config.max_msg_bytes,
+                actual: envelope.payload.len(),
+            });
+        }
+        decode_block(&envelope.payload).map_err(|_| NetworkError::InvalidBlockStructure)
+    }
+
     /// 转发决策（去重 + TTL + 大小；N-5）。
     pub fn should_forward(&mut self, msg_id: [u8; 32], ttl: u8, msg_len: usize) -> GossipDecision {
         if !self.check_size(msg_len) {
@@ -184,6 +212,100 @@ mod tests {
             v.validate_gossip_tx(kp.verifying_key(), &env),
             Err(NetworkError::SenderMismatch),
             "未签名 envelope 验证失败"
+        );
+    }
+
+    fn mk_block() -> nova_core::block::Block {
+        nova_core::block::Block {
+            header: nova_core::block::BlockHeader {
+                version: nova_core::block::BLOCK_VERSION,
+                chain_id: 1001,
+                height: 1,
+                parent_hash: [0xaa; 32],
+                finality_reference: None,
+                transaction_root: [0x11; 32],
+                state_root: [0x22; 32],
+                validator_set_hash: [0x33; 32],
+                timestamp: 0,
+            },
+            body: nova_core::block::BlockBody { txs: vec![] },
+            proposer_signature: [0xcc; 64],
+        }
+    }
+
+    #[test]
+    fn gossip_validate_block_ok() {
+        // P7-5 F3：合法 GossipBlock envelope + 完整 Block wire ⇒ 结构还原。
+        let kp = KeyPair::generate().unwrap();
+        let v = GossipValidator::new(GossipConfig::default());
+        let block = mk_block();
+        let mut env = MessageEnvelope {
+            version: 1,
+            message_type: MessageType::GossipBlock,
+            payload: nova_core::block::encode_block(&block).unwrap(),
+            sender: NodeId::from_bytes([0u8; 32]),
+            signature: [0u8; 64],
+        };
+        crate::message::sign_message(kp.signing_key(), &mut env).unwrap();
+        let decoded = v.validate_gossip_block(kp.verifying_key(), &env).unwrap();
+        assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn gossip_validate_block_rejects() {
+        // P7-5 F3 负路径：类型 / 结构 / 签名 / size。
+        let kp = KeyPair::generate().unwrap();
+        let v = GossipValidator::new(GossipConfig::default());
+        let block = mk_block();
+        let wire = nova_core::block::encode_block(&block).unwrap();
+        let mut env = MessageEnvelope {
+            version: 1,
+            message_type: MessageType::GossipBlock,
+            payload: wire.clone(),
+            sender: NodeId::from_bytes([0u8; 32]),
+            signature: [0u8; 64],
+        };
+        crate::message::sign_message(kp.signing_key(), &mut env).unwrap();
+        assert!(v.validate_gossip_block(kp.verifying_key(), &env).is_ok());
+
+        // 错误消息类型 ⇒ InvalidMessageType
+        let mut bad_type = env.clone();
+        bad_type.message_type = MessageType::GossipTransaction;
+        assert_eq!(
+            v.validate_gossip_block(kp.verifying_key(), &bad_type),
+            Err(NetworkError::InvalidMessageType(
+                MessageType::GossipTransaction.as_u8()
+            ))
+        );
+
+        // payload 结构非法（截断）⇒ InvalidBlockStructure
+        let mut bad_struct = env.clone();
+        bad_struct.payload = wire[..wire.len() - 1].to_vec();
+        crate::message::sign_message(kp.signing_key(), &mut bad_struct).unwrap();
+        assert_eq!(
+            v.validate_gossip_block(kp.verifying_key(), &bad_struct),
+            Err(NetworkError::InvalidBlockStructure)
+        );
+
+        // 签名篡改 ⇒ InvalidSignature
+        let mut bad_sig = env.clone();
+        bad_sig.signature[0] ^= 0xff;
+        assert_eq!(
+            v.validate_gossip_block(kp.verifying_key(), &bad_sig),
+            Err(NetworkError::InvalidSignature)
+        );
+
+        // size 超限 ⇒ InvalidLength
+        let small = GossipValidator::new(GossipConfig {
+            max_msg_bytes: 10,
+            ..GossipConfig::default()
+        });
+        assert_eq!(
+            small.validate_gossip_block(kp.verifying_key(), &env),
+            Err(NetworkError::InvalidLength {
+                expected: 10,
+                actual: env.payload.len()
+            })
         );
     }
 }

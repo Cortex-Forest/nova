@@ -6,10 +6,18 @@
 //!   （STEP 10-12 + PHASE 7）。
 
 use crate::message::NetworkError;
+use nova_core::block::{Block, BlockCodecError, encode_block};
 
-/// 区块负载占位（原始区块字节；完整 Block 格式 PHASE 7 定义结构）。
+/// 区块负载（P7-5 F2：完整 Block wire = `encode_block` 输出；无额外前缀——外层 len 前缀）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockPayload(pub Vec<u8>);
+
+impl BlockPayload {
+    /// 从完整 Block 构造 wire（P7-5 F2：`encode_block` 输出）。
+    pub fn from_block(block: &Block) -> Result<Self, BlockCodecError> {
+        Ok(Self(encode_block(block)?))
+    }
+}
 
 /// 区块同步请求（ADR-0032 N-6）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +177,50 @@ mod tests {
         assert_eq!(SyncBlockResponse::decode(&r.encode()).unwrap(), r);
         let empty = SyncBlockResponse { blocks: Vec::new() };
         assert_eq!(SyncBlockResponse::decode(&empty.encode()).unwrap(), empty);
+    }
+
+    fn mk_block() -> nova_core::block::Block {
+        nova_core::block::Block {
+            header: nova_core::block::BlockHeader {
+                version: nova_core::block::BLOCK_VERSION,
+                chain_id: 1001,
+                height: 1,
+                parent_hash: [0xaa; 32],
+                finality_reference: None,
+                transaction_root: [0x11; 32],
+                state_root: [0x22; 32],
+                validator_set_hash: [0x33; 32],
+                timestamp: 0,
+            },
+            body: nova_core::block::BlockBody { txs: vec![] },
+            proposer_signature: [0xcc; 64],
+        }
+    }
+
+    #[test]
+    fn block_payload_from_block_is_block_wire() {
+        // P7-5 F2：BlockPayload = encode_block 输出（完整 Block wire，无额外前缀）。
+        let b = mk_block();
+        let payload = BlockPayload::from_block(&b).unwrap();
+        assert_eq!(payload.0, nova_core::block::encode_block(&b).unwrap());
+        // 结构可 decode 还原
+        assert_eq!(nova_core::block::decode_block(&payload.0).unwrap(), b);
+    }
+
+    #[test]
+    fn sync_block_response_full_block_wire_roundtrip() {
+        // P7-5：SyncBlockResponse 承载完整 Block wire，roundtrip 后每个 payload 可结构还原。
+        let b = mk_block();
+        let payload = BlockPayload::from_block(&b).unwrap();
+        let r = SyncBlockResponse {
+            blocks: vec![payload.clone()],
+        };
+        let decoded = SyncBlockResponse::decode(&r.encode()).unwrap();
+        assert_eq!(decoded.blocks, vec![payload]);
+        assert_eq!(
+            nova_core::block::decode_block(&decoded.blocks[0].0).unwrap(),
+            b
+        );
     }
 
     #[test]
