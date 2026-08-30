@@ -146,6 +146,34 @@ pub fn verify_message(vk: &VerifyingKey, envelope: &MessageEnvelope) -> Result<(
     verify_message_hash(vk, &h, &sig).map_err(|_| NetworkError::InvalidSignature)
 }
 
+/// Network envelope validation API（STEP 11-3，**非 Consensus validation**）。
+///
+/// 验证边界（Network 域）：
+/// 1. N-4 envelope 签名 + sender 身份绑定（`verify_message`）。
+/// 2. `message_type` ∈ {`ConsensusVote`, `ConsensusProposal`, `ConsensusQc`}（否则 `InvalidMessageType`）。
+/// 3. payload 长度 ≤ `max_msg_bytes`（**既有消息大小约束**，非完整 payload validation）。
+///
+/// payload 保持 **OPAQUE**——不解析/不验证共识语义（Vote validity / QC evidence / quorum 归
+/// Node/Consensus）；语义 replay 检测归 Consensus context guards（10-11 §7）。
+pub fn validate_consensus_envelope(
+    vk: &VerifyingKey,
+    envelope: &MessageEnvelope,
+    max_msg_bytes: usize,
+) -> Result<MessageType, NetworkError> {
+    verify_message(vk, envelope)?;
+    match envelope.message_type {
+        MessageType::ConsensusVote | MessageType::ConsensusProposal | MessageType::ConsensusQc => {}
+        other => return Err(NetworkError::InvalidMessageType(other.as_u8())),
+    }
+    if envelope.payload.len() > max_msg_bytes {
+        return Err(NetworkError::InvalidLength {
+            expected: max_msg_bytes,
+            actual: envelope.payload.len(),
+        });
+    }
+    Ok(envelope.message_type)
+}
+
 /// canonical 二进制编码（N-4）：
 /// `version(1B) ‖ type(1B) ‖ payload_len(4B LE) ‖ payload ‖ sender(32B) ‖ signature(64B)`。
 pub fn encode(envelope: &MessageEnvelope) -> Vec<u8> {
@@ -398,4 +426,179 @@ mod tests {
             Err(NetworkError::SenderMismatch)
         );
     }
+
+    #[test]
+    fn validate_consensus_envelope_ok_all_types() {
+        // T1: 3 个 Consensus 类型有效 envelope → Ok(MessageType)。
+        let kp = KeyPair::generate().unwrap();
+        for mt in [
+            MessageType::ConsensusVote,
+            MessageType::ConsensusProposal,
+            MessageType::ConsensusQc,
+        ] {
+            let mut e = env(mt, vec![0x11; 32]);
+            sign_message(kp.signing_key(), &mut e).unwrap();
+            assert_eq!(
+                validate_consensus_envelope(kp.verifying_key(), &e, 64 * 1024),
+                Ok(mt)
+            );
+        }
+    }
+
+    #[test]
+    fn validate_consensus_envelope_rejects_non_consensus_type() {
+        // T2: 非 Consensus discriminator → InvalidMessageType。
+        let kp = KeyPair::generate().unwrap();
+        for mt in [
+            MessageType::Handshake,
+            MessageType::Ping,
+            MessageType::Pong,
+            MessageType::GossipTransaction,
+            MessageType::SyncBlockRequest,
+            MessageType::SyncBlockResponse,
+            MessageType::Status,
+        ] {
+            let mut e = env(mt, vec![1, 2, 3]);
+            sign_message(kp.signing_key(), &mut e).unwrap();
+            assert_eq!(
+                validate_consensus_envelope(kp.verifying_key(), &e, 64 * 1024),
+                Err(NetworkError::InvalidMessageType(mt.as_u8()))
+            );
+        }
+    }
+
+    #[test]
+    fn validate_consensus_envelope_rejects_oversize() {
+        // T3: payload 超既有 size constraint → InvalidLength。
+        let kp = KeyPair::generate().unwrap();
+        let mut e = env(MessageType::ConsensusVote, vec![0u8; 100]);
+        sign_message(kp.signing_key(), &mut e).unwrap();
+        assert_eq!(
+            validate_consensus_envelope(kp.verifying_key(), &e, 64),
+            Err(NetworkError::InvalidLength {
+                expected: 64,
+                actual: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_consensus_envelope_rejects_tampering() {
+        // T4: 篡改 payload/type/version/sender ⇒ 拒（N-4 signature coverage + sender binding）。
+        let kp = KeyPair::generate().unwrap();
+        // payload 篡改
+        let mut e = env(MessageType::ConsensusVote, vec![1, 2, 3]);
+        sign_message(kp.signing_key(), &mut e).unwrap();
+        e.payload[0] ^= 0xff;
+        assert_eq!(
+            validate_consensus_envelope(kp.verifying_key(), &e, 64 * 1024),
+            Err(NetworkError::InvalidSignature)
+        );
+        // type 篡改（ConsensusVote → ConsensusProposal）
+        let mut e2 = env(MessageType::ConsensusVote, vec![1, 2, 3]);
+        sign_message(kp.signing_key(), &mut e2).unwrap();
+        e2.message_type = MessageType::ConsensusProposal;
+        assert_eq!(
+            validate_consensus_envelope(kp.verifying_key(), &e2, 64 * 1024),
+            Err(NetworkError::InvalidSignature)
+        );
+        // version 篡改
+        let mut e3 = env(MessageType::ConsensusQc, vec![1, 2, 3]);
+        sign_message(kp.signing_key(), &mut e3).unwrap();
+        e3.version += 1;
+        assert_eq!(
+            validate_consensus_envelope(kp.verifying_key(), &e3, 64 * 1024),
+            Err(NetworkError::InvalidSignature)
+        );
+        // sender 篡改（身份绑定失败）
+        let mut e4 = env(MessageType::ConsensusProposal, vec![1, 2, 3]);
+        sign_message(kp.signing_key(), &mut e4).unwrap();
+        e4.sender = NodeId::from_bytes([0xee; 32]);
+        assert_eq!(
+            validate_consensus_envelope(kp.verifying_key(), &e4, 64 * 1024),
+            Err(NetworkError::SenderMismatch)
+        );
+    }
+
+    #[test]
+    fn validate_consensus_envelope_payload_opaque() {
+        // T5: 双层签名独立性 Network 侧——opaque payload（伪装 vote/QC 字节）→ Ok。
+        // Network 不解析/不验证共识语义（vote 签名 / QC evidence 归 Node/Consensus）。
+        let kp = KeyPair::generate().unwrap();
+        // 伪装 vote payload（121B canonical + 64B signature 形态）
+        let fake_vote = vec![0x5a; 121 + 64];
+        // 伪装 QC payload（encode_qc 形态：93B header + count*136B）
+        let fake_qc = vec![0x3c; 93 + 136];
+        for (mt, payload) in [
+            (MessageType::ConsensusVote, fake_vote),
+            (MessageType::ConsensusProposal, vec![0x01; 32]),
+            (MessageType::ConsensusQc, fake_qc),
+        ] {
+            let mut e = env(mt, payload);
+            sign_message(kp.signing_key(), &mut e).unwrap();
+            assert_eq!(
+                validate_consensus_envelope(kp.verifying_key(), &e, 64 * 1024),
+                Ok(mt),
+                "Network 不解析/不验证 consensus semantic payload"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_consensus_envelope_zero_size_boundary() {
+        // T6: max_msg_bytes=0 边界：空 payload Ok / 非空 Err。
+        let kp = KeyPair::generate().unwrap();
+        let mut e = env(MessageType::ConsensusVote, vec![]);
+        sign_message(kp.signing_key(), &mut e).unwrap();
+        assert_eq!(
+            validate_consensus_envelope(kp.verifying_key(), &e, 0),
+            Ok(MessageType::ConsensusVote)
+        );
+        let mut e2 = env(MessageType::ConsensusVote, vec![0u8; 1]);
+        sign_message(kp.signing_key(), &mut e2).unwrap();
+        assert_eq!(
+            validate_consensus_envelope(kp.verifying_key(), &e2, 0),
+            Err(NetworkError::InvalidLength {
+                expected: 0,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_consensus_envelope_after_decode_roundtrip() {
+        // T7: canonical envelope bytes roundtrip → validate 一致。
+        let kp = KeyPair::generate().unwrap();
+        for mt in [
+            MessageType::ConsensusVote,
+            MessageType::ConsensusProposal,
+            MessageType::ConsensusQc,
+        ] {
+            let mut e = env(mt, vec![0x77; 48]);
+            sign_message(kp.signing_key(), &mut e).unwrap();
+            let decoded = decode(&encode(&e)).unwrap();
+            assert_eq!(
+                validate_consensus_envelope(kp.verifying_key(), &decoded, 64 * 1024),
+                Ok(mt)
+            );
+        }
+    }
+
+    #[test]
+    fn validate_consensus_envelope_no_replay_tracking() {
+        // T9: replay boundary——Network 无状态，不跟踪语义 replay。
+        // 同一有效 envelope 重复验证 → 均 Ok（语义 replay 检测归 Consensus context guards，10-11 §7）。
+        let kp = KeyPair::generate().unwrap();
+        let mut e = env(MessageType::ConsensusVote, vec![1, 2, 3]);
+        sign_message(kp.signing_key(), &mut e).unwrap();
+        for _ in 0..3 {
+            assert_eq!(
+                validate_consensus_envelope(kp.verifying_key(), &e, 64 * 1024),
+                Ok(MessageType::ConsensusVote)
+            );
+        }
+    }
+
+    // T8（unknown discriminator 解码 0x0B → InvalidMessageType）由既有
+    // `decode_rejects_unknown_type_and_length` 覆盖（decode 层），此处不重复创建。
 }
