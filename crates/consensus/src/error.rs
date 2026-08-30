@@ -15,6 +15,8 @@ pub enum ConsensusError {
     InvalidSignature,
     /// V-5：canonical 编码错误。
     InvalidVoteEncoding,
+    /// ADR-0041 PR-5：ProposalRef canonical 编码错误（长度非 64B）。
+    InvalidProposalEncoding,
     /// V-5：域分离错误。
     InvalidDomain,
     /// V-5：chain_id 不匹配。
@@ -32,6 +34,7 @@ impl fmt::Display for ConsensusError {
             Self::ValidatorIdentityMismatch => write!(f, "validator identity mismatch"),
             Self::InvalidSignature => write!(f, "invalid vote signature"),
             Self::InvalidVoteEncoding => write!(f, "invalid vote encoding"),
+            Self::InvalidProposalEncoding => write!(f, "invalid proposal ref encoding"),
             Self::InvalidDomain => write!(f, "invalid signing domain"),
             Self::InvalidChainId => write!(f, "invalid chain_id"),
             Self::InvalidDagReference => write!(f, "invalid DAG reference"),

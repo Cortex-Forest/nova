@@ -6,6 +6,7 @@
 //! - [`LockedState`]：单 block lock + 兼容规则（B-5；higher justified override 归 10-6）。
 //! - [`RoundTimeoutConfig`]：本地事件（非共识输入；B-3）。
 
+use crate::error::ConsensusError;
 use crate::validator::ValidatorId;
 use crate::vote::{ValidatorVote, VoteType};
 use std::collections::{HashMap, HashSet};
@@ -28,6 +29,31 @@ pub enum RoundStep {
 pub struct ProposalRef {
     pub block_hash: [u8; 32],
     pub proposer: ValidatorId,
+}
+
+/// Canonical wire 编码（ADR-0041 PR-1）：`block_hash(32B) ‖ proposer(32B)` = 64B 定长。
+pub fn encode_proposal_ref(p: &ProposalRef) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(&p.block_hash);
+    out.extend_from_slice(p.proposer.as_bytes());
+    out
+}
+
+/// Decode（ADR-0041 PR-3/PR-4）：长度严格 64B（拒截断/超长/trailing）；
+/// `proposer` = `ValidatorId::from_bytes`；**不做** authority/membership/signature 验证（归 consensus 逻辑）。
+pub fn decode_proposal_ref(bytes: &[u8]) -> Result<ProposalRef, ConsensusError> {
+    const PROPOSAL_REF_LEN: usize = 64;
+    if bytes.len() != PROPOSAL_REF_LEN {
+        return Err(ConsensusError::InvalidProposalEncoding);
+    }
+    let mut block_hash = [0u8; 32];
+    block_hash.copy_from_slice(&bytes[0..32]);
+    let mut pid = [0u8; 32];
+    pid.copy_from_slice(&bytes[32..64]);
+    Ok(ProposalRef {
+        block_hash,
+        proposer: ValidatorId::from_bytes(pid),
+    })
 }
 
 /// 投票权重聚合（按 target 去重；B-2）。
@@ -477,5 +503,70 @@ mod tests {
         let t4 = process_vote(&mut state, &vote(0x01, VoteType::Prevote, 3), 100, quorum);
         assert!(!t4.prevote_quorum);
         assert_eq!(state.prevotes.weight_of(&[0x01; 32]), 200);
+    }
+
+    // ---- 11-7 / ADR-0041：ProposalRef canonical serialization ----
+
+    #[test]
+    fn proposal_ref_roundtrip() {
+        let p = ProposalRef {
+            block_hash: [0x11; 32],
+            proposer: vid(7),
+        };
+        let bytes = encode_proposal_ref(&p);
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(decode_proposal_ref(&bytes), Ok(p));
+    }
+
+    #[test]
+    fn proposal_ref_rejects_bad_length() {
+        let p = ProposalRef {
+            block_hash: [0x11; 32],
+            proposer: vid(7),
+        };
+        let bytes = encode_proposal_ref(&p);
+        // 截断
+        assert_eq!(
+            decode_proposal_ref(&bytes[..63]),
+            Err(ConsensusError::InvalidProposalEncoding)
+        );
+        // 超长 / trailing
+        let mut long = bytes.clone();
+        long.push(0x00);
+        assert_eq!(
+            decode_proposal_ref(&long),
+            Err(ConsensusError::InvalidProposalEncoding)
+        );
+        // 空
+        assert_eq!(
+            decode_proposal_ref(&[]),
+            Err(ConsensusError::InvalidProposalEncoding)
+        );
+    }
+
+    #[test]
+    fn proposal_ref_field_accuracy() {
+        let p = ProposalRef {
+            block_hash: [0xab; 32],
+            proposer: vid(9),
+        };
+        let bytes = encode_proposal_ref(&p);
+        // block_hash = bytes[0..32]
+        assert_eq!(&bytes[0..32], &[0xab; 32]);
+        // proposer = bytes[32..64]（ValidatorId raw）
+        assert_eq!(&bytes[32..64], vid(9).as_bytes());
+        // decode 恢复
+        let d = decode_proposal_ref(&bytes).unwrap();
+        assert_eq!(d.block_hash, [0xab; 32]);
+        assert_eq!(d.proposer, vid(9));
+    }
+
+    #[test]
+    fn proposal_ref_decode_no_authority_check() {
+        // decode 不做 authority/membership 验证（任意 proposer 32B 接受；归 consensus 逻辑）
+        let mut bytes = [0u8; 64];
+        bytes[32..64].copy_from_slice(&[0xee; 32]);
+        let d = decode_proposal_ref(&bytes).unwrap();
+        assert_eq!(d.proposer, ValidatorId::from_bytes([0xee; 32]));
     }
 }
