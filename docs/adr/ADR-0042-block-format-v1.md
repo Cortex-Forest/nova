@@ -25,9 +25,12 @@
 
 ## 3. Decision（冻结范围）
 
-- 本 ADR 冻结 Block 协议（Header / Body / block_hash / canonical / signature / validation / rejection）。
+- 本 ADR 冻结 Block 协议（Header / Body / **proposer_signature 承载** / block_hash / canonical /
+  signature / validation / rejection / **hash exclusion**）。
 - **本 ADR 一旦 FROZEN**：未经新 ADR / Protocol Review，不得改变：
-  - Block field · field order · encoding · hash coverage · signature coverage · validation semantics。
+  - Block field · field order · encoding · hash coverage · signature coverage · validation semantics
+    · **signature 承载字段 / hash exclusion**。
+- **Option B 已采纳**（signature 承载于 Block，但**不进 block_hash / 不进 canonical hash input**）。
 
 ## 4. BlockHeader（冻结）
 
@@ -45,21 +48,30 @@ pub struct BlockHeader {
 }
 ```
 
-## 5. BlockBody（冻结）
+## 5. BlockBody / Block（冻结）
 
 ```rust
 pub struct BlockBody { pub txs: Vec<TransactionV1> }
+
+pub struct Block {
+    pub header: BlockHeader,
+    pub body: BlockBody,
+    pub proposer_signature: [u8; 64],   // Option B：signature 承载于 Block（∉ block_hash / ∉ canonical hash input）
+}
 ```
 - V0.1 无收据 root（receipts 执行派生，留 future）。
+- `proposer_signature` 是 Block 字段（self-contained：received block ⇒ 可验证）；**非** BlockHeader/BlockBody 字段，**不进入** canonical hash input。
 
 ## 6. BlockHash（冻结）
 
 ```
 block_hash = SHA-256( canonical_block_header(header) ‖ canonical_block_body(body) )
 ```
-- 覆盖 = canonical_header + canonical_body（**不含 signature / 不含 block_hash 自身**）。
+- 覆盖 = canonical_header + canonical_body（**不含 proposer_signature / 不含 block_hash 自身**）。
+- **Hash Exclusion（明确）**：`proposer_signature` 承载于 Block，但**绝不进入** `block_hash` 输入；
+  修改 signature ⇒ block_hash **不变**（ADR-0042 hash coverage 保证）。
 - **BlockHash ≠ Signature Coverage**（signature 覆盖 header 承诺字段，见 §8）；两者独立、无循环依赖：
-  - block_hash 不依赖 signature（header 不含 signature）；
+  - block_hash 不依赖 signature（signature 不在 hash input）；
   - signature 不依赖 block_hash（覆盖 header 字段，不含 block_hash）；
   - state_root 由执行产生（不依赖 block_hash）；执行输入 = txs + 父状态 ⇒ 无循环；
   - finality_reference 指向过去 ⇒ 无循环。
@@ -73,20 +85,22 @@ block_hash = SHA-256( canonical_block_header(header) ‖ canonical_block_body(bo
   ```
   - finality_ref tag：`0x00` = None / `0x01` = Some + 32B（§4 Option）。
 - **Body**：`count(4LE) ‖ [ len(4LE) ‖ canonical_tx ]*`（§2 长度前缀）。
-- **Block** = canonical_header ‖ canonical_body。
-- **唯一表示**：定长 header + 严格长度 ⇒ roundtrip `decode(encode(b))==b`（§8）；无 alternate（§7）。
+- **Block wire**（Option B）：`canonical_header ‖ canonical_body ‖ proposer_signature(64B)`。
+- **BlockHash input（明确分离）**：只 `canonical_header ‖ canonical_body`（**不含** proposer_signature）。
+- **唯一表示**：定长 header + 严格长度 + signature 定长 ⇒ roundtrip `decode(encode(b))==b`（§8）；无 alternate（§7）。
 
 ## 8. Signature Coverage（冻结）
 
-- **proposer signature** = Ed25519（`verify_strict`），覆盖 **header 承诺字段**（ADR-0009 §3 顺序）：
+- **proposer_signature**（**承载位置：`Block.proposer_signature`**，Option B）= Ed25519（`verify_strict`），
+  覆盖 **header 承诺字段**（ADR-0009 §3 顺序）：
   ```
   version ‖ chain_id ‖ height ‖ parent_hash ‖ finality_reference
   ‖ transaction_root ‖ state_root ‖ validator_set_hash ‖ timestamp
   ```
-- **不签**：block_hash 自身、block body 交易列表（由 transaction_root 承诺）、signature 自身。
+- **不签**：block_hash 自身、block body 交易列表（由 transaction_root 承诺）、proposer_signature 自身。
 - **域分离**：`DomainId::Block = 0x03`（已注册）；`signed_bytes = alg(1) ‖ dom(0x03) ‖ chain_id(8LE) ‖ len(4LE) ‖ canonical_header`；`message_hash = SHA-256(signed_bytes)`。
 - proposer 身份绑定：签名用 proposer 共识公钥（从 validator set 按 `ValidatorId` 查）；`ValidatorId = SHA-256(pubkey)`（与 vote V-5 模式一致）。
-- **A11 边界**：本 ADR 只冻结 serialization/signature；**不新增 proposer authority 语义**（A11 保持 DEFERRED）。
+- **Authority Boundary（明确）**：验证 `proposer_signature` 只证明 `signature valid for proposer identity`；**不证明** proposer ∈ validator set / proposer 具 authority / proposer 当前 eligible。**A11 保持 DEFERRED**。
 
 ## 9. Validation Rules（冻结）
 
@@ -145,3 +159,4 @@ block_hash = SHA-256( canonical_block_header(header) ‖ canonical_block_body(bo
 |---|---|---|
 | 2026-08-31 | 初稿：ADR-0042 Block Format V1（单父 V0.1；Header/Body/block_hash/canonical/signature/validation/rejection + 冻结约束） | 用户授权创建 P7-1 Block Format ADR（仅写 ADR，不实现） |
 | 2026-08-31 | **FROZEN（ACCEPTED）**：P7-1 ADR Independent Review 10 项全 PASS（BlockHeader 顺序 / 单父 / BlockHash / Canonical / Signature / Validation Order / Commitment / Authority / Layer / Freeze Readiness）；Protocol Defect NO / Security Defect NO / 0 findings。冻结约束生效：未经新 ADR / Protocol Review 不得改变 field/order/encoding/hash coverage/signature coverage/validation semantics | 用户授权 P7-1 ADR Independent Review → PASS → ADR-0042 FROZEN（独立 documentation commit） |
+| 2026-08-31 | **AMENDMENT（Option B）**：P7-2 Signature Representation Protocol Review（10 项）——Option A FAIL（非 self-contained）/ **Option B PASS**（Block = Header + Body + `proposer_signature`；∉ block_hash / ∉ canonical hash input）。冻结：`Block.proposer_signature` 承载字段、Block wire = header‖body‖signature(64B)、**hash exclusion**（signature 改不影响 block_hash）、Authority Boundary（verify 只证明 signature valid for proposer identity，不证明 membership/authority/eligibility；A11 DEFERRED）。**不修改代码** | 用户裁决采纳 Option B → ADR-0042 Amendment（仅文档） |
