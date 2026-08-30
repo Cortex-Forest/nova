@@ -1,8 +1,10 @@
 //! P2P 消息信封（STEP 9-2 — ADR-0032 N-4）。
 //!
 //! - **签名覆盖** `version ‖ message_type ‖ payload`（**不覆盖 sender**——sender 由验证 key 决定，N-4）。
-//! - `MessageType` V0.1 七类：`Handshake` / `Ping` / `Pong` / `GossipTransaction` /
-//!   `SyncBlockRequest` / `SyncBlockResponse` / `Status`。
+//! - `MessageType` V0.1 十类：`Handshake` / `Ping` / `Pong` / `GossipTransaction` /
+//!   `SyncBlockRequest` / `SyncBlockResponse` / `Status`（7 类，STEP 9-2）+ `ConsensusVote` /
+//!   `ConsensusProposal` / `ConsensusQc`（3 类 Consensus wire discriminator，STEP 11-2；
+//!   payload opaque，Network 不解析共识语义，不依赖 consensus crate；注册值 ≠ 协议语义）。
 //! - 序列化 canonical binary；签名经 `hash_signing_message`（SHA-256）——**独立于链上
 //!   Transaction/Vote/Block domain**（N-4；不新增 DomainId）。
 
@@ -31,6 +33,12 @@ pub enum MessageType {
     SyncBlockResponse = 0x06,
     /// 状态广播（高度 / root 摘要）。
     Status = 0x07,
+    /// 共识投票 wire discriminator（STEP 11-2；payload opaque；仅 wire 注册值，≠ 协议语义）。
+    ConsensusVote = 0x08,
+    /// 共识提案 wire discriminator（STEP 11-2；payload opaque；ProposalRef encoding 本 STEP 不定义）。
+    ConsensusProposal = 0x09,
+    /// 共识 QC wire discriminator（STEP 11-2；payload opaque；不代表存在可消费的 ingestion path）。
+    ConsensusQc = 0x0A,
 }
 
 impl MessageType {
@@ -52,6 +60,9 @@ impl TryFrom<u8> for MessageType {
             0x05 => Ok(Self::SyncBlockRequest),
             0x06 => Ok(Self::SyncBlockResponse),
             0x07 => Ok(Self::Status),
+            0x08 => Ok(Self::ConsensusVote),
+            0x09 => Ok(Self::ConsensusProposal),
+            0x0a => Ok(Self::ConsensusQc),
             _ => Err(NetworkError::InvalidMessageType(v)),
         }
     }
@@ -266,6 +277,9 @@ mod tests {
             MessageType::SyncBlockRequest,
             MessageType::SyncBlockResponse,
             MessageType::Status,
+            MessageType::ConsensusVote,
+            MessageType::ConsensusProposal,
+            MessageType::ConsensusQc,
         ] {
             let mut e = env(mt, vec![0xab; 17]);
             sign_message(kp.signing_key(), &mut e).unwrap();
@@ -276,16 +290,112 @@ mod tests {
 
     #[test]
     fn decode_rejects_unknown_type_and_length() {
-        // 未知 type
-        let mut bad = vec![1u8, 0x08]; // type 0x08 未定义
+        // 未知 type（0x08~0x0A 已定义；0x0B 未知）
+        let mut bad = vec![1u8, 0x0B];
         bad.extend_from_slice(&0u32.to_le_bytes());
         bad.extend_from_slice(&[0u8; 32 + 64]);
-        assert_eq!(decode(&bad), Err(NetworkError::InvalidMessageType(0x08)));
+        assert_eq!(decode(&bad), Err(NetworkError::InvalidMessageType(0x0B)));
         // 长度不符
         let short = vec![1u8, 0x01, 0, 0, 0, 0, 0]; // 太短
         assert!(matches!(
             decode(&short),
             Err(NetworkError::InvalidLength { .. })
         ));
+    }
+
+    #[test]
+    fn consensus_wire_type_byte_values() {
+        // T6: 字节值断言 + TryFrom 双向。
+        assert_eq!(MessageType::ConsensusVote.as_u8(), 0x08);
+        assert_eq!(MessageType::ConsensusProposal.as_u8(), 0x09);
+        assert_eq!(MessageType::ConsensusQc.as_u8(), 0x0a);
+        assert_eq!(MessageType::try_from(0x08), Ok(MessageType::ConsensusVote));
+        assert_eq!(
+            MessageType::try_from(0x09),
+            Ok(MessageType::ConsensusProposal)
+        );
+        assert_eq!(MessageType::try_from(0x0a), Ok(MessageType::ConsensusQc));
+    }
+
+    #[test]
+    fn consensus_wire_payload_opaque_roundtrip() {
+        // T2/T7: 3 个 Consensus 类型 payload 在既有 size constraints 内对任意字节内容
+        // opaque、无损 roundtrip；Network 不因 payload 内容而拒（语义中性）。
+        let kp = KeyPair::generate().unwrap();
+        let payloads: &[Vec<u8>] = &[
+            vec![],
+            vec![0x00],
+            vec![0xff; 64],
+            (0..=255u8).collect(),
+            vec![0xab; 1024],
+        ];
+        for mt in [
+            MessageType::ConsensusVote,
+            MessageType::ConsensusProposal,
+            MessageType::ConsensusQc,
+        ] {
+            for p in payloads {
+                let mut e = env(mt, p.clone());
+                sign_message(kp.signing_key(), &mut e).unwrap();
+                assert_eq!(
+                    decode(&encode(&e)).unwrap(),
+                    e,
+                    "consensus wire payload opaque roundtrip"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn consensus_wire_sign_verify_ok() {
+        // T3: 3 个 Consensus 类型信封签名有效。
+        let kp = KeyPair::generate().unwrap();
+        for mt in [
+            MessageType::ConsensusVote,
+            MessageType::ConsensusProposal,
+            MessageType::ConsensusQc,
+        ] {
+            let mut e = env(mt, vec![0x42; 16]);
+            sign_message(kp.signing_key(), &mut e).unwrap();
+            assert_eq!(verify_message(kp.verifying_key(), &e), Ok(()));
+        }
+    }
+
+    #[test]
+    fn consensus_wire_tamper_rejected() {
+        // T4: 对 Consensus 类型信封篡改 payload/type/version/sender ⇒ 验证拒绝（N-4）。
+        let kp = KeyPair::generate().unwrap();
+        // payload 篡改
+        let mut e = env(MessageType::ConsensusVote, vec![1, 2, 3]);
+        sign_message(kp.signing_key(), &mut e).unwrap();
+        e.payload[0] ^= 0xff;
+        assert_eq!(
+            verify_message(kp.verifying_key(), &e),
+            Err(NetworkError::InvalidSignature)
+        );
+        // type 篡改（ConsensusVote → ConsensusProposal）
+        let mut e2 = env(MessageType::ConsensusVote, vec![1, 2, 3]);
+        sign_message(kp.signing_key(), &mut e2).unwrap();
+        e2.message_type = MessageType::ConsensusProposal;
+        assert_eq!(
+            verify_message(kp.verifying_key(), &e2),
+            Err(NetworkError::InvalidSignature)
+        );
+        // version 篡改
+        let mut e3 = env(MessageType::ConsensusQc, vec![1, 2, 3]);
+        sign_message(kp.signing_key(), &mut e3).unwrap();
+        e3.version += 1;
+        assert_eq!(
+            verify_message(kp.verifying_key(), &e3),
+            Err(NetworkError::InvalidSignature)
+        );
+        // sender 篡改（身份绑定失败）
+        let mut e4 = env(MessageType::ConsensusProposal, vec![1, 2, 3]);
+        sign_message(kp.signing_key(), &mut e4).unwrap();
+        e4.sender = NodeId::from_bytes([0xee; 32]);
+        assert_eq!(
+            verify_message(kp.verifying_key(), &e4),
+            Err(NetworkError::SenderMismatch)
+        );
     }
 }
