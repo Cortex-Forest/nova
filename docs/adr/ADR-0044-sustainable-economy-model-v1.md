@@ -807,6 +807,54 @@ OD7  Reward Budget 与 total_supply cap 的衔接（Accounting Identity 框架�
 - "Validators share the contributor reward pool"
 - "Rewards are newly minted"
 
+## Owner Decision Integration — STEP 6-E
+
+> 以下为 **STEP 6-E Owner Decision Gate 的决策状态映射**（记录当前分类）；**不代表这些项目已经冻结**。
+
+| Item | Decision State |
+|---|---|
+| Funding Source | **BLOCKED** |
+| Reward Amount | **NOT DEFINED** |
+| Economic Epoch | **OPEN** |
+| D2 Epoch Decay | **CANDIDATE** |
+| D4 Rolling Window | **CANDIDATE** |
+| MaxScore | **OPEN / CANDIDATE** |
+| Diminishing | **OPEN / CANDIDATE** |
+| Identity Cap | **OPEN** |
+| Contribution Cap | **OPEN** |
+| Domain Cap | **OPEN** |
+| Epoch Cap | **OPEN** |
+| Reward-Share Cap | **OPEN** |
+| Cap Ordering | **OPEN** |
+| Decay Parameters | **OPEN** |
+| Rounding Precision | **OPEN** |
+| Late Finalization | **OPEN** |
+| Reversal | **OPEN** |
+| Already-Paid Handling | **OPEN** |
+| Σweight = 0 | **OPEN** |
+| Remainder Destination | **OPEN** |
+| Budget Exhaustion | **OPEN** |
+| Rate Limit | **OPEN** |
+| Citation Parameters | **OPEN** |
+
+## Decision Boundary（STEP 6-E）
+
+```
+Owner Decision Integration does not constitute protocol finalization.
+
+No economic parameter is frozen by STEP 6-E unless explicitly designated as FROZEN
+by a later Owner Decision Gate.
+
+Funding remains BLOCKED.
+Reward Amount remains NOT DEFINED.
+Economic Epoch remains OPEN.
+Late Finalization remains OPEN.
+Zero-Weight handling remains OPEN.
+Remainder Destination remains OPEN.
+Budget Exhaustion remains OPEN.
+Cap Ordering remains OPEN.
+```
+
 ## References
 
 - ADR-0043（PoC，FROZEN）· ADR-0005（DomainId）· ADR-0021（nonce）· ADR-0022（gas/fee/cap）·
@@ -824,3 +872,4 @@ OD7  Reward Budget 与 total_supply cap 的衔接（Accounting Identity 框架�
 | 2026-08-31 | **STEP 6-B Score/Weight 架构落地（OWNER DECISION GATE 已批准）**：Decision A Score Architecture = W2 + W4 + W5（Layer 1；W1/W3 未采用）；Decision B Model R1（Score → Distribution，NOT Budget Expansion；与 EBI-7 对齐）；Decision C Score → Weight → Reward Pipeline（architectural equation，非冻结公式）；Decision D Deterministic Math（integer/fixed-point + checked + canonical rounding；禁浮点/oracle/主观）；Decision E Decay = D2/D4 候选（不冻结）；Decision F Anti-Concentration 架构边界（≠ Reward Budget）；Decision G 全部参数 OPEN；Score Components（protocol-verifiable vs subjective/FUTURE）；Score Architecture Boundary（Score = distribution signal，非 issuance）；Cross-Epoch Boundary（contribution_id unique / finalized immutable / 禁重复 allocation；late-finalization OPEN）。**Status 保持 DRAFT（非 FROZEN）** | 项目所有者批准 PHASE 2 STEP 6-B（Score Formula / Weight Architecture — OWNER DECISION GATE；DESIGN / ADR INTEGRATION ONLY / NO CODE） |
 | 2026-08-31 | **STEP 6-C Decay / Concentration / Sybil-Resistance 架构落地（OWNER DECISION GATE 已批准）**：D2/D4 decay 候选（均不冻结；deterministic replay REQUIRED；record/certificate IMMUTABLE；decay 只影响评估层）；Concentration Control 架构（anti-concentration ≠ Reward Budget；per-identity/domain/epoch/contribution/reward-share/MaxScore 候选层；数值 OPEN）；Cap Ordering（consensus-critical；canonical ordering = REQUIRED；具体顺序 OPEN）；Sybil-Resistance 架构（identity/contribution-level diminishing 等 = DESIGN DEFENSE）；Sybil/Spam Boundary（L1-verifiable vs 主观/oracle/off-chain = FUTURE）；Candidate Canonical Transformation Pipeline（非 Frozen）；Cross-Epoch 边界（record 不可变；late-finalization/reversal/already-paid/decay start = OPEN）；Zero-Weight/Empty Epoch 边界（Σweight=0 经济处理 OPEN；禁止发明 remainder 去向）；Cap Remainder 边界（handling OPEN）；Deterministic Edge Conditions（架构要求）；Security Matrix（17 项，DESIGN DEFENSE）；Parameter Boundary（全部 OPEN）。**无经济参数冻结；Funding 保持 UNDEFINED/BLOCKED；ADR 保持 DRAFT** | 项目所有者批准 PHASE 2 STEP 6-C（Decay / Concentration / Sybil-Resistance Architecture — OWNER DECISION GATE；DESIGN / ADR INTEGRATION ONLY / NO CODE） |
 | 2026-08-31 | **STEP 6-D Integration — Economic Parameter / Funding / Finalization boundaries**。integrated Economic Parameter / Funding / Finalization boundaries：Economic Epoch（REQUIRED concept；length/mapping OPEN）；Late-Finalization Boundary（rule OPEN；reversal / already-paid / post-finalization invalidation OPEN；禁止 clawback/burn/redistribution 等）；Zero-Weight Epoch（Σweight=0 handling OPEN；禁止指定资金去向）；Remainder Handling（destination OPEN；canonical rounding APPROVED vs precision OPEN）；Budget Exhaustion（budget = independent ceiling；exhaustion/truncation/scaling OPEN；禁止 pro-rata/carry-forward 等）；Economic Parameter Boundary（全部 OPEN；仅 symbolic）；Decay Status（D2/D4 CANDIDATE；不选最终机制）；Concentration/Sybil Boundary（Anti-Concentration APPROVED AS EXISTENCE；机制/数值 OPEN）；Canonical Transformation Order（canonical ordering REQUIRED；具体顺序 OPEN）；Deterministic Math（保持已批准架构）；Security Status（DESIGN DEFENSE）。**Funding and Reward Amount remain undefined/blocked; economic parameters remain open; late-finalization, zero-weight, remainder, budget-exhaustion, and cap-ordering rules remain open. No numeric economic parameters were frozen. No funding source was selected. No code or protocol-state changes were made. ADR 保持 DRAFT** | 项目所有者批准 PHASE 2 STEP 6-D（Economic Parameter / Funding / Finalization Decision Gate — DESIGN / ADR INTEGRATION ONLY / NO CODE） |
+| 2026-08-31 | **STEP 6-E — Owner Decision Integration**：Owner Decision Gate integrated into ADR-0044（新增 Owner Decision Integration 23 项决策状态映射 + Decision Boundary）。**No code changes. No funding source selected. No reward amount defined. No economic parameter frozen. No finalization rule frozen. No zero-weight destination selected. No remainder destination selected. No ADR-0045 created. ADR 保持 DRAFT** | 项目所有者批准 PHASE 2 STEP 6-E（Economic Simulation / Parameter Sensitivity — OWNER DECISION GATE → INTEGRATION；DESIGN / ADR INTEGRATION ONLY / NO CODE） |
