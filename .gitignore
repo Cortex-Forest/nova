@@ -50,3 +50,7 @@ Thumbs.db
 logs/
 # --- Nova Web (independent repo, do not track) ---
 nova-web/
+
+# --- Python 缓存（simulation 本地研究产物，NON-PROTOCOL） ---
+__pycache__/
+*.pyc
