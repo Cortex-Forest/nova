@@ -157,7 +157,8 @@ mod tests {
     use nova_crypto::key::KeyPair;
     use nova_crypto::signature::sign_message_hash;
     use nova_crypto::transaction::{TransactionType, sign_transaction};
-    use nova_storage::memory::MemoryBackend;
+    use nova_storage::memory::{MemoryBackend, MemorySnapshot};
+    use nova_storage::node::TrieKey;
 
     fn addr(key_hash: [u8; 32]) -> NovaAddress {
         NovaAddress::from_payload(NovaAddressPayload {
@@ -422,5 +423,98 @@ mod tests {
                 BlockCodecError::InvalidLength { .. }
             ))
         ));
+    }
+
+    /// TASK 1: execute_block 失败（重复 sender+nonce）⇒ Execution 类别，底层 BlockError 保留，
+    /// 不吞不 generic；不进入 commit（execute_and_verify_state_root 直接 Err）。
+    #[test]
+    fn pipeline_execution_failure_preserves_block_error() {
+        let chain_id = 1001;
+        let max_gas = 1_000_000;
+        let parent = ParentContext {
+            parent_height: 0,
+            parent_hash: [0xaa; 32],
+        };
+        let (store, mut block, keys, ctx, _kp) = make_valid_block(chain_id, 1, &parent, max_gas);
+
+        // 复制 tx → 同 sender 同 nonce → validate_block 返回 NonceConflict
+        let dup_tx = block.body.txs[0].clone();
+        block.body.txs.push(dup_tx);
+        let dup_keys = vec![keys[0], keys[0]];
+
+        let err =
+            execute_and_verify_state_root(&store, &block, &dup_keys, &ctx, max_gas).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockPipelineError::Execution(BlockError::NonceConflict)
+        ));
+        // 底层错误保留（Display 含具体信息，非 generic）
+        assert!(err.to_string().contains("nonce"));
+    }
+
+    /// TASK 2: apply_block 失败（backend put 注入失败）⇒ Storage 类别；
+    /// 原子回滚（state root 不变，无部分提交）；commit 未完成（返回 Err）。
+    #[derive(Clone)]
+    struct FailingBackend {
+        inner: MemoryBackend,
+    }
+
+    impl StorageBackend for FailingBackend {
+        type Snapshot = MemorySnapshot;
+
+        fn get(&self, key: &TrieKey) -> Option<Vec<u8>> {
+            self.inner.get(key)
+        }
+
+        fn put(&mut self, _key: TrieKey, _value: Vec<u8>) -> Result<(), StorageError> {
+            Err(StorageError::BackendFailure)
+        }
+
+        fn delete(&mut self, key: &TrieKey) -> Result<(), StorageError> {
+            self.inner.delete(key)
+        }
+
+        fn snapshot(&self) -> Self::Snapshot {
+            self.inner.snapshot()
+        }
+
+        fn restore(&mut self, snap: &Self::Snapshot) {
+            self.inner.restore(snap);
+        }
+
+        fn flush(&mut self) -> Result<(), StorageError> {
+            self.inner.flush()
+        }
+
+        fn entries(&self) -> Vec<(TrieKey, Vec<u8>)> {
+            self.inner.entries()
+        }
+    }
+
+    #[test]
+    fn pipeline_storage_failure_atomic_rollback() {
+        let chain_id = 1001;
+        let max_gas = 1_000_000;
+        let parent = ParentContext {
+            parent_height: 0,
+            parent_hash: [0xaa; 32],
+        };
+        let (store, block, keys, ctx, _kp) = make_valid_block(chain_id, 1, &parent, max_gas);
+
+        // ④ 正常执行 + state_root 验证（MemoryBackend）
+        let ber = execute_and_verify_state_root(&store, &block, &keys, &ctx, max_gas).unwrap();
+
+        // ⑥ 提交到 FailingBackend（put 注入失败）→ Storage 错误 + 原子回滚
+        let mut fstore = StateStore::new(FailingBackend {
+            inner: MemoryBackend::new(),
+        });
+        let root_before = fstore.state_root();
+        let err = commit_block(&mut fstore, &ber).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockPipelineError::Storage(StorageError::BackendFailure)
+        ));
+        // 原子回滚：无部分提交（root 不变）
+        assert_eq!(fstore.state_root(), root_before);
     }
 }
