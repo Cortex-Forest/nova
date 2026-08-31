@@ -1,0 +1,13 @@
+{
+  "simulation_version": "0.4-step6q",
+  "python_version": "3.14.6",
+  "execution_timestamp": "2026-08-31 (provenance only; NOT a model variable)",
+  "classification": "DESIGN / TOY / NON-PROTOCOL",
+  "goal": "close structural unknowns blocking ADR-0045 Freeze Design",
+  "experiments": ["Q1_group_key", "Q2_cross_domain_epoch", "Q3_contribution_variant",
+                  "Q4_cap_ordering", "Q5_economic_epoch", "Q6_d2d4_adversarial",
+                  "Q7_late_finalization_reversal", "Q8_remainder_budget", "Q9_rounding", "Q10_citation"],
+  "deterministic_ordering_rule": "canonical sort by (group, ident, domain, epoch, cid)",
+  "seed": "explicit seeds in shuffle tests only; no unseeded randomness",
+  "note": "TOY result != protocol proof; simulation pass != security proof; AI recommendation != Owner decision."
+}

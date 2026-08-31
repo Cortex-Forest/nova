@@ -1,0 +1,424 @@
+{
+  "Q1_group_key": {
+    "G1": {
+      "Derivable": "YES (from crypto key)",
+      "Canonical": "YES (key)",
+      "Serializable": "DESIGN ANALYSIS",
+      "Reconstructible": "DESIGN ANALYSIS",
+      "Verifiable": "DESIGN ANALYSIS",
+      "Deterministic": "DESIGN ANALYSIS",
+      "Replay-safe": "DESIGN ANALYSIS",
+      "Cross-domain stable": "DESIGN ANALYSIS",
+      "Cross-epoch stable": "DESIGN ANALYSIS",
+      "Split-resistant": "NO (key-per-attacker)",
+      "State-size acceptable": "DESIGN ANALYSIS"
+    },
+    "G2": {
+      "Derivable": "YES (protocol state)",
+      "Canonical": "CANDIDATE (needs key spec)",
+      "Serializable": "DESIGN ANALYSIS",
+      "Reconstructible": "DESIGN ANALYSIS",
+      "Verifiable": "DESIGN ANALYSIS",
+      "Deterministic": "DESIGN ANALYSIS",
+      "Replay-safe": "DESIGN ANALYSIS",
+      "Cross-domain stable": "DESIGN ANALYSIS",
+      "Cross-epoch stable": "DESIGN ANALYSIS",
+      "Split-resistant": "PARTIAL",
+      "State-size acceptable": "DESIGN ANALYSIS"
+    },
+    "G3": {
+      "Derivable": "YES (provenance set)",
+      "Canonical": "CANDIDATE",
+      "Serializable": "DESIGN ANALYSIS",
+      "Reconstructible": "DESIGN ANALYSIS",
+      "Verifiable": "DESIGN ANALYSIS",
+      "Deterministic": "DESIGN ANALYSIS",
+      "Replay-safe": "DESIGN ANALYSIS",
+      "Cross-domain stable": "DESIGN ANALYSIS",
+      "Cross-epoch stable": "DESIGN ANALYSIS",
+      "Split-resistant": "PARTIAL",
+      "State-size acceptable": "DESIGN ANALYSIS"
+    },
+    "group_split_gain": {
+      "1": 1.0,
+      "2": 2.0,
+      "4": 4.0,
+      "8": 8.0
+    },
+    "note": "multi-group splitting under per-group cap: toy shows linear gain (major risk); real-world identity NOT protocol-verifiable"
+  },
+  "Q2_cross_domain_epoch": {
+    "models": {
+      "A_global": 1.0,
+      "B_domain_scoped": 1.0,
+      "C_epoch_scoped": 1.0,
+      "D_domainxepoch": 1.0
+    },
+    "classification": "INCONCLUSIVE / DESIGN GAP (scoping semantics require Owner decision)"
+  },
+  "Q3_contribution_variant": {
+    "N=1": {
+      "N": 1,
+      "C1": 1.0,
+      "C2": 1.0,
+      "C5": 1.0,
+      "heavy_tail_C1": 1.0
+    },
+    "N=2": {
+      "N": 2,
+      "C1": 1.0,
+      "C2": 1.0,
+      "C5": 1.0,
+      "heavy_tail_C1": 1.0
+    },
+    "N=4": {
+      "N": 4,
+      "C1": 0.952,
+      "C2": 0.952,
+      "C5": 0.952,
+      "heavy_tail_C1": 0.952
+    },
+    "N=8": {
+      "N": 8,
+      "C1": 0.888,
+      "C2": 0.888,
+      "C5": 0.888,
+      "heavy_tail_C1": 0.888
+    },
+    "N=16": {
+      "N": 16,
+      "C1": 0.86,
+      "C2": 0.86,
+      "C5": 0.86,
+      "heavy_tail_C1": 0.86
+    },
+    "N=32": {
+      "N": 32,
+      "C1": 0.845,
+      "C2": 0.845,
+      "C5": 0.845,
+      "heavy_tail_C1": 0.845
+    },
+    "N=64": {
+      "N": 64,
+      "C1": 0.838,
+      "C2": 0.838,
+      "C5": 0.838,
+      "heavy_tail_C1": 0.838
+    },
+    "N=128": {
+      "N": 128,
+      "C1": 0.835,
+      "C2": 0.835,
+      "C5": 0.835,
+      "heavy_tail_C1": 0.42
+    },
+    "artifact_fix": "integer fixed-point units; total>N; each contribution positive integer (no q=0)"
+  },
+  "Q4_cap_ordering": {
+    "non_cap_dominated_pipelines": {
+      "A": {
+        "top1": 0.2058,
+        "total_share": 1.0,
+        "gini": 0.1149
+      },
+      "B": {
+        "top1": 0.2058,
+        "total_share": 1.0,
+        "gini": 0.1149
+      },
+      "C": {
+        "top1": 0.2058,
+        "total_share": 1.0,
+        "gini": 0.1149
+      }
+    },
+    "bypass_gain_by_dim": {
+      "identity": 1.0,
+      "domain": 1.0,
+      "epoch": 1.0,
+      "identity_domain": 1.0,
+      "identity_epoch": 1.0,
+      "domain_epoch": 1.0,
+      "id_dom_ep": 1.0,
+      "all4": 1.0
+    },
+    "order_sensitivity": "A/B/C identical in toy under both pressures; requires finer pipeline model",
+    "classification": "INCONCLUSIVE (pipeline semantics not fully separable in toy)"
+  },
+  "Q5_economic_epoch": {
+    "finalized_E+0": {
+      "eligibility_epoch": "OPEN (candidate: finalized epoch)",
+      "reward_epoch": "OPEN",
+      "decay_start": "OPEN",
+      "cap_epoch": "OPEN",
+      "already_paid": "IDEMPOTENT",
+      "reversal": "IMMUTABLE+SUPERSEDING"
+    },
+    "finalized_E+1": {
+      "eligibility_epoch": "OPEN (candidate: finalized epoch)",
+      "reward_epoch": "OPEN",
+      "decay_start": "OPEN",
+      "cap_epoch": "OPEN",
+      "already_paid": "IDEMPOTENT",
+      "reversal": "IMMUTABLE+SUPERSEDING"
+    },
+    "finalized_E+2": {
+      "eligibility_epoch": "OPEN (candidate: finalized epoch)",
+      "reward_epoch": "OPEN",
+      "decay_start": "OPEN",
+      "cap_epoch": "OPEN",
+      "already_paid": "IDEMPOTENT",
+      "reversal": "IMMUTABLE+SUPERSEDING"
+    },
+    "finalized_E+large": {
+      "eligibility_epoch": "OPEN (candidate: finalized epoch)",
+      "reward_epoch": "OPEN",
+      "decay_start": "OPEN",
+      "cap_epoch": "OPEN",
+      "already_paid": "IDEMPOTENT",
+      "reversal": "IMMUTABLE+SUPERSEDING"
+    },
+    "epoch_identity": "REQUIRED (deterministic accounting abstraction)",
+    "epoch_mapping": "OPEN (NOT block height / wall clock / consensus round / genesis)",
+    "arch_conflict_risk": "ISOLATE Economic Epoch from Consensus/Block epoch concepts"
+  },
+  "Q6_d2d4_adversarial": {
+    "h10": {
+      "D2": {
+        "early": 22,
+        "late": 114,
+        "persistent": 600,
+        "burst": 99,
+        "early_capture_index": 0.193
+      },
+      "D4": {
+        "early": 0,
+        "late": 114,
+        "persistent": 600,
+        "burst": 114,
+        "early_capture_index": 0.0
+      }
+    },
+    "h50": {
+      "D2": {
+        "early": 0,
+        "late": 114,
+        "persistent": 600,
+        "burst": 2,
+        "early_capture_index": 0.0
+      },
+      "D4": {
+        "early": 0,
+        "late": 114,
+        "persistent": 600,
+        "burst": 0,
+        "early_capture_index": 0.0
+      }
+    },
+    "h100": {
+      "D2": {
+        "early": 0,
+        "late": 114,
+        "persistent": 600,
+        "burst": 0,
+        "early_capture_index": 0.0
+      },
+      "D4": {
+        "early": 0,
+        "late": 114,
+        "persistent": 600,
+        "burst": 0,
+        "early_capture_index": 0.0
+      }
+    },
+    "h500": {
+      "D2": {
+        "early": 0,
+        "late": 114,
+        "persistent": 600,
+        "burst": 0,
+        "early_capture_index": 0.0
+      },
+      "D4": {
+        "early": 0,
+        "late": 114,
+        "persistent": 600,
+        "burst": 0,
+        "early_capture_index": 0.0
+      }
+    },
+    "h1000": {
+      "D2": {
+        "early": 0,
+        "late": 114,
+        "persistent": 600,
+        "burst": 0,
+        "early_capture_index": 0.0
+      },
+      "D4": {
+        "early": 0,
+        "late": 114,
+        "persistent": 600,
+        "burst": 0,
+        "early_capture_index": 0.0
+      }
+    },
+    "floor": "OPEN (not invented)"
+  },
+  "Q7_late_finalization_reversal": {
+    "transitions": [
+      {
+        "case": "not_paid_to_finalized",
+        "handling": "OK"
+      },
+      {
+        "case": "paid_to_duplicate_finalized",
+        "handling": "IDEMPOTENT (no duplicate)"
+      },
+      {
+        "case": "paid_to_reversal",
+        "handling": "SUPERSEDING RECORD (immutable original)"
+      },
+      {
+        "case": "paid_to_superseding",
+        "handling": "SUPERSEDED"
+      },
+      {
+        "case": "reversal_then_replay",
+        "handling": "NO REPLAY REWARD"
+      },
+      {
+        "case": "reversal_second",
+        "handling": "SECOND REVERSAL = new superseding record"
+      },
+      {
+        "case": "late_finalization_to_already_paid",
+        "handling": "IDEMPOTENT"
+      },
+      {
+        "case": "late_finalization_to_reversal",
+        "handling": "SUPERSEDING"
+      }
+    ],
+    "invariants": {
+      "idempotent": true,
+      "auditability": true,
+      "negative_reward_prohibited": true,
+      "double_allocation_prevented": true,
+      "supply_conservation": true,
+      "reconstruction": true
+    }
+  },
+  "Q8_remainder_budget": {
+    "long_horizon": {
+      "h10": {
+        "carry_forward_remainder": 5861894040,
+        "overflow_risk": true
+      },
+      "h100": {
+        "carry_forward_remainder": 8999760960,
+        "overflow_risk": true
+      },
+      "h1000": {
+        "carry_forward_remainder": 9000000000,
+        "overflow_risk": true
+      },
+      "h10000": {
+        "carry_forward_remainder": 9000000000,
+        "overflow_risk": true
+      },
+      "zero_weight": {
+        "total_alloc": 0,
+        "remainder": 1000000000,
+        "implicit_reward": false
+      }
+    },
+    "note": "carry-forward accumulation bounded in toy; REQUIRES VALIDATION"
+  },
+  "Q9_rounding": {
+    "below": {
+      "alloc": 50000000,
+      "remainder": 950000000,
+      "determinism": true
+    },
+    "exact": {
+      "alloc": 50000000,
+      "remainder": 950000000,
+      "determinism": true
+    },
+    "above": {
+      "alloc": 50000000,
+      "remainder": 950000000,
+      "determinism": true
+    },
+    "many_recipients": {
+      "alloc": 1000000000,
+      "conservation": true
+    },
+    "permutation_invariant": true,
+    "serialization_invariant": true
+  },
+  "Q10_citation": {
+    "cases": [
+      {
+        "case": "single",
+        "attack_surface": "citation amplification / fake evidence",
+        "verification_dependency": "protocol-verifiable citation relation (L1)",
+        "state_dependency": "citation graph state",
+        "oracle_dependency": "NONE (no off-chain oracle)",
+        "replay_risk": "must be idempotent"
+      },
+      {
+        "case": "duplicate",
+        "attack_surface": "citation amplification / fake evidence",
+        "verification_dependency": "protocol-verifiable citation relation (L1)",
+        "state_dependency": "citation graph state",
+        "oracle_dependency": "NONE (no off-chain oracle)",
+        "replay_risk": "must be idempotent"
+      },
+      {
+        "case": "conflicting",
+        "attack_surface": "citation amplification / fake evidence",
+        "verification_dependency": "protocol-verifiable citation relation (L1)",
+        "state_dependency": "citation graph state",
+        "oracle_dependency": "NONE (no off-chain oracle)",
+        "replay_risk": "must be idempotent"
+      },
+      {
+        "case": "fake",
+        "attack_surface": "citation amplification / fake evidence",
+        "verification_dependency": "protocol-verifiable citation relation (L1)",
+        "state_dependency": "citation graph state",
+        "oracle_dependency": "NONE (no off-chain oracle)",
+        "replay_risk": "must be idempotent"
+      },
+      {
+        "case": "same_evidence_many",
+        "attack_surface": "citation amplification / fake evidence",
+        "verification_dependency": "protocol-verifiable citation relation (L1)",
+        "state_dependency": "citation graph state",
+        "oracle_dependency": "NONE (no off-chain oracle)",
+        "replay_risk": "must be idempotent"
+      },
+      {
+        "case": "chain",
+        "attack_surface": "citation amplification / fake evidence",
+        "verification_dependency": "protocol-verifiable citation relation (L1)",
+        "state_dependency": "citation graph state",
+        "oracle_dependency": "NONE (no off-chain oracle)",
+        "replay_risk": "must be idempotent"
+      },
+      {
+        "case": "cross_domain",
+        "attack_surface": "citation amplification / fake evidence",
+        "verification_dependency": "protocol-verifiable citation relation (L1)",
+        "state_dependency": "citation graph state",
+        "oracle_dependency": "NONE (no off-chain oracle)",
+        "replay_risk": "must be idempotent"
+      }
+    ],
+    "classification": "DESIGN EXPLORATION ONLY; citation model REQUIRES dedicated experiment",
+    "note": "no real-world trusted third party as consensus-critical oracle"
+  }
+}

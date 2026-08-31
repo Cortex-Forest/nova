@@ -1,0 +1,13 @@
+{
+  "simulation_version": "0.3-validation",
+  "python_version": "3.14.6",
+  "execution_timestamp": "2026-08-31 (provenance only; NOT a model variable)",
+  "classification": "TOY MODEL / NON-PROTOCOL / EXPLORATORY",
+  "owner_direction_input": "PHASE 2 STEP 6-M (treated as INPUT, not new decision)",
+  "experiments": ["X1", "X2", "X3", "X4", "X5", "X6", "X7", "X8"],
+  "determinism_tests": ["D1", "D2", "D3", "D4"],
+  "invariant_checks": ["ES1", "ES2", "ES3", "ES4", "ES5", "ES6", "ES7", "ES8", "ES9", "ES10"],
+  "deterministic_ordering_rule": "canonical sort by (group, ident, domain, epoch, cid)",
+  "seed": "explicit seeds (random.Random) in shuffle tests only; no unseeded randomness in computation",
+  "note": "Results are TOY OBSERVATIONS only; they inform but do NOT make Owner decisions; no parameter is frozen."
+}
