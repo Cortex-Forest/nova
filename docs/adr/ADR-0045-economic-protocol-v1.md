@@ -102,6 +102,8 @@ Remainder Redistribution
       （identity 数量 ≠ economic power；防 K-GLID 分裂攻击）
 · Cap Identity Binding（SR-G7）：cap 绑定 verified GLID economic identity
       （cap 不绑定 arbitrary identifier；对真实经济主体生效）
+· Lineage Verification Boundary（MF-1）：lineage 的 L1 可验证性判定规则为实现设计阶段必填
+      （防虚假 lineage 创建 GLID——结构已锁 GCB-B，判定规则在实现设计明确）
 · 暂不包含：最终字节布局 · hash domain 参数 · implementation details
 ```
 
@@ -148,6 +150,11 @@ epoch length · epoch mapping · reward amount · emission rate · cap value(s)
 · rounding precision · rate limit · citation weight
 · GLID serialization 字节布局 / hash domain 参数（后续实现设计阶段）
 —— 全部为 Open Parameters（占位），由 Owner 在参数化阶段裁决
+
+【必填 Open Parameter（数值必须由 Owner 提供，不得由 AI/默认填充）】
+· emission bound        —— 必填（R-C Hybrid Bounded 结构有界承诺依赖其数值）
+· decay floor           —— 必填（D2 floor 机制存在；数值由 Owner 提供）
+· decay duration        —— 必填（D2 duration 机制存在；数值由 Owner 提供）
 ```
 
 ## 10. Compatibility
@@ -157,6 +164,15 @@ epoch length · epoch mapping · reward amount · emission rate · cap value(s)
 · 不新增 Block / Transaction / State 字段（经济状态为评估层派生）
 · 不修改 consensus / block / state / transaction
 · 仅引用已有结构（ADR-0041 canonical serialization · ADR-0022 fee · ADR-0016 accounting · ADR-0014 Genesis）
+```
+
+## 11. Governance Boundary
+
+```
+· 本协议无治理层（经济规则 immutable）
+· 治理能力 = 零：无 mint · 无 reserve · 无参数修改 · 无 GLID 规则修改
+· 任何经济参数变更须经新 ADR（FUTURE ADR / ADR 修订），不得由治理直接修改
+· reward 分配为 rule-based deterministic（无治理 bias）
 ```
 
 ## References
@@ -170,5 +186,6 @@ epoch length · epoch mapping · reward amount · emission rate · cap value(s)
 |---|---|---|
 | 2026-08-31 | 初稿 Draft：基于 STEP 6-R31 Creation Gate READY + 全部 Owner 签署结构（6-R19~R30） | STEP 6-R32（CONTROLLED DESIGN） |
 | 2026-08-31 | **M1 Micro-Fix 整合**：GLID Creation Boundary（SR-G5 = GCB-B Verified Lineage Creation · SR-G6 GLID 数量不增权重 · SR-G7 Cap 绑定 verified GLID identity）纳入 §5/§8 | STEP 6-R36（Micro-Fix Integration Review） |
+| 2026-09-01 | **R44/R45 Revision**：纳入 M2/MF-1/MF-2/MF-G1 —— §5 Lineage Verification Boundary（MF-1）· §9 必填 Open Parameter 标注（M2/MF-2）· 新增 §11 Governance Boundary（MF-G1）· 变更记录更新 | STEP 6-R44（Revision Scope Proposal）+ STEP 6-R45（Revision Write） |
 
 **Status 保持 DRAFT（非 FROZEN）** · 不定义数值参数 · 不修改 consensus/block/state/transaction。
