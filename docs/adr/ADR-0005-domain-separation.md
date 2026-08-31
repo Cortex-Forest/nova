@@ -51,7 +51,18 @@ message_hash = SHA-256(signed_bytes)
 | `0x03` | Block | 区块承诺签名（ADR-0009 §3） |
 | `0x04` | Governance | 治理提案/投票（ADR-0009 §4） |
 | `0x05` | Address | 地址派生（key_hash 计算，ADR-0004） |
-| `0x00` / `0x06+` | — | **Reserved / 未注册 ⇒ 必须拒绝** |
+| `0x06` | Witness | Witness availability proof（ADR-0036 W-5；FROZEN） |
+| `0x07` | Contribution | Proof of Contribution / Contribution protocol domain（ADR-0043，FROZEN） |
+| `0x00` / `0x08+` | — | **Reserved / 未注册 ⇒ 必须拒绝** |
+
+> **Registry 同步说明（PHASE 1.5 STEP 4）**：
+> - `0x06` Witness 由 ADR-0036（FROZEN）分配（W-5）。
+> - `0x07` Contribution 由 ADR-0043（FROZEN）分配：`DomainId::Contribution = 0x07`，
+>   Purpose = Proof of Contribution / Contribution protocol domain。
+> - `0x08+` 保留给未来协议域（不得分配 0x08 / 0x09 等）。
+> - 本同步仅登记**已冻结协议事实**；不改变任何签名/域分离语义（canonical signing structure /
+>   algorithm binding / chain_id binding / length encoding / payload handling / message hash
+>   构造均保持 ADR-0005 原文不变）。
 
 **约束**：
 - 每个域都必须绑定 `chain_id`（ADR-0010/0011；防跨链重放，Master Prompt §10）。
@@ -83,3 +94,11 @@ message_hash = SHA-256(signed_bytes)
 - 定长 `u8` domain_id 消除长度歧义（与 SHA-256 的 Merkle-Damgård 结构配合时尤为重要）。
 - `algorithm_id` 进入 signed bytes ⇒ 防 algorithm confusion（T16）。
 - 禁止把 domain_id 拼进用户可控 payload（防止域注入）。
+
+---
+
+## 变更记录
+
+| 日期 | 变更 | 依据 |
+|---|---|---|
+| 2026-08-31 | **PHASE 1.5 STEP 4 — Domain Registry Synchronization**：Registry 同步 `0x06` Witness（ADR-0036，FROZEN）与 `0x07` Contribution（ADR-0043，FROZEN）；`0x08+` 保持 Reserved；与已冻结 ADR-0043（`DomainId::Contribution = 0x07`）一致。**未改变** canonical signing structure / algorithm binding / chain_id binding / length encoding / payload handling / message hash construction；未改 consensus / economics；**未实现代码**（协议文档同步） | 项目所有者授权 ADR-0005 Registry Synchronization（DOCUMENT SYNCHRONIZATION ONLY） |
