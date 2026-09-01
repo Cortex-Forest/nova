@@ -149,6 +149,7 @@ mod tests {
     use nova_core::block::{
         BLOCK_VERSION, BlockBody, BlockHeader, compute_transaction_root, encode_block_header,
     };
+    use nova_core::transaction::gas_fee::TRANSFER_INTRINSIC_GAS;
     use nova_crypto::address::{
         ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
     };
@@ -450,6 +451,128 @@ mod tests {
         ));
         // 底层错误保留（Display 含具体信息，非 generic）
         assert!(err.to_string().contains("nonce"));
+    }
+
+    /// STEP 7-A (TASK 3): execute_block 失败（累计 gas 超 max_gas_per_block）⇒ Execution 类别，
+    /// 底层 BlockError 保留，不吞不 generic；不进入 commit（execute_and_verify_state_root 直接 Err）；
+    /// ②③ 先过（签名 + tx root 合法），失败纯粹来自 ④ gas 预算。
+    ///
+    /// 触发路径：`execute_block` → `validate_block` 预检 `n × TRANSFER_INTRINSIC_GAS > max_gas`
+    /// ⇒ `Err(BlockError::GasLimitExceeded)`（在逐 tx apply 之前，零状态副作用）。
+    #[test]
+    fn pipeline_gas_limit_failure_preserves_block_error() {
+        let chain_id = 1001;
+        // 每 tx intrinsic gas = 21_000；预算只够 2 个 tx，3-tx body 必然超限
+        let max_gas = TRANSFER_INTRINSIC_GAS * 2;
+        let (store, block, keys, ctx, proposer_vk) = make_gas_exceeding_block(chain_id, max_gas);
+
+        // ②③ 先过（签名 + tx root 合法）⇒ 失败纯粹来自 ④ gas 预算
+        assert!(validate_block_signature(&block, &proposer_vk, chain_id).is_ok());
+        assert!(validate_transaction_root(&block).is_ok());
+
+        let root_before = store.state_root();
+        let err = execute_and_verify_state_root(&store, &block, &keys, &ctx, max_gas).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockPipelineError::Execution(BlockError::GasLimitExceeded)
+        ));
+        // 底层错误保留（Display 含具体信息，非 generic）
+        assert!(err.to_string().contains("gas"));
+        // commit 未执行：execute_and_verify_state_root 直接 Err，无 result 可提交；
+        // state 未变化（execute 纯计算，未落盘）
+        assert_eq!(store.state_root(), root_before);
+    }
+
+    /// STEP 7-A helper：构造一个 gas 超限但结构合法的 Block。
+    ///
+    /// - N = 3 个**不同 sender** 的 tx（各 nonce 0，sender 均注资）→ 不触发 NonceConflict；
+    ///   transaction_root 覆盖完整 N-tx body（③ 通过）。
+    /// - state_root 由执行前 K = N-1 个 tx 计算（K×gas ≤ max_gas，根是"合法"的）；
+    ///   但完整 N-tx body 累计 gas 超 `max_gas` ⇒ ④ `validate_block` 预检触发
+    ///   `GasLimitExceeded`（逐 tx apply 之前，零副作用）。
+    fn make_gas_exceeding_block(
+        chain_id: u64,
+        max_gas: u64,
+    ) -> (
+        StateStore<MemoryBackend>,
+        Block,
+        Vec<VerifyingKey>,
+        ExecutionContext,
+        VerifyingKey,
+    ) {
+        let n_txs = 3usize;
+        let ctx = ctx(chain_id);
+        let mut store = StateStore::new(MemoryBackend::new());
+        let mut kps = Vec::with_capacity(n_txs);
+        let mut txs = Vec::with_capacity(n_txs);
+        let mut keys = Vec::with_capacity(n_txs);
+
+        for _ in 0..n_txs {
+            let kp = KeyPair::generate().unwrap();
+            let sender = NovaAddress::from_verifying_key(
+                kp.verifying_key(),
+                AddressType::UserAccount,
+                NetworkId::Mainnet,
+            )
+            .unwrap();
+            store
+                .apply(&[AccountChange {
+                    address: sender,
+                    new_balance: 1_000_000,
+                    new_nonce: 0,
+                    created: true,
+                }])
+                .unwrap();
+            let mut tx = nova_crypto::transaction::TransactionV1 {
+                version: 1,
+                chain_id,
+                nonce: 0,
+                sender,
+                receiver: addr([0xbb; 32]),
+                amount: 100,
+                gas_limit: 100_000,
+                gas_price: 1,
+                transaction_type: TransactionType::Transfer,
+                payload: vec![0u8; 140],
+                expiration: 0,
+                signature: [0u8; 64],
+            };
+            sign_transaction(kp.signing_key(), &mut tx).unwrap();
+            txs.push(tx);
+            keys.push(*kp.verifying_key());
+            kps.push(kp);
+        }
+
+        let body = BlockBody { txs };
+        let tx_root = compute_transaction_root(&body);
+
+        // 前 K = N-1 个 tx 的 gas 在预算内 ⇒ 以其执行结果计算 state_root（合法根）
+        let k = n_txs - 1;
+        let ber = execute_block(&store, &body.txs[..k], &keys[..k], &ctx, max_gas).unwrap();
+        let changes: Vec<&[AccountChange]> = ber
+            .tx_transitions
+            .iter()
+            .map(|t| t.changes.as_slice())
+            .collect();
+        let state_root = *calculate_state_root(&store, &changes).unwrap().as_bytes();
+
+        let header = BlockHeader {
+            version: BLOCK_VERSION,
+            chain_id,
+            height: 1,
+            parent_hash: [0xaa; 32],
+            finality_reference: None,
+            transaction_root: tx_root,
+            state_root,
+            validator_set_hash: [0x33; 32],
+            timestamp: 0,
+        };
+        let block = Block {
+            header: header.clone(),
+            body: body.clone(),
+            proposer_signature: block_signature(&header, kps[0].signing_key(), chain_id),
+        };
+        (store, block, keys, ctx, *kps[0].verifying_key())
     }
 
     /// TASK 2: apply_block 失败（backend put 注入失败）⇒ Storage 类别；
