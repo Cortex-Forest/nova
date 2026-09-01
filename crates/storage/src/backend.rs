@@ -37,4 +37,22 @@ pub trait StorageBackend {
     /// 全量枚举当前键值（**state reload** 用；ADR-0031 E-5）。
     /// `StateStore::load` 借此重建 trie（E-6：trie 不落盘，确定性重建）。
     fn entries(&self) -> Vec<(TrieKey, Vec<u8>)>;
+
+    /// 将不透明 metadata 加入下一次 flush 的**同一持久化批次**（STEP 7-J / ADR-0048 OD-7）。
+    ///
+    /// - **不落盘、不 fsync、不创建独立批次**；只缓冲，等待下次 `flush` 与 state changes 同批持久化。
+    /// - 单 head 约束：同一 pending transaction 内重复 enqueue ⇒ `Err`（防覆盖/防 phantom head）。
+    /// - trait 不感知 HeadRecord 语义（backend = 字节存储，E-2）；编码归 `StateStore`。
+    /// - 默认实现：不支持 co-meta 的后端**显式失败**（安全默认，防静默丢 head）。
+    fn enqueue_meta(&mut self, _meta: &[u8]) -> Result<(), StorageError> {
+        Err(StorageError::BackendFailure)
+    }
+
+    /// 读取恢复得到的 head metadata（ADR-0031 E-5 amendment / ADR-0048 recovery）。
+    ///
+    /// `MemoryBackend` = `None`（无持久 head）；`PersistentBackend` = 快照/WAL 重放得到的最后 head。
+    /// 默认 `None`（非持久后端无需实现）。
+    fn recovered_meta(&self) -> Option<Vec<u8>> {
+        None
+    }
 }

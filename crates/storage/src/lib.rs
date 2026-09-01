@@ -23,6 +23,7 @@ pub const DATABASE_VERSION: u32 = 1;
 pub mod backend;
 pub mod error;
 pub mod hashing;
+pub mod head;
 pub mod memory;
 pub mod node;
 pub mod persistent;

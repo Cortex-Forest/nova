@@ -21,10 +21,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// WAL 记录 magic（E-3）。
+/// WAL 记录 magic（E-3；state-only，legacy）。
 const WAL_MAGIC: u8 = 0x01;
-/// 快照文件 magic（E-4）。
+/// WAL 记录 magic（STEP 7-J；state + 可选 head section）。
+const WAL_MAGIC_HEAD: u8 = 0x05;
+/// 快照文件 magic（E-4；state-only，legacy）。
 const SNAPSHOT_MAGIC: u8 = 0x02;
+/// 快照文件 magic（STEP 7-J；state + head）。
+const SNAPSHOT_MAGIC_HEAD: u8 = 0x06;
 
 /// 持久化后端内存快照句柄（rollback 用，非磁盘快照；ADR-0028 D-5）。
 #[derive(Debug, Clone, Default)]
@@ -43,6 +47,10 @@ pub struct PersistentBackend {
     kv: HashMap<TrieKey, Vec<u8>>,
     pending: Vec<(TrieKey, Vec<u8>)>,
     next_batch_id: u64,
+    /// 未 flush 的 head metadata（随下次 flush 与 state 同批持久化；ADR-0048 OD-7）。
+    pending_meta: Option<Vec<u8>>,
+    /// 最后已随批次持久化的 head metadata（recovery / snapshot 用）。
+    committed_meta: Option<Vec<u8>>,
 }
 
 impl PersistentBackend {
@@ -63,6 +71,8 @@ impl PersistentBackend {
             kv: HashMap::new(),
             pending: Vec::new(),
             next_batch_id: 0,
+            pending_meta: None,
+            committed_meta: None,
         })
     }
 
@@ -74,11 +84,14 @@ impl PersistentBackend {
             return Err(StorageError::BackendFailure);
         }
         let mut kv = HashMap::new();
-        // 1. 快照
+        let mut committed_meta = None;
+        // 1. 快照（state + 可选 head）
         let snap_path = path.join("snapshot");
         if snap_path.exists() {
             let bytes = fs::read(&snap_path).map_err(|_| StorageError::BackendFailure)?;
-            kv = decode_snapshot(&bytes)?;
+            let (snap_kv, snap_head) = decode_snapshot(&bytes)?;
+            kv = snap_kv;
+            committed_meta = snap_head;
         }
         // 2. WAL 重放（顺序 = 状态转换顺序；尾部损坏丢弃）
         let wal_path = path.join("wal.log");
@@ -88,13 +101,16 @@ impl PersistentBackend {
             let mut pos = 0usize;
             while pos < bytes.len() {
                 match decode_wal_record(&bytes[pos..]) {
-                    Ok((batch_id, changes, consumed)) => {
+                    Ok((batch_id, changes, head, consumed)) => {
                         for (key, value) in changes {
                             if value.is_empty() {
                                 kv.remove(&key); // delete 原语
                             } else {
                                 kv.insert(key, value);
                             }
+                        }
+                        if let Some(h) = head {
+                            committed_meta = Some(h); // 最后有效 head
                         }
                         next_batch_id = batch_id + 1;
                         pos += consumed;
@@ -108,6 +124,8 @@ impl PersistentBackend {
             kv,
             pending: Vec::new(),
             next_batch_id,
+            pending_meta: None,
+            committed_meta,
         })
     }
 
@@ -121,13 +139,23 @@ impl PersistentBackend {
     pub fn persist_snapshot(&mut self) -> Result<(), StorageError> {
         self.flush()?;
         let tmp = self.dir.join("snapshot.tmp");
+        let has_head = self.committed_meta.is_some();
+        let magic = if has_head {
+            SNAPSHOT_MAGIC_HEAD
+        } else {
+            SNAPSHOT_MAGIC
+        };
         let mut body = Vec::new();
-        body.push(SNAPSHOT_MAGIC);
+        body.push(magic);
         body.extend_from_slice(&(self.kv.len() as u32).to_le_bytes());
         for (k, v) in &self.kv {
             body.extend_from_slice(k);
             body.extend_from_slice(&(v.len() as u32).to_le_bytes());
             body.extend_from_slice(v);
+        }
+        if let Some(h) = &self.committed_meta {
+            body.extend_from_slice(&(h.len() as u32).to_le_bytes());
+            body.extend_from_slice(h);
         }
         let mut out = body.clone();
         out.extend_from_slice(&protocol_hash(&body));
@@ -159,9 +187,19 @@ impl PersistentBackend {
 
 /// WAL 记录编码：`magic ‖ batch_id(8B LE) ‖ count(4B LE) ‖ count×(key35 ‖ vlen(4B LE) ‖ value)
 /// ‖ SHA-256(body)`。`value_len=0` 表示 delete 原语（账户 canonical 88B 永不为空）。
-fn encode_wal_record(batch_id: u64, changes: &[(TrieKey, Vec<u8>)]) -> Vec<u8> {
+fn encode_wal_record(
+    batch_id: u64,
+    changes: &[(TrieKey, Vec<u8>)],
+    head: Option<&[u8]>,
+) -> Vec<u8> {
+    // head 存在 ⇒ 0x05（state + head，同 checksum）；否则 0x01（legacy state-only）。
+    let magic = if head.is_some() {
+        WAL_MAGIC_HEAD
+    } else {
+        WAL_MAGIC
+    };
     let mut body = Vec::new();
-    body.push(WAL_MAGIC);
+    body.push(magic);
     body.extend_from_slice(&batch_id.to_le_bytes());
     body.extend_from_slice(&(changes.len() as u32).to_le_bytes());
     for (k, v) in changes {
@@ -169,22 +207,28 @@ fn encode_wal_record(batch_id: u64, changes: &[(TrieKey, Vec<u8>)]) -> Vec<u8> {
         body.extend_from_slice(&(v.len() as u32).to_le_bytes());
         body.extend_from_slice(v);
     }
+    if let Some(h) = head {
+        body.extend_from_slice(&(h.len() as u32).to_le_bytes());
+        body.extend_from_slice(h);
+    }
     let mut out = body.clone();
     out.extend_from_slice(&protocol_hash(&body));
     out
 }
 
-/// WAL 解码结果：`(batch_id, changes, consumed_bytes)`。
-type WalRecord = (u64, Vec<(TrieKey, Vec<u8>)>, usize);
+/// WAL 解码结果：`(batch_id, changes, head(可选), consumed_bytes)`。
+type WalRecord = (u64, Vec<(TrieKey, Vec<u8>)>, Option<Vec<u8>>, usize);
 
 /// WAL 记录解码：损坏/不完整 ⇒ `Err`。
 fn decode_wal_record(bytes: &[u8]) -> Result<WalRecord, StorageError> {
     if bytes.len() < 1 + 8 + 4 + 32 {
         return Err(StorageError::CorruptedState);
     }
-    if bytes[0] != WAL_MAGIC {
-        return Err(StorageError::CorruptedState);
-    }
+    let has_head = match bytes[0] {
+        WAL_MAGIC => false,     // legacy state-only
+        WAL_MAGIC_HEAD => true, // new: state + optional head
+        _ => return Err(StorageError::CorruptedState),
+    };
     let batch_id = u64::from_le_bytes(bytes[1..9].try_into().expect("len checked"));
     let count = u32::from_le_bytes(bytes[9..13].try_into().expect("len checked")) as usize;
     let mut pos = 13usize;
@@ -203,19 +247,43 @@ fn decode_wal_record(bytes: &[u8]) -> Result<WalRecord, StorageError> {
         changes.push((key, bytes[pos..pos + vlen].to_vec()));
         pos += vlen;
     }
+    // head section（仅 0x05）
+    let mut head = None;
+    if has_head {
+        if pos + 4 > bytes.len() - 32 {
+            return Err(StorageError::CorruptedState);
+        }
+        let hlen = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("slice 4")) as usize;
+        pos += 4;
+        if pos + hlen > bytes.len() - 32 {
+            return Err(StorageError::CorruptedState);
+        }
+        if hlen > 0 {
+            head = Some(bytes[pos..pos + hlen].to_vec());
+        }
+        pos += hlen;
+    }
     let body = &bytes[..pos];
     let cksum = &bytes[pos..pos + 32];
     if protocol_hash(body) != cksum {
         return Err(StorageError::CorruptedState);
     }
-    Ok((batch_id, changes, pos + 32))
+    Ok((batch_id, changes, head, pos + 32))
 }
 
 /// 快照解码：`magic ‖ count(4B LE) ‖ count×(key35 ‖ vlen ‖ value) ‖ SHA-256(body)`。
-fn decode_snapshot(bytes: &[u8]) -> Result<HashMap<TrieKey, Vec<u8>>, StorageError> {
-    if bytes.len() < 1 + 4 + 32 || bytes[0] != SNAPSHOT_MAGIC {
+/// 快照解码结果：`(KV, 可选 head bytes)`。
+type DecodedSnapshot = (HashMap<TrieKey, Vec<u8>>, Option<Vec<u8>>);
+
+fn decode_snapshot(bytes: &[u8]) -> Result<DecodedSnapshot, StorageError> {
+    if bytes.len() < 1 + 4 + 32 {
         return Err(StorageError::CorruptedState);
     }
+    let has_head = match bytes[0] {
+        SNAPSHOT_MAGIC => false,     // legacy state-only
+        SNAPSHOT_MAGIC_HEAD => true, // new: state + head
+        _ => return Err(StorageError::CorruptedState),
+    };
     let count = u32::from_le_bytes(bytes[1..5].try_into().expect("len checked")) as usize;
     let mut pos = 5usize;
     let mut kv = HashMap::new();
@@ -233,12 +301,27 @@ fn decode_snapshot(bytes: &[u8]) -> Result<HashMap<TrieKey, Vec<u8>>, StorageErr
         kv.insert(key, bytes[pos..pos + vlen].to_vec());
         pos += vlen;
     }
+    let mut head = None;
+    if has_head {
+        if pos + 4 > bytes.len() - 32 {
+            return Err(StorageError::CorruptedState);
+        }
+        let hlen = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("slice 4")) as usize;
+        pos += 4;
+        if pos + hlen > bytes.len() - 32 {
+            return Err(StorageError::CorruptedState);
+        }
+        if hlen > 0 {
+            head = Some(bytes[pos..pos + hlen].to_vec());
+        }
+        pos += hlen;
+    }
     let body = &bytes[..pos];
     let cksum = &bytes[pos..pos + 32];
     if protocol_hash(body) != cksum {
         return Err(StorageError::CorruptedState);
     }
-    Ok(kv)
+    Ok((kv, head))
 }
 
 impl StorageBackend for PersistentBackend {
@@ -269,13 +352,18 @@ impl StorageBackend for PersistentBackend {
     fn restore(&mut self, snap: &Self::Snapshot) {
         self.kv = snap.kv.clone();
         self.pending.clear(); // 恢复后 pending 变更无效（ADR-0031）
+        self.pending_meta = None; // 同批回滚：head 不入队，防 phantom head
     }
 
     fn flush(&mut self) -> Result<(), StorageError> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.pending_meta.is_none() {
             return Ok(());
         }
-        let record = encode_wal_record(self.next_batch_id, &self.pending);
+        let record = encode_wal_record(
+            self.next_batch_id,
+            &self.pending,
+            self.pending_meta.as_deref(),
+        );
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -284,9 +372,26 @@ impl StorageBackend for PersistentBackend {
         file.write_all(&record)
             .map_err(|_| StorageError::BackendFailure)?;
         file.sync_all().map_err(|_| StorageError::BackendFailure)?;
+        if let Some(m) = &self.pending_meta {
+            self.committed_meta = Some(m.clone());
+        }
         self.next_batch_id += 1;
         self.pending.clear();
+        self.pending_meta = None;
         Ok(())
+    }
+
+    fn enqueue_meta(&mut self, meta: &[u8]) -> Result<(), StorageError> {
+        if self.pending_meta.is_some() {
+            // 单 head 约束：拒绝重复 enqueue，防覆盖 / 防 phantom head。
+            return Err(StorageError::BackendFailure);
+        }
+        self.pending_meta = Some(meta.to_vec());
+        Ok(())
+    }
+
+    fn recovered_meta(&self) -> Option<Vec<u8>> {
+        self.committed_meta.clone()
     }
 
     fn entries(&self) -> Vec<(TrieKey, Vec<u8>)> {

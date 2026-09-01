@@ -15,6 +15,7 @@ use nova_runtime::{
     validate_height_parent, validate_transaction_root,
 };
 use nova_storage::backend::StorageBackend;
+use nova_storage::head::HeadRecord;
 use nova_storage::node::NodeHash;
 use nova_storage::store::StateStore;
 
@@ -172,17 +173,29 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
             parent_hash: self.head.block_hash,
         };
         validate_height_parent(&block, &parent)?;
-        // ⑥ commit（区块级原子；失败 ⇒ storage 内部 rollback）
-        let root = commit_block(&mut self.store, &exec)?;
-        // head 更新（仅成功 commit 后；先 commit 再更新 head）
+        // ⑥ 提交前：构造 HeadRecord 并入队（head 与 state 同批共持久化；ADR-0048 OD-7 PRIMARY）。
+        // head.state_root = header.state_root（④ 已验证 == 计算 root == commit root，ADR-0030 C-3）。
         let new_hash = block_hash(&block)
             .map_err(|e| NodeBlockApplicationError::Pipeline(BlockPipelineError::Decode(e)))?;
+        let head_height = self
+            .head
+            .height
+            .checked_add(1)
+            .ok_or(NodeBlockApplicationError::HeadInvalid)?;
+        let head_record = HeadRecord {
+            height: head_height,
+            block_hash: new_hash,
+            parent_hash: self.head.block_hash,
+            state_root: NodeHash::from_bytes(block.header.state_root),
+        };
+        self.store
+            .enqueue_head(head_record)
+            .map_err(|e| NodeBlockApplicationError::Pipeline(BlockPipelineError::Storage(e)))?;
+        // ⑥ commit（head 与 state 同批 flush；失败 ⇒ storage 内部 rollback 清 head）
+        let root = commit_block(&mut self.store, &exec)?;
+        // ⑥ 后：head 更新（仅成功 commit 后；先 commit 再更新 head）
         let next = ChainHead {
-            height: self
-                .head
-                .height
-                .checked_add(1)
-                .ok_or(NodeBlockApplicationError::HeadInvalid)?,
+            height: head_height,
             block_hash: new_hash,
             state_root: root,
             parent_hash: self.head.block_hash,
@@ -622,6 +635,10 @@ mod tests {
 
         fn flush(&mut self) -> Result<(), StorageError> {
             self.inner.flush()
+        }
+
+        fn enqueue_meta(&mut self, meta: &[u8]) -> Result<(), StorageError> {
+            self.inner.enqueue_meta(meta)
         }
 
         fn entries(&self) -> Vec<(TrieKey, Vec<u8>)> {

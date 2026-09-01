@@ -8,6 +8,7 @@
 
 use crate::backend::StorageBackend;
 use crate::error::StorageError;
+use crate::head::{HeadRecord, decode_head_record, encode_head_record};
 use crate::node::{NodeHash, TrieKey, ValueHash};
 use crate::trie::SparseMerkleTree;
 use nova_core::state::{
@@ -54,6 +55,37 @@ impl<B: StorageBackend> StateStore<B> {
             trie.insert(&key, &account_commitment(&state));
         }
         Ok(Self { backend, trie })
+    }
+
+    /// 将 canonical head 元数据加入下一次区块提交的**同一持久化批次**（STEP 7-J / ADR-0048 OD-7）。
+    ///
+    /// - 必须在 runtime ⑥ `commit_block` **之前**调用：`apply_block` 的 `flush` 会把
+    ///   [head + state changes] 写为**同一个 WAL 批次**（同一 checksum / 同一 fsync）。
+    /// - **不落盘、不 fsync、不创建独立批次**；只编码并缓冲到 backend（`enqueue_meta`）。
+    /// - 单 head 约束：同一 pending transaction 内重复调用 ⇒ `Err`（防覆盖 / 防 phantom head）。
+    pub fn enqueue_head(&mut self, head: HeadRecord) -> Result<(), StorageError> {
+        let bytes = encode_head_record(&head);
+        self.backend.enqueue_meta(&bytes)
+    }
+
+    /// 从 backend 全量恢复 state + 可选 ChainHead（ADR-0031 E-5 amendment / ADR-0048 recovery）。
+    ///
+    /// - state 由 backend 确定性重建（`load`）。
+    /// - head 由 backend 的 `recovered_meta` 解码（快照/WAL 重放得到的最后有效 head）。
+    /// - **cross-check**：head.state_root 必须 == 恢复的 state root；否则 `CorruptedState`
+    ///   （integrity failure；不自动修复；专用 `RecoveryError` 为 follow-up）。
+    pub fn load_with_head(backend: B) -> Result<(Self, Option<HeadRecord>), StorageError> {
+        let head = backend
+            .recovered_meta()
+            .map(|b| decode_head_record(&b))
+            .transpose()?;
+        let store = Self::load(backend)?;
+        if let Some(h) = &head
+            && store.state_root() != h.state_root
+        {
+            return Err(StorageError::CorruptedState);
+        }
+        Ok((store, head))
     }
 
     /// 当前 state root（空 = `EMPTY_STATE_ROOT`；ADR-0026 T-6）。
@@ -383,6 +415,10 @@ mod tests {
             self.inner.flush()
         }
 
+        fn enqueue_meta(&mut self, meta: &[u8]) -> Result<(), StorageError> {
+            self.inner.enqueue_meta(meta)
+        }
+
         fn entries(&self) -> Vec<(TrieKey, Vec<u8>)> {
             self.inner.entries()
         }
@@ -417,6 +453,106 @@ mod tests {
         assert_eq!(store.state_root(), root_before, "root must roll back");
         assert_eq!(store.account(&a), None, "change[0] must roll back");
         assert_eq!(store.account(&b), None);
+    }
+
+    // ---- OD-7 head durability（STEP 7-J / ADR-0048）----
+    fn test_head(height: u64) -> HeadRecord {
+        HeadRecord {
+            height,
+            block_hash: [height as u8; 32],
+            parent_hash: [0xaa; 32],
+            state_root: NodeHash::from_bytes([0xcc; 32]),
+        }
+    }
+
+    #[test]
+    fn memory_head_and_state_share_single_flush_boundary() {
+        let a = addr([0xaa; 32]);
+        let mut store = StateStore::new(MemoryBackend::new());
+        store
+            .apply(&[AccountChange {
+                address: a,
+                new_balance: 1000,
+                new_nonce: 0,
+                created: true,
+            }])
+            .unwrap();
+        let flushes_before = store.backend.flush_count();
+        // ⑥ 前 enqueue head
+        store.enqueue_head(test_head(1)).unwrap();
+        // 区块提交 ⇒ 单次 flush（head + state 同批）
+        let tx_changes = [AccountChange {
+            address: a,
+            new_balance: 900,
+            new_nonce: 1,
+            created: false,
+        }];
+        let tx_refs: Vec<&[AccountChange]> = vec![&tx_changes];
+        store.apply_block(&tx_refs).unwrap();
+        assert_eq!(
+            store.backend.flush_count(),
+            flushes_before + 1,
+            "exactly one flush"
+        );
+        let last = store.backend.flush_records().last().unwrap();
+        assert_eq!(last.changes, 1, "state changes in same flush");
+        assert!(last.head.is_some(), "head in same flush");
+    }
+
+    #[test]
+    fn memory_duplicate_enqueue_head_rejected() {
+        let mut store = StateStore::new(MemoryBackend::new());
+        store.enqueue_head(test_head(1)).unwrap();
+        // 同一 pending 事务内重复 ⇒ Err（不覆盖原 head）
+        assert_eq!(
+            store.enqueue_head(test_head(2)),
+            Err(StorageError::BackendFailure)
+        );
+        // 原 head 保留
+        store.apply_block(&[]).unwrap();
+        let last = store.backend.flush_records().last().unwrap();
+        assert_eq!(last.changes, 0);
+        let decoded = decode_head_record(last.head.as_deref().unwrap()).unwrap();
+        assert_eq!(decoded.height, 1, "original head preserved");
+    }
+
+    #[test]
+    fn memory_enqueue_head_without_commit_not_flushed() {
+        let mut store = StateStore::new(MemoryBackend::new());
+        let flushes_before = store.backend.flush_count();
+        store.enqueue_head(test_head(1)).unwrap();
+        assert_eq!(
+            store.backend.flush_count(),
+            flushes_before,
+            "no flush without commit"
+        );
+    }
+
+    #[test]
+    fn memory_apply_failure_clears_queued_head() {
+        let a = addr([0xaa; 32]);
+        let failing = FailingBackend {
+            inner: MemoryBackend::new(),
+            fail_key: a.payload().to_bytes(),
+        };
+        let mut store = StateStore::new(failing);
+        store.enqueue_head(test_head(1)).unwrap();
+        // apply_block 失败（fail_key put 失败）⇒ rollback
+        let tx_changes = [AccountChange {
+            address: a,
+            new_balance: 900,
+            new_nonce: 1,
+            created: true,
+        }];
+        let tx_refs: Vec<&[AccountChange]> = vec![&tx_changes];
+        assert!(store.apply_block(&tx_refs).is_err());
+        // rollback 清 pending_meta ⇒ 下一次 flush 无 head（无 phantom）
+        store.apply_block(&[]).unwrap();
+        let last = store.backend.inner.flush_records().last().unwrap();
+        assert!(
+            last.head.is_none(),
+            "rollback cleared queued head — no phantom"
+        );
     }
 
     // ---- apply_block（8D，区块级原子；ADR-0029 D-4）----
