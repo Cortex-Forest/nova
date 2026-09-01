@@ -34,7 +34,12 @@ pub mod assembly;
 /// Node 区块应用适配层（STEP 7-D / ADR-0046）：Block wire → runtime 7-step 管线 → StateStore → ChainHead。
 pub mod block_adapter;
 
+/// Node 启动 / 重启编排（PHASE 3 STEP 7-P；F-3）：genesis 加载/校验 + first-start bootstrap +
+/// restart recovery + 参数注入 + NodeBlockAdapter 构造。
+pub mod bootstrap;
+
 pub use block_adapter::{ChainHead, NodeBlockAdapter, NodeBlockApplicationError};
+pub use bootstrap::{NodeConfig, NodeStartupError, start};
 
 // 注意：本阶段禁止实现任何节点/共识业务逻辑（除 STEP 11-4 已冻结的 Vote + RoundTimeout 路径
 // 与 STEP 7-D 已授权的 Block 应用适配路径）。

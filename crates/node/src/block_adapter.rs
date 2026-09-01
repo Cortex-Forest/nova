@@ -95,6 +95,7 @@ pub struct NodeBlockAdapter<B: StorageBackend + Clone, R: KeyResolver> {
     resolver: R,
     chain_id: u64,
     genesis_hash: [u8; 32],
+    network_id: NetworkId,
     max_gas_per_block: u64,
     fee_burn_bps: u16,
     head: ChainHead,
@@ -111,12 +112,14 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
         max_gas_per_block: u64,
         fee_burn_bps: u16,
         head: ChainHead,
+        network_id: NetworkId,
     ) -> Self {
         Self {
             store,
             resolver,
             chain_id,
             genesis_hash,
+            network_id,
             max_gas_per_block,
             fee_burn_bps,
             head,
@@ -131,6 +134,31 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
     /// 当前 state store（只读）。
     pub fn store(&self) -> &StateStore<B> {
         &self.store
+    }
+
+    /// 当前 chain_id（来自 genesis；ADR-0010）。
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// 当前 genesis_hash（= SHA-256(canonical genesis)；ADR-0015）。
+    pub fn genesis_hash(&self) -> [u8; 32] {
+        self.genesis_hash
+    }
+
+    /// 当前 network_id（来自 genesis；非硬编码）。
+    pub fn network_id(&self) -> NetworkId {
+        self.network_id
+    }
+
+    /// 每区块最大 gas（来自 genesis.protocol_parameters）。
+    pub fn max_gas_per_block(&self) -> u64 {
+        self.max_gas_per_block
+    }
+
+    /// fee burn 基点（来自 genesis.economics_parameters）。
+    pub fn fee_burn_bps(&self) -> u16 {
+        self.fee_burn_bps
     }
 
     /// 应用一个完整 block wire（冻结顺序 ①~⑥；ADR-0046 §12）。
@@ -152,7 +180,7 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
         // E4 执行上下文（current_height = head.height）
         let ctx = ExecutionContext {
             chain: ChainIdentity {
-                network_id: NetworkId::Mainnet,
+                network_id: self.network_id,
                 chain_id: self.chain_id,
                 genesis_hash: self.genesis_hash,
             },
@@ -438,8 +466,16 @@ mod tests {
         let max_gas = 1_000_000;
         let (kp, sender, receiver, store, genesis_root, registry) = test_env();
         let head = ChainHead::genesis(genesis_hash, genesis_root);
-        let mut adapter =
-            NodeBlockAdapter::new(store, registry, chain_id, genesis_hash, max_gas, 0, head);
+        let mut adapter = NodeBlockAdapter::new(
+            store,
+            registry,
+            chain_id,
+            genesis_hash,
+            max_gas,
+            0,
+            head,
+            NetworkId::Mainnet,
+        );
 
         let tx = signed_tx(sender, receiver, 0, 100, kp.signing_key(), chain_id);
         let parent = ParentContext {
@@ -479,6 +515,7 @@ mod tests {
             max_gas,
             0,
             head,
+            NetworkId::Mainnet,
         );
         let root_before = adapter.store().state_root();
         let head_before = adapter.head().clone();
@@ -510,8 +547,16 @@ mod tests {
         let (kp, sender, receiver_b, store, genesis_root, registry) = test_env();
         let receiver_c = addr([0xcc; 32]);
         let head = ChainHead::genesis(genesis_hash, genesis_root);
-        let mut adapter =
-            NodeBlockAdapter::new(store, registry, chain_id, genesis_hash, max_gas, 0, head);
+        let mut adapter = NodeBlockAdapter::new(
+            store,
+            registry,
+            chain_id,
+            genesis_hash,
+            max_gas,
+            0,
+            head,
+            NetworkId::Mainnet,
+        );
 
         // Block N (height 1)：A → B，amount 100
         let tx_n = signed_tx(sender, receiver_b, 0, 100, kp.signing_key(), chain_id);
@@ -559,8 +604,16 @@ mod tests {
         let max_gas = 1_000_000;
         let (kp, sender, receiver, store, genesis_root, registry) = test_env();
         let head = ChainHead::genesis(genesis_hash, genesis_root);
-        let mut adapter =
-            NodeBlockAdapter::new(store, registry, chain_id, genesis_hash, max_gas, 0, head);
+        let mut adapter = NodeBlockAdapter::new(
+            store,
+            registry,
+            chain_id,
+            genesis_hash,
+            max_gas,
+            0,
+            head,
+            NetworkId::Mainnet,
+        );
         let root_before = adapter.store().state_root();
         let head_before = adapter.head().clone();
 
@@ -680,8 +733,16 @@ mod tests {
             .unwrap();
         let genesis_root = store.state_root();
         let head = ChainHead::genesis(genesis_hash, genesis_root);
-        let mut adapter =
-            NodeBlockAdapter::new(store, registry, chain_id, genesis_hash, max_gas, 0, head);
+        let mut adapter = NodeBlockAdapter::new(
+            store,
+            registry,
+            chain_id,
+            genesis_hash,
+            max_gas,
+            0,
+            head,
+            NetworkId::Mainnet,
+        );
         let root_before = adapter.store().state_root();
         let head_before = adapter.head().clone();
 
