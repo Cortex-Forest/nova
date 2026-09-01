@@ -575,6 +575,8 @@ dependencies = [
  "nova-consensus",
  "nova-crypto",
  "nova-network",
+ "nova-runtime",
+ "nova-storage",
 ]
 
 [[package]]

@@ -31,4 +31,10 @@ pub mod config {
 /// `transition` → `TransitionResult` 路由。**不执行 Consensus verification**（归 Consensus）。
 pub mod assembly;
 
-// 注意：本阶段禁止实现任何节点/共识业务逻辑（除 STEP 11-4 已冻结的 Vote + RoundTimeout 路径）。
+/// Node 区块应用适配层（STEP 7-D / ADR-0046）：Block wire → runtime 7-step 管线 → StateStore → ChainHead。
+pub mod block_adapter;
+
+pub use block_adapter::{ChainHead, NodeBlockAdapter, NodeBlockApplicationError};
+
+// 注意：本阶段禁止实现任何节点/共识业务逻辑（除 STEP 11-4 已冻结的 Vote + RoundTimeout 路径
+// 与 STEP 7-D 已授权的 Block 应用适配路径）。

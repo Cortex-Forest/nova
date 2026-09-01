@@ -26,3 +26,7 @@ mainnet = []
 nova-network = { path = "../network" }
 nova-consensus = { path = "../consensus" }
 nova-crypto = { path = "../crypto" }
+# STEP 7-D（ADR-0046 方案 A）：Node 经 runtime 消费 Block Lifecycle；
+# storage 仅用于 Backend / StateStore 构造接口。禁止 node → execution。
+nova-runtime = { path = "../runtime" }
+nova-storage = { path = "../storage" }
