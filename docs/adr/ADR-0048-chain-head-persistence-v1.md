@@ -8,6 +8,7 @@
   ADR-0029（Block State Root）、ADR-0030（StateRootCalculator / commit_changes 单源）、ADR-0040（Fork Choice，
   FROZEN）、ADR-0042（Block，FROZEN）、ADR-0046/0047（Node Integration / KeyResolver，候选）、
   `crates/storage/src/{persistent.rs,store.rs,backend.rs}`、`crates/node/src/block_adapter.rs`
+- **Freeze**: IMPLEMENTATION-LEVEL（OD-7 持久化格式；STEP 7-M，见 §12）· **Protocol Freeze**: NONE · **Implementation**: COMPLETE（OD-7 @2f20943，STEP 7-J）· **Commit**: 2f20943
 
 ## 1. Context
 
@@ -141,7 +142,7 @@ Node consensus boundary → unchanged
 - **M2（裁决）**：首次升级要求显式 checkpoint/bootstrap head（Owner 提供或从权威源重建）。
 - 禁止自动假设 head=genesis / 自动猜测。
 
-## 10. Testing Plan（设计；实现留后续授权）
+## 10. Testing Plan（设计；实现完成于 STEP 7-J @2f20943；见 §12 冻结规格）
 
 ```
 Unit:       HeadRecord encode/decode · malformed record · checksum failure · deterministic replay
@@ -159,8 +160,114 @@ Negative:   phantom head · stale head · state/head mismatch · invalid parent 
 - E-6：确定性重建 + head cross-check（state_root == head.state_root）
 - 同步：durability 措辞（recoverable atomicity / single-WAL-batch boundary）；backend 边界（additive enqueue_meta）
 
+## 12. OD-7 Persistence Format — Implementation-Level Freeze（STEP 7-M）
+
+### 12.1 冻结边界
+
+```
+OD-7 persistence format freeze
+= IMPLEMENTATION-LEVEL FREEZE（storage 持久化格式；F-2 关闭）
+≠ PROTOCOL FREEZE（未触发）
+```
+
+- **冻结对象**：HeadRecord serialization（`head.rs`）· WAL record format（`0x01`/`0x05`）·
+  snapshot head encoding（`0x02`/`0x06`）· storage recovery format（`open`/`load_with_head`）。
+- **不冻结**：consensus（ADR-0040）· finality（ADR-0038）· fork choice（ADR-0040）·
+  transaction validity（ADR-0019）· state transition（ADR-0023）· validator rules ·
+  tokenomics（ADR-0044/0045）· network protocol（ADR-0032）。
+- **HeadRecord 非共识协议字段**：不进入 Block wire（ADR-0042 不变），不进入 consensus 决策。
+- Protocol freeze = **NOT TRIGGERED**。
+
+### 12.2 HeadRecord（冻结）
+
+```
+magic    = 0x03（与 WAL 0x01/0x05、snapshot 0x02/0x06 区分）
+version  = 0x01（V0.1；未知版本 ⇒ 严格拒绝）
+字段顺序（定长，无 padding）:
+  magic(1) ‖ version(1) ‖ height(8 LE) ‖ block_hash(32) ‖ parent_hash(32) ‖ state_root(32) ‖ checksum(32)
+HEAD_BODY_LEN = 106 · HEAD_LEN = 138
+checksum = SHA-256(body)，body = 自 magic 起至 state_root（不含 checksum 本身）
+```
+
+确定性：固定字段序 / 全定长 / little-endian / 无 serde·bincode·HashMap 序·时间戳·随机。
+同一 HeadRecord ⇒ 恒同 bytes（`encode_head_record` 为纯函数）。
+
+### 12.3 Endianness（冻结）
+
+```
+integer encoding = little-endian
+覆盖: height（HeadRecord）· batch_id（WAL）· count（WAL/snapshot 条目数）·
+      value length（vlen，WAL/snapshot）· head length（hlen，WAL/snapshot）
+```
+
+### 12.4 Checksum 覆盖范围（精确）
+
+```
+HeadRecord : SHA-256( body = magic(1)+version(1)+height(8)+block_hash(32)+parent_hash(32)+state_root(32) )
+WAL record : SHA-256( body = magic(1)+batch_id(8)+count(4)+Σ(key35+vlen(4)+value) +
+                      [仅 0x05: hlen(4)+head] )
+Snapshot   : SHA-256( body = magic(1)+count(4)+Σ(key35+vlen(4)+value) +
+                      [仅 0x06: hlen(4)+head] )
+checksum 一律追加于 body 之后；checksum 覆盖含 head 段在内的整条 body。
+```
+
+### 12.5 WAL 格式（冻结）
+
+```
+legacy 0x01 = state-only（继续可读）
+current 0x05 = state + head（head = 当前 HeadRecord encoding）
+未知 magic ⇒ 严格拒绝（CorruptedState）
+head 无独立 durability boundary：
+  state + head → 同 WAL record → 同 checksum → 同 fsync → 同 recovery boundary
+```
+
+### 12.6 Snapshot 格式（冻结）
+
+```
+legacy 0x02 = state-only（继续可读）
+current 0x06 = state + head
+head 段 = hlen(4 LE) ‖ head bytes；head bytes = HeadRecord encoding（与 WAL 相同）
+checksum 覆盖 state + head body（防 WAL 截断后丢 head）
+写入路径（ADR-0031 E-4 冻结模型）: snapshot.tmp → fsync → atomic rename → 截断 WAL
+```
+
+### 12.7 Version / Compatibility Policy（冻结）
+
+```
+known version   → decode
+unknown version → reject（严格拒绝；不设计 forward compatibility）
+legacy: WAL 0x01 可读 · snapshot 0x02 可读
+M2: legacy state（无 head）→ 显式 bootstrap head → head.state_root == state_root
+```
+
+### 12.8 Edge Cases（已记录行为；不改代码）
+
+```
+hlen=0（WAL 0x05）: decoder 视为 no-head；writer 不产生该表示
+  —— implementation behavior，非新 protocol semantic
+snapshot entry ordering: HashMap 迭代序，非 canonical protocol format；
+  decoding 重建等价 state；OD-7 不把 snapshot 条目序作为协议承诺
+  （ADR-0031 E-4 冻结模型 + ADR-0048 HP-5 恢复确定性均不承诺条目序）
+truncated record : 尾部损坏 ⇒ 丢弃（静默）；完整批次校验失败 ⇒ CorruptedState
+checksum failure : ⇒ CorruptedState（head/state/记录均拒）
+state/head mismatch : load_with_head cross-check ⇒ CorruptedState（integrity failure，不自动修复）
+```
+
+### 12.9 Recovery Semantics（保持已验证语义）
+
+```
+state_root == head.state_root → accepted
+state_root != head.state_root → CorruptedState
+本步骤不引入 RecoveryError；F-1 保持 FOLLOW-UP（P2，DEFERRED，随 F-3 Node restart 一并处理）
+```
+
 ## 变更记录
 
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-09-01 | 初稿：ChainHead Persistence Boundary V1（OPTION A / OD-1~OD-7 裁决 / HP-1~5 / crash 矩阵 / M2 migration / 备选 B/C/D 否决） | STEP 7-E/F/G/H Owner Decision → 授权 ADR-0048 落盘（DRAFT，未冻结） |
+| 2026-09-01 | STEP 7-J：OD-7 implementation completed @2f20943（HeadRecord codec / enqueue_head / enqueue_meta / WAL 0x05 / snapshot 0x06 / recovery / M2 / node adapter） | STEP 7-J 实现 + 测试（Owner 授权） |
+| 2026-09-01 | STEP 7-K：post-implementation audit approved with follow-ups（F-1/F-2/F-3） | STEP 7-K 审计 |
+| 2026-09-01 | STEP 7-L：persistence format reviewed → F-2 READY for implementation-level freeze | STEP 7-L 审计 |
+| 2026-09-01 | STEP 7-M：OD-7 persistence format **IMPLEMENTATION-LEVEL FREEZE** approved（新增 §12 冻结规格；F-2 关闭；Status 保持 Draft，非协议冻结） | STEP 7-M Owner 授权 |
+| 2026-09-01 | STEP 7-N~7-T / F-3 implementation alignment：F-3 Node bootstrap/restart implementation 已完成并提交为 `1c002cf`（feat(node): implement genesis bootstrap and restart recovery）。ADR-0048 仍仅为既有冻结的 ChainHead persistence/recovery 边界文档；**未引入新 protocol decision**；Node / Runtime / Storage boundary 未改变；genesis identity / state root / persistence / recovery 描述与 F-3 实现保持一致。`1c002cf` 非本 ADR 的 commit | STEP 7-N/7-O 设计 · STEP 7-P/7-Q/7-R 实现与审计 · STEP 7-S 提交 · STEP 7-T push 前审计 |
