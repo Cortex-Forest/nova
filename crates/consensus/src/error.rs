@@ -25,6 +25,10 @@ pub enum ConsensusError {
     InvalidDagReference,
     /// D-2：block_hash 重复。
     DuplicateBlock,
+    /// ADR-0050 §30：proposer 输入 ValidatorSet 为空 / total_weight == 0 ⇒ 无 proposer。
+    EmptyValidatorSet,
+    /// ADR-0050 §30：proposer 输入 ValidatorSet 非法（duplicate ValidatorId / 权重算术溢出）。
+    InvalidValidatorSet,
 }
 
 impl fmt::Display for ConsensusError {
@@ -39,6 +43,10 @@ impl fmt::Display for ConsensusError {
             Self::InvalidChainId => write!(f, "invalid chain_id"),
             Self::InvalidDagReference => write!(f, "invalid DAG reference"),
             Self::DuplicateBlock => write!(f, "duplicate block hash"),
+            Self::EmptyValidatorSet => {
+                write!(f, "empty validator set / zero total weight: no proposer")
+            }
+            Self::InvalidValidatorSet => write!(f, "invalid validator set for proposer selection"),
         }
     }
 }

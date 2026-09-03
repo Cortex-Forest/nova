@@ -54,6 +54,10 @@ pub enum DomainId {
     Address = 0x05,
     /// Witness availability proof（ADR-0036 W-5；10-4）。
     Witness = 0x06,
+    /// Proposer selection seed domain（ADR-0050 §13/§20；STEP 10-13D）。
+    ///
+    /// 与 Witness/Vote/Block 隔离：`ProposerSeed ≠ WitnessSeed`（ADR-0050 §12）。
+    Proposer = 0x07,
 }
 
 impl DomainId {
@@ -74,6 +78,7 @@ impl TryFrom<u8> for DomainId {
             0x04 => Ok(Self::Governance),
             0x05 => Ok(Self::Address),
             0x06 => Ok(Self::Witness),
+            0x07 => Ok(Self::Proposer),
             _ => Err(DomainError::UnknownDomainId(v)),
         }
     }
@@ -240,6 +245,7 @@ mod tests {
             DomainId::Governance,
             DomainId::Address,
             DomainId::Witness,
+            DomainId::Proposer,
         ] {
             let s = build_signed_bytes(AlgorithmId::Ed25519, other, 7, payload).unwrap();
             assert_ne!(base, s, "domain must change signed_bytes");
@@ -281,8 +287,8 @@ mod tests {
             Err(DomainError::UnknownDomainId(0x00))
         );
         assert_eq!(
-            DomainId::try_from(0x07),
-            Err(DomainError::UnknownDomainId(0x07))
+            DomainId::try_from(0x08),
+            Err(DomainError::UnknownDomainId(0x08))
         );
         assert_eq!(
             DomainId::try_from(0xff),
@@ -292,6 +298,9 @@ mod tests {
         assert_eq!(DomainId::try_from(0x01), Ok(DomainId::Transaction));
         assert_eq!(DomainId::try_from(0x05), Ok(DomainId::Address));
         assert_eq!(DomainId::try_from(0x06), Ok(DomainId::Witness));
+        // ADR-0050：Proposer = 0x07（STEP 10-13D 注册）
+        assert_eq!(DomainId::try_from(0x07), Ok(DomainId::Proposer));
+        assert_eq!(DomainId::Proposer.as_u8(), 0x07);
     }
 
     #[test]

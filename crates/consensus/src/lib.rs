@@ -13,6 +13,8 @@
 //! - [`checkpoint`]：**STEP 10-7.2**——Checkpoint（`derive_checkpoint`/`verify_checkpoint`/
 //!   `encode_checkpoint`/`decode_checkpoint`，ADR-0039 CP-1~CP-8）。
 //! - [`fork_choice`]：**STEP 10-8.2**——Fork Choice（`fork_choice`，ADR-0040 FC-1~FC-14）。
+//! - [`proposer`]：**STEP 10-13D**——Proposer Selection（`select_proposer`/`proposer_seed_input`/`proposer_seed`，
+//!   ADR-0050 Proposer Selection V1 FROZEN）。
 //! - [`integration`]：**STEP 10-9.3**——Consensus State Machine Integration（`ConsensusState`/
 //!   `IntegrationContext`/`transition`/`QcRegistry`/`RoundEvidence`，10-9.2 FROZEN）。
 //!
@@ -27,6 +29,7 @@ pub mod error;
 pub mod finality;
 pub mod fork_choice;
 pub mod integration;
+pub mod proposer;
 pub mod round;
 pub mod validator;
 pub mod vote;
