@@ -6,7 +6,8 @@
 //! - [`verify_qc`]：**QC Validity**（context / target / validator_set / evidence / quorum）；**不 finalize**。
 //! - [`check_finality_applicability`]：**DAG Relation**（same / descendant / ancestor / unrelated）；
 //!   仅用 DAG parent relation，**禁止** height/round 推导 ancestry。
-//! - [`acquire_lock`]：**Lock transition**（valid PrecommitQC → `LockedState::lock`；不重复完整验证）。
+//! - [`acquire_lock`]：**Lock transition**（valid PrecommitQC → `LockedState::lock`；ADR-0053 L-8
+//!   advance guard：unlocked/same/descendant advance，unrelated ⇒ Ok no-op；不重复完整验证；不改 FinalityState）。
 //! - [`update_finalized_reference`]：**Finality state transition**（Advance 更新 / 其余不变；Conflict 非错误）。
 //!
 //! # 冻结约束（禁令）
@@ -340,17 +341,47 @@ pub fn check_finality_applicability(
     }
 }
 
-/// Lock transition（MF-10-6.1-4/F-7 + **MF-10-6.2-1**）：**valid PrecommitQC → Lock**。
+/// Lock transition（MF-10-6.1-4/F-7 + **MF-10-6.2-1** + **ADR-0053 L-8 advance guard**）：
+/// **valid PrecommitQC → Lock**（validator-local lock acquisition/advance）。
 ///
 /// - **Precommit-only 强制（代码级）**：`qc.context.vote_type != Precommit` ⇒ `Err(NotPrecommitQc)`，
 ///   lock **不改变**（从调用方前置契约升级为代码强制）。
-/// - 不重复执行完整 QC 验证（Validity 仍由调用方先 `verify_qc`）；本函数只做
-///   `LockedState::lock(qc.target, qc.context.round)`。
-pub fn acquire_lock(lock: &mut LockedState, qc: &QuorumCertificate) -> Result<(), FinalityError> {
+/// - **不重复完整 QC 验证**（Validity 仍由调用方先 `verify_qc`）；height/round/validator_set_id/
+///   domain 由调用方 QC 验证契约保证，本函数不重验（L-8/L-11）。
+/// - **L-8 advance guard（ADR-0053）**：
+///   - unlocked ⇒ `Lock(target, round)`；
+///   - target == 当前 locked block ⇒ **idempotent no-op**（block 与 round 均不变；不 invent round
+///     语义；不解锁）；
+///   - target 是当前 locked block 的 **full transitive DAG descendant** ⇒ advance `Lock(target, round)`；
+///   - 否则（unrelated / ancestor / unknown）⇒ **Ok no-op**：valid-but-inapplicable to local lock
+///     （F-9 模式；evidence 保留，不 invalidate QC、不改 FinalityState、不 unlock）。
+/// - **不修改 FinalityState**（global finality effect 由 Finality pipeline 管理）。
+pub fn acquire_lock(
+    lock: &mut LockedState,
+    qc: &QuorumCertificate,
+    dag: &Dag,
+) -> Result<(), FinalityError> {
     if qc.context.vote_type != VoteType::Precommit {
         return Err(FinalityError::NotPrecommitQc);
     }
-    lock.lock(qc.target, qc.context.round);
+    let current = match lock.locked_block_hash {
+        Some(h) => h,
+        None => {
+            // unlocked（CASE A）：直接 acquire
+            lock.lock(qc.target, qc.context.round);
+            return Ok(());
+        }
+    };
+    // same block（CASE B）：idempotent no-op（block/round 均不变）
+    if qc.target == current {
+        return Ok(());
+    }
+    // descendant（CASE C）：full transitive DAG ancestry ⇒ advance
+    if dag.is_ancestor(&current, &qc.target) {
+        lock.lock(qc.target, qc.context.round);
+        return Ok(());
+    }
+    // unrelated / ancestor / unknown（CASE D）：valid-but-inapplicable ⇒ no-op
     Ok(())
 }
 
@@ -893,8 +924,9 @@ mod tests {
             ZERO,
             100,
         );
+        let dag = build_dag();
         let mut lock = LockedState::new();
-        assert_eq!(acquire_lock(&mut lock, &qc), Ok(()));
+        assert_eq!(acquire_lock(&mut lock, &qc, &dag), Ok(()));
         assert!(lock.is_locked());
         assert_eq!(lock.locked_block_hash, Some(TARGET_B));
         assert_eq!(lock.locked_round, Some(0));
@@ -956,12 +988,167 @@ mod tests {
         );
         let mut lock = LockedState::new();
         assert_eq!(
-            acquire_lock(&mut lock, &qc),
+            acquire_lock(&mut lock, &qc, &build_dag()),
             Err(FinalityError::NotPrecommitQc)
         );
         assert!(!lock.is_locked(), "lock 不得改变");
         assert_eq!(lock.locked_block_hash, None);
         assert_eq!(lock.locked_round, None);
+    }
+
+    // ---- L-8：acquire_lock advance guard（ADR-0053 L-8）----
+
+    /// 在空 lock 上经 valid PrecommitQC 锁定 target（CASE A unlocked ⇒ acquire）。
+    fn lock_on(ctx: &TestCtx, dag: &Dag, target: [u8; 32], height: u64, round: u64) -> LockedState {
+        let qc = make_qc(
+            ctx,
+            &[0, 1, 2],
+            target,
+            round,
+            height,
+            VoteType::Precommit,
+            ZERO,
+            100,
+        );
+        let mut lock = LockedState::new();
+        assert_eq!(acquire_lock(&mut lock, &qc, dag), Ok(()));
+        lock
+    }
+
+    // ---- Test 2：same block（L-8 CASE B）⇒ idempotent，lock 不变 ----
+    #[test]
+    fn acquire_lock_same_block_preserves_lock() {
+        let ctx = test_ctx(3, 100);
+        let dag = build_dag();
+        let mut lock = lock_on(&ctx, &dag, TARGET, 0, 0); // locked A(0xAA, round 0)
+        // 更高 round 的 same-block PrecommitQC(A)
+        let qc = make_qc(
+            &ctx,
+            &[0, 1, 2],
+            TARGET,
+            3,
+            0,
+            VoteType::Precommit,
+            ZERO,
+            100,
+        );
+        assert_eq!(acquire_lock(&mut lock, &qc, &dag), Ok(()));
+        assert_eq!(
+            lock.locked_block_hash,
+            Some(TARGET),
+            "same block ⇒ block 不变"
+        );
+        assert_eq!(
+            lock.locked_round,
+            Some(0),
+            "same block ⇒ idempotent no-op（不刷新 round；不 invent higher-round 语义）"
+        );
+    }
+
+    // ---- Test 3：direct descendant（L-8 CASE C）⇒ advance ----
+    #[test]
+    fn acquire_lock_direct_descendant_advances() {
+        let ctx = test_ctx(3, 100);
+        let dag = build_dag();
+        let mut lock = lock_on(&ctx, &dag, TARGET, 0, 0); // locked A(0xAA)
+        let qc = make_qc(
+            &ctx,
+            &[0, 1, 2],
+            TARGET_B,
+            1,
+            1,
+            VoteType::Precommit,
+            ZERO,
+            100,
+        );
+        assert_eq!(acquire_lock(&mut lock, &qc, &dag), Ok(()));
+        assert_eq!(
+            lock.locked_block_hash,
+            Some(TARGET_B),
+            "direct descendant ⇒ advance"
+        );
+        assert_eq!(lock.locked_round, Some(1));
+    }
+
+    // ---- Test 4：transitive descendant（L-8 CASE C；KEY）A(0xAA)→B(0xBB)→C(0xCC) ----
+    #[test]
+    fn acquire_lock_transitive_descendant_advances() {
+        let ctx = test_ctx(3, 100);
+        let dag = build_dag();
+        let mut lock = lock_on(&ctx, &dag, TARGET, 0, 0); // locked A(0xAA)
+        let qc = make_qc(
+            &ctx,
+            &[0, 1, 2],
+            TARGET_C,
+            2,
+            2,
+            VoteType::Precommit,
+            ZERO,
+            100,
+        );
+        assert_eq!(acquire_lock(&mut lock, &qc, &dag), Ok(()));
+        assert_eq!(
+            lock.locked_block_hash,
+            Some(TARGET_C),
+            "X→A→B→C full transitive descendant ⇒ advance"
+        );
+        assert_eq!(lock.locked_round, Some(2));
+    }
+
+    // ---- Test 5：unrelated branch（L-8 CASE D；critical）⇒ no advance，QC 仍为有效证据 ----
+    #[test]
+    fn acquire_lock_unrelated_keeps_lock() {
+        let ctx = test_ctx(3, 100);
+        let dag = build_dag();
+        let mut lock = lock_on(&ctx, &dag, TARGET_B, 1, 0); // locked B(0xBB)
+        let qc = make_qc(
+            &ctx,
+            &[0, 1, 2],
+            TARGET_X,
+            0,
+            0,
+            VoteType::Precommit,
+            ZERO,
+            100,
+        );
+        assert_eq!(
+            acquire_lock(&mut lock, &qc, &dag),
+            Ok(()),
+            "unrelated PrecommitQC ⇒ Ok no-op（valid-but-inapplicable，非 Err）"
+        );
+        assert_eq!(
+            lock.locked_block_hash,
+            Some(TARGET_B),
+            "unrelated 不 advance lock"
+        );
+        assert_eq!(lock.locked_round, Some(0));
+        // evidence 保留：QC 仍可独立验证（valid-but-inapplicable ≠ invalid，F-9）
+        assert_eq!(verify_qc(&qc, &ctx.set, &GENESIS_HASH, &dag), Ok(()));
+    }
+
+    // ---- Test 7：unknown ancestry（target ∉ DAG）⇒ no advance，不 panic ----
+    #[test]
+    fn acquire_lock_unknown_target_no_advance() {
+        let ctx = test_ctx(3, 100);
+        let dag = build_dag();
+        let mut lock = lock_on(&ctx, &dag, TARGET, 0, 0); // locked A(0xAA)
+        let qc = make_qc(
+            &ctx,
+            &[0, 1, 2],
+            [0x99; 32],
+            0,
+            0,
+            VoteType::Precommit,
+            ZERO,
+            100,
+        );
+        assert_eq!(acquire_lock(&mut lock, &qc, &dag), Ok(()));
+        assert_eq!(
+            lock.locked_block_hash,
+            Some(TARGET),
+            "unknown ancestry ⇒ no advance（不 panic）"
+        );
+        assert_eq!(lock.locked_round, Some(0));
     }
 
     // ---- T17（MF-10-6.2-1）：valid PrevoteQC → update_finalized_reference 拒绝，FinalityState 不改变 ----

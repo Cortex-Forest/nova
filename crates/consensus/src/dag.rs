@@ -71,6 +71,41 @@ impl Dag {
         self.blocks.get(hash).map(|r| r.parents.as_slice())
     }
 
+    /// 全传递祖先判定（ADR-0053 L-4/L-8 的 canonical primitive；未来 Lock Enforcement 使用）。
+    ///
+    /// `ancestor` 是否为 `descendant` 的祖先（沿 DAG parent 边），或二者为同一 in-DAG 区块。
+    ///
+    /// - **full transitive**：沿一条或多条 parent 边；非 immediate-only（`L → A → B → Z` 时
+    ///   `is_ancestor(L, Z) == true`）。
+    /// - **self-inclusive**：`is_ancestor(X, X) == true`（X ∈ DAG；与既有 `dag_is_ancestor`/
+    ///   `dag_reaches` 一致）。
+    /// - **unknown hash**：`ancestor` 或 `descendant` 不在 DAG ⇒ `false`（不 panic、不插入节点）。
+    /// - **cycle-safe**：visited 集防御（虽 `add_block` 的 `parent.height < height` 已保证结构无环）。
+    /// - **deterministic / 无 mutation / 无 I/O / 无网络**：纯 DAG query。
+    /// - 仅沿 parent 边判断；不用 height 差异直接推导 ancestry（`same height ≠ ancestor`）。
+    pub fn is_ancestor(&self, ancestor: &[u8; 32], descendant: &[u8; 32]) -> bool {
+        if !self.contains(ancestor) || !self.contains(descendant) {
+            return false;
+        }
+        if ancestor == descendant {
+            return true;
+        }
+        let mut visited = HashSet::new();
+        let mut stack = vec![*descendant];
+        while let Some(cur) = stack.pop() {
+            if cur == *ancestor {
+                return true;
+            }
+            if !visited.insert(cur) {
+                continue;
+            }
+            if let Some(parents) = self.parents_of(&cur) {
+                stack.extend(parents.iter().copied());
+            }
+        }
+        false
+    }
+
     /// 叶子候选（无后代）。
     pub fn tips(&self) -> &[[u8; 32]] {
         &self.tips
@@ -256,5 +291,84 @@ mod tests {
     fn causal_order_unknown_returns_empty() {
         let dag = Dag::new();
         assert_eq!(dag.causal_order(&[0x77; 32]), Vec::<[u8; 32]>::new());
+    }
+
+    // ---- is_ancestor（ADR-0053 L-4/L-8 canonical primitive）----
+
+    #[test]
+    fn is_ancestor_self_and_unknown() {
+        let mut dag = Dag::new();
+        dag.add_block(block(0x01, 0, vec![])).unwrap();
+        // self-inclusive（in-DAG）
+        assert!(dag.is_ancestor(&[0x01; 32], &[0x01; 32]));
+        // unknown ancestor / descendant ⇒ false（不 panic）
+        assert!(!dag.is_ancestor(&[0x99; 32], &[0x01; 32]));
+        assert!(!dag.is_ancestor(&[0x01; 32], &[0x99; 32]));
+        assert!(
+            !dag.is_ancestor(&[0x99; 32], &[0x99; 32]),
+            "未知自等 ⇒ false"
+        );
+    }
+
+    #[test]
+    fn is_ancestor_transitive_chain() {
+        let mut dag = Dag::new();
+        dag.add_block(block(0x01, 0, vec![])).unwrap(); // A
+        dag.add_block(block(0x02, 1, vec![0x01])).unwrap(); // B ← A
+        dag.add_block(block(0x03, 2, vec![0x02])).unwrap(); // C ← B
+        dag.add_block(block(0x04, 3, vec![0x03])).unwrap(); // D ← C
+        // self
+        assert!(dag.is_ancestor(&[0x01; 32], &[0x01; 32]));
+        // direct
+        assert!(dag.is_ancestor(&[0x01; 32], &[0x02; 32]));
+        // full transitive（A→B→C→D）
+        assert!(dag.is_ancestor(&[0x01; 32], &[0x03; 32]));
+        assert!(dag.is_ancestor(&[0x01; 32], &[0x04; 32]));
+        assert!(dag.is_ancestor(&[0x02; 32], &[0x04; 32]));
+        // 反向（descendant 不是 ancestor）
+        assert!(!dag.is_ancestor(&[0x04; 32], &[0x01; 32]));
+        assert!(!dag.is_ancestor(&[0x03; 32], &[0x02; 32]));
+    }
+
+    #[test]
+    fn is_ancestor_unrelated_branches() {
+        let mut dag = Dag::new();
+        dag.add_block(block(0x01, 0, vec![])).unwrap(); // root A
+        dag.add_block(block(0x02, 1, vec![0x01])).unwrap(); // A-chain
+        dag.add_block(block(0x11, 0, vec![])).unwrap(); // independent root X
+        dag.add_block(block(0x12, 1, vec![0x11])).unwrap(); // X-chain
+        assert!(!dag.is_ancestor(&[0x01; 32], &[0x12; 32]));
+        assert!(!dag.is_ancestor(&[0x11; 32], &[0x02; 32]));
+        assert!(!dag.is_ancestor(&[0x02; 32], &[0x12; 32]));
+        assert!(!dag.is_ancestor(&[0x12; 32], &[0x01; 32]));
+    }
+
+    #[test]
+    fn is_ancestor_multi_parent() {
+        let mut dag = Dag::new();
+        dag.add_block(block(0x01, 0, vec![])).unwrap(); // A (root)
+        dag.add_block(block(0x02, 1, vec![0x01])).unwrap(); // B ← A
+        dag.add_block(block(0x03, 1, vec![0x01])).unwrap(); // C ← A (B 的 sibling)
+        dag.add_block(block(0x04, 2, vec![0x02, 0x03])).unwrap(); // D ← {B, C}
+        // D 有多 parent：A 经 B 或 C 均可达
+        assert!(dag.is_ancestor(&[0x01; 32], &[0x04; 32]));
+        assert!(dag.is_ancestor(&[0x02; 32], &[0x04; 32]));
+        assert!(dag.is_ancestor(&[0x03; 32], &[0x04; 32]));
+        assert!(!dag.is_ancestor(&[0x04; 32], &[0x01; 32]));
+    }
+
+    #[test]
+    fn is_ancestor_terminates_on_deep_chain() {
+        // 深链遍历有界终止（visited 防御；DAG 结构无环由 add_block parent.height<height 保证，
+        // 公共 API 无法构造真环）
+        let mut dag = Dag::new();
+        let mut prev: Vec<u8> = Vec::new();
+        for h in 0u64..40 {
+            let parents = prev.clone();
+            dag.add_block(block(h as u8, h, parents)).unwrap();
+            prev = vec![h as u8];
+        }
+        assert!(dag.is_ancestor(&[0u8; 32], &[39u8; 32]));
+        assert!(!dag.is_ancestor(&[39u8; 32], &[0u8; 32]));
     }
 }
