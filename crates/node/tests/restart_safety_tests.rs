@@ -856,3 +856,60 @@ fn rt_22b_lock_persisted_durable_before_adopt() {
     );
     let _ = set;
 }
+
+// ---------- RT-25（10-15T-HARDEN / OBS-3B）: missing safety journal fails closed ----------
+
+#[test]
+fn rt_25_missing_safety_journal_fails_closed() {
+    // ---- Part 1（store 层）：journal 被外部删除后再次 commit ⇒ Err(Io)，且不得重建文件 ----
+    let tmp1 = TempDir::new("rt25_store");
+    let journal1 = tmp1.journal();
+    let pk1 = valid_public_key();
+    let store1 = ValidatorSafetyStore::create(&journal1, identity_for(&pk1)).unwrap();
+    store1
+        .commit_vote_intent(&key_of(0, 0, VoteType::Prevote), [0xAA; 32], [0u8; 32], 0)
+        .unwrap();
+    assert!(journal1.exists(), "写入合法 record 后 journal 必须存在");
+    std::fs::remove_file(&journal1).unwrap(); // 外部删除
+    let err = store1
+        .commit_vote_intent(&key_of(1, 0, VoteType::Prevote), [0xAA; 32], [0u8; 32], 0)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        ValidatorSafetyError::Io,
+        "缺失 journal 必须立即 Err(Io) fail closed"
+    );
+    assert!(
+        !journal1.exists(),
+        "append_record 绝不自动 create 缺失 journal（不得产生无 header 文件）"
+    );
+
+    // ---- Part 2（actor 层）：存活 durable actor 期间删除 journal ⇒ 本地投票不签名、无事件 ----
+    let tmp2 = TempDir::new("rt25_actor");
+    let journal2 = tmp2.journal();
+    let pk2 = valid_public_key();
+    let set2 = set_for(pk2);
+    let dag2 = dag_ab();
+    let (actor, count) = fresh_actor(pk2, &journal2);
+    // 首次投票成功（file 存在；header + intent + signature 均 durable）
+    actor
+        .produce_vote(&req(0, 0, [0xAA; 32], VoteType::Prevote), &set2, &dag2)
+        .unwrap()
+        .expect("首次投票（journal 存在）");
+    assert_eq!(count.get(), 1);
+    assert!(journal2.exists());
+    // 外部删除 journal（actor 仍存活、仍持 store）
+    std::fs::remove_file(&journal2).unwrap();
+    // 下一次本地投票：durable intent 失败 ⇒ Err(Safety(Io))，不签名、无 VoteEvent
+    let result = actor.produce_vote(&req(1, 0, [0xAA; 32], VoteType::Prevote), &set2, &dag2);
+    let err = match result {
+        Ok(_) => panic!("RT-25：缺失 journal 时投票必须 Err（fail closed）"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, ValidatorActorError::Safety(ValidatorSafetyError::Io)),
+        "预期 Safety(Io)，got {err:?}"
+    );
+    assert_eq!(count.get(), 1, "缺失 journal ⇒ 绝不产生新签名");
+    assert!(!journal2.exists(), "actor 路径亦不得重建 journal");
+}

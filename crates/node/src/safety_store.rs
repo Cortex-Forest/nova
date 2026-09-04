@@ -262,10 +262,13 @@ impl ValidatorSafetyStore {
     }
 
     /// 追加一条 record（打开 → 追加 → fsync → 关闭；返回前已 durable）。
+    ///
+    /// OBS-3B（10-15T-HARDEN）：**Safety Journal 必须已存在才能写入**（不 `create`）。
+    /// 文件被外部删除/缺失 ⇒ 立即 `Err(Io)` fail closed —— 绝不静默重建无 header 文件 /
+    /// 产生虚假 durable 状态 / 继续签名。
     fn append_record(&self, record_type: u8, body: &[u8]) -> Result<(), ValidatorSafetyError> {
         let record = encode_record(record_type, body);
         let mut file = OpenOptions::new()
-            .create(true)
             .append(true)
             .open(&self.path)
             .map_err(|_| ValidatorSafetyError::Io)?;
