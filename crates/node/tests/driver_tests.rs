@@ -24,6 +24,7 @@ use nova_node::assembly::ConsensusNode;
 use nova_node::driver::{DriverError, NodeConsensusDriver};
 use nova_node::signer::SoftwareSigner;
 use nova_node::validator::{LocalVoteRequest, ValidatorActor};
+use nova_node::vote_ledger::VoteKey;
 
 const CHAIN_ID: u64 = 1001;
 const GENESIS_HASH: [u8; 32] = [0x42; 32];
@@ -318,6 +319,7 @@ fn b_local_vote_uses_same_verify_boundary_as_remote() {
                 driver.consensus().validator_set(),
                 driver.consensus().dag(),
             )
+            .unwrap()
             .expect("本地 prevote 应授权");
         match ev {
             ConsensusEvent::Vote { vote, signature } => (vote, signature),
@@ -646,6 +648,7 @@ fn j_local_remote_equivalence_same_canonical_input() {
                 local.consensus().validator_set(),
                 local.consensus().dag(),
             )
+            .unwrap()
             .expect("本地 prevote 授权");
         match ev {
             ConsensusEvent::Vote { vote, signature } => (vote, signature),
@@ -704,4 +707,62 @@ fn k_same_verified_qc_processed_twice_is_idempotent() {
     let lock = driver.actor(0).unwrap().locked_state();
     assert_eq!(lock.locked_block_hash, Some(target));
     assert_eq!(lock.locked_round, Some(0));
+}
+
+// ---------- DV-S9 / DV-S10（STEP 10-15S；Double-Vote Protection）----------
+
+#[test]
+fn dv_s9_remote_vote_does_not_pollute_local_ledger() {
+    let (mut kps, set) = make_ctx(3);
+    let a = kps.remove(0);
+    let b = kps.remove(0);
+    let c = kps.remove(0);
+    let target_x = [0x11; 32];
+    let target_y = [0x22; 32];
+    let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag2());
+    let (actor_a, _) = actor_of(a);
+    let mut driver = NodeConsensusDriver::new(consensus, vec![actor_a]);
+
+    // 两个 remote（b、c）对同一 (0,0,Prevote) 不同 target 各投一票（不同 validator —— 非本地双投）。
+    let (v, s) = remote_vote(&b, VoteType::Prevote, target_x, 0, 0);
+    driver.submit_remote_vote(v, s).unwrap();
+    let (v, s) = remote_vote(&c, VoteType::Prevote, target_y, 0, 0);
+    driver.submit_remote_vote(v, s).unwrap();
+
+    assert!(
+        driver.actor(0).unwrap().vote_ledger().is_empty(),
+        "remote vote 不得污染本地 VoteLedger"
+    );
+}
+
+#[test]
+fn dv_s10_driver_local_vote_goes_through_ledger() {
+    let (mut driver, target) = setup_single(); // 1-set 本地 actor
+    submit_proposal_for(&mut driver, target);
+    let res = driver.submit_local_vote(0, &prevote_req(target)).unwrap();
+    assert!(res.is_some(), "driver 提交本地 prevote");
+    // submit_local_vote 已驱动 produce → VoteLedger 记录 (0,0,Prevote)->target
+    let rec = driver.actor(0).unwrap().vote_ledger().lookup(&VoteKey {
+        height: 0,
+        round: 0,
+        vote_type: VoteType::Prevote,
+    });
+    assert_eq!(rec.map(|r| r.target_block_hash), Some(target));
+    // 同 key 不同 target ⇒ DV guard 拒绝（Err(DoubleVote)），不产生签名
+    let err = driver
+        .actor(0)
+        .unwrap()
+        .produce_vote(
+            &prevote_req([0xBB; 32]),
+            driver.consensus().validator_set(),
+            driver.consensus().dag(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            nova_node::validator::ValidatorActorError::DoubleVote { .. }
+        ),
+        "driver 本地投票必须经 VoteLedger guard"
+    );
 }

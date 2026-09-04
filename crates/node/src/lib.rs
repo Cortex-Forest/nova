@@ -45,6 +45,10 @@ pub mod signer;
 /// validator-local lock / 本地投票授权 → 标准 `ConsensusEvent::Vote`）。
 pub mod validator;
 
+/// Node-local 投票账本（STEP 10-15S；Double-Vote Protection）：`VoteKey`/`VoteRecord`/`VoteLedger`
+/// —— 同 `(height, round, vote_type)` 至多一个 target（内存实现；10-15T 持久化）。
+pub mod vote_ledger;
+
 /// Node Consensus Driver（STEP 10-15O）：Proposal → Local Vote → 统一 `verify_vote_input` →
 /// canonical transition → `TransitionDerived` → `verify_qc` → 路由至各本地 `ValidatorActor` lock。
 pub mod driver;
@@ -53,5 +57,6 @@ pub use block_adapter::{ChainHead, NodeBlockAdapter, NodeBlockApplicationError};
 pub use bootstrap::{NodeConfig, NodeStartupError, start};
 
 // 注意：本阶段禁止实现任何节点/共识业务逻辑（除 STEP 11-4 已冻结的 Vote + RoundTimeout 路径、
-// STEP 7-D 已授权的 Block 应用适配路径、STEP 10-15L 已授权的本地验证者投票边界 signer + validator，
-// 以及 STEP 10-15O 已授权的 Node Consensus Driver 编排接线）。
+// STEP 7-D 已授权的 Block 应用适配路径、STEP 10-15L 已授权的本地验证者投票边界 signer + validator、
+// STEP 10-15O 已授权的 Node Consensus Driver 编排接线，以及 STEP 10-15S 已授权的本地 Double-Vote
+// Protection（vote_ledger））。

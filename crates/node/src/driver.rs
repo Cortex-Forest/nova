@@ -27,7 +27,7 @@ use nova_consensus::vote::{ValidatorVote, VoteType, verify_vote_input};
 
 use crate::assembly::ConsensusNode;
 use crate::signer::SigningCapability;
-use crate::validator::{LocalVoteRequest, ValidatorActor};
+use crate::validator::{LocalVoteRequest, ValidatorActor, ValidatorActorError};
 
 /// Node Consensus Driver 错误（node operational；错误来源保持清晰，不静默吞掉）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +40,8 @@ pub enum DriverError {
     QcVerification(FinalityError),
     /// actor lock transition 失败（`acquire_lock`；如非 Precommit QC —— derived 不应出现）。
     ActorLock(FinalityError),
+    /// ValidatorActor 失败（含 Double-Vote 拒绝 —— 同 `(height,round,vote_type)` 已签其它 target）。
+    Actor(ValidatorActorError),
 }
 
 /// Node Consensus Driver：编排「本地投票 → 统一验证 → canonical transition → QC → 本地 lock」。
@@ -108,8 +110,8 @@ impl<S: SigningCapability> NodeConsensusDriver<S> {
         if !self.vote_matches_current_round(request) {
             return Ok(None);
         }
-        // ② authorize + construct + sign（ValidatorActor；锁兼容在 actor 内判定）。
-        let event = self
+        // ② authorize + construct + sign（ValidatorActor；锁兼容 + VoteLedger DV guard 在 actor 内判定）。
+        let produced = self
             .actors
             .get(actor_idx)
             .ok_or(DriverError::NoActor(actor_idx))?
@@ -117,8 +119,9 @@ impl<S: SigningCapability> NodeConsensusDriver<S> {
                 request,
                 self.consensus.validator_set(),
                 self.consensus.dag(),
-            );
-        let Some(event) = event else {
+            )
+            .map_err(DriverError::Actor)?;
+        let Some(event) = produced else {
             // 授权拒绝 ⇒ 不产生事件（无 vote / 无 sign / 无 ConsensusEvent）。
             return Ok(None);
         };
