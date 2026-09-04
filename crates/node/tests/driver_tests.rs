@@ -200,6 +200,27 @@ fn precommit_req(target: [u8; 32]) -> LocalVoteRequest {
     }
 }
 
+/// 构造一条远端 vote + 其真实签名（set 成员 key；与 local 同一 canonical shape）。
+fn remote_vote(
+    kp: &KeyPair,
+    vote_type: VoteType,
+    target: [u8; 32],
+    height: u64,
+    round: u64,
+) -> (ValidatorVote, [u8; 64]) {
+    let vote = ValidatorVote {
+        round,
+        height,
+        target_block_hash: target,
+        vote_type,
+        source_block_hash: [0; 32],
+        validator_id: vid_of(kp),
+        timestamp: 0,
+    };
+    let signature = sign_vote(kp.signing_key(), &vote);
+    (vote, signature)
+}
+
 /// 单验证者 driver（set n=1；dag 含 AA）。
 fn setup_single() -> (NodeConsensusDriver<SoftwareSigner>, [u8; 32]) {
     let (mut kps, set) = make_ctx(1);
@@ -452,4 +473,235 @@ fn f_no_derived_qc_no_lock_routing() {
         None,
         "无 precommit_qc ⇒ 不触发 lock routing"
     );
+}
+
+// ---------- Test G（STEP 10-15P）----------
+
+#[test]
+fn g_remote_vote_reaches_derived_precommit_qc() {
+    // 3-set；无本地 actor —— 纯 remote（B、C）经 submit_remote_vote 驱动 round。
+    let (mut kps, set) = make_ctx(3);
+    let b = kps.remove(0);
+    let c = kps.remove(0);
+    let target = [0xAA; 32];
+    let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag1());
+    let mut driver = NodeConsensusDriver::<SoftwareSigner>::new(consensus, Vec::new());
+
+    driver.submit_proposal(ProposalRef {
+        block_hash: target,
+        proposer: vid_of(&b),
+    });
+
+    // remote prevote B、C（2×100=200 达 prevote quorum）
+    for kp in [&b, &c] {
+        let (vote, sig) = remote_vote(kp, VoteType::Prevote, target, 0, 0);
+        let r = driver.submit_remote_vote(vote, sig).unwrap();
+        assert!(matches!(&r, TransitionResult::Applied { .. }));
+    }
+    assert_eq!(driver.consensus().state().round.step, RoundStep::Precommit);
+
+    // remote precommit B、C —— 最后一条达 precommit quorum ⇒ derived.precommit_qc Some
+    let mut qc_result = None;
+    for kp in [&b, &c] {
+        let (vote, sig) = remote_vote(kp, VoteType::Precommit, target, 0, 0);
+        let r = driver.submit_remote_vote(vote, sig).unwrap();
+        if matches!(
+            &r,
+            TransitionResult::Applied { derived, .. } if derived.precommit_qc.is_some()
+        ) {
+            qc_result = Some(r);
+        }
+    }
+    assert!(
+        qc_result.is_some(),
+        "remote 达 precommit quorum ⇒ derived.precommit_qc 必须出现"
+    );
+    assert_eq!(driver.consensus().state().round.step, RoundStep::Finalized);
+}
+
+// ---------- Test H（STEP 10-15P）----------
+
+#[test]
+fn h_remote_qc_routes_to_all_local_locks() {
+    // 3-set：本地 actors=[A,B]；remote C（set 成员）参与使 quorum 可达成。
+    let (mut kps, set) = make_ctx(3);
+    let a = kps.remove(0);
+    let b = kps.remove(0);
+    let c = kps.remove(0);
+    let a_id = vid_of(&a);
+    let target = [0xAA; 32];
+    let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag1());
+    let (actor_a, _) = actor_of(a);
+    let (actor_b, _) = actor_of(b);
+    let mut driver = NodeConsensusDriver::new(consensus, vec![actor_a, actor_b]);
+    driver.submit_proposal(ProposalRef {
+        block_hash: target,
+        proposer: a_id,
+    });
+
+    // A（local）prevote；C（remote）prevote → A+C=200 达 prevote quorum
+    driver
+        .submit_local_vote(0, &prevote_req(target))
+        .unwrap()
+        .unwrap();
+    let (cv, cs) = remote_vote(&c, VoteType::Prevote, target, 0, 0);
+    driver.submit_remote_vote(cv, cs).unwrap();
+    assert_eq!(driver.consensus().state().round.step, RoundStep::Precommit);
+
+    // C（remote）precommit；A（local）precommit → A+C=200 达 precommit quorum ⇒ derived QC
+    let (cv, cs) = remote_vote(&c, VoteType::Precommit, target, 0, 0);
+    driver.submit_remote_vote(cv, cs).unwrap();
+    let res = driver
+        .submit_local_vote(0, &precommit_req(target))
+        .unwrap()
+        .expect("A precommit 提交");
+    assert!(
+        matches!(
+            &res,
+            TransitionResult::Applied { derived, .. } if derived.precommit_qc.is_some()
+        ),
+        "含 remote 参与达 quorum ⇒ derived.precommit_qc 出现"
+    );
+
+    // 同一 choke：verify_qc → broadcast → 所有本地 actor 各自 acquire_lock
+    driver.process_transition_derived(&res).unwrap();
+    assert_eq!(
+        driver.actor(0).unwrap().locked_state().locked_block_hash,
+        Some(target),
+        "A lock 更新"
+    );
+    assert_eq!(
+        driver.actor(1).unwrap().locked_state().locked_block_hash,
+        Some(target),
+        "同一 verified QC 广播至所有本地 actor（B lock 更新）"
+    );
+}
+
+// ---------- Test I（STEP 10-15P）----------
+
+#[test]
+fn i_invalid_remote_vote_rejected_no_transition_no_lock() {
+    let (mut driver, target) = setup_single();
+    submit_proposal_for(&mut driver, target);
+    let a_id = driver.actor(0).unwrap().validator_id();
+    let outsider = KeyPair::generate().unwrap(); // 非 set 成员 key
+
+    let vote = ValidatorVote {
+        round: 0,
+        height: 0,
+        target_block_hash: target,
+        vote_type: VoteType::Prevote,
+        source_block_hash: [0; 32],
+        validator_id: a_id, // 声称是 A（set 成员）但签名非 A
+        timestamp: 0,
+    };
+    let bad_sig = sign_vote(outsider.signing_key(), &vote);
+    let err = driver.submit_remote_vote(vote, bad_sig).unwrap_err();
+    assert!(matches!(err, DriverError::VoteVerification(_)));
+
+    // no transition / no QC / no lock
+    assert_eq!(
+        driver.consensus().state().round.step,
+        RoundStep::Prevote,
+        "坏 remote vote 不得推进 consensus 状态"
+    );
+    assert_eq!(
+        driver.actor(0).unwrap().locked_state().locked_block_hash,
+        None
+    );
+}
+
+// ---------- Test J（STEP 10-15P）----------
+
+#[test]
+fn j_local_remote_equivalence_same_canonical_input() {
+    // 两个完全相同的单验证者 driver：local（actor 自投）vs remote（同 (vote, sig) 提交）。
+    let (mut kps, set) = make_ctx(1);
+    let kp = kps.remove(0);
+    let a_id = vid_of(&kp);
+    let target = [0xAA; 32];
+
+    let mut local = {
+        let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set.clone(), GENESIS_HASH, dag1());
+        let (actor, _) = actor_of(kp);
+        NodeConsensusDriver::new(consensus, vec![actor])
+    };
+    let mut remote = NodeConsensusDriver::<SoftwareSigner>::new(
+        ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag1()),
+        Vec::new(),
+    );
+    for d in [&mut local, &mut remote] {
+        d.submit_proposal(ProposalRef {
+            block_hash: target,
+            proposer: a_id,
+        });
+    }
+
+    // reference canonical vote（local produce；deterministic）
+    let (ref_vote, ref_sig) = {
+        let actor = local.actor(0).unwrap();
+        let ev = actor
+            .produce_vote(
+                &prevote_req(target),
+                local.consensus().validator_set(),
+                local.consensus().dag(),
+            )
+            .expect("本地 prevote 授权");
+        match ev {
+            ConsensusEvent::Vote { vote, signature } => (vote, signature),
+            _ => unreachable!("produce_vote 只产出 ConsensusEvent::Vote"),
+        }
+    };
+    // remote path：同一 (vote, sig)
+    let res_remote = remote.submit_remote_vote(ref_vote, ref_sig).unwrap();
+    // local path：driver 内部重产同一 canonical vote
+    let res_local = local
+        .submit_local_vote(0, &prevote_req(target))
+        .unwrap()
+        .expect("本地 prevote 提交");
+
+    assert!(matches!(&res_local, TransitionResult::Applied { .. }));
+    assert!(matches!(&res_remote, TransitionResult::Applied { .. }));
+    assert_eq!(local.consensus().state().round.step, RoundStep::Precommit);
+    assert_eq!(remote.consensus().state().round.step, RoundStep::Precommit);
+    // 只比较稳定可观察量（Applied / prevote_quorum / precommit_qc presence），不比对象地址
+    let obs = |r: &TransitionResult| match r {
+        TransitionResult::Applied {
+            observation,
+            derived,
+            ..
+        } => (observation.prevote_quorum, derived.precommit_qc.is_some()),
+        _ => (false, false),
+    };
+    assert_eq!(
+        obs(&res_local),
+        obs(&res_remote),
+        "local/remote 相同 canonical input ⇒ 一致 transition 结果"
+    );
+}
+
+// ---------- Test K（STEP 10-15P；QC replay 幂等）----------
+
+#[test]
+fn k_same_verified_qc_processed_twice_is_idempotent() {
+    let (mut driver, target) = setup_single();
+    submit_proposal_for(&mut driver, target);
+    driver
+        .submit_local_vote(0, &prevote_req(target))
+        .unwrap()
+        .unwrap();
+    let res = driver
+        .submit_local_vote(0, &precommit_req(target))
+        .unwrap()
+        .expect("precommit 提交");
+    driver.process_transition_derived(&res).unwrap();
+    assert_eq!(
+        driver.actor(0).unwrap().locked_state().locked_block_hash,
+        Some(target)
+    );
+    // 同一 verified QC 第二次处理 ⇒ Ok 且 lock 不变（L-8 same-target no-op；无需新增 dedup）
+    driver.process_transition_derived(&res).unwrap();
+    let lock = driver.actor(0).unwrap().locked_state();
+    assert_eq!(lock.locked_block_hash, Some(target));
+    assert_eq!(lock.locked_round, Some(0));
 }

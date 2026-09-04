@@ -6,7 +6,9 @@
 //! 2. `submit_local_vote`：`LocalVoteRequest` → `ValidatorActor`（authorize + construct + sign）→
 //!    **统一 MF-2 门面 `verify_vote_input`**（OPTION A —— 与 remote 同一边界）→
 //!    `ConsensusNode::submit_verified_vote` → canonical transition。
-//! 3. `process_transition_derived`：从 `TransitionResult::Applied` 提取 `derived.precommit_qc` →
+//! 3. `submit_remote_vote`：已解码 remote vote → 同一 `verify_vote_input` 门面 →
+//!    `ConsensusNode::submit_verified_vote` → canonical transition（STEP 10-15P）。
+//! 4. `process_transition_derived`：从 `TransitionResult::Applied` 提取 `derived.precommit_qc` →
 //!    **显式 `verify_qc`**（`is_some() ≠ 已验证`，STEP 10-15N §11）→ 通过后 **broadcast** 至每个
 //!    本地 `ValidatorActor::on_verified_precommit_qc`（各自 `acquire_lock` L-8；只改自身 LockedState）。
 //!
@@ -21,7 +23,7 @@ use nova_consensus::error::ConsensusError;
 use nova_consensus::finality::{FinalityError, verify_qc};
 use nova_consensus::integration::{ConsensusEvent, TransitionResult};
 use nova_consensus::round::{ProposalRef, RoundStep};
-use nova_consensus::vote::{VoteType, verify_vote_input};
+use nova_consensus::vote::{ValidatorVote, VoteType, verify_vote_input};
 
 use crate::assembly::ConsensusNode;
 use crate::signer::SigningCapability;
@@ -136,6 +138,30 @@ impl<S: SigningCapability> NodeConsensusDriver<S> {
         // ④ 提交已验证 vote（canonical transition 由 ConsensusNode 持有；driver 不触碰共识状态）。
         let result = self.consensus.submit_verified_vote(vote, signature);
         Ok(Some(result))
+    }
+
+    /// 提交一条**已解码 remote vote**（STEP 10-15P；OPTION A —— 与 local / network handle_vote
+    /// 同一 `verify_vote_input` 门面）：验证通过 → `submit_verified_vote` → 同一 canonical
+    /// transition；返回完整 `TransitionResult`（derived 保留）。
+    ///
+    /// - 不做本地 phase/context 预判：remote vote 是否适用由 canonical transition 的 guards
+    ///   判定（`Ignored`/`Applied`）—— 与 assembly::handle_vote 行为一致。
+    /// - 调用方应将返回结果交给**单一** `process_transition_derived` choke 以路由 derived
+    ///   precommit QC（`verify_qc` → broadcast）至各本地 actor —— 与 local 路径共用。
+    pub fn submit_remote_vote(
+        &mut self,
+        vote: ValidatorVote,
+        signature: [u8; 64],
+    ) -> Result<TransitionResult, DriverError> {
+        // MF-2：与 local 同一边界 —— 先 verify_vote_input 后进 canonical transition。
+        verify_vote_input(
+            &vote,
+            &signature,
+            self.consensus.chain_id(),
+            self.consensus.validator_set(),
+        )
+        .map_err(DriverError::VoteVerification)?;
+        Ok(self.consensus.submit_verified_vote(vote, signature))
     }
 
     /// 处理一次 transition 结果：从 `Applied` 提取 `derived.precommit_qc` → 显式 `verify_qc`
