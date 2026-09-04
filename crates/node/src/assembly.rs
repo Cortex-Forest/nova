@@ -18,7 +18,7 @@ use nova_consensus::finality::FinalityState;
 use nova_consensus::integration::{
     ConsensusEvent, ConsensusState, IntegrationContext, TransitionResult, transition,
 };
-use nova_consensus::round::{RoundState, decode_proposal_ref};
+use nova_consensus::round::{ProposalRef, RoundState, decode_proposal_ref};
 use nova_consensus::validator::ValidatorSet;
 use nova_consensus::vote::{ValidatorVote, decode_validator_vote, verify_vote_input};
 use nova_crypto::signature::VerifyingKey;
@@ -90,6 +90,63 @@ impl ConsensusNode {
         &self.state
     }
 
+    /// chain_id（transition 冻结参数；只读）。
+    pub fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// ValidatorSet（transition 冻结参数；只读，供 `verify_vote_input` / `verify_qc` / `select_proposer`）。
+    pub fn validator_set(&self) -> &ValidatorSet {
+        &self.set
+    }
+
+    /// genesis hash（= QC `validator_set_id` 锚；只读）。
+    pub fn genesis_hash(&self) -> [u8; 32] {
+        self.genesis_hash
+    }
+
+    /// DAG（只读；供 `acquire_lock` / `verify_qc` / fork choice 消费）。
+    pub fn dag(&self) -> &Dag {
+        &self.dag
+    }
+
+    /// 提交 proposal（STEP 10-15O driver 路径）：`ConsensusEvent::SetProposal` → `transition` →
+    /// 应用 `next_state`；返回完整 `TransitionResult`（derived 保留，供 driver 消费）。
+    pub fn submit_proposal(&mut self, proposal_ref: ProposalRef) -> TransitionResult {
+        let result = transition(
+            &self.state,
+            ConsensusEvent::SetProposal(proposal_ref),
+            &mut self.context,
+            self.chain_id,
+            &self.set,
+            &self.genesis_hash,
+            &self.dag,
+        );
+        self.apply_result(&result);
+        result
+    }
+
+    /// 提交**已验证** vote（MF-2 caller 契约；OPTION A —— 本地与远程共用同一 `verify_vote_input`
+    /// 门面后到达此处）：`ConsensusEvent::Vote` → `transition` → 应用 `next_state`；返回完整
+    /// `TransitionResult`（`derived.precommit_qc` 保留，供 driver `verify_qc` + lock routing）。
+    pub fn submit_verified_vote(
+        &mut self,
+        vote: ValidatorVote,
+        signature: [u8; 64],
+    ) -> TransitionResult {
+        let result = transition(
+            &self.state,
+            ConsensusEvent::Vote { vote, signature },
+            &mut self.context,
+            self.chain_id,
+            &self.set,
+            &self.genesis_hash,
+            &self.dag,
+        );
+        self.apply_result(&result);
+        result
+    }
+
     /// 处理网络到达的 consensus envelope（Vote 路径）。
     ///
     /// 流程：`validate_consensus_envelope`（Network 域）→ classify → Vote decode → construct →
@@ -131,34 +188,14 @@ impl ConsensusNode {
         // Consensus 验证门面（GAP-1 解决；MF-2 precondition）——Node 不拥有 V-5 语义。
         verify_vote_input(&vote, &signature, self.chain_id, &self.set)
             .map_err(NodeError::VoteVerification)?;
-        let result = transition(
-            &self.state,
-            ConsensusEvent::Vote { vote, signature },
-            &mut self.context,
-            self.chain_id,
-            &self.set,
-            &self.genesis_hash,
-            &self.dag,
-        );
-        self.apply_result(&result);
-        Ok(result)
+        Ok(self.submit_verified_vote(vote, signature))
     }
 
     /// Proposal 路径：decode wire payload（ADR-0041 64B）→ construct 既有
     /// `ConsensusEvent::SetProposal` → `transition`（不修改）。阶段守卫归 transition。
     fn handle_proposal(&mut self, payload: &[u8]) -> Result<TransitionResult, NodeError> {
         let proposal_ref = decode_proposal_ref(payload).map_err(NodeError::ProposalDecode)?;
-        let result = transition(
-            &self.state,
-            ConsensusEvent::SetProposal(proposal_ref),
-            &mut self.context,
-            self.chain_id,
-            &self.set,
-            &self.genesis_hash,
-            &self.dag,
-        );
-        self.apply_result(&result);
-        Ok(result)
+        Ok(self.submit_proposal(proposal_ref))
     }
 
     /// `Applied` ⇒ 应用 `next_state`；`Ignored`/`Rejected` ⇒ 不变（MF-12 契约 3）。

@@ -38,8 +38,20 @@ pub mod block_adapter;
 /// restart recovery + 参数注入 + NodeBlockAdapter 构造。
 pub mod bootstrap;
 
+/// Node-local 签名边界（STEP 10-15L）：`SigningCapability` + `SoftwareSigner`（validator 本地投票签名）。
+pub mod signer;
+
+/// 本地验证者投票边界（STEP 10-15L）：`ValidatorActor` + `LocalVoteContext`（ADR-0053
+/// validator-local lock / 本地投票授权 → 标准 `ConsensusEvent::Vote`）。
+pub mod validator;
+
+/// Node Consensus Driver（STEP 10-15O）：Proposal → Local Vote → 统一 `verify_vote_input` →
+/// canonical transition → `TransitionDerived` → `verify_qc` → 路由至各本地 `ValidatorActor` lock。
+pub mod driver;
+
 pub use block_adapter::{ChainHead, NodeBlockAdapter, NodeBlockApplicationError};
 pub use bootstrap::{NodeConfig, NodeStartupError, start};
 
-// 注意：本阶段禁止实现任何节点/共识业务逻辑（除 STEP 11-4 已冻结的 Vote + RoundTimeout 路径
-// 与 STEP 7-D 已授权的 Block 应用适配路径）。
+// 注意：本阶段禁止实现任何节点/共识业务逻辑（除 STEP 11-4 已冻结的 Vote + RoundTimeout 路径、
+// STEP 7-D 已授权的 Block 应用适配路径、STEP 10-15L 已授权的本地验证者投票边界 signer + validator，
+// 以及 STEP 10-15O 已授权的 Node Consensus Driver 编排接线）。
