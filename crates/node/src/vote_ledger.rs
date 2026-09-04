@@ -68,10 +68,11 @@ pub enum VoteLedgerError {
     MissingReservation,
 }
 
-/// Node-local 投票账本（内存实现；10-15S —— 10-15T 替换为 durable 实现）。
+/// Node-local 投票账本（内存实现；10-15S —— 10-15T 由 `safety_store` durable journal 支撑恢复）。
 ///
 /// 确定性：`BTreeMap`（键有序）。单线程同步：`RefCell` interior mutability 使
 /// `produce_vote` 保持 `&self`，与既有 actor 借用结构一致。
+#[derive(Debug, Clone)]
 pub struct VoteLedger {
     entries: RefCell<BTreeMap<(u64, u64, u8), VoteRecord>>,
 }

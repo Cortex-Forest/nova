@@ -53,6 +53,11 @@ pub mod vote_ledger;
 /// canonical transition → `TransitionDerived` → `verify_qc` → 路由至各本地 `ValidatorActor` lock。
 pub mod driver;
 
+/// Validator Safety Store（STEP 10-15T；Restart Safety）：独立 fail-closed 的 validator-local
+/// durable journal（VoteIntent / VoteSigned / LockedState + identity header）。Option B —— 与
+/// canonical `PersistentBackend` state WAL 分离；不持久化私钥。
+pub mod safety_store;
+
 pub use block_adapter::{ChainHead, NodeBlockAdapter, NodeBlockApplicationError};
 pub use bootstrap::{NodeConfig, NodeStartupError, start};
 

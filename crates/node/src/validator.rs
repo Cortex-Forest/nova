@@ -22,6 +22,7 @@ use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_consensus::vote::{ValidatorVote, VoteType, canonical_vote_payload};
 use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
 
+use crate::safety_store::{ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
 use crate::vote_ledger::{VoteKey, VoteLedger, VoteLedgerError, VotePrepare, VoteRecord};
 
@@ -38,6 +39,10 @@ pub enum ValidatorActorError {
         existing_target: [u8; 32],
         requested_target: [u8; 32],
     },
+    /// Safety store 持久化失败（I/O / 损坏 / 冲突 / identity 失配）⇒ fail closed（不签名）。
+    Safety(ValidatorSafetyError),
+    /// 本地 lock transition 失败（`acquire_lock`；如非 Precommit QC —— lock 不变）。
+    Lock(FinalityError),
 }
 
 /// 本地投票授权决策。
@@ -83,6 +88,20 @@ impl LocalVoteContext {
             validator_id,
             locked_state: LockedState::new(),
             vote_ledger: VoteLedger::new(),
+        }
+    }
+
+    /// 从 durable 恢复结果构造（STEP 10-15T restart：重建 ledger + lock；fail-closed 已由
+    /// `ValidatorSafetyStore::recover` 保证）。
+    fn restored(
+        validator_id: ValidatorId,
+        locked_state: LockedState,
+        vote_ledger: VoteLedger,
+    ) -> Self {
+        Self {
+            validator_id,
+            locked_state,
+            vote_ledger,
         }
     }
 
@@ -136,10 +155,14 @@ pub struct ValidatorActor<S: SigningCapability> {
     context: LocalVoteContext,
     signer: S,
     chain_id: u64,
+    /// Optional durable safety journal（STEP 10-15T）。`None` = 纯内存 actor（既有测试 /
+    /// 临时路径）；`Some` = restart-safe（persist-before-sign + fail-closed 恢复）。
+    store: Option<ValidatorSafetyStore>,
 }
 
 impl<S: SigningCapability> ValidatorActor<S> {
     /// 构造：校验 signer 公钥派生的 `ValidatorId` 与 configured id 一致（wrong-key 保护，sign 前）。
+    /// 纯内存（无 durable journal）—— 既有 10-15L/S 语义不变。
     pub fn new(
         validator_id: ValidatorId,
         signer: S,
@@ -153,6 +176,39 @@ impl<S: SigningCapability> ValidatorActor<S> {
             context: LocalVoteContext::new(validator_id),
             signer,
             chain_id,
+            store: None,
+        })
+    }
+
+    /// Durable 构造 / 重启（STEP 10-15T）：identity 三重校验（signer 派生 id == configured
+    /// validator_id == store header validator_id；store chain_id == actor chain_id）→ 严格恢复
+    /// （fail closed：损坏 / 截断 / 冲突 / identity 失配 ⇒ `Err(Safety)`，validator 不能继续签名）。
+    ///
+    /// `store` 须已绑定（`ValidatorSafetyStore::create` 首启 / `at` 重启）。
+    pub fn restore(
+        validator_id: ValidatorId,
+        signer: S,
+        chain_id: u64,
+        store: ValidatorSafetyStore,
+    ) -> Result<Self, ValidatorActorError> {
+        let derived = ValidatorId::from_consensus_public_key(&signer.public_key().to_bytes());
+        if derived != validator_id {
+            return Err(ValidatorActorError::IdentityMismatch);
+        }
+        let identity = store.identity();
+        if identity.validator_id != *validator_id.as_bytes() || identity.chain_id != chain_id {
+            return Err(ValidatorActorError::IdentityMismatch);
+        }
+        let recovered = store.recover().map_err(ValidatorActorError::Safety)?;
+        Ok(Self {
+            context: LocalVoteContext::restored(
+                validator_id,
+                recovered.locked_state,
+                recovered.ledger,
+            ),
+            signer,
+            chain_id,
+            store: Some(store),
         })
     }
 
@@ -171,12 +227,28 @@ impl<S: SigningCapability> ValidatorActor<S> {
 
     /// 收到并验证 valid `PrecommitQC` 时推进本地 lock（validator-local；经 consensus `acquire_lock`
     /// L-8 guard；**不改** FinalityState —— global finality 由 Finality pipeline 管理）。
+    ///
+    /// durable actor（STEP 10-15T）：新 lock 先 durable 持久化（`commit_lock`），成功后
+    /// 才 adopted —— RT-28「durable BEFORE relying on the new lock」；持久化失败 ⇒ fail closed
+    /// （lock 不变，返回 `Err(Safety)`）。
     pub fn on_verified_precommit_qc(
         &mut self,
         qc: &QuorumCertificate,
         dag: &Dag,
-    ) -> Result<(), FinalityError> {
-        acquire_lock(&mut self.context.locked_state, qc, dag)
+    ) -> Result<(), ValidatorActorError> {
+        // candidate：在副本上执行 acquire_lock（in-memory 不变，直至 durable 成功）。
+        let mut candidate = self.context.locked_state;
+        acquire_lock(&mut candidate, qc, dag).map_err(ValidatorActorError::Lock)?;
+        if candidate != self.context.locked_state {
+            // RT-28：新 lock durable BEFORE adopting（失败 ⇒ lock 保持原状，fail closed）。
+            if let Some(store) = &self.store {
+                store
+                    .commit_lock(&candidate)
+                    .map_err(ValidatorActorError::Safety)?;
+            }
+            self.context.locked_state = candidate;
+        }
+        Ok(())
     }
 
     /// 组装并签名一条本地投票（authorize → VoteLedger DV guard → construct → canonical → domain →
@@ -212,25 +284,13 @@ impl<S: SigningCapability> ValidatorActor<S> {
             round: vote.round,
             vote_type: vote.vote_type,
         };
-        match self.context.vote_ledger.prepare(
+        let prepare = match self.context.vote_ledger.prepare(
             &key,
             vote.target_block_hash,
             vote.source_block_hash,
             vote.timestamp,
         ) {
-            Ok(VotePrepare::New) => {}
-            Ok(VotePrepare::Existing { record }) => {
-                if let Some(signature) = record.signature {
-                    // 幂等复用（Decision 2）：不产生第二次签名。
-                    return Ok(Some(vote_event_from_parts(
-                        key,
-                        record,
-                        signature,
-                        validator_id,
-                    )));
-                }
-                // 已 reserve 未 finalize（首次签名尚未落）⇒ 继续签名并 finalize（仍为首次签名）。
-            }
+            Ok(prepare) => prepare,
             Err(VoteLedgerError::DoubleVote {
                 existing_target,
                 requested_target,
@@ -245,6 +305,30 @@ impl<S: SigningCapability> ValidatorActor<S> {
             }
             // prepare 不产生 MissingReservation（仅 finalize）；防御性：无 event。
             Err(VoteLedgerError::MissingReservation) => return Ok(None),
+        };
+        // 幂等复用（Decision 2）：同 target 已签 ⇒ 不产生第二次签名、不重复持久化。
+        if let VotePrepare::Existing { record } = &prepare
+            && let Some(signature) = record.signature
+        {
+            return Ok(Some(vote_event_from_parts(
+                key,
+                record.clone(),
+                signature,
+                validator_id,
+            )));
+        }
+        // RT-INV-2 / RT-INV-3（STEP 10-15T）：durable vote intent **先于签名**。append 幂等：
+        // New（首次）或既有未 finalize intent（重启恢复 / 上次 sign 失败）均确保 durable；
+        // 失败 ⇒ `Err(Safety)` fail closed —— 绝不签名。
+        if let Some(store) = &self.store {
+            store
+                .commit_vote_intent(
+                    &key,
+                    vote.target_block_hash,
+                    vote.source_block_hash,
+                    vote.timestamp,
+                )
+                .map_err(ValidatorActorError::Safety)?;
         }
         // domain separation（ADR-0009/0010/0013）：canonical_vote_payload → build_signed_bytes →
         // hash_signing_message → sign（绝不签 raw bytes / Debug / JSON）。
@@ -261,10 +345,18 @@ impl<S: SigningCapability> ValidatorActor<S> {
         };
         let message_hash = hash_signing_message(&signed);
         let Some(signature) = self.signer.sign(&message_hash).ok() else {
-            // sign 失败 ⇒ 保持 Reserved（不产出签名；同 target 可重试，不同 target 仍拒绝）。
+            // sign 失败 ⇒ 保持 Reserved + durable intent（不产出签名；同 target 可重试，
+            // 不同 target 仍拒绝）。
             return Ok(None);
         };
         let signature_bytes = signature.to_bytes();
+        // RT-INV-2（续）：durable signature **先于** in-memory finalize / 发事件；失败 ⇒
+        // `Err(Safety)` fail closed（in-memory 不 finalize ⇒ 同 target 可重试，不产生第二份广播）。
+        if let Some(store) = &self.store {
+            store
+                .commit_signature(&key, signature_bytes)
+                .map_err(ValidatorActorError::Safety)?;
+        }
         // record signature（fail-safe：记录失败则不产出无记录的签名）。
         if self
             .context

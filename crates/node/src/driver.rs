@@ -38,8 +38,8 @@ pub enum DriverError {
     VoteVerification(ConsensusError),
     /// derived PrecommitQC 未通过 `verify_qc`（不路由 ⇒ 无 actor lock 更新）。
     QcVerification(FinalityError),
-    /// actor lock transition 失败（`acquire_lock`；如非 Precommit QC —— derived 不应出现）。
-    ActorLock(FinalityError),
+    /// actor lock transition / durable 持久化失败（`acquire_lock` 或 safety store `commit_lock`）。
+    ActorLock(ValidatorActorError),
     /// ValidatorActor 失败（含 Double-Vote 拒绝 —— 同 `(height,round,vote_type)` 已签其它 target）。
     Actor(ValidatorActorError),
 }
