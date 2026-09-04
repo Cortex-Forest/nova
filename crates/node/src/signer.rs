@@ -59,6 +59,18 @@ impl SigningCapability for SoftwareSigner {
     }
 }
 
+/// Trait-object 转发（STEP 10-16）：`ValidatorActor<Box<dyn SigningCapability>>` 成立；
+/// 载体（software/HSM/remote）皆经 `KeyProvider::load_signer` 以 trait object 注入。
+impl SigningCapability for Box<dyn SigningCapability + '_> {
+    fn public_key(&self) -> VerifyingKey {
+        (**self).public_key()
+    }
+
+    fn sign(&self, message_hash: &SigningMessageHash) -> Result<Signature, SigningError> {
+        (**self).sign(message_hash)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

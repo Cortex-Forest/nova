@@ -29,6 +29,7 @@ use nova_storage::store::StateStore;
 use nova_storage::trie::EMPTY_STATE_ROOT;
 
 use crate::block_adapter::{ChainHead, NodeBlockAdapter};
+use crate::key_provider::KeyProviderConfig;
 
 /// 节点启动配置（F-3 最小；Node-local，非协议）。
 #[derive(Debug, Clone)]
@@ -41,8 +42,14 @@ pub struct NodeConfig {
     pub expected_chain_id: u64,
     /// 期望 network_id（须 == `GenesisV1.network_id`；ADR-0010 §5 / genesis-v1.md §15）。
     pub expected_network_id: NetworkId,
-    /// 持久化存储目录。
+    /// 持久化存储目录（canonical chain storage）。
     pub storage_dir: PathBuf,
+    /// 是否启用验证者模式（STEP 10-16；默认 false：不初始化 signer / safety / validator）。
+    pub validator_enabled: bool,
+    /// validator safety journal 目录（STEP 10-16；仅 validator_enabled=true；与 storage_dir 分离）。
+    pub safety_dir: PathBuf,
+    /// KeyProvider 配置（STEP 10-16 Phase 1：`None` = 由调用方注入 provider 实例）。
+    pub key_provider_config: KeyProviderConfig,
 }
 
 /// Node 启动错误（Node-local；typed，不 String 化 / 不 Box 隐藏）。
@@ -127,7 +134,9 @@ pub fn start<R: KeyResolver>(
 }
 
 /// genesis 文件 → decode → validate（expected hash / chain_id / network_id）。任一失败 ⇒ `Err`。
-fn load_genesis(config: &NodeConfig) -> Result<(GenesisV1, ChainIdentity), NodeStartupError> {
+pub(crate) fn load_genesis(
+    config: &NodeConfig,
+) -> Result<(GenesisV1, ChainIdentity), NodeStartupError> {
     let bytes = std::fs::read(&config.genesis_path).map_err(|_| NodeStartupError::GenesisRead)?;
     let genesis = decode_genesis_bytes(&bytes).map_err(NodeStartupError::GenesisDecode)?;
     let identity = validate_genesis_with_expected(&genesis, &config.expected_genesis_hash)

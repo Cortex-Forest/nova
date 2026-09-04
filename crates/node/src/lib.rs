@@ -53,11 +53,18 @@ pub mod vote_ledger;
 /// canonical transition → `TransitionDerived` → `verify_qc` → 路由至各本地 `ValidatorActor` lock。
 pub mod driver;
 
+/// KeyProvider seam（STEP 10-16）：`load_signer() -> Box<dyn SigningCapability>`；ValidatorActor
+/// 不知私钥位置 / 载体（software/HSM/remote/KMS 均为实现）。不修改 `SigningCapability`。
+pub mod key_provider;
 /// Validator Safety Store（STEP 10-15T；Restart Safety）：独立 fail-closed 的 validator-local
 /// durable journal（VoteIntent / VoteSigned / LockedState + identity header）。Option B —— 与
 /// canonical `PersistentBackend` state WAL 分离；不持久化私钥。
 pub mod safety_store;
 
+/// NodeRuntime 生命周期装配（STEP 10-16 Phase 1）：Config → Genesis → ChainIdentity → chain
+/// storage →（validator mode）KeyProvider → derive ValidatorId → SafetyStore → recover →
+/// ValidatorActor → ConsensusNode；Network / EventLoop 为 future 占位。
+pub mod runtime;
 pub use block_adapter::{ChainHead, NodeBlockAdapter, NodeBlockApplicationError};
 pub use bootstrap::{NodeConfig, NodeStartupError, start};
 
