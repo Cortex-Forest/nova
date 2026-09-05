@@ -26,11 +26,12 @@ use nova_storage::persistent::PersistentBackend;
 
 use crate::assembly::ConsensusNode;
 use crate::bootstrap::{self, NodeConfig, NodeStartupError};
-use crate::driver::NodeConsensusDriver;
+use crate::driver::{DriverError, NodeConsensusDriver};
 use crate::key_provider::{KeyProvider, KeyProviderError};
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
 use crate::validator::{ValidatorActor, ValidatorActorError};
+use crate::wiring::{NodeConsensusCommand, process_command};
 
 /// ValidatorActor 的签名能力类型（Phase 1：trait object）。
 type DynSigner = Box<dyn SigningCapability>;
@@ -194,6 +195,18 @@ impl NodeRuntime {
     /// NodeConsensusDriver（只读；ConsensusNode + ValidatorActor 的 owner）。
     pub fn driver(&self) -> &NodeConsensusDriver<DynSigner> {
         &self.driver
+    }
+
+    /// consensus orchestration 入口（STEP 10-18I-D-A Option A）：把 node 层 consensus command
+    /// （EventLoop → Handler decode queue → Runtime 承接）交给 Driver 的既有安全门面。
+    /// - verify/decode/transition 门面 FAIL 原样以 `DriverError` 传出（不吞错、不改状态）。
+    /// - outbound 不在此 egress：验证 PASS 后由更高层 `take_outbound()` 接出（GAP-A deferred）。
+    /// - 借用生命周期严格限当前调用（不长期借 Driver；无 self-reference）。
+    pub fn process_consensus_command(
+        &mut self,
+        command: NodeConsensusCommand,
+    ) -> Result<(), DriverError> {
+        process_command(&mut self.driver, command)
     }
 
     /// canonical consensus node handle（只读）—— **delegate** `driver.consensus()`（不复制）。

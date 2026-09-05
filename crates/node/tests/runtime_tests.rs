@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use nova_consensus::integration::ConsensusEvent;
+use nova_consensus::round::{ProposalRef, RoundStep};
 use nova_consensus::vote::VoteType;
 use nova_crypto::address::{
     ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
@@ -25,6 +26,7 @@ use nova_node::key_provider::SoftwareKeyProvider;
 use nova_node::runtime::{NodeRuntime, NodeRuntimeError, derive_validator_id};
 use nova_node::safety_store::{SafetyIdentity, ValidatorSafetyStore};
 use nova_node::validator::LocalVoteRequest;
+use nova_node::wiring::NodeConsensusCommand;
 
 const CHAIN_ID: u64 = 1001;
 
@@ -293,4 +295,35 @@ fn rt_28_validator_id_mismatch_startup_fails() {
         matches!(err, NodeRuntimeError::Validator(_)),
         "validator_id mismatch ⇒ validator 启动 fail closed（got {err:?}）"
     );
+}
+
+// ---------- RT-29 : consensus orchestration 入口（10-18I-D-A Option A） ----------
+
+/// RT-29：Runtime 承接 node 层 consensus command → Driver（唯一 mutation owner）。
+/// Proposal command（EventLoop/handler 已完成 decode）→ 既有 canonical 门面 Applied；
+/// ConsensusNode 是唯一 canonical 状态 owner（command 不停留在任何中间层）。
+#[test]
+fn rt_29_runtime_processes_consensus_command() {
+    let kp = KeyPair::generate().unwrap();
+    let pk = kp.verifying_key().to_bytes();
+    let env = Env::new(&genesis_for(pk));
+    let config = env.config(true, env.genesis_hash);
+    let provider = SoftwareKeyProvider::from_keypair(kp);
+
+    let mut runtime = NodeRuntime::start(&config, Some(&provider)).expect("validator 启动成功");
+    let proposer = derive_validator_id(&pk);
+    let pr = ProposalRef {
+        block_hash: [0xAA; 32],
+        proposer,
+    };
+
+    // 经 Runtime orchestration 入口提交 remote proposal（verify 由 Driver 既有门面完成）
+    runtime
+        .process_consensus_command(NodeConsensusCommand::Proposal(pr.clone()))
+        .expect("proposal orchestration Ok");
+
+    // ConsensusNode canonical 状态已推进（Proposal Applied ⇒ step=Prevote）
+    let state = runtime.consensus().state();
+    assert_eq!(state.round.proposal, Some(pr));
+    assert_eq!(state.round.step, RoundStep::Prevote);
 }

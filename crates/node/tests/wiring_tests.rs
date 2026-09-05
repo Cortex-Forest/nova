@@ -1,8 +1,14 @@
-//! Node Consensus Wiring 集成测试（STEP 10-18G-1；Owner Option 1）。
+//! Node Consensus Wiring 集成测试（STEP 10-18G-1 + 10-18I-D-A Option A 迁移）。
 //!
-//! 覆盖：NetworkEvent（vote/proposal/qc）经 EventLoop → NodeConsensusHandler → Driver
-//! （既有验证门面）→ ConsensusNode；Driver → outbound semantic → NetworkEgress seam；
+//! 覆盖：NetworkEvent（vote/proposal/qc）经 EventLoop → [`NodeConsensusHandler`]
+//! （decode/classify → owned command queue）→ [`process_command`]（node 层单一 orchestration）
+//! → Driver（既有验证门面）→ ConsensusNode；Driver → outbound semantic → NetworkEgress seam；
 //! QC 验证前后广播/锁语义；multi-validator 独立 lock；G-14/G-15 结构边界。
+//!
+//! Option A 迁移要点：`NodeConsensusHandler` **不拥有** driver/egress —— decode 只入队，
+//! verify/orchestration 由 `process_command(&mut driver, cmd)` 完成（测试经 `run_all` helper
+//! 模拟 Runtime orchestration）；verify 失败（bad signature / bad QC）不再计入 EventLoop
+//! `handler_errors`（那是 wire decode 失败专用），而是作为 orchestration 错误返回。
 //!
 //! 全部 deterministic（无随机路径）；fixture 复用既有 consensus/crypto 原语。
 //! 测试用 egress 之网络签名路径使用 test-only KeyPair（不修改生产 NodeRuntime）。
@@ -20,7 +26,7 @@ use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signin
 use nova_crypto::identity::{EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit};
 use nova_crypto::key::KeyPair;
 use nova_crypto::signature::{SigningKey, VerifyingKey, sign_message_hash};
-use nova_network::event_loop::{EventHandler, EventLoop, EventLoopConfig, NodeEvent};
+use nova_network::event_loop::{EventLoop, EventLoopConfig, NodeEvent};
 use nova_network::message::{
     MessageEnvelope, MessageType, decode, encode, sign_message, verify_message,
 };
@@ -33,7 +39,7 @@ use nova_node::driver::NodeConsensusDriver;
 use nova_node::outbound::{NetworkEgress, OutboundConsensusMessage};
 use nova_node::signer::SoftwareSigner;
 use nova_node::validator::{LocalVoteRequest, ValidatorActor};
-use nova_node::wiring::NodeConsensusHandler;
+use nova_node::wiring::{NodeConsensusHandler, process_command};
 
 const CHAIN_ID: u64 = 1001;
 const GENESIS_HASH: [u8; 32] = [0x42; 32];
@@ -240,7 +246,7 @@ fn setup_single_driver() -> (NodeConsensusDriver<SoftwareSigner>, [u8; 32]) {
     (driver, target)
 }
 
-// ---------- EventLoop / event 装配 ----------
+// ---------- EventLoop / orchestration 装配（Option A） ----------
 
 /// 记录 egress（收集 driver 产出的 outbound semantic batch）。
 #[derive(Default)]
@@ -268,20 +274,49 @@ impl NetworkEgress for RecordingEgress {
     }
 }
 
-/// 构造 EventLoop（wiring 测试不经真实 transport；事件由调用方 push 注入，run 直接 dispatch）。
-/// NetworkService 不在本 helper —— EventLoop 不拥有网络状态（ADR-0058）。
-fn make_loop<E: NetworkEgress>(
-    driver: NodeConsensusDriver<SoftwareSigner>,
-    egress: E,
-) -> EventLoop<NodeConsensusHandler<SoftwareSigner, E>> {
-    let handler = NodeConsensusHandler::new(driver, egress);
-    EventLoop::new(EventLoopConfig::default(), handler)
+/// 构造 EventLoop（wiring 测试不经真实 transport；事件由调用方 push 注入）。
+/// `NodeConsensusHandler` 无 driver/egress（Option A）；driver/egress 由测试独立持有。
+fn make_loop() -> EventLoop<NodeConsensusHandler> {
+    EventLoop::new(EventLoopConfig::default(), NodeConsensusHandler::new())
 }
 
-/// push 事件并 dispatch（无 transport poll / 无 timer；等价于 wiring 语义的受控 dispatch）。
-fn run<H: EventHandler>(el: &mut EventLoop<H>, event: NodeEvent) {
+/// push 事件并 dispatch —— 仅 decode/classify → command queue（无 driver mutation）。
+fn push_dispatch(el: &mut EventLoop<NodeConsensusHandler>, event: NodeEvent) {
     el.push_event(event).expect("push_event");
     el.dispatch_queued().expect("dispatch_queued");
+}
+
+/// Option A orchestration（模拟 NodeRuntime 承接 command 的路径）：
+/// handler command queue → `process_command(&mut driver)`；PASS 后才可能 record outbound →
+/// drain 到 egress。返回首个 process 失败（verify/transition 门面拒；fail-safe 不改状态；
+/// **不**计入 EventLoop handler_errors —— 那是 wire decode 失败专用）。
+fn orchestrate(
+    el: &mut EventLoop<NodeConsensusHandler>,
+    driver: &mut NodeConsensusDriver<SoftwareSigner>,
+    egress: &mut RecordingEgress,
+) -> Result<(), ()> {
+    let mut first_err = Ok(());
+    for command in el.handler_mut().take_commands() {
+        if process_command(driver, command).is_err() && first_err.is_ok() {
+            first_err = Err(());
+        }
+    }
+    let outbound = driver.take_outbound();
+    if !outbound.is_empty() {
+        egress.send_outbound(outbound);
+    }
+    first_err
+}
+
+/// 完整 wiring 流程：push → dispatch → orchestrate（Runtime 路径）。
+fn run_all(
+    el: &mut EventLoop<NodeConsensusHandler>,
+    driver: &mut NodeConsensusDriver<SoftwareSigner>,
+    egress: &mut RecordingEgress,
+    event: NodeEvent,
+) -> Result<(), ()> {
+    push_dispatch(el, event);
+    orchestrate(el, driver, egress)
 }
 
 fn vote_event(sender: NodeId, vote: ValidatorVote, signature: [u8; 64]) -> NodeEvent {
@@ -306,7 +341,8 @@ fn qc_event(sender: NodeId, qc: &QuorumCertificate) -> NodeEvent {
 
 // ---------- G-1 ----------
 
-/// G-1：NetworkEvent::ConsensusVote 经 EventLoop → handler → Driver → canonical transition。
+/// G-1：NetworkEvent::ConsensusVote 经 EventLoop → handler（decode queue）→ process_command
+/// → Driver → canonical transition。
 #[test]
 fn g1_vote_reaches_driver() {
     let (ks, set) = make_ctx(3);
@@ -315,10 +351,14 @@ fn g1_vote_reaches_driver() {
     let target = [0xAA; 32];
     let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag1());
     let driver = NodeConsensusDriver::<SoftwareSigner>::new(consensus, Vec::new());
-    let mut el = make_loop(driver, RecordingEgress::default());
+    let mut driver = driver;
+    let mut el = make_loop();
+    let mut egress = RecordingEgress::default();
 
-    run(
+    run_all(
         &mut el,
+        &mut driver,
+        &mut egress,
         proposal_event(
             node_id_of(b),
             &ProposalRef {
@@ -326,28 +366,36 @@ fn g1_vote_reaches_driver() {
                 proposer: vid_of(b),
             },
         ),
-    );
+    )
+    .expect("proposal orchestration");
     assert_eq!(
-        el.handler().driver().consensus().state().round.step,
+        driver.consensus().state().round.step,
         RoundStep::Prevote,
         "proposal Applied ⇒ step=Prevote"
     );
 
     for kp in [b, c] {
         let (vote, sig) = remote_vote(kp, VoteType::Prevote, target, 0, 0);
-        run(&mut el, vote_event(node_id_of(kp), vote, sig));
+        run_all(
+            &mut el,
+            &mut driver,
+            &mut egress,
+            vote_event(node_id_of(kp), vote, sig),
+        )
+        .expect("remote vote orchestration");
     }
     assert_eq!(
-        el.handler().driver().consensus().state().round.step,
+        driver.consensus().state().round.step,
         RoundStep::Precommit,
-        "remote votes 经 EventLoop 到达 Driver 并推进 round"
+        "remote votes 经 orchestration 到达 Driver 并推进 round"
     );
-    assert!(el.handler().egress().is_empty());
+    assert!(egress.is_empty());
 }
 
 // ---------- G-2 ----------
 
 /// G-2：remote vote 使用既有 verification facade（坏签名被拒；无状态变化）。
+/// Option A：坏签名 wire decode 成功（进 queue），verify 在 process_command 拒 ⇒ Err。
 #[test]
 fn g2_remote_vote_uses_verify_facade() {
     let (ks, set) = make_ctx(3);
@@ -355,9 +403,13 @@ fn g2_remote_vote_uses_verify_facade() {
     let target = [0xAA; 32];
     let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag1());
     let driver = NodeConsensusDriver::<SoftwareSigner>::new(consensus, Vec::new());
-    let mut el = make_loop(driver, RecordingEgress::default());
-    run(
+    let mut driver = driver;
+    let mut el = make_loop();
+    let mut egress = RecordingEgress::default();
+    run_all(
         &mut el,
+        &mut driver,
+        &mut egress,
         proposal_event(
             node_id_of(b),
             &ProposalRef {
@@ -365,13 +417,11 @@ fn g2_remote_vote_uses_verify_facade() {
                 proposer: vid_of(b),
             },
         ),
-    );
-    assert_eq!(
-        el.handler().driver().consensus().state().round.step,
-        RoundStep::Prevote
-    );
+    )
+    .expect("proposal orchestration");
+    assert_eq!(driver.consensus().state().round.step, RoundStep::Prevote);
 
-    // 声称是 B（set 成员）但由 outsider 签名 ⇒ verify_vote_input 拒
+    // 声称是 B（set 成员）但由 outsider 签名 ⇒ verify_vote_input 拒（process 层）
     let outsider = KeyPair::generate().unwrap();
     let (vote, _) = remote_vote(&outsider, VoteType::Prevote, target, 0, 0);
     let forged = ValidatorVote {
@@ -379,18 +429,19 @@ fn g2_remote_vote_uses_verify_facade() {
         ..vote
     };
     let bad_sig = sign_vote(outsider.signing_key(), &forged);
-    run(&mut el, vote_event(node_id_of(&outsider), forged, bad_sig));
-
-    assert!(
-        el.diagnostics().handler_errors >= 1,
-        "坏签名必须在 handler 层被拒"
+    let res = run_all(
+        &mut el,
+        &mut driver,
+        &mut egress,
+        vote_event(node_id_of(&outsider), forged, bad_sig),
     );
+    assert!(res.is_err(), "坏签名必须在 process_command 层被拒");
     assert_eq!(
-        el.handler().driver().consensus().state().round.step,
+        driver.consensus().state().round.step,
         RoundStep::Prevote,
         "invalid vote 不得推进 consensus"
     );
-    assert!(el.handler().egress().is_empty());
+    assert!(egress.is_empty());
 }
 
 // ---------- G-3 ----------
@@ -407,10 +458,14 @@ fn g3_remote_vote_never_enters_local_ledger() {
     let target = [0xAA; 32];
     let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag1());
     let driver = NodeConsensusDriver::new(consensus, vec![actor_of(a)]);
-    let mut el = make_loop(driver, RecordingEgress::default());
+    let mut driver = driver;
+    let mut el = make_loop();
+    let mut egress = RecordingEgress::default();
 
-    run(
+    run_all(
         &mut el,
+        &mut driver,
+        &mut egress,
         proposal_event(
             a_node,
             &ProposalRef {
@@ -418,79 +473,94 @@ fn g3_remote_vote_never_enters_local_ledger() {
                 proposer: a_id,
             },
         ),
-    );
+    )
+    .expect("proposal orchestration");
     // remote prevote B、C（A 不参与本地 prevote）
     for kp in [b, c] {
         let (vote, sig) = remote_vote(kp, VoteType::Prevote, target, 0, 0);
-        run(&mut el, vote_event(node_id_of(kp), vote, sig));
+        run_all(
+            &mut el,
+            &mut driver,
+            &mut egress,
+            vote_event(node_id_of(kp), vote, sig),
+        )
+        .expect("remote prevote orchestration");
     }
-    assert_eq!(
-        el.handler().driver().consensus().state().round.step,
-        RoundStep::Precommit
-    );
+    assert_eq!(driver.consensus().state().round.step, RoundStep::Precommit);
     // remote precommit B、C → Finalized + derived QC（本地 A 不投任何票）
     for kp in [b, c] {
         let (vote, sig) = remote_vote(kp, VoteType::Precommit, target, 0, 0);
-        run(&mut el, vote_event(node_id_of(kp), vote, sig));
+        run_all(
+            &mut el,
+            &mut driver,
+            &mut egress,
+            vote_event(node_id_of(kp), vote, sig),
+        )
+        .expect("remote precommit orchestration");
     }
-    assert_eq!(
-        el.handler().driver().consensus().state().round.step,
-        RoundStep::Finalized
-    );
+    assert_eq!(driver.consensus().state().round.step, RoundStep::Finalized);
     assert!(
-        el.handler()
-            .driver()
-            .actor(0)
-            .unwrap()
-            .vote_ledger()
-            .is_empty(),
+        driver.actor(0).unwrap().vote_ledger().is_empty(),
         "remote vote 不得进入本地 VoteLedger"
     );
 }
 
 // ---------- G-4 ----------
 
-/// G-4：valid ProposalRef 经 EventLoop → Driver → ConsensusNode。
+/// G-4：valid ProposalRef 经 EventLoop → process_command → ConsensusNode。
 #[test]
 fn g4_valid_proposal_reaches_driver() {
     let (driver, target) = setup_single_driver();
+    let mut driver = driver;
     let proposer = driver.actor(0).unwrap().validator_id();
     let sender = NodeId::from_bytes([0x99; 32]);
     let pr = ProposalRef {
         block_hash: target,
         proposer,
     };
-    let mut el = make_loop(driver, RecordingEgress::default());
-    run(&mut el, proposal_event(sender, &pr));
-    let state = el.handler().driver().consensus().state();
+    let mut el = make_loop();
+    let mut egress = RecordingEgress::default();
+    run_all(
+        &mut el,
+        &mut driver,
+        &mut egress,
+        proposal_event(sender, &pr),
+    )
+    .expect("proposal orchestration");
+    let state = driver.consensus().state();
     assert_eq!(state.round.proposal, Some(pr));
     assert_eq!(state.round.step, RoundStep::Prevote);
 }
 
 // ---------- G-5 ----------
 
-/// G-5：invalid ProposalRef 不改变 consensus。
+/// G-5：invalid wire（decode 失败）⇒ EventLoop handler_errors；不改 consensus。
+/// （Option A：decode 在 handler；此断言保留 EventLoop 计数语义。）
 #[test]
 fn g5_invalid_proposal_no_mutation() {
     let (driver, _target) = setup_single_driver();
-    let mut el = make_loop(driver, RecordingEgress::default());
-    let before = el.handler().driver().consensus().state().round.step;
+    let mut driver = driver;
+    let mut el = make_loop();
+    let mut egress = RecordingEgress::default();
+    let before = driver.consensus().state().round.step;
 
     let bad = NodeEvent::Network(NetworkEvent::ConsensusProposal {
         sender: NodeId::from_bytes([0x77; 32]),
         payload: vec![0x00; 63],
     });
-    run(&mut el, bad);
+    push_dispatch(&mut el, bad);
 
     assert!(el.diagnostics().handler_errors >= 1);
-    let state = el.handler().driver().consensus().state();
+    let state = driver.consensus().state();
     assert!(state.round.proposal.is_none());
     assert_eq!(state.round.step, before);
+    assert!(orchestrate(&mut el, &mut driver, &mut egress).is_ok());
 }
 
 // ---------- G-6 ----------
 
-/// G-6：valid QC 经 EventLoop → Driver.submit_inbound_qc（verify_qc PASS → local lock）。
+/// G-6：valid QC 经 EventLoop → process_command → Driver.submit_inbound_qc
+/// （verify_qc PASS → local lock）。
 #[test]
 fn g6_valid_qc_reaches_driver() {
     let (mut ks, set) = make_ctx(1);
@@ -506,18 +576,20 @@ fn g6_valid_qc_reaches_driver() {
 
     let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag1());
     let driver = NodeConsensusDriver::new(consensus, vec![actor_of(a)]);
-    let mut el = make_loop(driver, RecordingEgress::default());
-    run(&mut el, qc_event(a_node, &qc));
+    let mut driver = driver;
+    let mut el = make_loop();
+    let mut egress = RecordingEgress::default();
+    run_all(&mut el, &mut driver, &mut egress, qc_event(a_node, &qc)).expect("qc orchestration");
 
-    let lock = el.handler().driver().actor(0).unwrap().locked_state();
+    let lock = driver.actor(0).unwrap().locked_state();
     assert_eq!(lock.locked_block_hash, Some(target));
     assert_eq!(lock.locked_round, Some(0));
-    assert!(el.handler().egress().is_empty(), "inbound QC 不重广播");
+    assert!(egress.is_empty(), "inbound QC 不重广播");
 }
 
 // ---------- G-7 / G-8 ----------
 
-/// G-7/G-8：invalid QC ⇒ 无 outbound 且无 lock。
+/// G-7/G-8：invalid QC（verify 失败）⇒ orchestration Err 且无 outbound 且无 lock。
 #[test]
 fn g7_g8_invalid_qc_no_outbound_no_lock() {
     let (mut ks, set) = make_ctx(1);
@@ -526,20 +598,20 @@ fn g7_g8_invalid_qc_no_outbound_no_lock() {
     let target = [0xAA; 32];
     let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag1());
     let driver = NodeConsensusDriver::new(consensus, vec![actor_of(a)]);
-    let mut el = make_loop(driver, RecordingEgress::default());
+    let mut driver = driver;
+    let mut el = make_loop();
+    let mut egress = RecordingEgress::default();
 
     let bad_qc = make_precommit_qc(&target, &[(vid_of(&outsider), &outsider)], GENESIS_HASH);
-    run(&mut el, qc_event(node_id_of(&outsider), &bad_qc));
-
-    assert!(
-        el.diagnostics().handler_errors >= 1,
-        "invalid QC 必须被 handler 拒"
+    let res = run_all(
+        &mut el,
+        &mut driver,
+        &mut egress,
+        qc_event(node_id_of(&outsider), &bad_qc),
     );
-    assert!(
-        el.handler().egress().is_empty(),
-        "G-7：invalid QC 不得 outbound"
-    );
-    let lock = el.handler().driver().actor(0).unwrap().locked_state();
+    assert!(res.is_err(), "invalid QC 必须在 process_command 层被拒");
+    assert!(egress.is_empty(), "G-7：invalid QC 不得 outbound");
+    let lock = driver.actor(0).unwrap().locked_state();
     assert_eq!(lock.locked_block_hash, None, "G-8：invalid QC 不得 lock");
     assert_eq!(lock.locked_round, None);
 }
@@ -563,12 +635,20 @@ fn g9_valid_qc_reaches_every_local_actor() {
 
     let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag1());
     let driver = NodeConsensusDriver::new(consensus, vec![actor_of(a), actor_of(b)]);
-    let mut el = make_loop(driver, RecordingEgress::default());
-    run(&mut el, qc_event(node_id_of(&c), &qc));
+    let mut driver = driver;
+    let mut el = make_loop();
+    let mut egress = RecordingEgress::default();
+    run_all(
+        &mut el,
+        &mut driver,
+        &mut egress,
+        qc_event(node_id_of(&c), &qc),
+    )
+    .expect("qc orchestration");
 
-    let actor_a = el.handler().driver().actor(0).unwrap();
+    let actor_a = driver.actor(0).unwrap();
     assert_eq!(actor_a.locked_state().locked_block_hash, Some(target));
-    let actor_b = el.handler().driver().actor(1).unwrap();
+    let actor_b = driver.actor(1).unwrap();
     assert_eq!(actor_b.locked_state().locked_block_hash, Some(target));
 }
 
@@ -597,42 +677,38 @@ fn g10_each_actor_independently_acquires_lock() {
 
     let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag2());
     let driver = NodeConsensusDriver::new(consensus, vec![actor_of(a), actor_of(b)]);
-    let mut el = make_loop(driver, RecordingEgress::default());
+    let mut driver = driver;
+    let mut el = make_loop();
+    let mut egress = RecordingEgress::default();
 
     let pre_dag = dag2();
-    el.handler_mut()
-        .driver_mut()
+    driver
         .actor_mut(0)
         .unwrap()
         .on_verified_precommit_qc(&qc_aa, &pre_dag)
         .unwrap();
-    el.handler_mut()
-        .driver_mut()
+    driver
         .actor_mut(1)
         .unwrap()
         .on_verified_precommit_qc(&qc_bb, &pre_dag)
         .unwrap();
 
     // inbound valid QC target CC → A advance；B（unrelated）不变
-    run(&mut el, qc_event(node_id_of(&c), &qc_cc));
+    run_all(
+        &mut el,
+        &mut driver,
+        &mut egress,
+        qc_event(node_id_of(&c), &qc_cc),
+    )
+    .expect("qc orchestration");
 
     assert_eq!(
-        el.handler()
-            .driver()
-            .actor(0)
-            .unwrap()
-            .locked_state()
-            .locked_block_hash,
+        driver.actor(0).unwrap().locked_state().locked_block_hash,
         Some(cc),
         "A: descendant ⇒ advance"
     );
     assert_eq!(
-        el.handler()
-            .driver()
-            .actor(1)
-            .unwrap()
-            .locked_state()
-            .locked_block_hash,
+        driver.actor(1).unwrap().locked_state().locked_block_hash,
         Some(bb),
         "B: unrelated ⇒ 不被同一 QC 改写（独立 lock）"
     );
@@ -760,29 +836,31 @@ fn g14_g15_driver_and_actor_have_no_transport_dependency() {
     let _driver = NodeConsensusDriver::new(consensus, vec![actor_of(kp)]);
 }
 
-// ---------- 附加：非 consensus 事件不塞入 Driver ----------
+// ---------- 附加：非 consensus 事件不产生 command / 不触 driver ----------
 
 #[test]
 fn gossip_sync_never_reach_driver() {
     let (driver, _target) = setup_single_driver();
-    let mut el = make_loop(driver, RecordingEgress::default());
-    let before = el.handler().driver().consensus().state().round.step;
+    let mut driver = driver;
+    let mut el = make_loop();
+    let mut egress = RecordingEgress::default();
+    let before = driver.consensus().state().round.step;
 
-    run(
+    push_dispatch(
         &mut el,
         NodeEvent::Network(NetworkEvent::Ping {
             sender: NodeId::from_bytes([0x11; 32]),
             payload: vec![1, 2, 3],
         }),
     );
-    run(
+    push_dispatch(
         &mut el,
         NodeEvent::Network(NetworkEvent::SyncBlockRequest {
             sender: NodeId::from_bytes([0x22; 32]),
             payload: vec![0xAA; 8],
         }),
     );
-    run(
+    push_dispatch(
         &mut el,
         NodeEvent::Network(NetworkEvent::GossipTransaction {
             sender: NodeId::from_bytes([0x33; 32]),
@@ -791,13 +869,15 @@ fn gossip_sync_never_reach_driver() {
     );
 
     assert_eq!(el.handler().non_consensus_seen(), 3);
+    assert_eq!(el.handler().pending_commands(), 0);
     assert_eq!(
-        el.handler().driver().consensus().state().round.step,
+        driver.consensus().state().round.step,
         before,
         "gossip/sync 不得经 ConsensusNode 伪装进入共识"
     );
-    assert!(el.handler().egress().is_empty());
+    assert!(egress.is_empty());
     assert_eq!(el.diagnostics().handler_errors, 0);
+    assert!(orchestrate(&mut el, &mut driver, &mut egress).is_ok());
 }
 
 // ---------- 附加：NetworkEgress 真实网络路径（test-only KeyPair + MemoryTransport） ----------

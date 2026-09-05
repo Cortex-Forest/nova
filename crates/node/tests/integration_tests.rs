@@ -45,7 +45,7 @@ use nova_node::safety_store::{SafetyIdentity, ValidatorSafetyStore};
 use nova_node::signer::{SigningCapability, SigningError, SoftwareSigner};
 use nova_node::validator::{LocalVoteRequest, ValidatorActor};
 use nova_node::vote_ledger::VoteKey;
-use nova_node::wiring::NodeConsensusHandler;
+use nova_node::wiring::{NodeConsensusHandler, process_command};
 
 const CHAIN_ID: u64 = 1001;
 const GENESIS_HASH: [u8; 32] = [0x42; 32];
@@ -219,33 +219,52 @@ impl NetworkEgress for CollectorEgress {
     }
 }
 
-/// 单节点装配（ADR-0058：独立拥有 NS 与 EL）：NetworkService + EventLoop + NodeConsensusHandler。
-/// NS 由 Rig 独立持有；EventLoop 不拥有 NS（poll 经 `&mut NetworkService` 注入）。
+/// 单节点装配（ADR-0058/0057：NS、EventLoop、Driver 各自独立 owner）：
+/// NetworkService + EventLoop(NodeConsensusHandler decode-queue) + Driver。
+/// - NS 由 Rig 独立持有；EventLoop 不拥有 NS（poll 经 `&mut NetworkService` 注入）。
+/// - `NodeConsensusHandler` 不拥有 driver/egress（10-18I-D-A Option A）：inbound decode 只入
+///   owned command queue；Driver 由 Rig 独立持有，poll 内经 `process_command` orchestrate。
 struct Rig {
     peer: NodeId,
     net_key: KeyPair,
     ns: NetworkService<MemoryTransport>,
-    el: EventLoop<NodeConsensusHandler<SoftwareSigner, CollectorEgress>>,
+    el: EventLoop<NodeConsensusHandler>,
+    driver: NodeConsensusDriver<SoftwareSigner>,
     egress: CollectorEgress,
 }
 
 impl Rig {
     fn driver(&self) -> &NodeConsensusDriver<SoftwareSigner> {
-        self.el.handler().driver()
+        &self.driver
     }
     fn driver_mut(&mut self) -> &mut NodeConsensusDriver<SoftwareSigner> {
-        self.el.handler_mut().driver_mut()
+        &mut self.driver
     }
     fn state(&self) -> &ConsensusState {
-        self.el.handler().driver().consensus().state()
+        self.driver.consensus().state()
     }
-    /// 一轮 inbound：transport → NS → EventLoop → handler → driver（EL 经 &mut NS 注入）。
+    /// Option A orchestration（Runtime 承接路径的测试等价物）：handler command queue →
+    /// `process_command(&mut driver)` → PASS 后 outbound drain 到 egress。
+    /// process 失败静默返回（fail-open）；测试经 state 断言验证（不改 EventLoop diagnostics）。
+    fn orchestrate(&mut self) {
+        let commands = self.el.handler_mut().take_commands();
+        for command in commands {
+            let _ = process_command(&mut self.driver, command);
+        }
+        let outbound = self.driver.take_outbound();
+        if !outbound.is_empty() {
+            self.egress.send_outbound(outbound);
+        }
+    }
+    /// 一轮 inbound：transport → NS → EventLoop（dispatch/decode → queue）→ orchestrate
+    ///（process_command → driver → egress）（EL 经 &mut NS 注入）。
     fn poll(&mut self) {
         let el = &mut self.el;
         let ns = &mut self.ns;
         el.poll_once(ns).expect("poll_once");
+        self.orchestrate();
     }
-    /// 取走本节点当前全部 outbound（driver pending + handler egress 收集）。
+    /// 取走本节点当前全部 outbound（driver pending + egress 收集）。
     fn collect_outbound(&mut self) -> Vec<OutboundConsensusMessage> {
         let mut v = self.driver_mut().take_outbound();
         v.extend(self.egress.drain());
@@ -281,13 +300,13 @@ fn make_rig(
     let egress = CollectorEgress::new();
     let mut ns = NetworkService::new(NetworkServiceConfig::default(), id, ta);
     ns.connect_peer(peer).expect("connect peer");
-    let handler = NodeConsensusHandler::new(driver, egress.clone());
-    let el = EventLoop::new(EventLoopConfig::default(), handler);
+    let el = EventLoop::new(EventLoopConfig::default(), NodeConsensusHandler::new());
     Rig {
         peer,
         net_key,
         ns,
         el,
+        driver,
         egress,
     }
 }
@@ -555,7 +574,7 @@ fn h5_shutdown_order_blocks_new_votes() {
         dispatched,
         "无新 dispatch"
     );
-    assert_eq!(rig.el.handler().driver().outbound_pending_len(), 0);
+    assert_eq!(rig.driver().outbound_pending_len(), 0);
     assert_eq!(rig.egress.len(), 0, "shutdown 后无新 outbound");
     // Driver drop 随本测试 rig 作用域结束（本装配无 SafetyStore ⇒ 不写 store）
 }
@@ -715,26 +734,10 @@ fn h6_restart_restores_safety_and_rebuilds_network() {
     let x_id = node_id_of(&net_x);
     let y_id = node_id_of(&net_y);
     let (tx, ty) = MemoryTransport::pair(x_id, y_id);
-    let egress_x = CollectorEgress::new();
-    let egress_y = CollectorEgress::new();
     let mut ns_x = NetworkService::new(NetworkServiceConfig::default(), x_id, tx);
     let mut ns_y = NetworkService::new(NetworkServiceConfig::default(), y_id, ty);
-    let driver_x = NodeConsensusDriver::<SoftwareSigner>::new(
-        ConsensusNode::new(0, 0, CHAIN_ID, set_for_pk(pk), GENESIS_HASH, dag_aa()),
-        Vec::new(),
-    );
-    let driver_y = NodeConsensusDriver::<SoftwareSigner>::new(
-        ConsensusNode::new(0, 0, CHAIN_ID, set_for_pk(pk), GENESIS_HASH, dag_aa()),
-        Vec::new(),
-    );
-    let mut el_x = EventLoop::new(
-        EventLoopConfig::default(),
-        NodeConsensusHandler::new(driver_x, egress_x.clone()),
-    );
-    let mut el_y = EventLoop::new(
-        EventLoopConfig::default(),
-        NodeConsensusHandler::new(driver_y, egress_y.clone()),
-    );
+    let mut el_x = EventLoop::new(EventLoopConfig::default(), NodeConsensusHandler::new());
+    let mut el_y = EventLoop::new(EventLoopConfig::default(), NodeConsensusHandler::new());
     ns_x.connect_peer(y_id).unwrap();
     ns_y.connect_peer(x_id).unwrap();
 
