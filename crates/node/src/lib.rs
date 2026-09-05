@@ -60,6 +60,10 @@ pub mod outbound;
 /// KeyProvider seam（STEP 10-16）：`load_signer() -> Box<dyn SigningCapability>`；ValidatorActor
 /// 不知私钥位置 / 载体（software/HSM/remote/KMS 均为实现）。不修改 `SigningCapability`。
 pub mod key_provider;
+
+/// Network Identity seam（STEP 10-18I-A）：`NetworkIdentityProvider` / `NetworkSigner`
+/// （NodeId + envelope 签名）；网络身份与 validator 身份分离；生产网络 key DEFERRED。
+pub mod network_identity;
 /// Validator Safety Store（STEP 10-15T；Restart Safety）：独立 fail-closed 的 validator-local
 /// durable journal（VoteIntent / VoteSigned / LockedState + identity header）。Option B —— 与
 /// canonical `PersistentBackend` state WAL 分离；不持久化私钥。
