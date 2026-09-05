@@ -3,7 +3,8 @@
 //! # 职责（仅装配 / 生命周期；不实现共识算法）
 //! 固定启动顺序：`Config → Genesis → ChainIdentity 校验 → chain storage →（validator mode）
 //! KeyProvider → derive ValidatorId → SafetyStore open → strict recover → ValidatorActor →
-//! ConsensusNode`（Network / EventLoop 为 future 占位）。
+//! ConsensusNode → NodeConsensusDriver`（STEP 10-18I-C：Runtime 经 [`crate::driver::NodeConsensusDriver`]
+//! 持有 ConsensusNode + ValidatorActor；Network / EventLoop / NetworkIdentity 为 future 占位）。
 //!
 //! # 边界
 //! - [`NodeRuntime`] **拥有生命周期**（组件创建顺序 / 注入），但：
@@ -25,6 +26,7 @@ use nova_storage::persistent::PersistentBackend;
 
 use crate::assembly::ConsensusNode;
 use crate::bootstrap::{self, NodeConfig, NodeStartupError};
+use crate::driver::NodeConsensusDriver;
 use crate::key_provider::{KeyProvider, KeyProviderError};
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
@@ -48,34 +50,43 @@ pub enum NodeRuntimeError {
     Validator(ValidatorActorError),
 }
 
-/// 单验证者运行时视图（Phase 1：每 NodeRuntime 至多一个验证者）。
-pub struct ValidatorRuntime {
+/// 单验证者只读 **compatibility view**（STEP 10-18I-C；非 owning）。
+///
+/// - ValidatorActor 的真正 ownership 在 [`NodeConsensusDriver`]（`actors: Vec<ValidatorActor<DynSigner>>`）。
+/// - [`NodeRuntime::validator`] 在调用时**动态构造**本 view（含对 `driver.actor(0)` 的借用），
+///   避免 self-referential ownership；不长期存储 actor 引用字段。
+pub struct ValidatorView<'a> {
     validator_id: ValidatorId,
-    actor: ValidatorActor<DynSigner>,
-    journal_path: PathBuf,
+    journal_path: &'a std::path::Path,
+    actor: &'a ValidatorActor<DynSigner>,
 }
 
-impl ValidatorRuntime {
+impl ValidatorView<'_> {
     pub fn validator_id(&self) -> ValidatorId {
         self.validator_id
     }
 
+    /// 本地 ValidatorActor（只读；safety/signing owner 在 actor —— 经 driver 拥有）。
     pub fn actor(&self) -> &ValidatorActor<DynSigner> {
-        &self.actor
+        self.actor
     }
 
-    /// safety journal 文件路径（只读；生命周期审计）。
     pub fn journal_path(&self) -> &std::path::Path {
-        &self.journal_path
+        self.journal_path
     }
 }
 
-/// 生产节点生命周期装配根（STEP 10-16 Phase 1 骨架）。
+/// 生产节点生命周期装配根（STEP 10-16 Phase 1 骨架；STEP 10-18I-C ownership migration）。
+///
+/// - **ConsensusNode + ValidatorActor 的实际 ownership 在 [`NodeConsensusDriver`]**（`driver` 字段）；
+///   Runtime **不再**独立持有 ConsensusNode / ValidatorActor（避免 duplication，ADR-0057）。
+/// - Runtime 只负责 composition / lifecycle / accessor delegation。
 pub struct NodeRuntime {
     chain_identity: ChainIdentity,
     chain_storage: PersistentBackend,
-    consensus: ConsensusNode,
-    validator: Option<ValidatorRuntime>,
+    driver: NodeConsensusDriver<DynSigner>,
+    /// validator 元数据（safety journal 路径；actor 本体在 driver）。full-node ⇒ `None`。
+    validator_journal: Option<PathBuf>,
 }
 
 impl NodeRuntime {
@@ -83,6 +94,8 @@ impl NodeRuntime {
     ///
     /// - `key_provider`：validator mode 时**必须**提供（None ⇒ `KeyNotProvisioned`）；
     ///   full-node 时忽略。
+    /// - SafetyStore 打开 / recover 仍在 Runtime lifecycle（`build_validator`）；
+    ///   Driver 只接收已构造好的 `ConsensusNode` + `ValidatorActor(s)`。
     pub fn start(
         config: &NodeConfig,
         key_provider: Option<&dyn KeyProvider>,
@@ -98,7 +111,7 @@ impl NodeRuntime {
             .map_err(NodeStartupError::Storage)
             .map_err(NodeRuntimeError::Startup)?;
 
-        // 10. ConsensusNode handle（canonical 状态 owner 在 ConsensusNode；Runtime 只持有）。
+        // 10. ConsensusNode（canonical state owner）——随后装配进 NodeConsensusDriver。
         let set = ValidatorSet::from_genesis(&genesis);
         let consensus = ConsensusNode::new(
             0,
@@ -109,27 +122,33 @@ impl NodeRuntime {
             Dag::new(),
         );
 
-        // 5–9. validator mode 生命周期（key → id → safety → recover → actor）。
-        let validator = if config.validator_enabled {
-            Some(Self::build_validator(config, &identity, key_provider)?)
+        // 5–11. validator mode：KeyProvider → id → SafetyStore → recover → ValidatorActor
+        //      （Runtime lifecycle）→ 与 ConsensusNode 一并装配进 NodeConsensusDriver。
+        let (driver, validator_journal) = if config.validator_enabled {
+            let (actor, journal_path) = Self::build_validator(config, &identity, key_provider)?;
+            let driver = NodeConsensusDriver::new(consensus, vec![actor]);
+            (driver, Some(journal_path))
         } else {
-            None
+            // full-node：consensus-only driver（actors = []）；不触碰 Provider。
+            let driver = NodeConsensusDriver::<DynSigner>::new(consensus, Vec::new());
+            (driver, None)
         };
 
         Ok(Self {
             chain_identity: identity,
             chain_storage,
-            consensus,
-            validator,
+            driver,
+            validator_journal,
         })
     }
 
     /// validator mode 生命周期装配（key provider → derive id → safety store → recover → actor）。
+    /// 返回 `(actor, journal_path)`；actor 随后移入 Driver（ownership）。
     fn build_validator(
         config: &NodeConfig,
         identity: &ChainIdentity,
         key_provider: Option<&dyn KeyProvider>,
-    ) -> Result<ValidatorRuntime, NodeRuntimeError> {
+    ) -> Result<(ValidatorActor<DynSigner>, PathBuf), NodeRuntimeError> {
         // 5. KeyProvider（validator mode 必填；不默认生成不稳定生产密钥）。
         let provider = key_provider.ok_or(NodeRuntimeError::KeyNotProvisioned)?;
         let signer = provider
@@ -160,11 +179,7 @@ impl NodeRuntime {
         let actor = ValidatorActor::restore(validator_id, signer, identity.chain_id, store)
             .map_err(NodeRuntimeError::Validator)?;
 
-        Ok(ValidatorRuntime {
-            validator_id,
-            actor,
-            journal_path,
-        })
+        Ok((actor, journal_path))
     }
 
     pub fn chain_identity(&self) -> &ChainIdentity {
@@ -176,19 +191,31 @@ impl NodeRuntime {
         &self.chain_storage
     }
 
-    /// canonical consensus node handle（只读）。
+    /// NodeConsensusDriver（只读；ConsensusNode + ValidatorActor 的 owner）。
+    pub fn driver(&self) -> &NodeConsensusDriver<DynSigner> {
+        &self.driver
+    }
+
+    /// canonical consensus node handle（只读）—— **delegate** `driver.consensus()`（不复制）。
     pub fn consensus(&self) -> &ConsensusNode {
-        &self.consensus
+        self.driver.consensus()
     }
 
-    /// validator mode 是否启用。
+    /// validator mode 是否启用 —— **delegate** `driver.actor_count()`。
     pub fn validator_enabled(&self) -> bool {
-        self.validator.is_some()
+        self.driver.actor_count() > 0
     }
 
-    /// validator 运行时（validator mode 时为 `Some`）。
-    pub fn validator(&self) -> Option<&ValidatorRuntime> {
-        self.validator.as_ref()
+    /// 单验证者只读 view（validator mode 时为 `Some`）—— **delegate** `driver.actor(0)`。
+    /// 调用时动态构造（含对 actor 的借用）；不长期存储 actor 引用（无 self-reference）。
+    pub fn validator(&self) -> Option<ValidatorView<'_>> {
+        let actor = self.driver.actor(0)?;
+        let journal = self.validator_journal.as_ref()?;
+        Some(ValidatorView {
+            validator_id: actor.validator_id(),
+            journal_path: journal.as_path(),
+            actor,
+        })
     }
 }
 
