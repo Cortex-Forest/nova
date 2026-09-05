@@ -24,7 +24,7 @@ use nova_network::event_loop::{EventHandler, EventLoop, EventLoopConfig, NodeEve
 use nova_network::message::{
     MessageEnvelope, MessageType, decode, encode, sign_message, verify_message,
 };
-use nova_network::network_service::{NetworkEvent, NetworkService, NetworkServiceConfig};
+use nova_network::network_service::NetworkEvent;
 use nova_network::node_id::NodeId;
 use nova_network::transport::{MemoryTransport, Transport};
 
@@ -268,21 +268,20 @@ impl NetworkEgress for RecordingEgress {
     }
 }
 
+/// 构造 EventLoop（wiring 测试不经真实 transport；事件由调用方 push 注入，run 直接 dispatch）。
+/// NetworkService 不在本 helper —— EventLoop 不拥有网络状态（ADR-0058）。
 fn make_loop<E: NetworkEgress>(
     driver: NodeConsensusDriver<SoftwareSigner>,
     egress: E,
-) -> EventLoop<MemoryTransport, NodeConsensusHandler<SoftwareSigner, E>> {
-    let self_node = NodeId::from_bytes([0xEE; 32]);
-    let peer = NodeId::from_bytes([0xDD; 32]);
-    let (ta, _tb) = MemoryTransport::pair(self_node, peer);
-    let ns = NetworkService::new(NetworkServiceConfig::default(), self_node, ta);
+) -> EventLoop<NodeConsensusHandler<SoftwareSigner, E>> {
     let handler = NodeConsensusHandler::new(driver, egress);
-    EventLoop::new(EventLoopConfig::default(), ns, handler)
+    EventLoop::new(EventLoopConfig::default(), handler)
 }
 
-fn run<H: EventHandler>(el: &mut EventLoop<MemoryTransport, H>, event: NodeEvent) {
+/// push 事件并 dispatch（无 transport poll / 无 timer；等价于 wiring 语义的受控 dispatch）。
+fn run<H: EventHandler>(el: &mut EventLoop<H>, event: NodeEvent) {
     el.push_event(event).expect("push_event");
-    el.poll_once().expect("poll_once");
+    el.dispatch_queued().expect("dispatch_queued");
 }
 
 fn vote_event(sender: NodeId, vote: ValidatorVote, signature: [u8; 64]) -> NodeEvent {

@@ -172,27 +172,29 @@ pub trait EventHandler {
 
 /// EventLoop —— 同步单线程 dispatch 层。
 ///
-/// - 拥有 [`NetworkService<T>`]（网络状态 owner；poll 经其方法，不直接碰 Transport/Peer 内部）。
+/// - **不拥有** [`NetworkService`]：网络状态（Transport/Peer/queues）由外部 owner 持有
+///   （NodeRuntime，ADR-0058）；EventLoop 仅经 `&mut NetworkService<T>` 参数（poll_network /
+///   poll_once）在需要时借用它 poll —— 不保存 NetworkService / Transport / PeerManager / network
+///   state 为 ownership field。
 /// - 拥有统一 bounded 事件队列（`VecDeque<NodeEvent>`；deterministic FIFO，本版无 QoS）。
 /// - 拥有同步 timer 表（仅到期事件源）。
-/// - **不拥有**任何 consensus / validator / safety / key / storage 状态（见模块 doc）。
-pub struct EventLoop<T: Transport, H: EventHandler> {
+/// - **不拥有**任何 consensus / validator / safety / key / storage / network 状态（见模块 doc）。
+pub struct EventLoop<H: EventHandler> {
     state: EventLoopState,
     config: EventLoopConfig,
-    network: NetworkService<T>,
     handler: H,
     queue: BoundedQueue<NodeEvent>,
     timers: Vec<TimerEntry>,
     diagnostics: EventLoopDiagnostics,
 }
 
-impl<T: Transport, H: EventHandler> EventLoop<T, H> {
-    /// 构造（Running）。`network` 由本层拥有；`handler` 由调用方注入（dispatch seam）。
-    pub fn new(config: EventLoopConfig, network: NetworkService<T>, handler: H) -> Self {
+impl<H: EventHandler> EventLoop<H> {
+    /// 构造（Running）。`handler` 由调用方注入（dispatch seam）。NetworkService 由外部 owner
+    /// 独立持有（ADR-0058：EventLoop 不拥有网络状态；poll 经 `&mut NetworkService` 参数注入）。
+    pub fn new(config: EventLoopConfig, handler: H) -> Self {
         Self {
             state: EventLoopState::Running,
             config,
-            network,
             handler,
             queue: BoundedQueue::new(config.queue_capacity),
             timers: Vec::new(),
@@ -212,16 +214,6 @@ impl<T: Transport, H: EventHandler> EventLoop<T, H> {
         self.diagnostics
     }
 
-    /// 底层 NetworkService（只读）。
-    pub fn network(&self) -> &NetworkService<T> {
-        &self.network
-    }
-
-    /// 底层 NetworkService（可变；供 10-18G outbound 注入 / 测试驱动）。
-    pub fn network_mut(&mut self) -> &mut NetworkService<T> {
-        &mut self.network
-    }
-
     /// 注入的 handler（只读）。
     pub fn handler(&self) -> &H {
         &self.handler
@@ -239,16 +231,17 @@ impl<T: Transport, H: EventHandler> EventLoop<T, H> {
 
     // ---------- inbound ----------
 
-    /// 单轮 poll：`NetworkService.poll_transport`（transport → NS inbound）→
-    /// 取走 NS inbound → 移入本层 bounded 队列（满 ⇒ drop + 计数）。
+    /// 单轮 poll（调用时借用 `NetworkService`）：`network.poll_transport`（transport → NS
+    /// inbound）→ 取走 NS inbound → 移入本层 bounded 队列（满 ⇒ drop + 计数）。
     /// 返回成功移入队列的事件数；不做永久 loop（busy-loop 禁止；等待/唤醒归 10-18G）。
-    pub fn poll_network(&mut self) -> Result<usize, EventLoopError> {
+    pub fn poll_network<T: Transport>(
+        &mut self,
+        network: &mut NetworkService<T>,
+    ) -> Result<usize, EventLoopError> {
         self.ensure_running()?;
         // transport → NS inbound（单次 drain；由 NS 完成 decode/验签/classify —— 本层不解析）。
-        self.network
-            .poll_transport()
-            .map_err(EventLoopError::Network)?;
-        let events = self.network.drain_inbound();
+        network.poll_transport().map_err(EventLoopError::Network)?;
+        let events = network.drain_inbound();
         let mut moved = 0usize;
         for event in events {
             match self.queue.push_back(NodeEvent::Network(event)) {
@@ -304,10 +297,13 @@ impl<T: Transport, H: EventHandler> EventLoop<T, H> {
         Ok(dispatched as usize)
     }
 
-    /// 受控单轮：poll → expire timers → dispatch。返回 dispatch 成功数。
-    /// 不做无限 busy-loop；调用方（NodeRuntime / 10-18G）决定轮询节奏与睡眠。
-    pub fn poll_once(&mut self) -> Result<usize, EventLoopError> {
-        self.poll_network()?;
+    /// 受控单轮（调用时借用 `NetworkService`）：poll → expire timers → dispatch。
+    /// 返回 dispatch 成功数。不做无限 busy-loop；调用方（NodeRuntime）决定轮询节奏与睡眠。
+    pub fn poll_once<T: Transport>(
+        &mut self,
+        network: &mut NetworkService<T>,
+    ) -> Result<usize, EventLoopError> {
+        self.poll_network(network)?;
         self.expire_due_timers()?;
         self.dispatch_queued()
     }
@@ -349,8 +345,9 @@ impl<T: Transport, H: EventHandler> EventLoop<T, H> {
 
     // ---------- lifecycle ----------
 
-    /// Shutdown：**幂等**。置 Stopped + 清空事件队列 / timer 表 + 关闭 NetworkService。
-    /// 停止后：不产生新 vote / 不写 SafetyStore / 不发送 network message / 拒绝 push / poll。
+    /// Shutdown：**幂等**。只停止 EventLoop 自身（置 Stopped + 清空事件队列 / timer 表）。
+    /// **不**关闭 NetworkService —— NetworkService 由独立 owner（NodeRuntime）负责 shutdown
+    /// （ADR-0058：EventLoop 不拥有网络生命周期）。停止后拒绝 push / poll / timer。
     pub fn shutdown(&mut self) {
         if self.state == EventLoopState::Stopped {
             return;
@@ -358,7 +355,6 @@ impl<T: Transport, H: EventHandler> EventLoop<T, H> {
         self.state = EventLoopState::Stopped;
         self.queue.clear();
         self.timers.clear();
-        self.network.shutdown();
     }
 
     fn ensure_running(&self) -> Result<(), EventLoopError> {
@@ -476,10 +472,10 @@ mod tests {
         let (a, b, ta, mut tb) = pair(&ka, &kb);
         let mut ns = NetworkService::new(ns_cfg(16), a, ta);
         ns.connect_peer(b).unwrap();
-        let mut el = EventLoop::new(cfg(), ns, Recorder::default());
+        let mut el = EventLoop::new(cfg(), Recorder::default());
         let env = signed_env(kb.signing_key(), MessageType::Ping, vec![0x42; 4]);
         deliver_b_to_a(&mut tb, a, &env);
-        let handled = el.poll_once().unwrap();
+        let handled = el.poll_once(&mut ns).unwrap();
         assert_eq!(handled, 1);
         assert_eq!(el.pending_len(), 0);
         let events = &el.handler().events;
@@ -500,10 +496,10 @@ mod tests {
     fn el_2_timer_event_dispatch() {
         let ka = KeyPair::generate().unwrap();
         let (a, _b, ta, _tb) = pair(&ka, &KeyPair::generate().unwrap());
-        let ns = NetworkService::new(ns_cfg(16), a, ta);
-        let mut el = EventLoop::new(cfg(), ns, Recorder::default());
+        let mut ns = NetworkService::new(ns_cfg(16), a, ta);
+        let mut el = EventLoop::new(cfg(), Recorder::default());
         el.set_timer(TimerId(7), Duration::ZERO).unwrap();
-        let handled = el.poll_once().unwrap();
+        let handled = el.poll_once(&mut ns).unwrap();
         assert_eq!(handled, 1);
         let events = &el.handler().events;
         assert_eq!(events.len(), 1);
@@ -517,11 +513,11 @@ mod tests {
     fn el_3_internal_event_dispatch() {
         let ka = KeyPair::generate().unwrap();
         let (a, _b, ta, _tb) = pair(&ka, &KeyPair::generate().unwrap());
-        let ns = NetworkService::new(ns_cfg(16), a, ta);
-        let mut el = EventLoop::new(cfg(), ns, Recorder::default());
+        let mut ns = NetworkService::new(ns_cfg(16), a, ta);
+        let mut el = EventLoop::new(cfg(), Recorder::default());
         el.push_event(NodeEvent::Internal(InternalEvent::Wakeup))
             .unwrap();
-        let handled = el.poll_once().unwrap();
+        let handled = el.poll_once(&mut ns).unwrap();
         assert_eq!(handled, 1);
         let events = &el.handler().events;
         assert_eq!(events.len(), 1);
@@ -534,11 +530,11 @@ mod tests {
     fn el_4_block_event_dispatch() {
         let ka = KeyPair::generate().unwrap();
         let (a, _b, ta, _tb) = pair(&ka, &KeyPair::generate().unwrap());
-        let ns = NetworkService::new(ns_cfg(16), a, ta);
-        let mut el = EventLoop::new(cfg(), ns, Recorder::default());
+        let mut ns = NetworkService::new(ns_cfg(16), a, ta);
+        let mut el = EventLoop::new(cfg(), Recorder::default());
         el.push_event(NodeEvent::Block(BlockEvent::NewBlock { height: 9 }))
             .unwrap();
-        let handled = el.poll_once().unwrap();
+        let handled = el.poll_once(&mut ns).unwrap();
         assert_eq!(handled, 1);
         let events = &el.handler().events;
         assert_eq!(events.len(), 1);
@@ -552,14 +548,11 @@ mod tests {
     /// EL-5：bounded queue（push 到容量即 QueueFull，不增长）。
     #[test]
     fn el_5_bounded_queue() {
-        let ka = KeyPair::generate().unwrap();
-        let (a, _b, ta, _tb) = pair(&ka, &KeyPair::generate().unwrap());
-        let ns = NetworkService::new(ns_cfg(16), a, ta);
         let config = EventLoopConfig {
             queue_capacity: 2,
             timer_capacity: 4,
         };
-        let mut el = EventLoop::new(config, ns, Recorder::default());
+        let mut el = EventLoop::new(config, Recorder::default());
         let ev = NodeEvent::Internal(InternalEvent::Wakeup);
         assert!(el.push_event(ev.clone()).is_ok());
         assert!(el.push_event(ev.clone()).is_ok());
@@ -579,13 +572,13 @@ mod tests {
             queue_capacity: 2,
             timer_capacity: 4,
         };
-        let mut el = EventLoop::new(config, ns, Recorder::default());
+        let mut el = EventLoop::new(config, Recorder::default());
         // 3 条有效入站 → queue cap=2 ⇒ 1 条 overflow drop。
         for i in 0..3u8 {
             let env = signed_env(kb.signing_key(), MessageType::Ping, vec![i]);
             deliver_b_to_a(&mut tb, a, &env);
         }
-        let moved = el.poll_network().unwrap();
+        let moved = el.poll_network(&mut ns).unwrap();
         assert_eq!(moved, 2);
         assert_eq!(el.pending_len(), 2);
         assert_eq!(el.diagnostics().events_dropped_overflow, 1);
@@ -601,14 +594,19 @@ mod tests {
     fn el_7_shutdown() {
         let ka = KeyPair::generate().unwrap();
         let (a, _b, ta, _tb) = pair(&ka, &KeyPair::generate().unwrap());
-        let ns = NetworkService::new(ns_cfg(16), a, ta);
-        let mut el = EventLoop::new(cfg(), ns, Recorder::default());
+        let mut ns = NetworkService::new(ns_cfg(16), a, ta);
+        let mut el = EventLoop::new(cfg(), Recorder::default());
         el.push_event(NodeEvent::Internal(InternalEvent::Wakeup))
             .unwrap();
+        // EventLoop shutdown ≠ NetworkService shutdown：先停 EventLoop
         el.shutdown();
         assert_eq!(el.state(), EventLoopState::Stopped);
         assert_eq!(el.pending_len(), 0);
-        assert_eq!(el.network().state(), NetworkServiceState::Stopped);
+        // NetworkService 仍由调用方独立控制（EventLoop 未级联关闭它）
+        assert_eq!(ns.state(), NetworkServiceState::Running);
+        // 调用方再显式关闭 NetworkService
+        ns.shutdown();
+        assert_eq!(ns.state(), NetworkServiceState::Stopped);
     }
 
     /// EL-8：shutdown 幂等（多次调用安全）。
@@ -617,12 +615,14 @@ mod tests {
         let ka = KeyPair::generate().unwrap();
         let (a, _b, ta, _tb) = pair(&ka, &KeyPair::generate().unwrap());
         let ns = NetworkService::new(ns_cfg(16), a, ta);
-        let mut el = EventLoop::new(cfg(), ns, Recorder::default());
+        let mut el = EventLoop::new(cfg(), Recorder::default());
         el.shutdown();
         el.shutdown();
         el.shutdown();
         assert_eq!(el.state(), EventLoopState::Stopped);
         assert_eq!(el.pending_len(), 0);
+        // EventLoop shutdown 幂等；不自动关闭 NetworkService（独立生命周期）
+        assert_eq!(ns.state(), NetworkServiceState::Running);
     }
 
     /// EL-9：stopped 后拒绝新事件 / poll / timer。
@@ -630,14 +630,15 @@ mod tests {
     fn el_9_stopped_rejects_work() {
         let ka = KeyPair::generate().unwrap();
         let (a, _b, ta, _tb) = pair(&ka, &KeyPair::generate().unwrap());
-        let ns = NetworkService::new(ns_cfg(16), a, ta);
-        let mut el = EventLoop::new(cfg(), ns, Recorder::default());
+        let mut ns = NetworkService::new(ns_cfg(16), a, ta);
+        let mut el = EventLoop::new(cfg(), Recorder::default());
         el.shutdown();
         assert_eq!(
             el.push_event(NodeEvent::Internal(InternalEvent::Wakeup)),
             Err(EventLoopError::Stopped)
         );
-        assert_eq!(el.poll_network(), Err(EventLoopError::Stopped));
+        // stopped 的 EventLoop 拒绝 poll（即使注入 NS）
+        assert_eq!(el.poll_network(&mut ns), Err(EventLoopError::Stopped));
         assert_eq!(
             el.set_timer(TimerId(1), Duration::ZERO),
             Err(EventLoopError::Stopped)
@@ -652,8 +653,8 @@ mod tests {
         let ka = KeyPair::generate().unwrap();
         let kb = KeyPair::generate().unwrap();
         let (a, b, ta, _tb) = pair(&ka, &kb);
-        let ns = NetworkService::new(ns_cfg(16), a, ta);
-        let mut el = EventLoop::new(cfg(), ns, Recorder::default());
+        let mut ns = NetworkService::new(ns_cfg(16), a, ta);
+        let mut el = EventLoop::new(cfg(), Recorder::default());
         let payload = vec![0xAA; 8];
         // caller push：ConsensusVote 原样入队 → handler（EventLoop 不做任何 verify）。
         el.push_event(NodeEvent::Network(NetworkEvent::ConsensusVote {
@@ -661,7 +662,7 @@ mod tests {
             payload: payload.clone(),
         }))
         .unwrap();
-        let handled = el.poll_once().unwrap();
+        let handled = el.poll_once(&mut ns).unwrap();
         assert_eq!(handled, 1);
         let events = &el.handler().events;
         assert_eq!(events.len(), 1);
@@ -678,10 +679,7 @@ mod tests {
     /// handler 失败不中断 dispatch（fail-safe；handler_errors 计数）。
     #[test]
     fn el_handler_error_non_fatal() {
-        let ka = KeyPair::generate().unwrap();
-        let (a, _b, ta, _tb) = pair(&ka, &KeyPair::generate().unwrap());
-        let ns = NetworkService::new(ns_cfg(16), a, ta);
-        let mut el = EventLoop::new(cfg(), ns, Failing);
+        let mut el = EventLoop::new(cfg(), Failing);
         el.push_event(NodeEvent::Internal(InternalEvent::Wakeup))
             .unwrap();
         el.push_event(NodeEvent::Internal(InternalEvent::Wakeup))
@@ -697,9 +695,9 @@ mod tests {
     #[test]
     fn el_network_transport_error() {
         let self_id = NodeId::from_bytes([0u8; 32]);
-        let ns = NetworkService::new(ns_cfg(16), self_id, ErrTransport);
-        let mut el = EventLoop::new(cfg(), ns, Recorder::default());
-        match el.poll_network() {
+        let mut ns = NetworkService::new(ns_cfg(16), self_id, ErrTransport);
+        let mut el = EventLoop::new(cfg(), Recorder::default());
+        match el.poll_network(&mut ns) {
             Err(EventLoopError::Network(NetworkServiceError::Transport(
                 NetworkError::SenderMismatch,
             ))) => {}
@@ -712,14 +710,11 @@ mod tests {
     /// timer 槽位 bounded（满 ⇒ TimerError）；cancel 后释放槽位。
     #[test]
     fn el_timer_capacity_and_cancel() {
-        let ka = KeyPair::generate().unwrap();
-        let (a, _b, ta, _tb) = pair(&ka, &KeyPair::generate().unwrap());
-        let ns = NetworkService::new(ns_cfg(16), a, ta);
         let config = EventLoopConfig {
             queue_capacity: 16,
             timer_capacity: 2,
         };
-        let mut el = EventLoop::new(config, ns, Recorder::default());
+        let mut el = EventLoop::new(config, Recorder::default());
         assert!(el.set_timer(TimerId(1), Duration::from_secs(60)).is_ok());
         assert!(el.set_timer(TimerId(2), Duration::from_secs(60)).is_ok());
         assert_eq!(

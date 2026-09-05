@@ -219,11 +219,13 @@ impl NetworkEgress for CollectorEgress {
     }
 }
 
-/// 单节点装配：NetworkService（MemoryTransport）+ EventLoop + NodeConsensusHandler(Driver)。
+/// 单节点装配（ADR-0058：独立拥有 NS 与 EL）：NetworkService + EventLoop + NodeConsensusHandler。
+/// NS 由 Rig 独立持有；EventLoop 不拥有 NS（poll 经 `&mut NetworkService` 注入）。
 struct Rig {
     peer: NodeId,
     net_key: KeyPair,
-    el: EventLoop<MemoryTransport, NodeConsensusHandler<SoftwareSigner, CollectorEgress>>,
+    ns: NetworkService<MemoryTransport>,
+    el: EventLoop<NodeConsensusHandler<SoftwareSigner, CollectorEgress>>,
     egress: CollectorEgress,
 }
 
@@ -237,9 +239,11 @@ impl Rig {
     fn state(&self) -> &ConsensusState {
         self.el.handler().driver().consensus().state()
     }
-    /// 一轮 inbound：transport → NS → EventLoop → handler → driver。
+    /// 一轮 inbound：transport → NS → EventLoop → handler → driver（EL 经 &mut NS 注入）。
     fn poll(&mut self) {
-        self.el.poll_once().expect("poll_once");
+        let el = &mut self.el;
+        let ns = &mut self.ns;
+        el.poll_once(ns).expect("poll_once");
     }
     /// 取走本节点当前全部 outbound（driver pending + handler egress 收集）。
     fn collect_outbound(&mut self) -> Vec<OutboundConsensusMessage> {
@@ -251,18 +255,16 @@ impl Rig {
     fn send_consensus(&mut self, msgs: Vec<OutboundConsensusMessage>) {
         for m in &msgs {
             let env = envelope_for(&self.net_key, m);
-            self.el
-                .network_mut()
+            self.ns
                 .enqueue_outbound(self.peer, env)
                 .expect("enqueue outbound");
         }
-        self.el.network_mut().flush_outbound().expect("flush");
+        self.ns.flush_outbound().expect("flush");
         assert!(!msgs.is_empty(), "应有 outbound 可发");
     }
     /// 注入原始帧到 peer（经本节点 transport 直发；H-3 测 NS 层 drop）。
     fn inject_raw_to_peer(&mut self, raw: Vec<u8>) {
-        self.el
-            .network_mut()
+        self.ns
             .transport()
             .send(&self.peer, raw)
             .expect("inject raw");
@@ -277,13 +279,14 @@ fn make_rig(
 ) -> Rig {
     let id = node_id_of(&net_key);
     let egress = CollectorEgress::new();
-    let ns = NetworkService::new(NetworkServiceConfig::default(), id, ta);
+    let mut ns = NetworkService::new(NetworkServiceConfig::default(), id, ta);
+    ns.connect_peer(peer).expect("connect peer");
     let handler = NodeConsensusHandler::new(driver, egress.clone());
-    let mut el = EventLoop::new(EventLoopConfig::default(), ns, handler);
-    el.network_mut().connect_peer(peer).expect("connect peer");
+    let el = EventLoop::new(EventLoopConfig::default(), handler);
     Rig {
         peer,
         net_key,
+        ns,
         el,
         egress,
     }
@@ -307,10 +310,12 @@ fn h1_single_node_assembly() {
     rig.poll();
     assert_eq!(rig.el.diagnostics().handler_errors, 0);
 
+    // 生命周期独立：先停 EventLoop，再独立停 NetworkService
     rig.el.shutdown();
     assert_eq!(rig.el.state(), EventLoopState::Stopped);
-    assert_eq!(rig.el.network().state(), NetworkServiceState::Stopped);
     assert_eq!(rig.el.pending_len(), 0);
+    rig.ns.shutdown();
+    assert_eq!(rig.ns.state(), NetworkServiceState::Stopped);
 }
 
 // ---------- H-2 ----------
@@ -397,7 +402,7 @@ fn h3_invalid_messages_dropped_no_state_change() {
         rig_a.inject_raw_to_peer(encode(&env));
         rig_b.poll();
         assert!(
-            rig_b.el.network().diagnostics().dropped_invalid >= 1,
+            rig_b.ns.diagnostics().dropped_invalid >= 1,
             "坏 signature 必须被 NS drop"
         );
         assert_eq!(rig_b.state().round.step, step_before);
@@ -408,7 +413,7 @@ fn h3_invalid_messages_dropped_no_state_change() {
         env.sender = NodeId::from_bytes([0x77; 32]);
         rig_a.inject_raw_to_peer(encode(&env));
         rig_b.poll();
-        let dropped = rig_b.el.network().diagnostics().dropped_invalid;
+        let dropped = rig_b.ns.diagnostics().dropped_invalid;
         assert!(dropped >= 2, "坏 sender 必须被 NS drop (dropped={dropped})");
         assert_eq!(rig_b.state().round.step, step_before);
     }
@@ -530,10 +535,11 @@ fn h5_shutdown_order_blocks_new_votes() {
     let _ = rig.collect_outbound();
 
     rig.el.shutdown();
-    // 顺序：EventLoop stop → NS stop；队列清空
+    // 顺序：EventLoop stop → NS stop（独立 owner 顺序）；队列清空
     assert_eq!(rig.el.state(), EventLoopState::Stopped);
-    assert_eq!(rig.el.network().state(), NetworkServiceState::Stopped);
     assert_eq!(rig.el.pending_len(), 0);
+    rig.ns.shutdown();
+    assert_eq!(rig.ns.state(), NetworkServiceState::Stopped);
 
     // 停止后：拒绝新事件 / poll；handler 不再被调用（无新 vote、无新 outbound）
     assert_eq!(
@@ -541,7 +547,7 @@ fn h5_shutdown_order_blocks_new_votes() {
             .push_event(NodeEvent::Internal(InternalEvent::Wakeup)),
         Err(EventLoopError::Stopped)
     );
-    assert_eq!(rig.el.poll_once(), Err(EventLoopError::Stopped));
+    assert_eq!(rig.el.poll_once(&mut rig.ns), Err(EventLoopError::Stopped));
     let dispatched = rig.el.diagnostics().events_dispatched;
     rig.el.shutdown(); // 幂等
     assert_eq!(
@@ -711,8 +717,8 @@ fn h6_restart_restores_safety_and_rebuilds_network() {
     let (tx, ty) = MemoryTransport::pair(x_id, y_id);
     let egress_x = CollectorEgress::new();
     let egress_y = CollectorEgress::new();
-    let ns_x = NetworkService::new(NetworkServiceConfig::default(), x_id, tx);
-    let ns_y = NetworkService::new(NetworkServiceConfig::default(), y_id, ty);
+    let mut ns_x = NetworkService::new(NetworkServiceConfig::default(), x_id, tx);
+    let mut ns_y = NetworkService::new(NetworkServiceConfig::default(), y_id, ty);
     let driver_x = NodeConsensusDriver::<SoftwareSigner>::new(
         ConsensusNode::new(0, 0, CHAIN_ID, set_for_pk(pk), GENESIS_HASH, dag_aa()),
         Vec::new(),
@@ -723,24 +729,20 @@ fn h6_restart_restores_safety_and_rebuilds_network() {
     );
     let mut el_x = EventLoop::new(
         EventLoopConfig::default(),
-        ns_x,
         NodeConsensusHandler::new(driver_x, egress_x.clone()),
     );
     let mut el_y = EventLoop::new(
         EventLoopConfig::default(),
-        ns_y,
         NodeConsensusHandler::new(driver_y, egress_y.clone()),
     );
-    el_x.network_mut().connect_peer(y_id).unwrap();
-    el_y.network_mut().connect_peer(x_id).unwrap();
+    ns_x.connect_peer(y_id).unwrap();
+    ns_y.connect_peer(x_id).unwrap();
 
     // x → y Ping
     let ping = sign_envelope(&net_x, MessageType::Ping, vec![7]);
-    el_x.network_mut()
-        .enqueue_outbound(y_id, ping)
-        .expect("enqueue ping");
-    el_x.network_mut().flush_outbound().unwrap();
-    el_y.poll_once().expect("y poll");
+    ns_x.enqueue_outbound(y_id, ping).expect("enqueue ping");
+    ns_x.flush_outbound().unwrap();
+    el_y.poll_once(&mut ns_y).expect("y poll");
     assert_eq!(
         el_y.handler().non_consensus_seen(),
         1,
@@ -748,19 +750,20 @@ fn h6_restart_restores_safety_and_rebuilds_network() {
     );
     // y → x Pong
     let pong = sign_envelope(&net_y, MessageType::Pong, vec![8]);
-    el_y.network_mut()
-        .enqueue_outbound(x_id, pong)
-        .expect("enqueue pong");
-    el_y.network_mut().flush_outbound().unwrap();
-    el_x.poll_once().expect("x poll");
+    ns_y.enqueue_outbound(x_id, pong).expect("enqueue pong");
+    ns_y.flush_outbound().unwrap();
+    el_x.poll_once(&mut ns_x).expect("x poll");
     assert_eq!(
         el_x.handler().non_consensus_seen(),
         1,
         "Pong 经验签到达 handler"
     );
 
+    // 生命周期独立：EventLoop 与 NetworkService 各自 shutdown
     el_x.shutdown();
     el_y.shutdown();
-    assert_eq!(el_x.network().state(), NetworkServiceState::Stopped);
-    assert_eq!(el_y.network().state(), NetworkServiceState::Stopped);
+    ns_x.shutdown();
+    ns_y.shutdown();
+    assert_eq!(ns_x.state(), NetworkServiceState::Stopped);
+    assert_eq!(ns_y.state(), NetworkServiceState::Stopped);
 }
