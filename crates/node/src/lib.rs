@@ -53,6 +53,10 @@ pub mod vote_ledger;
 /// canonical transition → `TransitionDerived` → `verify_qc` → 路由至各本地 `ValidatorActor` lock。
 pub mod driver;
 
+/// Consensus outbound semantic seam（STEP 10-18G-1）：`OutboundConsensusMessage`（what to send）+
+/// `NetworkEgress`；生产网络身份签名 DEFERRED。
+pub mod outbound;
+
 /// KeyProvider seam（STEP 10-16）：`load_signer() -> Box<dyn SigningCapability>`；ValidatorActor
 /// 不知私钥位置 / 载体（software/HSM/remote/KMS 均为实现）。不修改 `SigningCapability`。
 pub mod key_provider;
@@ -65,6 +69,10 @@ pub mod safety_store;
 /// storage →（validator mode）KeyProvider → derive ValidatorId → SafetyStore → recover →
 /// ValidatorActor → ConsensusNode；Network / EventLoop 为 future 占位。
 pub mod runtime;
+
+/// Consensus inbound/outbound wiring adapter（STEP 10-18G-1）：`NodeEvent → Driver` 的 node 层
+/// decode seam + outbound semantic egress（NetworkService/EventLoop 不解析 consensus）。
+pub mod wiring;
 pub use block_adapter::{ChainHead, NodeBlockAdapter, NodeBlockApplicationError};
 pub use bootstrap::{NodeConfig, NodeStartupError, start};
 

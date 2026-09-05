@@ -13,8 +13,10 @@
 //! - **禁止** `network → execution` / `network → storage`（消息层不执行状态转换）。
 //! - 未实现：libp2p adapter / QUIC / Noise / Gossipsub 调度 / 完整状态同步。
 
+pub mod event_loop;
 pub mod gossip;
 pub mod message;
+pub mod network_service;
 pub mod node_id;
 pub mod sync;
 pub mod transport;

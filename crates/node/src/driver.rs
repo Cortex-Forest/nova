@@ -20,12 +20,13 @@
 //! - 依赖方向：node → consensus / crypto；wallet / runtime 不参与投票签名。
 
 use nova_consensus::error::ConsensusError;
-use nova_consensus::finality::{FinalityError, verify_qc};
+use nova_consensus::finality::{FinalityError, QuorumCertificate, verify_qc};
 use nova_consensus::integration::{ConsensusEvent, TransitionResult};
 use nova_consensus::round::{ProposalRef, RoundStep};
 use nova_consensus::vote::{ValidatorVote, VoteType, verify_vote_input};
 
 use crate::assembly::ConsensusNode;
+use crate::outbound::OutboundConsensusMessage;
 use crate::signer::SigningCapability;
 use crate::validator::{LocalVoteRequest, ValidatorActor, ValidatorActorError};
 
@@ -51,12 +52,18 @@ pub enum DriverError {
 pub struct NodeConsensusDriver<S: SigningCapability> {
     consensus: ConsensusNode,
     actors: Vec<ValidatorActor<S>>,
+    /// 待广播的 consensus **semantic** output（只装验证 PASS 的 outbound；Driver 不负责发送）。
+    pending_outbound: Vec<OutboundConsensusMessage>,
 }
 
 impl<S: SigningCapability> NodeConsensusDriver<S> {
     /// 构造：consensus 拥有 canonical state；actors 拥有各本地 validator state。
     pub fn new(consensus: ConsensusNode, actors: Vec<ValidatorActor<S>>) -> Self {
-        Self { consensus, actors }
+        Self {
+            consensus,
+            actors,
+            pending_outbound: Vec::new(),
+        }
     }
 
     /// canonical consensus 节点（只读）。
@@ -138,6 +145,12 @@ impl<S: SigningCapability> NodeConsensusDriver<S> {
             self.consensus.validator_set(),
         )
         .map_err(DriverError::VoteVerification)?;
+        // ⑤ outbound semantic：仅 `verify_vote_input` PASS 后才可能进入待广播
+        //    （unverified never outbound）。vote 随后被 `submit_verified_vote` 消耗 ⇒ 先 clone。
+        self.pending_outbound.push(OutboundConsensusMessage::Vote {
+            vote: vote.clone(),
+            signature,
+        });
         // ④ 提交已验证 vote（canonical transition 由 ConsensusNode 持有；driver 不触碰共识状态）。
         let result = self.consensus.submit_verified_vote(vote, signature);
         Ok(Some(result))
@@ -191,11 +204,50 @@ impl<S: SigningCapability> NodeConsensusDriver<S> {
             self.consensus.dag(),
         )
         .map_err(DriverError::QcVerification)?;
+        // outbound semantic：仅 `verify_qc` PASS 的 QC 才可广播（unverified / FAIL ⇒ no outbound）。
+        self.pending_outbound
+            .push(OutboundConsensusMessage::VerifiedQc(qc.clone()));
         // Broadcast-to-all-local：每 actor 独立 acquire_lock（L-8；QC 是共享 evidence，
         // LockedState 是 validator-local —— 不把 QC 直接写入任何 actor）。
         for i in 0..self.actors.len() {
             self.actors[i]
                 .on_verified_precommit_qc(qc, self.consensus.dag())
+                .map_err(DriverError::ActorLock)?;
+        }
+        Ok(())
+    }
+
+    /// 取走当前待广播的 consensus **semantic** output（只有经既有验证门面的消息才可能在其中；
+    /// 网络层发送由 [`crate::outbound::NetworkEgress`] seam 负责 —— Driver 不拥有网络）。
+    pub fn take_outbound(&mut self) -> Vec<OutboundConsensusMessage> {
+        std::mem::take(&mut self.pending_outbound)
+    }
+
+    /// 当前待广播 semantic output 数量。
+    pub fn outbound_pending_len(&self) -> usize {
+        self.pending_outbound.len()
+    }
+
+    /// 处理**网络到达**的 QC（STEP 10-18G-1 inbound QC）。
+    ///
+    /// 顺序（不可变）：`decode_qc`（node adapter 层完成）→ 本方法 `verify_qc` →
+    /// PASS ⇒ 每个本地 `ValidatorActor` 独立 `acquire_lock`（L-8；只改自身 LockedState）。
+    ///
+    /// - `verify_qc` FAIL ⇒ `Err(QcVerification)`：**无 lock / 无 outbound / 无 canonical 变化**。
+    /// - 不 record outbound（inbound QC 是外部证据，不是本地待广播 QC）。
+    /// - 不进 canonical `ConsensusState`（外部 QC ingestion DEFERRED —— canonical 只由 votes 推进）。
+    pub fn submit_inbound_qc(&mut self, qc: QuorumCertificate) -> Result<(), DriverError> {
+        verify_qc(
+            &qc,
+            self.consensus.validator_set(),
+            &self.consensus.genesis_hash(),
+            self.consensus.dag(),
+        )
+        .map_err(DriverError::QcVerification)?;
+        // 每个本地 actor 独立 acquire_lock（与 process_transition_derived 的 actor 段同一语义）。
+        for i in 0..self.actors.len() {
+            self.actors[i]
+                .on_verified_precommit_qc(&qc, self.consensus.dag())
                 .map_err(DriverError::ActorLock)?;
         }
         Ok(())
