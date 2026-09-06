@@ -6,6 +6,7 @@
 //!   （STEP 10-12 + PHASE 7）。
 
 use crate::message::NetworkError;
+use crate::security::RequestId;
 use nova_core::block::{Block, BlockCodecError, encode_block};
 
 /// 区块负载（P7-5 F2：完整 Block wire = `encode_block` 输出；无额外前缀——外层 len 前缀）。
@@ -19,17 +20,21 @@ impl BlockPayload {
     }
 }
 
-/// 区块同步请求（ADR-0032 N-6）。
+/// 区块同步请求（ADR-0032 N-6；STEP 10-19-10-B2：request correlation）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncBlockRequest {
+    /// 请求关联 id（canonical 16B；`SyncBlockResponse` 必须回带同一 id ——
+    /// **非 block hash / 非 height**；生成归上层 caller，CSPRNG deferred）。
+    pub request_id: RequestId,
     pub height: u64,
     pub block_hash: Option<[u8; 32]>,
 }
 
 impl SyncBlockRequest {
-    /// canonical 编码：`height(8B LE) ‖ has_hash(1B) ‖ hash(32B 若有)`。
+    /// canonical 编码：`request_id(16B) ‖ height(8B LE) ‖ has_hash(1B) ‖ hash(32B 若有)`。
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + 1 + 32);
+        let mut out = Vec::with_capacity(16 + 8 + 1 + 32);
+        out.extend_from_slice(self.request_id.as_bytes());
         out.extend_from_slice(&self.height.to_le_bytes());
         match self.block_hash {
             Some(h) => {
@@ -41,60 +46,67 @@ impl SyncBlockRequest {
         out
     }
 
-    /// canonical 解码。
+    /// canonical 解码（request_id 前置；长度严格）。
     pub fn decode(bytes: &[u8]) -> Result<Self, NetworkError> {
-        if bytes.len() < 9 {
+        const HDR: usize = 16 + 8 + 1; // request_id(16) + height(8) + has_hash tag(1)
+        if bytes.len() < HDR {
             return Err(NetworkError::InvalidLength {
-                expected: 9,
+                expected: HDR,
                 actual: bytes.len(),
             });
         }
-        let height = u64::from_le_bytes(bytes[0..8].try_into().expect("len checked"));
-        match bytes[8] {
+        let request_id = RequestId::from_bytes(bytes[0..16].try_into().expect("len checked"));
+        let height = u64::from_le_bytes(bytes[16..24].try_into().expect("len checked"));
+        match bytes[24] {
             0 => {
-                if bytes.len() != 9 {
+                if bytes.len() != HDR {
                     return Err(NetworkError::InvalidLength {
-                        expected: 9,
+                        expected: HDR,
                         actual: bytes.len(),
                     });
                 }
                 Ok(Self {
+                    request_id,
                     height,
                     block_hash: None,
                 })
             }
             1 => {
-                if bytes.len() != 9 + 32 {
+                if bytes.len() != HDR + 32 {
                     return Err(NetworkError::InvalidLength {
-                        expected: 41,
+                        expected: HDR + 32,
                         actual: bytes.len(),
                     });
                 }
                 let mut h = [0u8; 32];
-                h.copy_from_slice(&bytes[9..41]);
+                h.copy_from_slice(&bytes[25..57]);
                 Ok(Self {
+                    request_id,
                     height,
                     block_hash: Some(h),
                 })
             }
             _ => Err(NetworkError::InvalidLength {
-                expected: 9,
+                expected: HDR,
                 actual: bytes.len(),
             }),
         }
     }
 }
 
-/// 区块同步响应（ADR-0032 N-6）。
+/// 区块同步响应（ADR-0032 N-6；STEP 10-19-10-B2：绑定请求）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncBlockResponse {
+    /// 回带请求关联 id（必须 == 对应 `SyncBlockRequest.request_id`；否则 correlation 拒绝）。
+    pub request_id: RequestId,
     pub blocks: Vec<BlockPayload>,
 }
 
 impl SyncBlockResponse {
-    /// canonical 编码：`count(4B LE) ‖ count×(len(4B LE) ‖ bytes)`。
+    /// canonical 编码：`request_id(16B) ‖ count(4B LE) ‖ count×(len(4B LE) ‖ bytes)`。
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        out.extend_from_slice(self.request_id.as_bytes());
         out.extend_from_slice(&(self.blocks.len() as u32).to_le_bytes());
         for b in &self.blocks {
             out.extend_from_slice(&(b.0.len() as u32).to_le_bytes());
@@ -103,16 +115,18 @@ impl SyncBlockResponse {
         out
     }
 
-    /// canonical 解码。
+    /// canonical 解码（request_id 前置；长度严格；拒 trailing）。
     pub fn decode(bytes: &[u8]) -> Result<Self, NetworkError> {
-        if bytes.len() < 4 {
+        const HDR: usize = 16 + 4; // request_id(16) + count(4)
+        if bytes.len() < HDR {
             return Err(NetworkError::InvalidLength {
-                expected: 4,
+                expected: HDR,
                 actual: bytes.len(),
             });
         }
-        let count = u32::from_le_bytes(bytes[0..4].try_into().expect("len checked")) as usize;
-        let mut pos = 4usize;
+        let request_id = RequestId::from_bytes(bytes[0..16].try_into().expect("len checked"));
+        let count = u32::from_le_bytes(bytes[16..20].try_into().expect("len checked")) as usize;
+        let mut pos = 20usize;
         let mut blocks = Vec::with_capacity(count);
         for _ in 0..count {
             if pos + 4 > bytes.len() {
@@ -139,7 +153,7 @@ impl SyncBlockResponse {
                 actual: bytes.len(),
             });
         }
-        Ok(Self { blocks })
+        Ok(Self { request_id, blocks })
     }
 }
 
@@ -147,27 +161,34 @@ impl SyncBlockResponse {
 mod tests {
     use super::*;
 
+    fn rid(tag: u8) -> RequestId {
+        RequestId::from_bytes([tag; 16])
+    }
+
     #[test]
     fn sync_block_request_roundtrip() {
         // 无 hash
         let r1 = SyncBlockRequest {
+            request_id: rid(1),
             height: 42,
             block_hash: None,
         };
         assert_eq!(SyncBlockRequest::decode(&r1.encode()).unwrap(), r1);
         // 有 hash
         let r2 = SyncBlockRequest {
+            request_id: rid(2),
             height: 7,
             block_hash: Some([0xab; 32]),
         };
         let bytes = r2.encode();
-        assert_eq!(bytes.len(), 41);
+        assert_eq!(bytes.len(), 16 + 8 + 1 + 32);
         assert_eq!(SyncBlockRequest::decode(&bytes).unwrap(), r2);
     }
 
     #[test]
     fn sync_block_response_roundtrip() {
         let r = SyncBlockResponse {
+            request_id: rid(3),
             blocks: vec![
                 BlockPayload(vec![1, 2, 3]),
                 BlockPayload(Vec::new()),
@@ -175,8 +196,37 @@ mod tests {
             ],
         };
         assert_eq!(SyncBlockResponse::decode(&r.encode()).unwrap(), r);
-        let empty = SyncBlockResponse { blocks: Vec::new() };
+        let empty = SyncBlockResponse {
+            request_id: rid(4),
+            blocks: Vec::new(),
+        };
         assert_eq!(SyncBlockResponse::decode(&empty.encode()).unwrap(), empty);
+    }
+
+    // TEST 1（B2）：RequestId 经 request/response 编解码 roundtrip 保留（上方 roundtrip 已断言
+    // request_id 字段相等）；此处显式验证 request_id 不是 hash / height 派生。
+    #[test]
+    fn request_id_preserved_and_not_hash_height() {
+        let rid_bytes = [0x42; 16];
+        let rid_value = RequestId::from_bytes(rid_bytes);
+        let req = SyncBlockRequest {
+            request_id: rid_value,
+            height: 1,
+            block_hash: Some([0xab; 32]),
+        };
+        let decoded_req = SyncBlockRequest::decode(&req.encode()).unwrap();
+        assert_eq!(decoded_req.request_id, rid_value);
+        // request_id ≠ block hash（长度/语义独立：16B correlation id vs 32B hash）
+        assert_ne!(
+            decoded_req.request_id.as_bytes()[0..16],
+            decoded_req.block_hash.unwrap()[0..16]
+        );
+        let resp = SyncBlockResponse {
+            request_id: rid_value,
+            blocks: vec![BlockPayload(vec![1, 2, 3])],
+        };
+        let decoded_resp = SyncBlockResponse::decode(&resp.encode()).unwrap();
+        assert_eq!(decoded_resp.request_id, rid_value);
     }
 
     fn mk_block() -> nova_core::block::Block {
@@ -213,9 +263,11 @@ mod tests {
         let b = mk_block();
         let payload = BlockPayload::from_block(&b).unwrap();
         let r = SyncBlockResponse {
+            request_id: rid(5),
             blocks: vec![payload.clone()],
         };
         let decoded = SyncBlockResponse::decode(&r.encode()).unwrap();
+        assert_eq!(decoded.request_id, rid(5));
         assert_eq!(decoded.blocks, vec![payload]);
         assert_eq!(
             nova_core::block::decode_block(&decoded.blocks[0].0).unwrap(),
@@ -225,13 +277,23 @@ mod tests {
 
     #[test]
     fn sync_decode_rejects_bad_length() {
+        // request：缺 request_id / 长度 < 25 ⇒ reject
         assert!(SyncBlockRequest::decode(&[0u8; 4]).is_err());
-        // has_hash=1 但缺 hash
-        let mut bad = vec![0u8; 9];
-        bad[8] = 1;
-        assert!(SyncBlockRequest::decode(&bad).is_err());
-        // response count 声明但字节不足
-        let mut bad2 = vec![2u8, 0, 0, 0, 1, 0, 0, 0];
+        assert!(SyncBlockRequest::decode(&[0u8; 24]).is_err());
+        // request：has_hash tag=1 但缺 hash（25B，tag 位 = 24）⇒ reject
+        let mut bad_req = vec![0u8; 25];
+        bad_req[24] = 1;
+        assert!(SyncBlockRequest::decode(&bad_req).is_err());
+        // request：非法 tag ⇒ reject
+        let mut bad_tag = vec![0u8; 25];
+        bad_tag[24] = 2;
+        assert!(SyncBlockRequest::decode(&bad_tag).is_err());
+        // response：缺 request_id（< 20B）⇒ reject
+        assert!(SyncBlockResponse::decode(&[0u8; 19]).is_err());
+        // response：request_id(16) + count=2 但字节不足 ⇒ reject
+        let mut bad2 = vec![0u8; 16];
+        bad2.extend_from_slice(&2u32.to_le_bytes());
+        bad2.extend_from_slice(&1u32.to_le_bytes());
         bad2.extend_from_slice(&[0xaa; 3]); // 声称 2 块，只有 1 块的 3 字节
         assert!(SyncBlockResponse::decode(&bad2).is_err());
     }

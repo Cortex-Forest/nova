@@ -20,6 +20,7 @@ use nova_crypto::signature::{SigningKey, sign_message_hash};
 use nova_network::event_loop::{EventHandler, NodeEvent};
 use nova_network::network_service::NetworkEvent;
 use nova_network::node_id::NodeId;
+use nova_network::security::RequestId;
 use nova_network::sync::{BlockPayload, SyncBlockResponse};
 use nova_runtime::{
     BLOCK_VERSION, Block, BlockBody, BlockHeader, compute_transaction_root, encode_block,
@@ -315,6 +316,7 @@ fn bdis_8_sync_response_same_seam_as_gossip() {
     let adapter = create_adapter(&chain);
     let block = canonical_next_block(&kp);
     let response = SyncBlockResponse {
+        request_id: RequestId::from_bytes([0x2a; 16]),
         blocks: vec![BlockPayload::from_block(&block).unwrap()],
     };
     let payload = response.encode();
@@ -342,6 +344,7 @@ fn bdis_9_handler_collects_gossip_and_sync_block_payloads() {
     let block = canonical_next_block(&kp);
     let gossip_payload = wire(&block);
     let sync_payload = SyncBlockResponse {
+        request_id: RequestId::from_bytes([0x2b; 16]),
         blocks: vec![BlockPayload::from_block(&block).unwrap()],
     }
     .encode();
@@ -467,6 +470,7 @@ fn bdis_b1_8_sync_response_future_records_intent() {
     // SyncBlockResponse 携带一个 future block（height 3）→ dispatch → FutureMissingAncestor
     let future = empty_block(3, head1, empty_root(), kp.signing_key(), 0);
     let response = SyncBlockResponse {
+        request_id: RequestId::from_bytes([0x2c; 16]),
         blocks: vec![BlockPayload::from_block(&future).unwrap()],
     };
     let results = dispatch_sync_block_response(&adapter, MAX_BLOCK_BYTES, &response.encode());

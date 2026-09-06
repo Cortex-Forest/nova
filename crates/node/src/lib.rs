@@ -87,6 +87,12 @@ pub mod block_dispatch;
 /// finality；纯 Node-local 观察状态。
 pub mod intent_ledger;
 
+/// Node-local Sync Request/Response Correlator（STEP 10-19-10-B2）：`RequestId`（network
+/// `security::RequestId`，canonical 16B）pending correlation —— `register(request_id, target)` /
+/// consuming `resolve(response.request_id)`；bounded、无网络 I/O、无 timeout/retry、无 eviction。
+/// 匹配只绑定 request，不 imply 块有效/canonical/finality。
+pub mod sync_correlator;
+
 /// Node-local Proposer orchestration（STEP 10-19-2）：ProposalRef 装配（ADR-0050 `select_proposer`
 /// 判定 + deterministic placeholder commitment）；ProposerService ≠ BlockBuilder / ValidatorActor /
 /// NetworkService / Storage / ConsensusState。
