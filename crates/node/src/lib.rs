@@ -69,6 +69,12 @@ pub mod egress;
 /// 持久化）。签名 seam：`attach_proposer_signature`（`SigningCapability`；signature ∉ block_hash）。
 pub mod block_builder;
 
+/// Remote Block Inbound Validation Boundary v1（STEP 10-19-9）：远端 Block wire →
+/// Wire + Canonical validation（纯只读，最多到 CANONICAL VALIDATED）。**不 commit / 不推进
+/// ChainHead / 不更新 StateStore / 不写 BlockStore**；产物 CanonicalNextCandidate 非
+/// finality-authorized（finality→commit 归未来 STEP）。
+pub mod block_inbound;
+
 /// Node-local Proposer orchestration（STEP 10-19-2）：ProposalRef 装配（ADR-0050 `select_proposer`
 /// 判定 + deterministic placeholder commitment）；ProposerService ≠ BlockBuilder / ValidatorActor /
 /// NetworkService / Storage / ConsensusState。
