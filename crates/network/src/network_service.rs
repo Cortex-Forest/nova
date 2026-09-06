@@ -332,10 +332,23 @@ impl<T> BoundedQueue<T> {
     }
 }
 
+/// 单次 poll 中每个 dial connection 处理的帧数上界（bounded/fairness；非无限 drain）。
+const MAX_FRAMES_PER_CONNECTION: usize = 16;
+
 /// NetworkService（网络状态 owner；同步；无共识语义）。
+///
+/// 连接模型（STEP 10-19-10-B7-A1-D7-Implementation-1）：
+/// - `transport`：外部注入的 transport（预建；单连接 / 测试 / dev 注入；peer 关联经
+///   PeerManager/session；`transport()` accessor 保留供 EventLoop/测试驱动）。
+/// - `connections`：dial 建立的 per-peer connections（multi-peer；key = NodeId —— canonical
+///   connection owner；NodeId ≠ SocketAddr）。
+/// - poll = 注入 transport（drain）+ 每条 connections（NodeId bytes 序、bounded、per-peer 隔离）。
 pub struct NetworkService<T: Transport> {
     state: NetworkServiceState,
+    /// 外部注入的 transport（预建；见模块 doc）。
     transport: T,
+    /// dial 建立的 per-peer connections（NodeId → transport；KEEP-FIRST）。
+    connections: HashMap<NodeId, T>,
     peers: PeerManager,
     inbound: BoundedQueue<NetworkEvent>,
     outbound: BoundedQueue<(NodeId, MessageEnvelope)>,
@@ -368,6 +381,7 @@ impl<T: Transport> NetworkService<T> {
         Self {
             state: NetworkServiceState::Running,
             transport,
+            connections: HashMap::new(),
             peers: PeerManager::new(),
             inbound: BoundedQueue::new(config.inbound_capacity),
             outbound: BoundedQueue::new(config.outbound_capacity),
@@ -463,6 +477,8 @@ impl<T: Transport> NetworkService<T> {
         // STEP 10-18I-L：断连 ⇒ 会话关闭（session/rate 状态清理；replay cache 保留防跨会话重放）。
         self.sessions.remove(&node);
         self.handshake_attempts.remove(&node);
+        // multi-peer：仅移除该 peer 的 dial connection（不影响其它 peer；注入 transport 保留）。
+        self.connections.remove(&node);
         Ok(())
     }
 
@@ -472,6 +488,7 @@ impl<T: Transport> NetworkService<T> {
         // STEP 10-18I-L：移除 ⇒ 会话关闭（session/rate 状态清理；replay cache 保留）。
         self.sessions.remove(&node);
         self.handshake_attempts.remove(&node);
+        self.connections.remove(&node);
         Ok(())
     }
 
@@ -538,14 +555,21 @@ impl<T: Transport> NetworkService<T> {
         Ok(peers.len())
     }
 
-    /// 排空 outbound：编码 envelope → `Transport.send`。返回成功发送数。
+    /// 排空 outbound：编码 envelope → **per-peer 路由**（dial connection 或注入 transport）。
+    /// 返回成功发送数。
     pub fn flush_outbound(&mut self) -> Result<usize, NetworkServiceError> {
         self.ensure_running()?;
         let mut sent = 0usize;
         while let Some((peer, envelope)) = self.outbound.pop_front() {
             let bytes = encode(&envelope);
-            // 单条发送失败 ⇒ 跳过并计数（不 panic / 不改共识）；send 错误透出仅当持续失败时由上层重试。
-            match self.transport.send(&peer, bytes) {
+            // 路由：peer 在 dial connections ⇒ 用该 peer 的 transport；否则注入 transport
+            // （单连接注入模型；TcpTransport 会校验 peer==remote 防串发）。
+            let res = if let Some(conn) = self.connections.get_mut(&peer) {
+                conn.send(&peer, bytes)
+            } else {
+                self.transport.send(&peer, bytes)
+            };
+            match res {
                 Ok(()) => {
                     sent += 1;
                     self.diagnostics.sent += 1;
@@ -562,13 +586,15 @@ impl<T: Transport> NetworkService<T> {
 
     // ---------- inbound ----------
 
-    /// **单次** drain transport（非永久 loop；完整 wakeup/timer 归 10-18F）。
+    /// **单次** poll：注入 transport（drain；既有单连接语义）→ 每条 dial connection
+    /// （NodeId bytes 字典序；每连接 bounded；per-peer 错误隔离）。非永久 loop；无 async。
     ///
     /// 对每条可用帧：decode → validate(sender/signature) → classify → inbound queue。
-    /// 返回成功入队数；invalid 帧 drop + 计数（不 panic、不进 consensus）。
+    /// 返回成功入队数；invalid 帧 drop + 计数（不 panic、不进共识）。
     pub fn poll_transport(&mut self) -> Result<usize, NetworkServiceError> {
         self.ensure_running()?;
         let mut accepted = 0usize;
+        // 1. 注入 transport（兼容既有注入/测试语义）。
         loop {
             match self.transport.try_recv() {
                 Ok(Some((raw_sender, bytes))) => {
@@ -579,6 +605,31 @@ impl<T: Transport> NetworkService<T> {
                 }
                 Ok(None) => break,
                 Err(e) => return Err(NetworkServiceError::Transport(e)),
+            }
+        }
+        // 2. dial connections：确定性 NodeId 序；每连接 bounded（fairness）；单 peer 错误隔离。
+        let mut conn_peers: Vec<NodeId> = self.connections.keys().copied().collect();
+        conn_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for peer in conn_peers {
+            let frames: Vec<(NodeId, Vec<u8>)> = {
+                let Some(conn) = self.connections.get_mut(&peer) else {
+                    continue;
+                };
+                let mut out = Vec::new();
+                for _ in 0..MAX_FRAMES_PER_CONNECTION {
+                    match conn.try_recv() {
+                        Ok(Some(f)) => out.push(f),
+                        Ok(None) => break,
+                        Err(_) => break, // per-peer isolation：跳过该 peer，继续其它
+                    }
+                }
+                out
+            };
+            for (raw_sender, bytes) in frames {
+                self.diagnostics.frames_received += 1;
+                if self.handle_inbound_frame(raw_sender, &bytes) {
+                    accepted += 1;
+                }
             }
         }
         Ok(accepted)
@@ -749,6 +800,7 @@ impl<T: Transport> NetworkService<T> {
         self.inbound.clear();
         self.outbound.clear();
         self.peers = PeerManager::new();
+        self.connections.clear();
         // STEP 10-18I-L：会话 / replay / rate 状态清理（NetworkService owns network session state）。
         self.sessions.clear();
         self.handshake_attempts.clear();
@@ -766,13 +818,13 @@ impl<T: Transport> NetworkService<T> {
 }
 
 impl NetworkService<BoxTransport> {
-    /// 建立一条 outbound connection（**single-active seam**；STEP 10-19-10-B7-A1-D4）。
+    /// 建立一条 outbound connection（**multi-peer**；STEP 10-19-10-B7-A1-D7-Implementation-1）。
     ///
-    /// 成功顺序（§dial success）：`dialer.dial`（真实建连）→ 成功后才装箱替换 transport +
-    /// 登记 `connected`。**绝不先标记 connected 再 dial**。
+    /// 成功顺序（§dial success）：`dialer.dial`（真实建连）→ 成功后才登记 `connections[remote]`
+    /// + `connected`。**绝不先标记 connected 再 dial**。
     ///
     /// 错误语义：
-    /// - 已有 connected peer ⇒ `Err(AlreadyConnected)`（不静默替换在用的 transport）。
+    /// - remote 已有 dial connection ⇒ `Err(AlreadyConnected)`（KEEP-FIRST；不覆盖）。
     /// - 无注入 dialer ⇒ `Err(DialerUnavailable)`。
     /// - dial 失败 ⇒ `Err(Dial(NetworkError))`：**不登记 connected / 不建 fake session /
     ///   不自动 retry / 不自动选 peer**。
@@ -786,7 +838,8 @@ impl NetworkService<BoxTransport> {
         idle_timeout: Option<std::time::Duration>,
     ) -> Result<(), NetworkServiceError> {
         self.ensure_running()?;
-        if !self.peers.connected_peers().is_empty() {
+        // KEEP-FIRST：同 NodeId 已有 dial connection ⇒ 拒绝（不覆盖；防连接替换/替身）。
+        if self.connections.contains_key(&remote) {
             return Err(NetworkServiceError::AlreadyConnected);
         }
         let local = self.self_id;
@@ -799,8 +852,8 @@ impl NetworkService<BoxTransport> {
                 .dial(addr, local, remote, max_frame, idle_timeout)
                 .map_err(NetworkServiceError::Dial)?
         };
-        // dial 成功后才 owns transport + 登记 connected。
-        self.transport = BoxTransport::new(conn);
+        // dial 成功后才登记（原子：connections insert + PeerManager connected）。
+        self.connections.insert(remote, BoxTransport::new(conn));
         self.peers.connect(remote);
         Ok(())
     }
@@ -1080,5 +1133,218 @@ mod tests {
             let ev = svc.drain_inbound().pop().expect("事件");
             assert_eq!(ev.message_type(), mt);
         }
+    }
+
+    // ---------- STEP 10-19-10-B7-A1-D7-Implementation-1：multi-peer connection set ----------
+
+    /// 可观测 fake connection：rx（对端→NS 入站帧）+ sent（NS→对端记录）。
+    #[derive(Default)]
+    struct Spec {
+        rx: std::collections::VecDeque<(NodeId, Vec<u8>)>,
+        sent: Vec<(NodeId, Vec<u8>)>,
+    }
+
+    struct FakeConn {
+        spec: std::rc::Rc<std::cell::RefCell<Spec>>,
+    }
+
+    impl Transport for FakeConn {
+        fn send(&mut self, peer: &NodeId, message: Vec<u8>) -> Result<(), NetworkError> {
+            self.spec.borrow_mut().sent.push((*peer, message));
+            Ok(())
+        }
+        fn try_recv(&mut self) -> Result<Option<(NodeId, Vec<u8>)>, NetworkError> {
+            Ok(self.spec.borrow_mut().rx.pop_front())
+        }
+    }
+
+    /// fake dialer：per-remote 一条 FakeConn（测试可 seed 入站帧 / 观察出站）。
+    #[derive(Clone)]
+    struct FakeDialer {
+        specs: std::rc::Rc<
+            std::cell::RefCell<
+                std::collections::HashMap<NodeId, std::rc::Rc<std::cell::RefCell<Spec>>>,
+            >,
+        >,
+    }
+
+    impl FakeDialer {
+        fn new() -> Self {
+            Self {
+                specs: std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new())),
+            }
+        }
+        fn spec(&self, remote: NodeId) -> std::rc::Rc<std::cell::RefCell<Spec>> {
+            self.specs.borrow_mut().entry(remote).or_default().clone()
+        }
+        fn push_inbound(&self, remote: NodeId, sender: NodeId, bytes: Vec<u8>) {
+            self.spec(remote).borrow_mut().rx.push_back((sender, bytes));
+        }
+        fn sent_len(&self, remote: NodeId) -> usize {
+            self.spec(remote).borrow().sent.len()
+        }
+    }
+
+    impl ConnectionDialer for FakeDialer {
+        fn dial(
+            &self,
+            _target_addr: std::net::SocketAddr,
+            _local: NodeId,
+            remote: NodeId,
+            _max_frame: usize,
+            _idle_timeout: Option<std::time::Duration>,
+        ) -> Result<Box<dyn Transport>, NetworkError> {
+            Ok(Box::new(FakeConn {
+                spec: self.spec(remote),
+            }))
+        }
+    }
+
+    fn fake_addr() -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0))
+    }
+
+    /// dial 型 service：注入空闲 MemoryTransport（poll 首段恒空）+ fake dialer。
+    fn dial_svc(a: NodeId, dialer: FakeDialer) -> NetworkService<BoxTransport> {
+        let (mem_a, _) = MemoryTransport::pair(a, NodeId::from_bytes([0xfe; 32]));
+        NetworkService::<BoxTransport>::new(cfg(256), a, BoxTransport::new(Box::new(mem_a)))
+            .with_dialer(Box::new(dialer))
+    }
+
+    /// peer 签名的 Ping 帧（payload = 单 byte tag）；返回 (sender, encoded)。
+    fn ping_frame(signing: &nova_crypto::signature::SigningKey, tag: u8) -> (NodeId, Vec<u8>) {
+        let env = signed_env(signing, MessageType::Ping, vec![tag]);
+        (env.sender, encode(&env))
+    }
+
+    // T6 — poll：dial connections 按 NodeId bytes 字典序轮询；per-peer 路由无串扰；组内 FIFO。
+    #[test]
+    fn d7_1_poll_multi_connection_ordered_and_routed() {
+        let ka = KeyPair::generate().unwrap();
+        let kb = KeyPair::generate().unwrap();
+        let kc = KeyPair::generate().unwrap();
+        let a = NodeId::from_verifying_key(ka.verifying_key());
+        let b = NodeId::from_verifying_key(kb.verifying_key());
+        let c = NodeId::from_verifying_key(kc.verifying_key());
+        let dialer = FakeDialer::new();
+        for tag in [0u8, 1, 2] {
+            let (s, bytes) = ping_frame(kb.signing_key(), tag);
+            dialer.push_inbound(b, s, bytes);
+        }
+        let (cs, cbytes) = ping_frame(kc.signing_key(), 9);
+        dialer.push_inbound(c, cs, cbytes);
+        let mut svc = dial_svc(a, dialer);
+        svc.dial_peer(fake_addr(), b, 4096, None).unwrap();
+        svc.dial_peer(fake_addr(), c, 4096, None).unwrap();
+        assert_eq!(svc.poll_transport().unwrap(), 4, "四条帧全部入站");
+        let evs = svc.drain_inbound();
+        assert_eq!(evs.len(), 4);
+        let seq: Vec<(NodeId, u8)> = evs
+            .iter()
+            .map(|e| match e {
+                NetworkEvent::Ping { sender, payload } => (*sender, payload[0]),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        // 顺序 = NodeId bytes 序（较小者先）；组内 FIFO（b tags 0,1,2 保持）。
+        let (first, second) = if b.as_bytes() < c.as_bytes() {
+            (b, c)
+        } else {
+            (c, b)
+        };
+        let (first_tags, second_tags): (Vec<u8>, Vec<u8>) = if first == b {
+            (vec![0, 1, 2], vec![9])
+        } else {
+            (vec![9], vec![0, 1, 2])
+        };
+        assert_eq!(seq.len(), first_tags.len() + second_tags.len(), "全帧分组");
+        for (i, t) in first_tags.iter().enumerate() {
+            assert_eq!(seq[i], (first, *t), "first-ordered connection 组内 FIFO");
+        }
+        for (i, t) in second_tags.iter().enumerate() {
+            let n = first_tags.len() + i;
+            assert_eq!(seq[n], (second, *t), "second-ordered connection 组内 FIFO");
+        }
+    }
+
+    // T7 — poll bounded + fairness：每 connection 每 poll ≤16 帧（不无限 drain / 不饿死其它 peer）。
+    #[test]
+    fn d7_1_poll_bounded_per_connection_fair() {
+        let ka = KeyPair::generate().unwrap();
+        let kb = KeyPair::generate().unwrap();
+        let kc = KeyPair::generate().unwrap();
+        let a = NodeId::from_verifying_key(ka.verifying_key());
+        let b = NodeId::from_verifying_key(kb.verifying_key());
+        let c = NodeId::from_verifying_key(kc.verifying_key());
+        let dialer = FakeDialer::new();
+        for tag in 0u8..20 {
+            let (s, bytes) = ping_frame(kb.signing_key(), tag);
+            dialer.push_inbound(b, s, bytes);
+        }
+        for tag in 100u8..120 {
+            let (s, bytes) = ping_frame(kc.signing_key(), tag);
+            dialer.push_inbound(c, s, bytes);
+        }
+        let mut svc = dial_svc(a, dialer);
+        svc.dial_peer(fake_addr(), b, 4096, None).unwrap();
+        svc.dial_peer(fake_addr(), c, 4096, None).unwrap();
+        // 每 connection 16 帧上界：两连接共 32（非 40）—— bounded。
+        assert_eq!(svc.poll_transport().unwrap(), 32, "bounded 16/connection");
+        // 剩余各 4 帧第二轮收完。
+        assert_eq!(svc.poll_transport().unwrap(), 8, "剩余公平收完");
+    }
+
+    // T8 — flush：enqueue_outbound(peer) 只经该 peer 的 connection 发送（per-peer 路由）。
+    #[test]
+    fn d7_1_flush_routes_to_peer_connection() {
+        let ka = KeyPair::generate().unwrap();
+        let kb = KeyPair::generate().unwrap();
+        let kc = KeyPair::generate().unwrap();
+        let a = NodeId::from_verifying_key(ka.verifying_key());
+        let b = NodeId::from_verifying_key(kb.verifying_key());
+        let c = NodeId::from_verifying_key(kc.verifying_key());
+        let dialer = FakeDialer::new();
+        let mut svc = dial_svc(a, dialer.clone());
+        svc.dial_peer(fake_addr(), b, 4096, None).unwrap();
+        svc.dial_peer(fake_addr(), c, 4096, None).unwrap();
+        let env = signed_env(ka.signing_key(), MessageType::Ping, vec![0xAB]);
+        svc.enqueue_outbound(b, env).unwrap();
+        assert_eq!(svc.flush_outbound().unwrap(), 1);
+        assert_eq!(dialer.sent_len(b), 1, "b 的帧走 b connection");
+        assert_eq!(dialer.sent_len(c), 0, "不串到 c connection");
+    }
+
+    // T9 — disconnect：只影响单 peer（connection/session 移除；其它 connection 保留可用）。
+    #[test]
+    fn d7_1_disconnect_isolates_single_peer() {
+        let ka = KeyPair::generate().unwrap();
+        let kb = KeyPair::generate().unwrap();
+        let kc = KeyPair::generate().unwrap();
+        let a = NodeId::from_verifying_key(ka.verifying_key());
+        let b = NodeId::from_verifying_key(kb.verifying_key());
+        let c = NodeId::from_verifying_key(kc.verifying_key());
+        let dialer = FakeDialer::new();
+        let mut svc = dial_svc(a, dialer.clone());
+        svc.dial_peer(fake_addr(), b, 4096, None).unwrap();
+        svc.dial_peer(fake_addr(), c, 4096, None).unwrap();
+        assert_eq!(svc.connected_peer_count(), 2);
+        svc.disconnect_peer(b).unwrap();
+        assert!(!svc.is_connected(b), "b 已断连");
+        assert!(svc.is_connected(c), "c 不受影响");
+        assert_eq!(svc.connected_peer_count(), 1);
+        // b 已断（仍 registered）⇒ 拒发 PeerNotConnected；c 正常收发。
+        let env_b = signed_env(ka.signing_key(), MessageType::Ping, vec![0x01]);
+        assert_eq!(
+            svc.enqueue_outbound(b, env_b),
+            Err(NetworkServiceError::PeerNotConnected)
+        );
+        let env_c = signed_env(ka.signing_key(), MessageType::Ping, vec![0x02]);
+        svc.enqueue_outbound(c, env_c).unwrap();
+        assert_eq!(svc.flush_outbound().unwrap(), 1);
+        assert_eq!(dialer.sent_len(b), 0, "断连后不再发 b");
+        assert_eq!(dialer.sent_len(c), 1);
+        // 断连后可重建 dial（KEEP-FIRST 不阻挡 reconnect）。
+        assert!(svc.dial_peer(fake_addr(), b, 4096, None).is_ok());
+        assert!(svc.is_connected(b));
     }
 }

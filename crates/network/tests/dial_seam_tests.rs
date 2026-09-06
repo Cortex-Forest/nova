@@ -143,17 +143,23 @@ fn dial_target_propagated_exactly() {
     assert_eq!(fake.last_remote(), Some(nid(0xbb)), "remote NodeId 一致");
 }
 
-// T5 — single-active：已有 connected peer 时再次 dial ⇒ AlreadyConnected（不静默替换）
+// T5 — multi-peer：不同 remote 可同时 connected；同 remote 重复 dial ⇒ KEEP-FIRST
+//（STEP 10-19-10-B7-A1-D7-Implementation-1：不再 single-active 全拒）
 #[test]
-fn second_dial_rejected_not_silent_replace() {
+fn dial_multi_peer_keep_first_rejects_duplicate() {
     let fake = FakeDialer::ok();
     let mut svc = svc_with(fake);
     svc.dial_peer(addr(), nid(0xbb), 4096, None).unwrap();
-    let res = svc.dial_peer(addr(), nid(0xcc), 4096, None);
-    assert_eq!(res, Err(NetworkServiceError::AlreadyConnected));
-    // 原连接未被替换：connected 仍为 bb，cc 未连接
+    // 多 peer：不同 remote 允许并行连接。
+    svc.dial_peer(addr(), nid(0xcc), 4096, None).unwrap();
     assert!(svc.is_connected(nid(0xbb)));
-    assert!(!svc.is_connected(nid(0xcc)));
+    assert!(svc.is_connected(nid(0xcc)));
+    assert_eq!(svc.connected_peer_count(), 2);
+    // KEEP-FIRST：同 remote 再 dial ⇒ AlreadyConnected（不覆盖在用连接）。
+    let dup = svc.dial_peer(addr(), nid(0xbb), 4096, None);
+    assert_eq!(dup, Err(NetworkServiceError::AlreadyConnected));
+    assert!(svc.is_connected(nid(0xbb)), "原连接未被替换");
+    assert_eq!(svc.connected_peer_count(), 2, "重复 dial 不新增连接");
 }
 
 // — 无 dialer ⇒ DialerUnavailable（明确错误，不 panic / 不假连接）
