@@ -105,6 +105,14 @@ pub mod sync_correlator;
 /// 的 intent 诚实返回 `Unschedulable`（不伪造 height/hash）。
 pub mod sync_scheduler;
 
+/// Node-local Outbound Sync Request Dispatch Seam（STEP 10-19-10-B6）：`OutboundSyncDispatcher`
+/// trait（Node-side adapter seam → 既有 NetworkService outbound boundary）+ `sync_block_request_from_intent`
+///（B5 intent → 复用 `network::sync::SyncBlockRequest`，无第二套 wire）+ `dispatch_batch`
+///（bounded FIFO；**register-before-send**；send 失败 ⇒ `Rejected` 不自动 retry/换 peer）。
+/// **OUTBOUND ONLY**：不处理 SyncBlockResponse / 不写 BlockStore / 不改 ChainHead / 无 finality；
+/// 不生成 RequestId（caller-owned）。
+pub mod sync_dispatch;
+
 /// Node-local Proposer orchestration（STEP 10-19-2）：ProposalRef 装配（ADR-0050 `select_proposer`
 /// 判定 + deterministic placeholder commitment）；ProposerService ≠ BlockBuilder / ValidatorActor /
 /// NetworkService / Storage / ConsensusState。
