@@ -54,7 +54,8 @@ pub mod vote_ledger;
 pub mod driver;
 
 /// Consensus outbound semantic seam（STEP 10-18G-1）：`OutboundConsensusMessage`（what to send）+
-/// `NetworkEgress`；生产网络身份签名 DEFERRED。
+/// `NetworkEgress`（抽象 seam，未实现 impl）。Production semantic→envelope egress 由
+/// `egress` 模块实现（STEP 10-18I-N-IMPL）。
 pub mod outbound;
 
 /// Node Production Egress Adapter（STEP 10-18I-N-IMPL）：Driver semantic outbound →

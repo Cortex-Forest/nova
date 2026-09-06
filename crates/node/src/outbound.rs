@@ -9,8 +9,13 @@
 //!   [`crate::driver::NodeConsensusDriver`] 放入 outbound（unverified never outbound）。
 //!
 //! # NetworkEgress seam
-//! - 把 Driver 产出的 outbound intent 接出的最小接口；生产网络身份签名
-//!   （NodeId key → pre-signed `MessageEnvelope` → `NetworkService`）**DEFERRED（GAP-A）**。
+//! - 把 Driver 产出的 outbound intent 接出的**最小抽象 seam**（本 trait 自身仍未实现 impl；
+//!   不宣称整个 seam 已落地）。
+//! - Production semantic→envelope egress 已由 [`crate::egress`] 实现：Driver semantic →
+//!   canonical payload → `MessageEnvelope` → `NetworkSigner` 网络签名 → `NetworkService`
+//!   （STEP 10-18I-N-IMPL）—— 网络 envelope 签名已不再处于 GAP-A / DEFERRED。
+//! - Permanent network-key 持久化 / encrypted key storage / HSM / KMS 仍 **DEFERRED**
+//!   （区别于 production egress；见 [`crate::network_identity`]）。
 //! - 测试实现可用 test KeyPair + `MemoryTransport` 证明整条网络发送路径（见 node tests）。
 //!
 //! # 边界
@@ -39,10 +44,13 @@ pub enum OutboundConsensusMessage {
     Proposal(ProposalRef),
 }
 
-/// 出站 egress seam：把 Driver 产出的 consensus semantic output 接出。
+/// 出站 egress seam：把 Driver 产出的 consensus semantic output 接出（**抽象 seam**；
+/// 当前 production 路径由 [`crate::egress`] adapter 承担）。
 ///
-/// - 生产实现（未来，GAP-A 解除后）：`intent → network identity signing → MessageEnvelope →
-///   NetworkService.broadcast`。
+/// - 当前 production：`Driver semantic → egress.rs → NetworkSigner → MessageEnvelope →
+///   NetworkService.broadcast`（STEP 10-18I-N-IMPL；不经过本 trait）。
+/// - 未来（可选）若改经本 trait 统一接出：同一 `intent → network identity signing →
+///   MessageEnvelope → NetworkService` 语义不变。
 /// - 测试实现：test KeyPair + `MemoryTransport`（真实 sign + 发送路径）。
 pub trait NetworkEgress {
     /// 发送一批 consensus outbound semantic 消息。
