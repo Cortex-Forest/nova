@@ -37,6 +37,7 @@ use crate::driver::{DriverError, NodeConsensusDriver};
 use crate::key_provider::{KeyProvider, KeyProviderError};
 use crate::network_identity::NetworkSigner;
 use crate::outbound::OutboundConsensusMessage;
+use crate::proposer::proposer_decision;
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
 use crate::validator::{ValidatorActor, ValidatorActorError};
@@ -44,6 +45,25 @@ use crate::wiring::{NodeConsensusCommand, NodeConsensusHandler, process_command}
 
 /// ValidatorActor 的签名能力类型（Phase 1：trait object）。
 type DynSigner = Box<dyn SigningCapability>;
+
+/// Node-local proposer step（STEP 10-19-2）：判定本节点是否当前 proposer → submit ProposalRef。
+///
+/// - 纯编排：`driver.consensus()` 只读判定；提交走 `NodeConsensusDriver::submit_proposal`
+///   （`SetProposal` → canonical transition；阶段守卫 + 幂等由 decision 与 consensus 保证）。
+/// - 不自动投票：proposal 成功后 local vote 仍走既有 `submit_local_vote` 路径（ValidatorActor）。
+/// - 无 validator actor ⇒ no-op；decision 错误（非法 ValidatorSet）⇒ `Err`（fail-closed）。
+fn runtime_propose(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+) -> Result<(), nova_consensus::error::ConsensusError> {
+    let Some(local_id) = driver.actor(0).map(|a| a.validator_id()) else {
+        return Ok(());
+    };
+    let decision = proposer_decision(local_id, driver.consensus())?;
+    if let Some(pr) = decision {
+        let _ = driver.submit_proposal(pr);
+    }
+    Ok(())
+}
 
 /// NodeRuntime 启动错误（node-local；typed；fail closed）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +89,8 @@ pub enum RuntimeError {
     Driver(DriverError),
     /// Node Egress 网络签名失败（fail-closed；不吞安全错误）。
     Egress(crate::egress::EgressError),
+    /// Node-local Proposer orchestration 失败（select_proposer 非法 ValidatorSet；fail-closed）。
+    Proposer(nova_consensus::error::ConsensusError),
 }
 
 /// Runtime 关闭错误（Stage C `shutdown`；仅 Storage 可失败 ——
@@ -364,6 +386,8 @@ impl NodeRuntime {
     /// 无 `Handler → &mut Driver/Runtime`、无 self-reference（无 Rc/RefCell/Arc/unsafe/async）。
     pub fn step(&mut self) -> Result<(), RuntimeError> {
         let Some(stack) = &mut self.network_stack else {
+            // 网络 disabled：仍执行 node-local proposer orchestration（无网络 identity 依赖）。
+            runtime_propose(&mut self.driver).map_err(RuntimeError::Proposer)?;
             return Ok(());
         };
         stack
@@ -374,6 +398,10 @@ impl NodeRuntime {
         for command in commands {
             process_command(&mut self.driver, command).map_err(RuntimeError::Driver)?;
         }
+        // STEP 10-19-2：node-local proposer orchestration —— 仅本节点为当前 proposer 且阶段
+        // Propose 且本轮未提案时提交 ProposalRef；否则幂等 no-op。不触碰 validator 安全；
+        // 不自动投票（vote 仍走既有路径）。
+        runtime_propose(&mut self.driver).map_err(RuntimeError::Proposer)?;
         // STEP 10-18I-N-IMPL：production egress —— drain Driver semantic outbound →
         // NetworkSigner 编码签名 → NetworkService.broadcast（established-only/queue 由 NS 负责）
         // → flush（TCP send）。sign 失败 fail-closed；NS broadcast/flush 失败（queue full / 无

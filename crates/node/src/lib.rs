@@ -62,6 +62,11 @@ pub mod outbound;
 /// `MessageEnvelope`（canonical）+ `NetworkSigner` 签名 → NetworkService。
 pub mod egress;
 
+/// Node-local Proposer orchestration（STEP 10-19-2）：ProposalRef 装配（ADR-0050 `select_proposer`
+/// 判定 + deterministic placeholder commitment）；ProposerService ≠ BlockBuilder / ValidatorActor /
+/// NetworkService / Storage / ConsensusState。
+pub mod proposer;
+
 /// KeyProvider seam（STEP 10-16）：`load_signer() -> Box<dyn SigningCapability>`；ValidatorActor
 /// 不知私钥位置 / 载体（software/HSM/remote/KMS 均为实现）。不修改 `SigningCapability`。
 pub mod key_provider;
