@@ -2,14 +2,17 @@
 
 Nova Chain 是一条面向 **AI、数字创作、数字娱乐和开放应用生态**的模块化 Layer1 区块链。核心理念：Creator Economy、AI Applications、Digital Ownership、Open Developer Ecosystem、Mobile-first User Experience、Permissionless Network Participation。
 
-> **⚠️ 当前状态：PHASE 2 — Protocol Design（协议冻结完成，进入实现阶段）**
+> **⚠️ 当前状态：PHASE 2 — Protocol Design COMPLETE / FROZEN；Implementation & Integration In Progress**
 >
 > **完整可运行区块链尚未发布。**
-> 本仓库已完成：Cargo Workspace 工程基础、代码质量工具、CI、文档体系、ADR 治理框架（ADR-0001~0040）、
-> Crypto / Genesis / Consensus 协议规范冻结，以及 **Consensus 纯计算核心实现**（STEP 10，lib 108 tests，
-> 含 BFT Round / Finality / Checkpoint / ForkChoice / Integration）。
-> **端到端共识（网络接入 / 节点驱动 / 持久化恢复）与 WASM / 完整 P2P / Storage 持久化尚未完成。**
-> 未实现的能力均标注为 `PLANNED` / `NOT IMPLEMENTED`，绝不虚报。当前不是 Devnet / Testnet / Mainnet。
+> 本仓库已完成：Cargo Workspace 工程基础、代码质量工具、CI、文档体系、ADR 治理框架（ADR-0001~0060 tracked）、
+> Crypto / Genesis / Consensus 协议规范冻结，以及 **Consensus 纯计算核心**（STEP 10-1~10-14 COMPLETE / FINAL FROZEN）。
+> **实现已推进至节点运行时 / 集成层与持久化**：node-driven consensus、validator 安全持久化（fail-closed）/ 重启恢复、
+> 持久化区块存储 / chain head / 崩溃一致性提交、Network 运行时基础设施（network_service / event_loop / security /
+> session / 生产 TcpTransport）、区块生命周期与同步基础设施（implemented，integration hardening 中）。
+> **仍未完成**：生产鉴权出站网络路径、libp2p、WASM Execution、完整 Storage / Network 生产认证、Node / RPC / Wallet 发布。
+> 未实现的能力均标注为 `PLANNED` / `NOT IMPLEMENTED`，绝不虚报。
+> **Release**：Devnet / Testnet / Mainnet — `NOT RELEASED`（当前不是 Devnet / Testnet / Mainnet）。
 
 ## 1. 简介
 
@@ -44,14 +47,19 @@ Storage（RocksDB + 状态树）
 
 ## 3. 状态
 
-- **PHASE**: PHASE 2 — Protocol Design（完成）→ 实现阶段
-- **Consensus**: 协议冻结完成 + **纯计算核心已实现**（STEP 10-1~10-14 COMPLETE / FINAL FROZEN）；
-  端到端共识（网络接入 / 节点驱动 / 持久化恢复）`NOT IMPLEMENTED`
+- **PHASE**: PHASE 2 — Protocol Design COMPLETE / FROZEN；Implementation & Integration In Progress
+- **Consensus**: 协议设计 FINAL FROZEN + 纯计算核心已实现（STEP 10-1~10-14 COMPLETE / FINAL FROZEN）；
+  node-driven consensus、validator 安全持久化（fail-closed）/ 重启恢复、consensus ↔ node / network 集成已实现
+  （integration hardening）；**生产鉴权出站网络路径仍不完整**（非生产就绪）
 - **WASM Execution**: `NOT IMPLEMENTED`（state transition / block 执行纯计算已实现）
-- **P2P Network**: 消息层骨架已实现（STEP 9-2~9-5）；完整传输 / libp2p `NOT IMPLEMENTED`
-- **Storage**: SMT / StateStore 已实现（STEP 8B/8C）；持久化后端（8E）`DEFERRED`
+- **Network / P2P**: 运行时基础设施已实现（message / transport / security / session / network_service / event_loop /
+  gossip / sync，含生产 std::net TcpTransport）；**libp2p 未采用；生产鉴权出站网络运行时 BLOCKED / 不完整**
+- **Storage**: StateStore / SMT + PersistentBackend（8E）+ chain head persistence + block store +
+  crash-consistent block commit 已实现；进一步集成 / 加固中（**非"生产已认证"**）
+- **Node**: 运行时 / 集成层已实现（NodeRuntime / driver / ValidatorActor / bootstrap / restart recovery / egress /
+  block builder / inbound / dispatch / sync 等），integration hardening 中
 - **Wallet / Explorer / Website**: `PLANNED`
-- **当前不是 Devnet / Testnet / Mainnet**：本项目尚未进入任何网络阶段（见 Master Prompt §72）。
+- **Release**: Devnet / Testnet / Mainnet：`NOT RELEASED`（尚未进入任何网络阶段，见 Master Prompt §72）。
 - 详见 [docs/architecture/overview.md](docs/architecture/overview.md) 与 [docs/adr/](docs/adr/)
 
 ## 4. Repository Structure
@@ -61,13 +69,13 @@ NovaChain/
 ├── Cargo.toml            # Cargo Workspace 根（统一版本/依赖/lints）
 ├── crates/
 │   ├── core/             # nova-core：协议类型与规则（transaction/nonce/replay/gas/state，已实现）
-│   ├── consensus/        # nova-consensus：PoS + DAG + BFT 纯计算核心（STEP 10 冻结，已实现）
+│   ├── consensus/        # nova-consensus：PoS + DAG + BFT 协议设计 FINAL FROZEN；纯计算核心 + proposer selection + consensus 集成已实现
 │   ├── crypto/           # nova-crypto：哈希/签名/地址/domain/genesis（PHASE 2 完成）
 │   ├── execution/        # nova-execution：state transition / block 执行纯计算（已实现；WASM 未实现）
-│   ├── network/          # nova-network：P2P 消息层骨架（STEP 9-2~9-5；libp2p 未实现）
-│   ├── node/             # nova-node：节点组装/配置骨架
+│   ├── network/          # nova-network：运行时基础设施（message/transport/security/session/network_service/event_loop/gossip/sync；libp2p 未采用）
+│   ├── node/             # nova-node：运行时 / 集成层（NodeRuntime/driver/validator safety/bootstrap/block/sync 等；integration hardening）
 │   ├── rpc/              # nova-rpc（占位）
-│   ├── storage/          # nova-storage：SMT / StateStore（STEP 8B/8C 已实现；8E 持久化未完成）
+│   ├── storage/          # nova-storage：StateStore/SMT + PersistentBackend + chain head + block store（持久化 / 崩溃一致性已实现）
 │   └── wallet/           # nova-wallet（占位）
 ├── tests/                # 跨 crate 集成测试入口
 ├── benches/              # benchmark 入口
@@ -110,8 +118,8 @@ cargo fmt --all -- --check
 
 见 [docs/architecture/overview.md](docs/architecture/overview.md)。开发顺序为 PHASE 1 → PHASE 24（Project Foundation → Crypto → Address → Transaction → State → Storage → Block/DAG → P2P → PoS → BFT → Node → WASM → RPC → Explorer → Wallet → Staking → Mobile → Website → Creator → Devnet → Public Testnet → Security/Chaos/Economic → Mainnet Candidate → Mainnet）。
 
-**已推进**：PHASE 2 Protocol Design（Crypto / Genesis / 协议规范）完成；Consensus 协议与纯计算实现（PoS / BFT 阶段，STEP 10-1~10-14）COMPLETE / FINAL FROZEN。
-**未推进**：端到端共识集成、完整 Storage 持久化、完整 P2P、WASM、Node、RPC、Wallet 等，均为 `PLANNED` / `NOT IMPLEMENTED`。
+**已推进 / 已实现**：PHASE 2 Protocol Design（Crypto / Genesis / 协议规范）COMPLETE / FROZEN；Consensus 协议与纯计算核心（STEP 10-1~10-14）COMPLETE / FINAL FROZEN；node-driven consensus、validator 安全持久化 / 重启恢复、Node 运行时 / 集成层、Storage 持久化（block store / chain head / crash-consistent）、Network 运行时基础设施、区块生命周期与同步基础设施均已实现（integration hardening 中）。
+**未推进 / 未完成**：生产鉴权出站网络路径（BLOCKED）、libp2p、WASM Execution、RPC、Wallet、Explorer、Staking 等，均为 `PLANNED` / `NOT IMPLEMENTED`；Devnet / Testnet / Mainnet：`NOT RELEASED`。
 
 ---
 
