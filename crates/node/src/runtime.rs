@@ -643,6 +643,26 @@ impl NodeRuntime {
         }
     }
 
+    /// 断开 configured peer 并清本地握手状态（STEP 10-19-10-B7-A1-D6 生命周期）。
+    ///
+    /// - 调用 `NetworkService::disconnect_peer`（PeerManager connected 清除 + session 清除；
+    ///   session owner = NetworkService，此处不手工改 session）。
+    /// - 清 `handshake_init_sent_for` ⇒ 之后 `establish_configured_peer` 可重新 dial + 生成
+    ///   **新 nonce** + 发送新 Init（reconnect；L5/L6）。幂等（未连接 / 空 peers ⇒ Ok）。
+    pub fn disconnect_configured_peer(&mut self) -> Result<(), RuntimeError> {
+        let Some(target) = self.configured_targets.first().copied() else {
+            return Ok(());
+        };
+        if let Some(stack) = &mut self.network_stack {
+            stack
+                .ns
+                .disconnect_peer(target.peer_id)
+                .map_err(RuntimeError::NetworkDial)?;
+        }
+        self.handshake_init_sent_for = None;
+        Ok(())
+    }
+
     /// 构造 outbound Handshake Init envelope（本端身份；`claimed = signer.node_id()`，**非**
     /// configured peer）。复用 session `handshake_payload_encode` + `random_session_nonce`
     /// （每次新 nonce）+ 既有 `MessageEnvelope` + `NetworkSigner::sign_envelope`。

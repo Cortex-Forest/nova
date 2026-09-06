@@ -18,13 +18,16 @@ use nova_crypto::identity::{
     canonical_genesis_bytes, compute_genesis_hash,
 };
 use nova_crypto::key::KeyPair;
-use nova_network::message::{MessageEnvelope, MessageType, sign_message};
+use nova_network::message::{MessageEnvelope, MessageType, decode, encode, sign_message};
 use nova_network::network_service::{NetworkService, NetworkServiceConfig};
 use nova_network::node_id::NodeId;
 use nova_network::session::{
-    HandshakeKind, PeerAuthConfig, handshake_payload_encode, random_session_nonce,
+    HandshakeKind, PeerAuthConfig, handshake_payload_decode, handshake_payload_encode,
+    random_session_nonce,
 };
-use nova_network::transport::{BoxTransport, ConnectionTarget, MemoryTransport, TcpTransport};
+use nova_network::transport::{
+    BoxTransport, ConnectionTarget, MemoryTransport, TcpTransport, Transport,
+};
 
 use nova_node::bootstrap::NodeConfig;
 use nova_node::network_identity::SoftwareNetworkIdentity;
@@ -185,6 +188,45 @@ fn b_init(b_kp: &KeyPair, auth: &PeerAuthConfig) -> MessageEnvelope {
     };
     sign_message(b_kp.signing_key(), &mut env).unwrap();
     env
+}
+
+/// 对端 B（纯 transport；不跑 NS）—— reconnect 生命周期测试用：每轮 accept 一条新连接，
+/// 读 A 的 Init（记录其 session_nonce）并回 B 的 Init。B 不 process A（A 侧 NS 验证 B Init 即可
+/// 使 A Established B）。用于验证 disconnect→reconnect 每轮发出新 nonce 的 Init。
+fn run_peer_b_reconnect(
+    listener: TcpListener,
+    auth: PeerAuthConfig,
+    b_kp: KeyPair,
+    rounds: usize,
+) -> thread::JoinHandle<Vec<[u8; 16]>> {
+    thread::spawn(move || {
+        let mut nonces = Vec::new();
+        for _ in 0..rounds {
+            let b_id = NodeId::from_verifying_key(b_kp.verifying_key());
+            let Ok(mut tcp) =
+                TcpTransport::accept(&listener, b_id, 4096, Some(Duration::from_secs(5)))
+            else {
+                break;
+            };
+            let a_id = tcp.peer_id();
+            let mut got: Option<Vec<u8>> = None;
+            for _ in 0..500 {
+                if let Ok(Some((_, frame))) = tcp.try_recv() {
+                    got = Some(frame);
+                    break;
+                }
+                thread::yield_now();
+            }
+            if let Some(frame) = got
+                && let Ok(env) = decode(&frame)
+                && let Ok(hs) = handshake_payload_decode(&env.payload)
+            {
+                nonces.push(*hs.session_nonce.as_bytes());
+            }
+            let _ = tcp.send(&a_id, encode(&b_init(&b_kp, &auth)));
+        }
+        nonces
+    })
 }
 
 /// 对端 B（listener 侧）：accept A → 处理 A 的 Init（若 context 匹配则 B 侧 Established A）→
@@ -386,4 +428,75 @@ fn self_peer_rejected_at_startup() {
             nova_node::bootstrap::ConnectionTargetError::SelfTarget { .. }
         ))
     ));
+}
+
+// T5/T6/T7 — disconnect 清状态 + reconnect（L5/L6）：Established → disconnect → 再 establish
+// （新 dial + 新 nonce + 新 Init）→ Established；两轮 Init nonce 不同；Established 幂等。
+#[test]
+fn disconnect_then_reconnect_establishes_with_new_nonce() {
+    let env = Env::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let laddr = listener.local_addr().unwrap();
+    let b_kp = KeyPair::generate().unwrap();
+    let b_id = NodeId::from_verifying_key(b_kp.verifying_key());
+    let rounds = 2;
+    let handle = run_peer_b_reconnect(listener, env.auth(), b_kp, rounds);
+
+    let mut rt = start_a(
+        &env,
+        vec![ConnectionTarget {
+            peer_id: b_id,
+            address: laddr,
+        }],
+    );
+    for round in 0..rounds {
+        let mut done = false;
+        for _ in 0..800 {
+            match rt.establish_configured_peer() {
+                Ok(Some(p)) => {
+                    assert_eq!(p, b_id);
+                    done = true;
+                    break;
+                }
+                Ok(None) => thread::yield_now(),
+                Err(e) => panic!("establish error round {round}: {e:?}"),
+            }
+        }
+        assert!(done, "round {round} 应 Established");
+        if round + 1 < rounds {
+            rt.disconnect_configured_peer().expect("disconnect ok");
+        }
+    }
+    // L3 — Established 幂等：再调 establish 直接成功（不重 dial / 不重发 Init）。
+    assert_eq!(rt.establish_configured_peer().unwrap(), Some(b_id));
+    let nonces = handle.join().unwrap();
+    assert_eq!(nonces.len(), rounds, "每轮收到一次 A Init（无重复发送）");
+    assert_ne!(
+        nonces[0], nonces[1],
+        "reconnect 必须新 nonce（handshake_init_sent_for 已清）"
+    );
+}
+
+// T9 — dial 失败不自动 retry / 不自动 switch（typed 错误；不 Established）。
+#[test]
+fn dial_failure_no_auto_retry() {
+    let env = Env::new();
+    let b_id = NodeId::from_bytes([0x0b; 32]);
+    // localhost 未监听端口（非公网；connect 快速 refused）。
+    let laddr = SocketAddr::from(([127, 0, 0, 1], 1));
+    let mut rt = start_a(
+        &env,
+        vec![ConnectionTarget {
+            peer_id: b_id,
+            address: laddr,
+        }],
+    );
+    let res = rt.establish_configured_peer();
+    assert!(
+        res.is_err(),
+        "dial 失败 typed error（不 Established / 不静默成功）"
+    );
+    // 显式再次调用（非自动 retry）仍不成功（不自动转 Ok(Some) / 不自动换 peer）。
+    let res2 = rt.establish_configured_peer();
+    assert!(res2.is_err(), "不自动 retry / 不自动 switch");
 }
