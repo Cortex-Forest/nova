@@ -31,7 +31,7 @@ use nova_network::transport::{
 
 use nova_node::bootstrap::NodeConfig;
 use nova_node::network_identity::SoftwareNetworkIdentity;
-use nova_node::runtime::{NodeRuntime, NodeRuntimeError};
+use nova_node::runtime::{NodeRuntime, NodeRuntimeError, PeerEstablishment, PeerStatus};
 
 const CHAIN_ID: u64 = 3003;
 
@@ -524,4 +524,391 @@ fn dial_failure_no_auto_retry() {
     // 显式再次调用（非自动 retry）仍不成功（不自动转 Ok(Some) / 不自动换 peer）。
     let res2 = rt.establish_configured_peer();
     assert!(res2.is_err(), "不自动 retry / 不自动 switch");
+}
+
+// ===== STEP 10-19-10-B7-A1-D7-Implementation-3：Node Runtime Multi-Configured Peer =====
+
+/// 建一个正常对端（run_peer_b：accept → 处理 A Init → 回 B Init → keep-alive）。
+fn spawn_peer_b(env: &Env) -> (SocketAddr, NodeId, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let laddr = listener.local_addr().unwrap();
+    let b_kp = KeyPair::generate().unwrap();
+    let b_id = NodeId::from_verifying_key(b_kp.verifying_key());
+    let handle = run_peer_b(listener, env.auth(), b_kp);
+    (laddr, b_id, handle)
+}
+
+/// 无效地址（localhost 未监听 ⇒ dial 快速 refused）。
+fn bad_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 1))
+}
+
+/// 反复调用 `establish_configured_peers` 直至无 Pending（Established/Failed 即 settle）。
+/// 返回最后一次 per-peer 结果。不含任何 sleep / retry 语义 —— 纯多次显式调用驱动 poll。
+fn drive_until_settled(rt: &mut NodeRuntime, budget: usize) -> Vec<PeerEstablishment> {
+    let mut last = rt.establish_configured_peers().expect("poll 无全局错误");
+    for _ in 0..budget {
+        if last
+            .iter()
+            .all(|e| !matches!(e.status, PeerStatus::Pending))
+        {
+            break;
+        }
+        last = rt.establish_configured_peers().expect("poll 无全局错误");
+    }
+    last
+}
+
+// T1 — no configured peers：空 peers ⇒ 空结果；无 panic / 无 dial。
+#[test]
+fn d7_3_no_configured_peers() {
+    let env = Env::new();
+    let mut rt = start_a(&env, Vec::new());
+    let res = rt.establish_configured_peers().expect("正常返回");
+    assert!(res.is_empty(), "T1 no configured peers ⇒ empty");
+}
+
+// T2 — single peer regression：multi 方法对单 configured peer 行为与既有一致。
+#[test]
+fn d7_3_single_peer_regression_via_multi() {
+    let env = Env::new();
+    let (addr, b_id, handle) = spawn_peer_b(&env);
+    let mut rt = start_a(
+        &env,
+        vec![ConnectionTarget {
+            peer_id: b_id,
+            address: addr,
+        }],
+    );
+    let res = drive_until_settled(&mut rt, 500);
+    assert_eq!(res.len(), 1);
+    assert!(
+        matches!(res[0].status, PeerStatus::Established),
+        "T2 single peer Established: {res:?}"
+    );
+    assert!(rt.network_peer_established(b_id));
+    drop(rt);
+    handle.join().unwrap();
+}
+
+// T3/T4 — two / three peers establish independently（各对端正常）。
+#[test]
+fn d7_3_two_peers_establish_independently() {
+    let env = Env::new();
+    let (addr1, id1, h1) = spawn_peer_b(&env);
+    let (addr2, id2, h2) = spawn_peer_b(&env);
+    let mut rt = start_a(
+        &env,
+        vec![
+            ConnectionTarget {
+                peer_id: id1,
+                address: addr1,
+            },
+            ConnectionTarget {
+                peer_id: id2,
+                address: addr2,
+            },
+        ],
+    );
+    let res = drive_until_settled(&mut rt, 800);
+    assert_eq!(res.len(), 2);
+    assert!(
+        matches!(res[0].status, PeerStatus::Established),
+        "T3 peer1 Established: {res:?}"
+    );
+    assert!(
+        matches!(res[1].status, PeerStatus::Established),
+        "T3 peer2 Established: {res:?}"
+    );
+    assert!(rt.network_peer_established(id1) && rt.network_peer_established(id2));
+    drop(rt);
+    h1.join().unwrap();
+    h2.join().unwrap();
+}
+
+#[test]
+fn d7_3_three_peers_establish_independently() {
+    let env = Env::new();
+    let mut peers = Vec::new();
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+        let (addr, id, h) = spawn_peer_b(&env);
+        peers.push(ConnectionTarget {
+            peer_id: id,
+            address: addr,
+        });
+        handles.push(h);
+    }
+    let mut rt = start_a(&env, peers);
+    let res = drive_until_settled(&mut rt, 1000);
+    assert_eq!(res.len(), 3);
+    assert!(
+        res.iter()
+            .all(|e| matches!(e.status, PeerStatus::Established)),
+        "T4 all three Established: {res:?}"
+    );
+    for h in handles {
+        h.join().unwrap();
+    }
+    drop(rt);
+}
+
+// T5 — first peer dial failure 不阻塞 second peer 建立（最重要隔离测试之一）。
+#[test]
+fn d7_3_first_peer_failure_does_not_block_second() {
+    let env = Env::new();
+    let fail_id = NodeId::from_bytes([0x0a; 32]);
+    let (addr_b, b_id, handle_b) = spawn_peer_b(&env);
+    let mut rt = start_a(
+        &env,
+        vec![
+            ConnectionTarget {
+                peer_id: fail_id,
+                address: bad_addr(),
+            },
+            ConnectionTarget {
+                peer_id: b_id,
+                address: addr_b,
+            },
+        ],
+    );
+    let res = drive_until_settled(&mut rt, 500);
+    assert_eq!(res.len(), 2);
+    assert!(
+        matches!(res[0].status, PeerStatus::Failed(_)),
+        "T5 peer A dial failure recorded, not blocking others: {res:?}"
+    );
+    assert!(
+        matches!(res[1].status, PeerStatus::Established),
+        "T5 peer B still Established despite A failure: {res:?}"
+    );
+    assert!(rt.network_peer_established(b_id));
+    drop(rt);
+    handle_b.join().unwrap();
+}
+
+// T6 — middle peer failure 不阻塞后序 peer。
+#[test]
+fn d7_3_middle_peer_failure_does_not_block_later() {
+    let env = Env::new();
+    let fail_id = NodeId::from_bytes([0x0b; 32]);
+    let (addr1, id1, h1) = spawn_peer_b(&env);
+    let (addr3, id3, h3) = spawn_peer_b(&env);
+    let mut rt = start_a(
+        &env,
+        vec![
+            ConnectionTarget {
+                peer_id: id1,
+                address: addr1,
+            },
+            ConnectionTarget {
+                peer_id: fail_id,
+                address: bad_addr(),
+            },
+            ConnectionTarget {
+                peer_id: id3,
+                address: addr3,
+            },
+        ],
+    );
+    let res = drive_until_settled(&mut rt, 800);
+    assert_eq!(res.len(), 3);
+    assert!(matches!(res[0].status, PeerStatus::Established), "{res:?}");
+    assert!(matches!(res[1].status, PeerStatus::Failed(_)), "{res:?}");
+    assert!(matches!(res[2].status, PeerStatus::Established), "{res:?}");
+    drop(rt);
+    h1.join().unwrap();
+    h3.join().unwrap();
+}
+
+// T7 — 已 Established 的 peer 在再次 orchestration 中不被重 dial / 重 Init；其它 peer 仍可建立。
+#[test]
+fn d7_3_established_peer_not_redialed_while_other_establishes() {
+    let env = Env::new();
+    let (addr_a, a_id, h_a) = spawn_peer_b(&env);
+    let (addr_b, b_id, h_b) = spawn_peer_b(&env);
+    let mut rt = start_a(
+        &env,
+        vec![
+            ConnectionTarget {
+                peer_id: a_id,
+                address: addr_a,
+            },
+            ConnectionTarget {
+                peer_id: b_id,
+                address: addr_b,
+            },
+        ],
+    );
+    let res = drive_until_settled(&mut rt, 800);
+    assert!(matches!(res[0].status, PeerStatus::Established), "{res:?}");
+    assert!(matches!(res[1].status, PeerStatus::Established), "{res:?}");
+    // 再次 orchestration：A/B 均 Established（不重 dial —— 对端只 accept 一次仍成立）。
+    let again = rt.establish_configured_peers().expect("poll ok");
+    assert!(
+        matches!(again[0].status, PeerStatus::Established),
+        "{again:?}"
+    );
+    assert!(
+        matches!(again[1].status, PeerStatus::Established),
+        "{again:?}"
+    );
+    assert!(rt.network_peer_connected(a_id) && rt.network_peer_established(a_id));
+    drop(rt);
+    h_a.join().unwrap();
+    h_b.join().unwrap();
+}
+
+// T8 — disconnect 隔离：disconnect(A) 只清 A；B/C Established 保留。
+#[test]
+fn d7_3_disconnect_isolation_among_three() {
+    let env = Env::new();
+    let mut peers = Vec::new();
+    let mut handles = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let (addr, id, h) = spawn_peer_b(&env);
+        peers.push(ConnectionTarget {
+            peer_id: id,
+            address: addr,
+        });
+        handles.push(h);
+        ids.push(id);
+    }
+    let mut rt = start_a(&env, peers);
+    let res = drive_until_settled(&mut rt, 1000);
+    assert!(
+        res.iter()
+            .all(|e| matches!(e.status, PeerStatus::Established))
+    );
+    // 断 A（ids[0]）。
+    rt.disconnect_configured_peer_for(ids[0])
+        .expect("disconnect ok");
+    assert!(!rt.network_peer_connected(ids[0]), "T8 A disconnected");
+    assert!(
+        !rt.network_peer_established(ids[0]),
+        "T8 A 不再 Established"
+    );
+    assert!(rt.network_peer_established(ids[1]), "T8 B 保留");
+    assert!(rt.network_peer_established(ids[2]), "T8 C 保留");
+    assert!(rt.network_peer_connected(ids[1]) && rt.network_peer_connected(ids[2]));
+    drop(rt);
+    for h in handles {
+        h.join().unwrap();
+    }
+}
+
+// T9 — 显式 reconnect：EOF/断开 A → 再次显式 orchestration ⇒ A 重新 Established。
+#[test]
+fn d7_3_explicit_reconnect_after_disconnect() {
+    let env = Env::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let laddr = listener.local_addr().unwrap();
+    let b_kp = KeyPair::generate().unwrap();
+    let b_id = NodeId::from_verifying_key(b_kp.verifying_key());
+    // 对端 accept 两轮（reconnect 需第二轮 accept）。
+    let handle = run_peer_b_reconnect(listener, env.auth(), b_kp, 2);
+    let mut rt = start_a(
+        &env,
+        vec![ConnectionTarget {
+            peer_id: b_id,
+            address: laddr,
+        }],
+    );
+    // 第一轮：Established。
+    let mut done = false;
+    for _ in 0..800 {
+        let res = rt.establish_configured_peers().expect("poll ok");
+        if matches!(res[0].status, PeerStatus::Established) {
+            done = true;
+            break;
+        }
+    }
+    assert!(done, "第一轮 Established");
+    // 断开 A。
+    rt.disconnect_configured_peer_for(b_id)
+        .expect("disconnect ok");
+    assert!(!rt.network_peer_connected(b_id));
+    // 显式再次 orchestration ⇒ 重建（新连接）。
+    let mut redone = false;
+    for _ in 0..800 {
+        let res = rt.establish_configured_peers().expect("poll ok");
+        if matches!(res[0].status, PeerStatus::Established) {
+            redone = true;
+            break;
+        }
+    }
+    assert!(redone, "T9 explicit reconnect re-Established");
+    assert!(rt.network_peer_established(b_id));
+    drop(rt);
+    let nonces = handle.join().unwrap();
+    assert_eq!(nonces.len(), 2, "每轮一次 Init（无自动重复）");
+    assert_ne!(nonces[0], nonces[1], "reconnect 新 nonce");
+}
+
+// T10 — no automatic retry：dial 失败即 Failed；不会内部自动重试成功 / 等待 timer。
+#[test]
+fn d7_3_no_automatic_retry_on_dial_failure() {
+    let env = Env::new();
+    let fail_id = NodeId::from_bytes([0x0c; 32]);
+    let mut rt = start_a(
+        &env,
+        vec![ConnectionTarget {
+            peer_id: fail_id,
+            address: bad_addr(),
+        }],
+    );
+    // 单次 orchestration 调用（不循环）：dial 失败 ⇒ Failed（不 hang / 不内部 retry）。
+    let res = rt.establish_configured_peers().expect("调用返回");
+    assert_eq!(res.len(), 1);
+    assert!(
+        matches!(res[0].status, PeerStatus::Failed(_)),
+        "T10 dial failure ⇒ Failed once（无自动 retry）: {res:?}"
+    );
+    // 显式再次调用仍 Failed（不自动转成功 / 不自动换 peer）。
+    let res2 = rt.establish_configured_peers().expect("调用返回");
+    assert!(matches!(res2[0].status, PeerStatus::Failed(_)));
+}
+
+// T11 — handshake idempotency per peer：A/B Established 后重复 orchestration ⇒
+// 不重复 Init（对端只 accept 一次仍 Established 保留）、A 状态不影响 B。
+#[test]
+fn d7_3_handshake_idempotent_per_peer() {
+    let env = Env::new();
+    let (addr_a, a_id, h_a) = spawn_peer_b(&env);
+    let (addr_b, b_id, h_b) = spawn_peer_b(&env);
+    let mut rt = start_a(
+        &env,
+        vec![
+            ConnectionTarget {
+                peer_id: a_id,
+                address: addr_a,
+            },
+            ConnectionTarget {
+                peer_id: b_id,
+                address: addr_b,
+            },
+        ],
+    );
+    let res = drive_until_settled(&mut rt, 800);
+    assert!(
+        res.iter()
+            .all(|e| matches!(e.status, PeerStatus::Established))
+    );
+    // 重复 orchestration：两 peer 均 Established（幂等；不因 A 状态跳过 B / 反之）。
+    for _ in 0..5 {
+        let again = rt.establish_configured_peers().expect("poll ok");
+        assert_eq!(again.len(), 2);
+        assert!(
+            matches!(again[0].status, PeerStatus::Established),
+            "{again:?}"
+        );
+        assert!(
+            matches!(again[1].status, PeerStatus::Established),
+            "{again:?}"
+        );
+    }
+    drop(rt);
+    h_a.join().unwrap();
+    h_b.join().unwrap();
 }

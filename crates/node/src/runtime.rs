@@ -18,7 +18,7 @@
 //!   **目录分离**，绝不混用；SafetyStore recover 失败 = validator mode 启动失败（fail closed）。
 //! - full-node（`validator_enabled=false`）：跳过 key / safety / validator，不触碰 Provider。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use nova_consensus::dag::Dag;
@@ -153,6 +153,26 @@ enum HandshakeOutcome {
     ForeignEstablished(Vec<NodeId>),
 }
 
+/// 单个 configured peer 的建立状态（STEP 10-19-10-B7-A1-D7-Implementation-3；每 peer 独立）。
+#[derive(Debug)]
+pub enum PeerStatus {
+    /// 已认证（Established）且身份匹配（不重复 dial / 不重复 Init）。
+    Established,
+    /// 尚未（已 dial / 已发 Init 或等待对端握手；后续轮再推进）。
+    Pending,
+    /// 本 peer 建立失败（dial / Init / 签名 typed error；**不阻塞其它 peer**）。
+    Failed(RuntimeError),
+    /// 网络未启用（无 NetworkStack）。
+    Unavailable,
+}
+
+/// 单个 configured peer 的建立结果（peer_id + 独立状态；D7-Implementation-3）。
+#[derive(Debug)]
+pub struct PeerEstablishment {
+    pub peer_id: NodeId,
+    pub status: PeerStatus,
+}
+
 /// Runtime 关闭错误（Stage C `shutdown`；仅 Storage 可失败 ——
 /// EventLoop/NetworkService shutdown 均 infallible，Driver 无显式 shutdown）。
 #[derive(Debug)]
@@ -225,8 +245,9 @@ pub struct NodeRuntime {
     network_stack: Option<NetworkStack>,
     /// 静态 configured connection targets（STEP 10-19-10-B7-A3；来自 `config.peers`）。
     configured_targets: Vec<ConnectionTarget>,
-    /// 已为本 configured peer 发送过 outbound Handshake Init（防重复发送；每目标一次）。
-    handshake_init_sent_for: Option<NodeId>,
+    /// 已为各 configured peer 发送过 outbound Handshake Init 的集合（per-peer；防重复发送）。
+    /// D7-Implementation-3：每 peer 独立 —— disconnect(A) 只清 A，不影响 B/C。
+    handshake_init_sent_for: HashSet<NodeId>,
     /// validator 元数据（safety journal 路径；actor 本体在 driver）。full-node ⇒ `None`。
     validator_journal: Option<PathBuf>,
     /// step-driven proposer 出块的显式 timestamp（默认 0；无系统时钟；调用方可配置）。
@@ -371,7 +392,7 @@ impl NodeRuntime {
             driver,
             network_stack,
             configured_targets: config.peers.clone(),
-            handshake_init_sent_for: None,
+            handshake_init_sent_for: HashSet::new(),
             validator_journal,
             proposal_timestamp: 0,
             last_proposal: None,
@@ -492,6 +513,22 @@ impl NodeRuntime {
         self.network_stack.as_ref().map(NetworkStack::node_id)
     }
 
+    /// configured peer 当前是否已认证 Established（D7-Implementation-3 观测；只读）。
+    pub fn network_peer_established(&self, peer_id: NodeId) -> bool {
+        self.network_stack
+            .as_ref()
+            .map(|s| s.ns.is_peer_established(peer_id))
+            .unwrap_or(false)
+    }
+
+    /// configured peer 当前是否 connected（D7-Implementation-3 观测；只读）。
+    pub fn network_peer_connected(&self, peer_id: NodeId) -> bool {
+        self.network_stack
+            .as_ref()
+            .map(|s| s.ns.is_connected(peer_id))
+            .unwrap_or(false)
+    }
+
     /// 连接第一个 configured connection target（STEP 10-19-10-B7-A3；single-active）。
     ///
     /// - 无网络栈 / 无 configured peers / 已有 active connection ⇒ `Ok(None)`（幂等）。
@@ -553,7 +590,7 @@ impl NodeRuntime {
             .map(|s| s.ns.is_peer_established(target.peer_id))
             .unwrap_or(false);
         if established_now {
-            self.handshake_init_sent_for = None;
+            self.handshake_init_sent_for.remove(&target.peer_id);
             return Ok(Some(target.peer_id));
         }
         // 1. dial（无 active connection 时）。
@@ -579,7 +616,7 @@ impl NodeRuntime {
                 .map_err(RuntimeError::NetworkDial)?;
         }
         // 2. 发送本端 Handshake Init（每目标一次；新 nonce）。
-        if self.handshake_init_sent_for != Some(target.peer_id) {
+        if !self.handshake_init_sent_for.contains(&target.peer_id) {
             let env = {
                 let Some(stack) = &self.network_stack else {
                     return Ok(None);
@@ -599,7 +636,7 @@ impl NodeRuntime {
                 .enqueue_outbound(target.peer_id, env)
                 .map_err(RuntimeError::NetworkDial)?;
             let _ = stack.ns.flush_outbound();
-            self.handshake_init_sent_for = Some(target.peer_id);
+            self.handshake_init_sent_for.insert(target.peer_id);
         }
         // 3. poll 一次推进（读对端握手；无 while / 无 sleep）。
         let outcome = {
@@ -623,7 +660,7 @@ impl NodeRuntime {
         };
         match outcome {
             HandshakeOutcome::Established(id) => {
-                self.handshake_init_sent_for = None;
+                self.handshake_init_sent_for.remove(&id);
                 Ok(Some(id))
             }
             HandshakeOutcome::Pending => Ok(None),
@@ -635,7 +672,10 @@ impl NodeRuntime {
                     }
                     let _ = stack.ns.disconnect_peer(target.peer_id);
                 }
-                self.handshake_init_sent_for = None;
+                for o in &others {
+                    self.handshake_init_sent_for.remove(o);
+                }
+                self.handshake_init_sent_for.remove(&target.peer_id);
                 Err(RuntimeError::IdentityMismatch {
                     configured: target.peer_id,
                 })
@@ -643,23 +683,158 @@ impl NodeRuntime {
         }
     }
 
-    /// 断开 configured peer 并清本地握手状态（STEP 10-19-10-B7-A1-D6 生命周期）。
+    /// 断开 first configured peer 并清其握手状态（STEP 10-19-10-B7-A1-D6 生命周期；兼容单 peer）。
     ///
     /// - 调用 `NetworkService::disconnect_peer`（PeerManager connected 清除 + session 清除；
     ///   session owner = NetworkService，此处不手工改 session）。
-    /// - 清 `handshake_init_sent_for` ⇒ 之后 `establish_configured_peer` 可重新 dial + 生成
-    ///   **新 nonce** + 发送新 Init（reconnect；L5/L6）。幂等（未连接 / 空 peers ⇒ Ok）。
+    /// - 清该 peer 的 `handshake_init_sent_for` ⇒ 之后可重新 dial + 生成 **新 nonce** + 发送
+    ///   新 Init（reconnect；L5/L6）。幂等（未连接 / 空 peers ⇒ Ok）。
     pub fn disconnect_configured_peer(&mut self) -> Result<(), RuntimeError> {
         let Some(target) = self.configured_targets.first().copied() else {
             return Ok(());
         };
+        self.disconnect_configured_peer_for(target.peer_id)
+    }
+
+    /// 断开指定 configured peer 并清其 per-peer Init 状态（D7-Implementation-3）。
+    ///
+    /// **只影响该 peer**：其它 configured peers 的 connection / session / handshake 状态不受影响
+    /// （`NetworkService::disconnect_peer` 本身即单 peer 清理 —— D7-1/2 隔离语义）。非 configured
+    /// peer 或未连接 ⇒ 幂等 Ok。不自动 reconnect（之后显式 `establish_configured_peers` 可重建）。
+    pub fn disconnect_configured_peer_for(&mut self, peer_id: NodeId) -> Result<(), RuntimeError> {
+        if !self.configured_targets.iter().any(|t| t.peer_id == peer_id) {
+            return Ok(());
+        }
         if let Some(stack) = &mut self.network_stack {
             stack
                 .ns
-                .disconnect_peer(target.peer_id)
+                .disconnect_peer(peer_id)
                 .map_err(RuntimeError::NetworkDial)?;
         }
-        self.handshake_init_sent_for = None;
+        self.handshake_init_sent_for.remove(&peer_id);
+        Ok(())
+    }
+
+    /// 建立**全部** configured peers（STEP 10-19-10-B7-A1-D7-Implementation-3；multi-peer）。
+    ///
+    /// 单次调用 = 一轮受控推进，对每个 configured target（配置顺序，确定性）：
+    /// （1）已 Established ⇒ 跳过（不重复 dial / 不重复 Init）；
+    /// （2）未 connected ⇒ `dial_peer`（KEEP-FIRST 防同 NodeId 重复连接）；
+    /// （3）已 connected 但本 peer 未发过 Init ⇒ 发送一次（per-peer `handshake_init_sent_for`）；
+    ///     已发 ⇒ 等待后续 poll。
+    /// 随后 **一次 bounded poll**（`EventLoop::poll_once` ⇒ `NetworkService::poll_transport`
+    /// 轮询全部 connections —— NS 是 A/B/C connections owner；Runtime 不直连 Transport）。
+    ///
+    /// 错误隔离：单个 peer 的 dial / Init / 签名失败只进该 peer 的 `PeerStatus::Failed`，
+    /// **不阻塞其它 peer**；仅全局 poll（EventLoop/NS 层）失败 ⇒ `Err(RuntimeError)`。
+    /// 返回 `Ok(Vec<PeerEstablishment>)`（按 `configured_targets` 顺序，每 peer 独立结果）。
+    ///
+    /// 幂等 / 显式 reconnect：Established 不重复建立；EOF/断开后的 peer 再次调用本方法
+    /// （无自动 reconnect / 无 retry / 无 timer）即可重建。
+    pub fn establish_configured_peers(&mut self) -> Result<Vec<PeerEstablishment>, RuntimeError> {
+        let targets: Vec<ConnectionTarget> = self.configured_targets.clone();
+        if self.network_stack.is_none() {
+            return Ok(targets
+                .iter()
+                .map(|t| PeerEstablishment {
+                    peer_id: t.peer_id,
+                    status: PeerStatus::Unavailable,
+                })
+                .collect());
+        }
+        // A. per-peer 准备（dial / Init）；错误隔离：单 peer 失败记入其 status，继续其它。
+        let mut prepare: Vec<Option<RuntimeError>> = Vec::with_capacity(targets.len());
+        for t in &targets {
+            match self.establish_prepare(t.peer_id, t.address) {
+                Ok(()) => prepare.push(None),
+                Err(e) => prepare.push(Some(e)),
+            }
+        }
+        // B. 一次 bounded poll（推进全部连接的握手；无 while / 无 sleep / 无 async）。
+        if let Some(stack) = &mut self.network_stack {
+            stack
+                .el
+                .poll_once(&mut stack.ns)
+                .map_err(RuntimeError::EventLoop)?;
+        }
+        // C. 观察每 target 状态（Established / Pending / prepare 错误）。
+        let mut out = Vec::with_capacity(targets.len());
+        for (i, t) in targets.iter().enumerate() {
+            if let Some(e) = prepare[i].take() {
+                out.push(PeerEstablishment {
+                    peer_id: t.peer_id,
+                    status: PeerStatus::Failed(e),
+                });
+                continue;
+            }
+            let established = self
+                .network_stack
+                .as_ref()
+                .map(|s| s.ns.is_peer_established(t.peer_id))
+                .unwrap_or(false);
+            let status = if established {
+                PeerStatus::Established
+            } else {
+                PeerStatus::Pending
+            };
+            out.push(PeerEstablishment {
+                peer_id: t.peer_id,
+                status,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 单 target 的 dial / Init 准备（D7-Implementation-3；per-peer；不 poll）。
+    ///
+    /// - 已 Established ⇒ 不 dial / 不 Init（返回 Ok）。
+    /// - 未 connected ⇒ `dial_peer`（dial 失败 ⇒ Err；由调用方隔离）。
+    /// - 已 connected 但本 peer 未发过 Init ⇒ 构造 + 发送一次（每 target 一次；新 nonce）。
+    fn establish_prepare(
+        &mut self,
+        remote: NodeId,
+        address: std::net::SocketAddr,
+    ) -> Result<(), RuntimeError> {
+        let Some(stack) = &self.network_stack else {
+            return Ok(());
+        };
+        if stack.ns.is_peer_established(remote) {
+            return Ok(());
+        }
+        // dial（若未连；per-peer —— NS KEEP-FIRST 保证同 NodeId 不重复连接）。
+        if !stack.ns.is_connected(remote) {
+            let max_frame = stack.ns.config().max_msg_bytes;
+            let Some(stack) = &mut self.network_stack else {
+                return Ok(());
+            };
+            stack
+                .ns
+                .dial_peer(address, remote, max_frame, None)
+                .map_err(RuntimeError::NetworkDial)?;
+        }
+        // 发送 Init（本 peer 未发过；per-peer 集合）。
+        if !self.handshake_init_sent_for.contains(&remote) {
+            let env = {
+                let Some(stack) = &self.network_stack else {
+                    return Ok(());
+                };
+                let auth = stack
+                    .ns
+                    .config()
+                    .peer_auth
+                    .ok_or(RuntimeError::PeerAuthMissing)?;
+                Self::build_outbound_handshake(stack.signer.as_ref(), &auth)?
+            };
+            let Some(stack) = &mut self.network_stack else {
+                return Ok(());
+            };
+            stack
+                .ns
+                .enqueue_outbound(remote, env)
+                .map_err(RuntimeError::NetworkDial)?;
+            let _ = stack.ns.flush_outbound();
+            self.handshake_init_sent_for.insert(remote);
+        }
         Ok(())
     }
 
