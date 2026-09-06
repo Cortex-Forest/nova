@@ -38,7 +38,17 @@ pub trait Transport {
     fn send(&mut self, peer: &NodeId, message: Vec<u8>) -> Result<(), NetworkError>;
 
     /// 非阻塞接收下一条 `(发送者, 消息)`；无消息 ⇒ `Ok(None)`。
+    ///
+    /// **注意**：`Ok(None)` ≠ EOF —— 它也可能是"当前无可用帧"。
     fn try_recv(&mut self) -> Result<Option<(NodeId, Vec<u8>)>, NetworkError>;
+
+    /// 连接是否已关闭（EOF / fail-closed）。
+    ///
+    /// - object-safe；默认 `false`（无真实 closed 状态的 transport 不需覆写）。
+    /// - 不区分 `Ok(None)`：closed 判定只由 `is_closed()` 表达（poll 后调用）。
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 /// 内存传输（测试 / 单节点；1:1 通道对）。
@@ -335,6 +345,12 @@ impl TcpTransport {
 }
 
 impl Transport for TcpTransport {
+    /// 连接关闭状态（EOF / fail-closed / idle 超时）；trait 方法使 `dyn Transport`
+    /// dispatch 能穿透（固有 `pub fn is_closed` 保留作直接调用）。
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+
     fn send(&mut self, peer: &NodeId, message: Vec<u8>) -> Result<(), NetworkError> {
         if self.closed {
             return Err(NetworkError::TransportIo);
@@ -409,6 +425,11 @@ impl Transport for BoxTransport {
 
     fn try_recv(&mut self) -> Result<Option<(NodeId, Vec<u8>)>, NetworkError> {
         self.0.try_recv()
+    }
+
+    /// delegate：NetworkService → BoxTransport → TcpTransport → closed 穿透。
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
     }
 }
 
@@ -557,5 +578,46 @@ mod tcp_tests {
         // idle 超时后 try_recv ⇒ None（连接已关闭标记）。
         assert_eq!(a.try_recv().unwrap(), None);
         assert!(a.is_closed(), "M-20 idle timeout closes");
+    }
+
+    // ===== STEP 10-19-10-B7-A1-D7-Implementation-2：closed / EOF detection =====
+
+    /// 反复 poll 直到对端 close 的 FIN 被读到（本地回环；无 sleep；上限防挂死）。
+    fn poll_until_closed(t: &mut TcpTransport) -> bool {
+        for _ in 0..50 {
+            let _ = t.try_recv().unwrap();
+            if t.is_closed() {
+                return true;
+            }
+        }
+        false
+    }
+
+    // T1/T3 — peer EOF ⇒ closed；正常连接保持 open（Ok(None) ≠ EOF）。
+    #[test]
+    fn tcp_eof_detected_via_peer_close() {
+        let (addr, server) = pair_tcp();
+        let mut a = TcpTransport::dial(addr, nid(0xaa), nid(0xbb), 4096, None).unwrap();
+        let mut b = server.join().unwrap().unwrap();
+        // T3：active transport remains open。
+        assert!(!a.is_closed(), "T3 active connection open");
+        assert!(!b.is_closed(), "T3 server side open");
+        // 对端关闭 → 本端 poll 读到 EOF ⇒ closed（不把 Ok(None) 当 EOF）。
+        b.close();
+        drop(b);
+        assert!(poll_until_closed(&mut a), "T1 peer EOF detected as closed");
+    }
+
+    // T2 — BoxTransport delegate 穿透：TcpTransport closed ⇒ BoxTransport.is_closed() true。
+    #[test]
+    fn box_transport_delegates_closed() {
+        let (addr, server) = pair_tcp();
+        let mut a = TcpTransport::dial(addr, nid(0xaa), nid(0xbb), 4096, None).unwrap();
+        let mut b = server.join().unwrap().unwrap();
+        b.close();
+        drop(b);
+        assert!(poll_until_closed(&mut a), "prereq closed");
+        let boxed = BoxTransport::new(Box::new(a));
+        assert!(boxed.is_closed(), "T2 BoxTransport delegates closed state");
     }
 }

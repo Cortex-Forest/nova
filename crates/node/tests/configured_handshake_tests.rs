@@ -224,6 +224,14 @@ fn run_peer_b_reconnect(
                 nonces.push(*hs.session_nonce.as_bytes());
             }
             let _ = tcp.send(&a_id, encode(&b_init(&b_kp, &auth)));
+            // keep-alive：等 A 关闭（disconnect_configured_peer / drop）再 accept 下一连接。
+            for _ in 0..600 {
+                let _ = tcp.try_recv();
+                if tcp.is_closed() {
+                    break;
+                }
+                thread::yield_now();
+            }
         }
         nonces
     })
@@ -265,6 +273,15 @@ fn run_peer_b(
             // B 侧已认证 A ⇒ 回 B 的 Init（A 侧将 Established B）。
             let _ = bns.enqueue_outbound(a_id, b_init(&b_kp, &auth));
             let _ = bns.flush_outbound();
+        }
+        // keep-alive：保持连接直到 A 关闭（EOF）—— 模拟稳定对端（非发完即断）；
+        // D7-Implementation-2 EOF 检测下，回送后立即断会让 A 刚 Established 即断开。
+        for _ in 0..600 {
+            let _ = bns.poll_transport();
+            if bns.transport().is_closed() {
+                break;
+            }
+            thread::yield_now();
         }
     })
 }
@@ -326,7 +343,6 @@ fn valid_remote_establishes_configured_peer() {
             Err(e) => panic!("establish error: {e:?}"),
         }
     }
-    handle.join().unwrap();
     assert_eq!(
         established,
         Some(b_id),
@@ -334,6 +350,9 @@ fn valid_remote_establishes_configured_peer() {
     );
     // 幂等：再次 establish ⇒ 已完成。
     assert_eq!(rt.establish_configured_peer().unwrap(), Some(b_id));
+    // B 为稳定对端（keep-alive）：关闭 A 连接后 B 检测 EOF 退出。
+    drop(rt);
+    handle.join().unwrap();
 }
 
 // T4 — identity mismatch：configured = C，实际对端 = B ⇒ **fail-closed（绝不误认证）**。
@@ -368,6 +387,8 @@ fn identity_mismatch_fail_closed() {
             Err(e) => panic!("establish error: {e:?}"),
         }
     }
+    // 关闭 A 连接 → B keep-alive 检测 EOF 退出。
+    drop(rt);
     handle.join().unwrap();
     // fail-closed 达成：configured C 从未 Established（无 Ok(Some) 触发过 panic）。
 }
@@ -402,6 +423,8 @@ fn wrong_context_not_established() {
             Err(e) => panic!("establish error: {e:?}"),
         }
     }
+    // 关闭 A 连接 → B keep-alive 检测 EOF 退出。
+    drop(rt);
     handle.join().unwrap();
     // wrong chain context ⇒ configured peer 从未 Established（未触发任何 Ok(Some) panic）。
 }
@@ -469,6 +492,8 @@ fn disconnect_then_reconnect_establishes_with_new_nonce() {
     }
     // L3 — Established 幂等：再调 establish 直接成功（不重 dial / 不重发 Init）。
     assert_eq!(rt.establish_configured_peer().unwrap(), Some(b_id));
+    // B keep-alive：关闭 A 使 B 最后轮退出。
+    drop(rt);
     let nonces = handle.join().unwrap();
     assert_eq!(nonces.len(), rounds, "每轮收到一次 A Init（无重复发送）");
     assert_ne!(

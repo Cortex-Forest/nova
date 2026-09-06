@@ -610,6 +610,9 @@ impl<T: Transport> NetworkService<T> {
         // 2. dial connections：确定性 NodeId 序；每连接 bounded（fairness）；单 peer 错误隔离。
         let mut conn_peers: Vec<NodeId> = self.connections.keys().copied().collect();
         conn_peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        // EOF 检测：收集 closed 的 peer，**收集后统一 disconnect**（不在借用 connections 的同时
+        // 修改 HashMap；`is_closed()` 与 `Ok(None)` 区分 —— `Ok(None)` 也可能是"暂无帧"）。
+        let mut closed_peers: Vec<NodeId> = Vec::new();
         for peer in conn_peers {
             let frames: Vec<(NodeId, Vec<u8>)> = {
                 let Some(conn) = self.connections.get_mut(&peer) else {
@@ -631,6 +634,14 @@ impl<T: Transport> NetworkService<T> {
                     accepted += 1;
                 }
             }
+            // poll 后该 connection 已 closed（EOF）⇒ 标记待清理。
+            if self.connections.get(&peer).is_some_and(|c| c.is_closed()) {
+                closed_peers.push(peer);
+            }
+        }
+        // 复用 disconnect_peer：connection + PeerManager connected + session + rate/replay 语义。
+        for peer in closed_peers {
+            let _ = self.disconnect_peer(peer);
         }
         Ok(accepted)
     }
@@ -1137,11 +1148,13 @@ mod tests {
 
     // ---------- STEP 10-19-10-B7-A1-D7-Implementation-1：multi-peer connection set ----------
 
-    /// 可观测 fake connection：rx（对端→NS 入站帧）+ sent（NS→对端记录）。
+    /// 可观测 fake connection：rx（对端→NS 入站帧）+ sent（NS→对端记录）+ closed（EOF 仿真）。
     #[derive(Default)]
     struct Spec {
         rx: std::collections::VecDeque<(NodeId, Vec<u8>)>,
         sent: Vec<(NodeId, Vec<u8>)>,
+        /// 连接关闭状态（EOF / fail-closed 仿真；默认 open）。
+        closed: bool,
     }
 
     struct FakeConn {
@@ -1154,7 +1167,14 @@ mod tests {
             Ok(())
         }
         fn try_recv(&mut self) -> Result<Option<(NodeId, Vec<u8>)>, NetworkError> {
+            if self.spec.borrow().closed {
+                // closed ⇒ Ok(None)（无帧）—— EOF 由 is_closed() 表达，不靠 Ok(None)。
+                return Ok(None);
+            }
             Ok(self.spec.borrow_mut().rx.pop_front())
+        }
+        fn is_closed(&self) -> bool {
+            self.spec.borrow().closed
         }
     }
 
@@ -1183,6 +1203,13 @@ mod tests {
         fn sent_len(&self, remote: NodeId) -> usize {
             self.spec(remote).borrow().sent.len()
         }
+        /// 置连接 closed（EOF 仿真；作用于当前 dial 的 spec）。
+        fn set_closed(&self, remote: NodeId) {
+            self.spec(remote).borrow_mut().closed = true;
+        }
+        fn is_closed(&self, remote: NodeId) -> bool {
+            self.spec(remote).borrow().closed
+        }
     }
 
     impl ConnectionDialer for FakeDialer {
@@ -1194,9 +1221,20 @@ mod tests {
             _max_frame: usize,
             _idle_timeout: Option<std::time::Duration>,
         ) -> Result<Box<dyn Transport>, NetworkError> {
-            Ok(Box::new(FakeConn {
-                spec: self.spec(remote),
-            }))
+            // 每次 dial = 一条新连接：已有 spec 仅当仍 open 时复用（保持 D7-1 seed-before-dial）；
+            // closed / 无 spec ⇒ fresh（reconnect 语义：新连接不再 closed）。
+            let spec = {
+                let existing = self.specs.borrow().get(&remote).cloned();
+                match existing {
+                    Some(s) if !s.borrow().closed => s,
+                    _ => {
+                        let fresh = std::rc::Rc::new(std::cell::RefCell::new(Spec::default()));
+                        self.specs.borrow_mut().insert(remote, fresh.clone());
+                        fresh
+                    }
+                }
+            };
+            Ok(Box::new(FakeConn { spec }))
         }
     }
 
@@ -1346,5 +1384,121 @@ mod tests {
         // 断连后可重建 dial（KEEP-FIRST 不阻挡 reconnect）。
         assert!(svc.dial_peer(fake_addr(), b, 4096, None).is_ok());
         assert!(svc.is_connected(b));
+    }
+
+    // ---------- STEP 10-19-10-B7-A1-D7-Implementation-2：EOF / disconnect detection ----------
+
+    fn three_key_svc() -> (
+        NodeId,
+        NodeId,
+        NodeId,
+        NetworkService<BoxTransport>,
+        FakeDialer,
+    ) {
+        let ka = KeyPair::generate().unwrap();
+        let kb = KeyPair::generate().unwrap();
+        let kc = KeyPair::generate().unwrap();
+        let a = NodeId::from_verifying_key(ka.verifying_key());
+        let b = NodeId::from_verifying_key(kb.verifying_key());
+        let c = NodeId::from_verifying_key(kc.verifying_key());
+        let dialer = FakeDialer::new();
+        let mut svc = dial_svc(a, dialer.clone());
+        svc.dial_peer(fake_addr(), b, 4096, None).unwrap();
+        svc.dial_peer(fake_addr(), c, 4096, None).unwrap();
+        (a, b, c, svc, dialer)
+    }
+
+    // T4/T8 — poll 检测 closed ⇒ auto disconnect；healthy peer 保留（per-peer isolation）。
+    #[test]
+    fn d7_2_poll_auto_disconnects_closed_peer() {
+        let (_a, b, c, mut svc, dialer) = three_key_svc();
+        assert_eq!(svc.connected_peer_count(), 2);
+        // 仅 B closed。
+        dialer.set_closed(b);
+        svc.poll_transport().unwrap();
+        assert!(!svc.is_connected(b), "T4 closed peer auto-disconnected");
+        assert!(svc.is_connected(c), "T8 healthy peer remains");
+        assert_eq!(svc.connected_peer_count(), 1);
+        // B 的 connection 已移除 ⇒ 可显式重建（KEEP-FIRST 不阻挡）。
+        assert!(svc.dial_peer(fake_addr(), b, 4096, None).is_ok());
+        assert!(svc.is_connected(b));
+    }
+
+    // T5 — Established 不得残留：EOF ⇒ session 清理 ⇒ is_peer_established false。
+    #[test]
+    fn d7_2_established_cleared_after_eof() {
+        let (_a, b, _c, mut svc, dialer) = three_key_svc();
+        // 模拟已认证：dial connection 关联 Established session。
+        svc.sessions.insert(b, PeerSessionState::Established);
+        assert!(svc.is_peer_established(b));
+        dialer.set_closed(b);
+        svc.poll_transport().unwrap();
+        assert!(!svc.is_peer_established(b), "T5 no Established ghost state");
+        assert_eq!(svc.peer_session(b), None);
+    }
+
+    // T6 — EOF 后 outbound 拒发（不继续发送到 closed transport）。
+    #[test]
+    fn d7_2_outbound_rejected_after_eof() {
+        let (_a, b, _c, mut svc, dialer) = three_key_svc();
+        dialer.set_closed(b);
+        svc.poll_transport().unwrap();
+        let signer = KeyPair::generate().unwrap();
+        let env = signed_env(signer.signing_key(), MessageType::Ping, vec![0xEE]);
+        let res = svc.enqueue_outbound(b, env);
+        assert!(
+            matches!(res, Err(NetworkServiceError::PeerNotConnected)),
+            "T6 outbound rejected after EOF: {res:?}"
+        );
+    }
+
+    // T7 — reconnect possible：EOF → auto disconnect → explicit dial 重建（无自动 retry）。
+    #[test]
+    fn d7_2_reconnect_possible_after_eof() {
+        let ka = KeyPair::generate().unwrap();
+        let kb = KeyPair::generate().unwrap();
+        let a = NodeId::from_verifying_key(ka.verifying_key());
+        let b = NodeId::from_verifying_key(kb.verifying_key());
+        let dialer = FakeDialer::new();
+        let mut svc = dial_svc(a, dialer.clone());
+        svc.dial_peer(fake_addr(), b, 4096, None).unwrap();
+        assert!(svc.is_connected(b));
+        // EOF → auto disconnect。
+        dialer.set_closed(b);
+        svc.poll_transport().unwrap();
+        assert!(!svc.is_connected(b), "EOF disconnected");
+        // explicit dial 重建（无自动 reconnect；无 retry 状态残留）。
+        assert!(svc.dial_peer(fake_addr(), b, 4096, None).is_ok());
+        assert!(svc.is_connected(b), "T7 reconnect via explicit dial");
+        assert_eq!(svc.connected_peer_count(), 1);
+        // 新连接为 open（fresh），不继承旧 closed。
+        assert!(!dialer.is_closed(b));
+    }
+
+    // T8（隔离）已在 d7_2_poll_auto_disconnects_closed_peer 内验证：仅 B closed 时 C 保留。
+
+    // T9 — 多条 closed peers 同时清理；healthy 保留。
+    #[test]
+    fn d7_2_multiple_closed_peers_cleaned() {
+        let ka = KeyPair::generate().unwrap();
+        let kb = KeyPair::generate().unwrap();
+        let kc = KeyPair::generate().unwrap();
+        let a = NodeId::from_verifying_key(ka.verifying_key());
+        let b = NodeId::from_verifying_key(kb.verifying_key());
+        let c = NodeId::from_verifying_key(kc.verifying_key());
+        let dialer = FakeDialer::new();
+        let mut svc = dial_svc(a, dialer.clone());
+        svc.dial_peer(fake_addr(), a, 4096, None).unwrap();
+        svc.dial_peer(fake_addr(), b, 4096, None).unwrap();
+        svc.dial_peer(fake_addr(), c, 4096, None).unwrap();
+        assert_eq!(svc.connected_peer_count(), 3);
+        // A 与 C closed；B 保持。
+        dialer.set_closed(a);
+        dialer.set_closed(c);
+        svc.poll_transport().unwrap();
+        assert!(!svc.is_connected(a), "T9 closed A removed");
+        assert!(svc.is_connected(b), "T9 healthy B remains");
+        assert!(!svc.is_connected(c), "T9 closed C removed");
+        assert_eq!(svc.connected_peer_count(), 1);
     }
 }
