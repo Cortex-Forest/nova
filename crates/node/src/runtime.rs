@@ -38,6 +38,7 @@ use crate::block_dispatch::{dispatch_gossip_block, dispatch_sync_block_response}
 use crate::block_inbound::{InboundBlockError, InboundBlockVerdict};
 use crate::bootstrap::{self, NodeConfig, NodeStartupError};
 use crate::driver::{DriverError, NodeConsensusDriver};
+use crate::intent_ledger::{BlockInboundSource, MissingAncestorIntentLedger};
 use crate::key_provider::{KeyProvider, KeyProviderError};
 use crate::network_identity::NetworkSigner;
 use crate::outbound::OutboundConsensusMessage;
@@ -54,6 +55,9 @@ type DynSigner = Box<dyn SigningCapability>;
 
 /// block inbound 观测队列有界容量（Node-local；满则丢最早 —— 不累积无限历史）。
 const BLOCK_INBOUND_OUTCOME_CAP: usize = 128;
+
+/// missing-ancestor intent ledger 有界容量（Node-local；满 ⇒ FIFO evict —— 不无限增长）。
+const MISSING_ANCESTOR_LEDGER_CAP: usize = 256;
 
 /// Node-local proposer step（STEP 10-19-6 OPT-1）：本节点为当前 proposer 时经真实 BlockBuilder
 /// 产出 Block + ProposalRef → submit ProposalRef。
@@ -219,6 +223,9 @@ pub struct NodeRuntime {
     block_inbound_outcomes: VecDeque<Result<InboundBlockVerdict, InboundBlockError>>,
     /// 无 canonical 上下文（full-node / 无 adapter）而跳过的 block inbound payload 数。
     block_inbound_skipped: u64,
+    /// missing-ancestor intent ledger（STEP 10-19-10-B1；bounded + dedup）。
+    /// 仅记录 `FutureMissingAncestor` 观察；**不发送 / 不写存储 / 不触发 finality**。
+    missing_ancestor_ledger: MissingAncestorIntentLedger,
 }
 
 impl NodeRuntime {
@@ -336,6 +343,7 @@ impl NodeRuntime {
             max_block_bytes,
             block_inbound_outcomes: VecDeque::new(),
             block_inbound_skipped: 0,
+            missing_ancestor_ledger: MissingAncestorIntentLedger::new(MISSING_ANCESTOR_LEDGER_CAP),
         })
     }
 
@@ -419,6 +427,18 @@ impl NodeRuntime {
     /// 无 canonical 上下文（full-node）而跳过的 block inbound payload 计数。
     pub fn block_inbound_skipped(&self) -> u64 {
         self.block_inbound_skipped
+    }
+
+    /// 当前 missing-ancestor intent ledger 深度（STEP 10-19-10-B1）。
+    pub fn missing_ancestor_intent_len(&self) -> usize {
+        self.missing_ancestor_ledger.len()
+    }
+
+    /// 取走全部 missing-ancestor intents（FIFO；consuming）。只读/消费观测；不发送 / 不写存储。
+    pub fn take_missing_ancestor_intents(
+        &mut self,
+    ) -> Vec<crate::intent_ledger::MissingAncestorIntent> {
+        self.missing_ancestor_ledger.take_all()
     }
 
     /// 显式设置 step-driven 出块 timestamp（无系统时钟；默认 0；确定性由调用方保证）。
@@ -513,22 +533,30 @@ impl NodeRuntime {
         // 不 commit / 不写存储 / 不推进 head（CanonicalNextCandidate 非 finality-authorized）。
         let block_msgs = stack.el.handler_mut().take_block_inbound();
         for msg in block_msgs {
-            let outcomes = match (&self.block_production, msg) {
-                (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => {
-                    vec![dispatch_gossip_block(adapter, self.max_block_bytes, &wire)]
-                }
-                (Some(adapter), BlockInboundMessage::SyncBlockResponse(payload)) => {
-                    dispatch_sync_block_response(adapter, self.max_block_bytes, &payload)
-                }
+            let (source, outcomes) = match (&self.block_production, msg) {
+                (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => (
+                    BlockInboundSource::Gossip,
+                    vec![dispatch_gossip_block(adapter, self.max_block_bytes, &wire)],
+                ),
+                (Some(adapter), BlockInboundMessage::SyncBlockResponse(payload)) => (
+                    BlockInboundSource::SyncResponse,
+                    dispatch_sync_block_response(adapter, self.max_block_bytes, &payload),
+                ),
                 (None, _) => {
                     // full-node / 无 canonical adapter：无法验证（无 state/head 上下文）→ 丢弃并计数。
                     self.block_inbound_skipped += 1;
-                    Vec::new()
+                    continue;
                 }
             };
             for outcome in outcomes {
+                // observation（bounded outcomes；保留既有语义）
                 if self.block_inbound_outcomes.len() >= BLOCK_INBOUND_OUTCOME_CAP {
                     self.block_inbound_outcomes.pop_front();
+                }
+                // STEP 10-19-10-B1：FutureMissingAncestor → intent ledger（bounded + dedup；
+                // 只记录，不发送 / 不写存储 / 不触发 finality）。
+                if let Ok(verdict) = &outcome {
+                    self.missing_ancestor_ledger.observe(verdict, source);
                 }
                 self.block_inbound_outcomes.push_back(outcome);
             }
@@ -579,6 +607,7 @@ impl NodeRuntime {
             max_block_bytes: _,
             block_inbound_outcomes: _,
             block_inbound_skipped: _,
+            missing_ancestor_ledger: _,
         } = self;
 
         if let Some(mut stack) = network_stack {

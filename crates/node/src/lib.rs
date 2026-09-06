@@ -81,6 +81,12 @@ pub mod block_inbound;
 /// finality-authorized。wire 收集 seam 在 `wiring::NodeConsensusHandler`。
 pub mod block_dispatch;
 
+/// Node-local Missing-Ancestor Intent Ledger（STEP 10-19-10-B1）：`FutureMissingAncestor`
+/// verdict → bounded + deduplicated 缺失祖先需求记账（FIFO eviction；count saturating）。
+/// **≠ Sync / ≠ 存储 / ≠ finality**：不发送请求、不写 BlockStore/StateStore/ChainHead、不触发
+/// finality；纯 Node-local 观察状态。
+pub mod intent_ledger;
+
 /// Node-local Proposer orchestration（STEP 10-19-2）：ProposalRef 装配（ADR-0050 `select_proposer`
 /// 判定 + deterministic placeholder commitment）；ProposerService ≠ BlockBuilder / ValidatorActor /
 /// NetworkService / Storage / ConsensusState。

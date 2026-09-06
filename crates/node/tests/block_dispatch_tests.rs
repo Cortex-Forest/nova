@@ -33,6 +33,7 @@ use nova_storage::store::StateStore;
 use nova_node::block_adapter::{ChainHead, NoAccountsKeyResolver, NodeBlockAdapter};
 use nova_node::block_dispatch::{dispatch_gossip_block, dispatch_sync_block_response};
 use nova_node::block_inbound::{InboundBlockError, InboundBlockVerdict, UnverifiableItem};
+use nova_node::intent_ledger::{BlockInboundSource, MissingAncestorIntentLedger};
 use nova_node::wiring::{BlockInboundMessage, NodeConsensusHandler};
 
 const CHAIN_ID: u64 = 1001;
@@ -404,4 +405,98 @@ fn bdis_10_no_mutation_across_reject_paths() {
     assert_eq!(adapter.store().state_root(), root_before, "state unchanged");
     assert_eq!(adapter.head(), &head_before, "head unchanged");
     assert!(!adapter.block_store().unwrap().contains(&hash).unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// STEP 10-19-10-B1：FutureMissingAncestor → MissingAncestorIntentLedger（Gossip / Sync）
+// ---------------------------------------------------------------------------
+
+/// 推进 head 到 1 后 Gossip 一个 future block（height 3）→ FutureMissingAncestor verdict。
+fn future_verdict(adapter: &FileAdapter, kp: &KeyPair) -> InboundBlockVerdict {
+    let head1 = nova_runtime::block_hash(&canonical_next_block(kp)).unwrap();
+    let future = empty_block(3, head1, empty_root(), kp.signing_key(), 0);
+    dispatch_gossip_block(adapter, MAX_BLOCK_BYTES, &wire(&future)).unwrap()
+}
+
+#[test]
+fn bdis_b1_7_gossip_future_records_intent() {
+    let kp = KeyPair::generate().unwrap();
+    let chain = TestChain::new();
+    let mut adapter = create_adapter(&chain);
+    let _head1 = advance_head(&mut adapter, &kp); // head = 1
+    let verdict = future_verdict(&adapter, &kp);
+    assert!(matches!(
+        verdict,
+        InboundBlockVerdict::FutureMissingAncestor { height: 3, .. }
+    ));
+
+    // ledger record（Gossip source）；重复观察 ⇒ dedup + count
+    let mut ledger = MissingAncestorIntentLedger::new(8);
+    ledger.observe(&verdict, BlockInboundSource::Gossip);
+    ledger.observe(&verdict, BlockInboundSource::Gossip);
+    assert_eq!(ledger.len(), 1, "dedup：同块不新增 entry");
+    assert_eq!(ledger.get(&block_hash_of(&verdict)).unwrap().count, 2);
+    assert_eq!(
+        ledger.get(&block_hash_of(&verdict)).unwrap().source,
+        BlockInboundSource::Gossip
+    );
+    // 零存储 / 零 head 变更
+    assert_eq!(adapter.head().height, 1);
+    assert!(
+        !adapter
+            .block_store()
+            .unwrap()
+            .contains(&block_hash_of(&verdict))
+            .unwrap()
+    );
+}
+
+fn block_hash_of(v: &InboundBlockVerdict) -> [u8; 32] {
+    match v {
+        InboundBlockVerdict::FutureMissingAncestor { block_hash, .. } => *block_hash,
+        _ => unreachable!("helper only for FutureMissingAncestor"),
+    }
+}
+
+#[test]
+fn bdis_b1_8_sync_response_future_records_intent() {
+    let kp = KeyPair::generate().unwrap();
+    let chain = TestChain::new();
+    let mut adapter = create_adapter(&chain);
+    let head1 = advance_head(&mut adapter, &kp);
+    // SyncBlockResponse 携带一个 future block（height 3）→ dispatch → FutureMissingAncestor
+    let future = empty_block(3, head1, empty_root(), kp.signing_key(), 0);
+    let response = SyncBlockResponse {
+        blocks: vec![BlockPayload::from_block(&future).unwrap()],
+    };
+    let results = dispatch_sync_block_response(&adapter, MAX_BLOCK_BYTES, &response.encode());
+    assert_eq!(results.len(), 1);
+    let verdict = results[0].as_ref().unwrap();
+    assert!(matches!(
+        verdict,
+        InboundBlockVerdict::FutureMissingAncestor { height: 3, .. }
+    ));
+
+    // SyncResponse source 记账
+    let mut ledger = MissingAncestorIntentLedger::new(8);
+    ledger.observe(verdict, BlockInboundSource::SyncResponse);
+    assert_eq!(ledger.len(), 1);
+    assert_eq!(
+        ledger.get(&block_hash_of(verdict)).unwrap().source,
+        BlockInboundSource::SyncResponse
+    );
+    // 同块再经 Gossip ⇒ 同一 intent（count 累加，不新增 entry）
+    let gossip_result = dispatch_gossip_block(&adapter, MAX_BLOCK_BYTES, &wire(&future)).unwrap();
+    ledger.observe(&gossip_result, BlockInboundSource::Gossip);
+    assert_eq!(ledger.len(), 1, "Gossip + Sync 同块 ⇒ 同一 intent");
+    assert_eq!(ledger.get(&block_hash_of(verdict)).unwrap().count, 2);
+    // 零 head 变更 / 零 BlockStore 写
+    assert_eq!(adapter.head().height, 1);
+    assert!(
+        !adapter
+            .block_store()
+            .unwrap()
+            .contains(&block_hash_of(verdict))
+            .unwrap()
+    );
 }
