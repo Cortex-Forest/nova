@@ -389,6 +389,7 @@ mod tests {
             max_msg_bytes: 4096,
             inbound_capacity: cap,
             outbound_capacity: cap,
+            peer_auth: None,
         }
     }
 

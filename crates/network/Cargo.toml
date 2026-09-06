@@ -14,3 +14,5 @@ workspace = true
 # 禁止 network → execution / network → storage（消息层不执行状态转换）
 nova-core = { path = "../core" }
 nova-crypto = { path = "../crypto" }
+# STEP 10-18I-L（ADR-0059）：SessionNonce 生成（OS CSPRNG 无 fallback；复用 workspace 既有 getrandom）
+getrandom.workspace = true

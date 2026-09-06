@@ -18,5 +18,7 @@ pub mod gossip;
 pub mod message;
 pub mod network_service;
 pub mod node_id;
+pub mod security;
+pub mod session;
 pub mod sync;
 pub mod transport;

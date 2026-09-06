@@ -564,6 +564,7 @@ dependencies = [
 name = "nova-network"
 version = "0.1.0"
 dependencies = [
+ "getrandom",
  "nova-core",
  "nova-crypto",
 ]

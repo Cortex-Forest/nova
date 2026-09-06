@@ -84,6 +84,10 @@ pub enum NetworkError {
     SenderMismatch,
     /// Block 结构验证失败（decode_block 拒绝：length/version/tag/trailing；P7-5 F4）。
     InvalidBlockStructure,
+    /// transport 层 IO 错误（同步 socket；fail-closed —— 不携带 io 细节）。
+    TransportIo,
+    /// transport frame 长度超限（拒绝，不分配）。
+    FrameTooLarge { max: usize, actual: usize },
 }
 
 impl fmt::Display for NetworkError {
@@ -99,6 +103,10 @@ impl fmt::Display for NetworkError {
             Self::InvalidSignature => write!(f, "invalid message signature"),
             Self::SenderMismatch => write!(f, "sender NodeId does not match public key"),
             Self::InvalidBlockStructure => write!(f, "invalid block structure"),
+            Self::TransportIo => write!(f, "transport io failure"),
+            Self::FrameTooLarge { max, actual } => {
+                write!(f, "transport frame too large: max {max}, actual {actual}")
+            }
         }
     }
 }

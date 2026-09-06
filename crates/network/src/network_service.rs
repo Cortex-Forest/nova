@@ -22,6 +22,10 @@
 
 use crate::message::{MessageEnvelope, MessageType, NetworkError, decode, encode, verify_message};
 use crate::node_id::NodeId;
+use crate::session::{
+    PeerAuthConfig, PeerSessionState, ReplayCache, ReplayKey, handshake_payload_decode,
+    validate_handshake_context,
+};
 use crate::transport::Transport;
 use core::fmt;
 use nova_crypto::signature::VerifyingKey;
@@ -43,6 +47,9 @@ pub struct NetworkServiceConfig {
     pub inbound_capacity: usize,
     /// outbound queue 容量（bounded；满 ⇒ `QueueFull`）。
     pub outbound_capacity: usize,
+    /// peer-auth / handshake / session / replay（ADR-0059；STEP 10-18I-L）。
+    /// `None` = 关闭（保持既有行为，不与 NS-INV 冲突）。
+    pub peer_auth: Option<PeerAuthConfig>,
 }
 
 impl Default for NetworkServiceConfig {
@@ -51,6 +58,7 @@ impl Default for NetworkServiceConfig {
             max_msg_bytes: 1024 * 1024,
             inbound_capacity: 1024,
             outbound_capacity: 1024,
+            peer_auth: None,
         }
     }
 }
@@ -68,6 +76,16 @@ pub struct NetworkDiagnostics {
     pub dropped_overflow: u64,
     /// 已成功发出的出站消息数。
     pub sent: u64,
+    /// 握手尝试总数（STEP 10-18I-L；ADR-0059）。
+    pub handshake_attempts: u64,
+    /// 握手成功数。
+    pub handshake_success: u64,
+    /// 握手失败数（身份 / 链上下文 / 结构 / 速率）。
+    pub handshake_failures: u64,
+    /// replay 检测丢弃数。
+    pub replay_drops: u64,
+    /// 未认证（非 Established session）消息丢弃数。
+    pub unauthenticated_drops: u64,
 }
 
 /// NetworkService 错误（node-local 网络域；fail-safe：不 panic、不改共识）。
@@ -314,6 +332,16 @@ pub struct NetworkService<T: Transport> {
     outbound: BoundedQueue<(NodeId, MessageEnvelope)>,
     config: NetworkServiceConfig,
     diagnostics: NetworkDiagnostics,
+    /// peer-auth 配置（ADR-0059/STEP 10-18I-L；`None` = 关闭 gate）。
+    auth: Option<PeerAuthConfig>,
+    /// peer → session state（NetworkService owns；EventLoop 不决定认证）。
+    sessions: HashMap<NodeId, PeerSessionState>,
+    /// per-peer 握手尝试计数（rate limit）。
+    handshake_attempts: HashMap<NodeId, u32>,
+    /// 全局握手尝试计数。
+    global_handshake_attempts: u32,
+    /// bounded replay cache（握手去重；FIFO 驱逐）。
+    replay: ReplayCache,
 }
 
 impl<T: Transport> NetworkService<T> {
@@ -322,6 +350,10 @@ impl<T: Transport> NetworkService<T> {
     pub fn new(config: NetworkServiceConfig, self_id: NodeId, transport: T) -> Self {
         // self_id 保留为文档化身份锚（未来 10-18G 可用于拒绝 sender≠self 的 outbound）。
         let _ = self_id;
+        let replay_capacity = config
+            .peer_auth
+            .map(|a| a.replay_cache_capacity)
+            .unwrap_or(0);
         Self {
             state: NetworkServiceState::Running,
             transport,
@@ -330,6 +362,11 @@ impl<T: Transport> NetworkService<T> {
             outbound: BoundedQueue::new(config.outbound_capacity),
             config,
             diagnostics: NetworkDiagnostics::default(),
+            auth: config.peer_auth,
+            sessions: HashMap::new(),
+            handshake_attempts: HashMap::new(),
+            global_handshake_attempts: 0,
+            replay: ReplayCache::new(replay_capacity),
         }
     }
 
@@ -343,6 +380,26 @@ impl<T: Transport> NetworkService<T> {
 
     pub fn diagnostics(&self) -> NetworkDiagnostics {
         self.diagnostics
+    }
+
+    // ---------- peer-auth / session 观察（ADR-0059；STEP 10-18I-L） ----------
+
+    /// peer 当前 session 状态（auth 模式；无记录 = 未认证 / 已关闭）。
+    pub fn peer_session(&self, node: NodeId) -> Option<PeerSessionState> {
+        self.sessions.get(&node).copied()
+    }
+
+    /// peer 是否 Established（允许承载 authenticated 流量）。
+    pub fn is_peer_established(&self, node: NodeId) -> bool {
+        matches!(
+            self.sessions.get(&node),
+            Some(PeerSessionState::Established)
+        )
+    }
+
+    /// per-peer 握手尝试数（诊断 / rate 观察）。
+    pub fn handshake_attempts_for(&self, node: NodeId) -> u32 {
+        self.handshake_attempts.get(&node).copied().unwrap_or(0)
     }
 
     /// 本服务拥有的 transport（可变；供 EventLoop/测试直接驱动）。
@@ -368,12 +425,18 @@ impl<T: Transport> NetworkService<T> {
     pub fn disconnect_peer(&mut self, node: NodeId) -> Result<(), NetworkServiceError> {
         self.ensure_running()?;
         self.peers.disconnect(node);
+        // STEP 10-18I-L：断连 ⇒ 会话关闭（session/rate 状态清理；replay cache 保留防跨会话重放）。
+        self.sessions.remove(&node);
+        self.handshake_attempts.remove(&node);
         Ok(())
     }
 
     pub fn remove_peer(&mut self, node: NodeId) -> Result<(), NetworkServiceError> {
         self.ensure_running()?;
         self.peers.remove(node);
+        // STEP 10-18I-L：移除 ⇒ 会话关闭（session/rate 状态清理；replay cache 保留）。
+        self.sessions.remove(&node);
+        self.handshake_attempts.remove(&node);
         Ok(())
     }
 
@@ -407,15 +470,31 @@ impl<T: Transport> NetworkService<T> {
                 Err(NetworkServiceError::UnknownPeer)
             };
         }
+        // STEP 10-18I-M：auth 启用时仅 Established 对端可收（未认证/关闭 ⇒ 拒发，防串发）；
+        // Handshake 例外 —— 握手本就是建立认证的消息，允许发给未认证对端。
+        if self.auth.is_some()
+            && !self.is_peer_established(peer)
+            && envelope.message_type != MessageType::Handshake
+        {
+            return Err(NetworkServiceError::PeerNotConnected);
+        }
         self.outbound
             .push_back((peer, envelope))
             .map_err(|_| NetworkServiceError::QueueFull)
     }
 
-    /// 广播到所有 connected peers（入队；部分满 ⇒ 返回 `Err(QueueFull)`，不部分静默丢）。
+    /// 广播（auth 启用时仅 Established peers；peer 过滤有界）。部分满 ⇒ `Err(QueueFull)`。
     pub fn broadcast(&mut self, envelope: MessageEnvelope) -> Result<usize, NetworkServiceError> {
         self.ensure_running()?;
-        let peers = self.peers.connected_peers();
+        let connected = self.peers.connected_peers();
+        let peers: Vec<NodeId> = if self.auth.is_some() {
+            connected
+                .into_iter()
+                .filter(|p| self.is_peer_established(*p))
+                .collect()
+        } else {
+            connected
+        };
         for peer in &peers {
             self.outbound
                 .push_back((*peer, envelope.clone()))
@@ -519,9 +598,21 @@ impl<T: Transport> NetworkService<T> {
             self.diagnostics.dropped_invalid += 1;
             return false;
         }
-        // 4. classify → NetworkEvent（payload opaque；不解析共识语义）。
+        // 4. peer-auth / session gate（ADR-0059；`auth` 启用时）：
+        //    Handshake → 握手处理（身份 / 链上下文 / 速率 / replay → 建 Established session）；
+        //    其它消息 → 仅 Established session 允许（否则 fail-closed drop，不进入 classify）。
+        if let Some(auth) = self.auth {
+            if envelope.message_type == MessageType::Handshake {
+                return self.process_handshake(auth, envelope.sender, &envelope.payload);
+            }
+            if !self.is_peer_established(envelope.sender) {
+                self.diagnostics.unauthenticated_drops += 1;
+                return false;
+            }
+        }
+        // 5. classify → NetworkEvent（payload opaque；不解析共识语义）。
         let event = classify(&envelope);
-        // 5. bounded inbound；满 ⇒ drop + overflow 计数（consensus/gossip/sync/block 一致策略）。
+        // 6. bounded inbound；满 ⇒ drop + overflow 计数（consensus/gossip/sync/block 一致策略）。
         match self.inbound.push_back(event) {
             Ok(()) => {
                 self.diagnostics.events_enqueued += 1;
@@ -534,6 +625,86 @@ impl<T: Transport> NetworkService<T> {
         }
     }
 
+    /// 入站握手处理（ADR-0059/STEP 10-18I-L；NetworkService owns session）。
+    /// 成功 ⇒ peer 置 `Established` + 入队 `NetworkEvent::Handshake`；
+    /// 任何失败 ⇒ fail-closed（drop + 计数）；身份 / 链上下文 / 速率失败 ⇒ 关闭 peer session。
+    fn process_handshake(&mut self, auth: PeerAuthConfig, sender: NodeId, payload: &[u8]) -> bool {
+        self.diagnostics.handshake_attempts += 1;
+        // STEP 10-18I-M：已 Established 的 peer 再次握手 ⇒ 确定性拒绝（先到连接胜出；
+        // reconnect 必须先 remove/disconnect 清 session）。
+        if self.is_peer_established(sender) {
+            self.diagnostics.replay_drops += 1;
+            return false;
+        }
+        self.global_handshake_attempts += 1;
+        // 速率：全局上界。
+        if self.global_handshake_attempts > auth.global_handshake_limit {
+            self.diagnostics.handshake_failures += 1;
+            self.close_peer(sender);
+            return false;
+        }
+        // 速率：per-peer 上界（不无限 retry；达到上界后后续尝试不再增长计数）。
+        let attempts = self.handshake_attempts.entry(sender).or_insert(0);
+        if *attempts >= auth.per_peer_handshake_limit {
+            self.diagnostics.handshake_failures += 1;
+            self.close_peer(sender);
+            return false;
+        }
+        *attempts += 1;
+        // 结构 decode。
+        let decoded = match handshake_payload_decode(payload) {
+            Ok(d) => d,
+            Err(_) => {
+                self.diagnostics.handshake_failures += 1;
+                self.close_peer(sender);
+                return false;
+            }
+        };
+        // 身份：claimed NodeId == envelope sender（sender 已由 verify_message 保证 == vk 派生）。
+        if decoded.claimed_node_id != sender {
+            self.diagnostics.handshake_failures += 1;
+            self.close_peer(sender);
+            return false;
+        }
+        // 链上下文：network / chain / genesis / protocol（错误链 = REJECT / close）。
+        if validate_handshake_context(&decoded, &auth).is_err() {
+            self.diagnostics.handshake_failures += 1;
+            self.close_peer(sender);
+            return false;
+        }
+        // replay：同 (peer, nonce) 握手已记录 ⇒ drop（不重复建立 / 不占 cache 之外空间）。
+        let key = ReplayKey {
+            peer: sender,
+            nonce: decoded.session_nonce,
+        };
+        if !self.replay.insert(key) {
+            self.diagnostics.replay_drops += 1;
+            return false;
+        }
+        // 成功：Established + 入队 Handshake event。
+        self.sessions.insert(sender, PeerSessionState::Established);
+        self.diagnostics.handshake_success += 1;
+        match self.inbound.push_back(NetworkEvent::Handshake {
+            sender,
+            payload: payload.to_vec(),
+        }) {
+            Ok(()) => {
+                self.diagnostics.events_enqueued += 1;
+                true
+            }
+            Err(_) => {
+                self.diagnostics.dropped_overflow += 1;
+                false
+            }
+        }
+    }
+
+    /// 关闭 peer session（fail-closed；会话移除 + 断开 = 非 Established，不再承载流量）。
+    fn close_peer(&mut self, node: NodeId) {
+        self.sessions.remove(&node);
+        self.peers.disconnect(node);
+    }
+
     // ---------- lifecycle ----------
 
     /// Shutdown：idempotent。置 Stopped + 清理队列；不接受新 work / 不再 peer op。
@@ -543,6 +714,11 @@ impl<T: Transport> NetworkService<T> {
         self.inbound.clear();
         self.outbound.clear();
         self.peers = PeerManager::new();
+        // STEP 10-18I-L：会话 / replay / rate 状态清理（NetworkService owns network session state）。
+        self.sessions.clear();
+        self.handshake_attempts.clear();
+        self.global_handshake_attempts = 0;
+        self.replay = ReplayCache::new(0);
     }
 
     fn ensure_running(&self) -> Result<(), NetworkServiceError> {
@@ -587,6 +763,7 @@ mod tests {
             max_msg_bytes: 4096,
             inbound_capacity: cap,
             outbound_capacity: cap,
+            peer_auth: None,
         }
     }
 
