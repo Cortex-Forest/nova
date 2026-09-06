@@ -13,6 +13,7 @@
 //! - 不触碰 runtime / execution / consensus / storage backend internals / WAL。
 //! - 不修改 runtime ⑥ / `ExecutionContext` 语义 / 协议。
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use nova_crypto::address::NetworkId;
@@ -20,6 +21,8 @@ use nova_crypto::identity::{
     AccountInit, ChainIdentity, GenesisError, GenesisV1, decode_genesis_bytes,
     validate_genesis_with_expected,
 };
+use nova_network::node_id::NodeId;
+use nova_network::transport::ConnectionTarget;
 use nova_runtime::{AccountChange, BlockPipelineError, KeyResolver};
 use nova_storage::block_store::BlockStore;
 use nova_storage::error::StorageError;
@@ -51,6 +54,45 @@ pub struct NodeConfig {
     pub safety_dir: PathBuf,
     /// KeyProvider 配置（STEP 10-16 Phase 1：`None` = 由调用方注入 provider 实例）。
     pub key_provider_config: KeyProviderConfig,
+    /// 静态 configured connection targets（STEP 10-19-10-B7-A3；`[]` = 无网络 peer，合法）。
+    /// 仅 initial connection targets（不 discovery / 不自动连接策略）。
+    pub peers: Vec<ConnectionTarget>,
+}
+
+/// configured connection target 校验错误（node-local config 域；dial **前**失败，fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTargetError {
+    /// `peer_id == self_id`（自我连接；dial 前拒绝）。
+    SelfTarget { peer_id: NodeId },
+    /// 同一 `peer_id` 配置多次。
+    DuplicateNodeId { peer_id: NodeId },
+    /// 同一 `address` 配置多次。
+    DuplicateAddress { address: SocketAddr },
+}
+
+impl NodeConfig {
+    /// 校验 configured connection targets（dial **前**；`self_id` 供自我连接检测）。
+    ///
+    /// 结构级（SocketAddr 由标准类型保证 IP/port）；**不**解析字符串、不新增 address parser。
+    /// 允许 loopback / private（测试与 LAN 需要）；生产 policy 另开 STEP。
+    pub fn validate_network_targets(&self, self_id: NodeId) -> Result<(), ConnectionTargetError> {
+        let mut seen_ids: Vec<NodeId> = Vec::with_capacity(self.peers.len());
+        let mut seen_addrs: Vec<SocketAddr> = Vec::with_capacity(self.peers.len());
+        for t in &self.peers {
+            if t.peer_id == self_id {
+                return Err(ConnectionTargetError::SelfTarget { peer_id: t.peer_id });
+            }
+            if seen_ids.contains(&t.peer_id) {
+                return Err(ConnectionTargetError::DuplicateNodeId { peer_id: t.peer_id });
+            }
+            if seen_addrs.contains(&t.address) {
+                return Err(ConnectionTargetError::DuplicateAddress { address: t.address });
+            }
+            seen_ids.push(t.peer_id);
+            seen_addrs.push(t.address);
+        }
+        Ok(())
+    }
 }
 
 /// Node 启动错误（Node-local；typed，不 String 化 / 不 Box 隐藏）。

@@ -412,6 +412,19 @@ impl Transport for BoxTransport {
     }
 }
 
+/// 静态 connection target（STEP 10-19-10-B7-A3；network domain）。
+///
+/// `{ peer_id, address }`：**expected peer identity + socket address**。address ≠ identity：
+/// 这只是连接目标（dials），**不 imply authenticated/Established**（认证经后续 handshake；
+/// configured `peer_id` 须与未来 authenticated NodeId 一致）。不含 priority/score/role/DNS。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionTarget {
+    /// 对端预期 NodeId（dial 关联身份；供未来 handshake 身份一致性检查）。
+    pub peer_id: NodeId,
+    /// 对端 socket 地址（dial target）。
+    pub address: SocketAddr,
+}
+
 /// outbound connection factory seam（object-safe；NetworkService 拥有并调用）。
 ///
 /// 参数复用 `TcpTransport::dial` 的真实签名语义：`addr` = 目标 socket 地址；`local` = 本端

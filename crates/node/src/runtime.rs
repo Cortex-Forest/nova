@@ -25,10 +25,9 @@ use nova_consensus::dag::Dag;
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_crypto::identity::ChainIdentity;
 use nova_network::event_loop::{EventLoop, EventLoopConfig, EventLoopError};
-use nova_network::message::NetworkError;
-use nova_network::network_service::{NetworkService, NetworkServiceConfig};
+use nova_network::network_service::{NetworkService, NetworkServiceConfig, NetworkServiceError};
 use nova_network::node_id::NodeId;
-use nova_network::transport::Transport;
+use nova_network::transport::{BoxTransport, ConnectionTarget, TcpDialer, Transport};
 use nova_storage::error::StorageError;
 use nova_storage::persistent::PersistentBackend;
 
@@ -36,7 +35,7 @@ use crate::assembly::ConsensusNode;
 use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter};
 use crate::block_dispatch::{dispatch_gossip_block, dispatch_sync_block_response};
 use crate::block_inbound::{InboundBlockError, InboundBlockVerdict};
-use crate::bootstrap::{self, NodeConfig, NodeStartupError};
+use crate::bootstrap::{self, ConnectionTargetError, NodeConfig, NodeStartupError};
 use crate::driver::{DriverError, NodeConsensusDriver};
 use crate::intent_ledger::{BlockInboundSource, MissingAncestorIntentLedger};
 use crate::key_provider::{KeyProvider, KeyProviderError};
@@ -107,6 +106,8 @@ pub enum NodeRuntimeError {
     Safety(ValidatorSafetyError),
     /// ValidatorActor 构造 / 恢复失败（含 identity mismatch）。
     Validator(ValidatorActorError),
+    /// configured connection target 校验失败（self / duplicate；dial **前** fail-closed）。
+    NetworkTarget(ConnectionTargetError),
 }
 
 /// Runtime 运行期错误（Stage C `step`；分层、不吞错、不改底层语义）。
@@ -122,6 +123,8 @@ pub enum RuntimeError {
     Proposer(ProposerError),
     /// ValidatorActor 出块签名失败（`sign_block`；fail-closed）。
     Validator(ValidatorActorError),
+    /// outbound dial 失败（NetworkServiceError 透传；不自动 retry / 不自动换 peer）。
+    NetworkDial(NetworkServiceError),
 }
 
 /// Runtime 关闭错误（Stage C `shutdown`；仅 Storage 可失败 ——
@@ -130,21 +133,6 @@ pub enum RuntimeError {
 pub enum ShutdownError {
     /// ChainStorage 关闭失败（`PersistentBackend::close`）。
     Storage(StorageError),
-}
-
-/// 最小 trait-object transport 适配（Stage C）：使 `Box<dyn Transport>` 满足 `Transport`
-/// bound（network crate 不提供 blanket impl；**不修改** network crate）。
-/// 非 speculative abstraction —— 必要 trait-object 适配（D1 冻结：Runtime 组合层类型擦除）。
-struct BoxTransport(Box<dyn Transport>);
-
-impl Transport for BoxTransport {
-    fn send(&mut self, peer: &NodeId, message: Vec<u8>) -> Result<(), NetworkError> {
-        self.0.send(peer, message)
-    }
-
-    fn try_recv(&mut self) -> Result<Option<(NodeId, Vec<u8>)>, NetworkError> {
-        self.0.try_recv()
-    }
 }
 
 /// Stage C 网络子栈（最小 owned container；非 factory / provider / framework）。
@@ -209,6 +197,8 @@ pub struct NodeRuntime {
     driver: NodeConsensusDriver<DynSigner>,
     /// 可选网络子栈（Stage C；`start` ⇒ `None`）。
     network_stack: Option<NetworkStack>,
+    /// 静态 configured connection targets（STEP 10-19-10-B7-A3；来自 `config.peers`）。
+    configured_targets: Vec<ConnectionTarget>,
     /// validator 元数据（safety journal 路径；actor 本体在 driver）。full-node ⇒ `None`。
     validator_journal: Option<PathBuf>,
     /// step-driven proposer 出块的显式 timestamp（默认 0；无系统时钟；调用方可配置）。
@@ -313,20 +303,29 @@ impl NodeRuntime {
         };
 
         // Stage C：网络资产注入 ⇒ NetworkStack（identity → node_id → NetworkService）。
-        let network_stack = network_assets.map(|(transport, network_identity)| {
-            let self_id = network_identity.node_id();
-            let ns = NetworkService::new(
-                NetworkServiceConfig::default(),
-                self_id,
-                BoxTransport(transport),
-            );
-            let el = EventLoop::new(EventLoopConfig::default(), NodeConsensusHandler::new());
-            NetworkStack {
-                ns,
-                el,
-                signer: network_identity,
+        //   configured peers 校验（self / duplicate）在 dial 前启动时执行（fail-closed）；
+        //   NS 注入 TcpDialer（复用 D4 seam；Node 不直调 TcpTransport::dial）。
+        let network_stack = match network_assets {
+            Some((transport, network_identity)) => {
+                let self_id = network_identity.node_id();
+                config
+                    .validate_network_targets(self_id)
+                    .map_err(NodeRuntimeError::NetworkTarget)?;
+                let ns = NetworkService::new(
+                    NetworkServiceConfig::default(),
+                    self_id,
+                    BoxTransport::new(transport),
+                )
+                .with_dialer(Box::new(TcpDialer));
+                let el = EventLoop::new(EventLoopConfig::default(), NodeConsensusHandler::new());
+                Some(NetworkStack {
+                    ns,
+                    el,
+                    signer: network_identity,
+                })
             }
-        });
+            None => None,
+        };
 
         // 协议参数（block inbound size 上限；来自 genesis；只读）。
         let max_block_bytes = genesis.protocol_parameters.max_block_bytes as usize;
@@ -337,6 +336,7 @@ impl NodeRuntime {
             block_production,
             driver,
             network_stack,
+            configured_targets: config.peers.clone(),
             validator_journal,
             proposal_timestamp: 0,
             last_proposal: None,
@@ -455,6 +455,38 @@ impl NodeRuntime {
     /// NodeId 来自网络 key pubkey（≠ ValidatorId；Network/Validator identity 分离）。
     pub fn network_node_id(&self) -> Option<NodeId> {
         self.network_stack.as_ref().map(NetworkStack::node_id)
+    }
+
+    /// 连接第一个 configured connection target（STEP 10-19-10-B7-A3；single-active）。
+    ///
+    /// - 无网络栈 / 无 configured peers / 已有 active connection ⇒ `Ok(None)`（幂等）。
+    /// - 配置校验（self / duplicate）已在启动（`start_with_network`）时 fail-closed；此处直接
+    ///   dial `configured_targets[0]`（ordered；不并发 / 不多连接）。
+    /// - 成功 ⇒ `Ok(Some(peer_id))`（仅 `Connected`；**不 handshake / 不 Established**）。
+    /// - dial 失败 ⇒ `Err(NetworkDial(..))`（不自动 retry / 不自动换 peer / 不自动 next）。
+    pub fn connect_configured_peer(&mut self) -> Result<Option<NodeId>, RuntimeError> {
+        if self.configured_targets.is_empty() {
+            return Ok(None);
+        }
+        let max_frame = {
+            let Some(stack) = &self.network_stack else {
+                return Ok(None);
+            };
+            if stack.ns.connected_peer_count() > 0 {
+                // single-active：已有 active connection（不重连 / 不静默替换）。
+                return Ok(None);
+            }
+            stack.ns.config().max_msg_bytes
+        };
+        let t = self.configured_targets[0];
+        let Some(stack) = &mut self.network_stack else {
+            return Ok(None);
+        };
+        stack
+            .ns
+            .dial_peer(t.address, t.peer_id, max_frame, None)
+            .map_err(RuntimeError::NetworkDial)?;
+        Ok(Some(t.peer_id))
     }
 
     /// 取走 Driver 验证 PASS 后待广播的 consensus outbound **semantic**（手动提取 / 测试用；
@@ -601,6 +633,7 @@ impl NodeRuntime {
             block_production,
             driver,
             network_stack,
+            configured_targets: _,
             validator_journal: _,
             proposal_timestamp: _,
             last_proposal: _,

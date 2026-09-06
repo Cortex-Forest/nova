@@ -153,6 +153,7 @@ impl TestNode {
             validator_enabled: false,
             safety_dir: self.dir.join("safety"),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::default(),
+            peers: Vec::new(),
         }
     }
 }
