@@ -20,7 +20,8 @@ use nova_crypto::identity::{
     AccountInit, ChainIdentity, GenesisError, GenesisV1, decode_genesis_bytes,
     validate_genesis_with_expected,
 };
-use nova_runtime::{AccountChange, KeyResolver};
+use nova_runtime::{AccountChange, BlockPipelineError, KeyResolver};
+use nova_storage::block_store::BlockStore;
 use nova_storage::error::StorageError;
 use nova_storage::head::HeadRecord;
 use nova_storage::persistent::PersistentBackend;
@@ -28,7 +29,7 @@ use nova_storage::state_root::calculate_state_root;
 use nova_storage::store::StateStore;
 use nova_storage::trie::EMPTY_STATE_ROOT;
 
-use crate::block_adapter::{ChainHead, NodeBlockAdapter};
+use crate::block_adapter::{ChainHead, NodeBlockAdapter, NodeBlockApplicationError};
 use crate::key_provider::KeyProviderConfig;
 
 /// 节点启动配置（F-3 最小；Node-local，非协议）。
@@ -121,7 +122,10 @@ pub fn start<R: KeyResolver>(
     };
 
     // 4. 参数提取 + 适配器构造（全部来自 genesis；Node 不自行决定）。
-    Ok(NodeBlockAdapter::new(
+    //    同时装配 BlockStore（canonical block commit；chain storage 目录下 blocks/ 子目录）。
+    let block_store =
+        BlockStore::open(&config.storage_dir.join("blocks")).map_err(NodeStartupError::Storage)?;
+    let adapter = NodeBlockAdapter::with_block_store(
         store,
         resolver,
         identity.chain_id,
@@ -130,7 +134,17 @@ pub fn start<R: KeyResolver>(
         genesis.economics_parameters.fee_burn_bps,
         head,
         identity.network_id,
-    ))
+        Some(block_store),
+    );
+    // 恢复一致性（BC-1/R-2..R-4）：重启后 head 指向的 canonical block 必须存在且与 head 一致；
+    // 缺失 / 损坏 / mismatch ⇒ fail closed（不自动跳过 / 不静默恢复）。
+    adapter.verify_committed_head_block().map_err(|e| {
+        NodeStartupError::Storage(match e {
+            NodeBlockApplicationError::Pipeline(BlockPipelineError::Storage(s)) => s,
+            _ => StorageError::CorruptedState,
+        })
+    })?;
+    Ok(adapter)
 }
 
 /// genesis 文件 → decode → validate（expected hash / chain_id / network_id）。任一失败 ⇒ `Err`。

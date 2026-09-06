@@ -15,6 +15,8 @@ use nova_runtime::{
     validate_height_parent, validate_transaction_root,
 };
 use nova_storage::backend::StorageBackend;
+use nova_storage::block_store::BlockStore;
+use nova_storage::error::StorageError;
 use nova_storage::head::HeadRecord;
 use nova_storage::node::NodeHash;
 use nova_storage::store::StateStore;
@@ -99,10 +101,13 @@ pub struct NodeBlockAdapter<B: StorageBackend + Clone, R: KeyResolver> {
     max_gas_per_block: u64,
     fee_burn_bps: u16,
     head: ChainHead,
+    /// canonical block commit：`Some` 时 `apply_block` 将 block durable-first 持久化（crash-consistent）。
+    block_store: Option<BlockStore>,
 }
 
 impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
     /// 构造适配器（Node 负责提供 store / resolver / 运行参数 / 初始 head）。
+    /// **无 block storage**：`apply_block` 不持久化 block（遗留 / 直接测试路径）。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: StateStore<B>,
@@ -114,6 +119,33 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
         head: ChainHead,
         network_id: NetworkId,
     ) -> Self {
+        Self::with_block_store(
+            store,
+            resolver,
+            chain_id,
+            genesis_hash,
+            max_gas_per_block,
+            fee_burn_bps,
+            head,
+            network_id,
+            None,
+        )
+    }
+
+    /// 构造适配器并注入 [`BlockStore`]（**canonical block commit**：`apply_block` 将 block
+    /// durable-first 持久化，随后 state + head 同批；recovery 校验 head 指向 block 存在且一致）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_block_store(
+        store: StateStore<B>,
+        resolver: R,
+        chain_id: u64,
+        genesis_hash: [u8; 32],
+        max_gas_per_block: u64,
+        fee_burn_bps: u16,
+        head: ChainHead,
+        network_id: NetworkId,
+        block_store: Option<BlockStore>,
+    ) -> Self {
         Self {
             store,
             resolver,
@@ -123,7 +155,18 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
             max_gas_per_block,
             fee_burn_bps,
             head,
+            block_store,
         }
+    }
+
+    /// 注入 / 替换 block storage（`Some` = 启用 canonical block commit 持久化）。
+    pub fn set_block_store(&mut self, block_store: Option<BlockStore>) {
+        self.block_store = block_store;
+    }
+
+    /// 当前 block storage（canonical block commit 启用时 `Some`）。
+    pub fn block_store(&self) -> Option<&BlockStore> {
+        self.block_store.as_ref()
     }
 
     /// 当前 head（只读）。
@@ -171,6 +214,13 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
     ) -> Result<ChainHead, NodeBlockApplicationError> {
         // ① decode
         let block = decode_block(wire)?;
+        let new_hash = block_hash(&block)
+            .map_err(|e| NodeBlockApplicationError::Pipeline(BlockPipelineError::Decode(e)))?;
+        // ①a already-committed（canonical commit 路径）：该 block 已为 head ⇒ 幂等返回，
+        //    不重复执行 / 不重复推进（BC-4/BC-6；idempotent）。
+        if self.block_store.is_some() && self.head.block_hash == new_hash {
+            return Ok(self.head.clone());
+        }
         // ② proposer signature（A11 DEFERRED：仅对给定 key 验证，无 membership）
         validate_block_signature(&block, proposer_vk, self.chain_id)?;
         // ③ transaction root
@@ -201,10 +251,14 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
             parent_hash: self.head.block_hash,
         };
         validate_height_parent(&block, &parent)?;
-        // ⑥ 提交前：构造 HeadRecord 并入队（head 与 state 同批共持久化；ADR-0048 OD-7 PRIMARY）。
+        // ⑥a block durable first（crash-consistent：canonical block 先落盘；state+head 批在后）。
+        //    - 后续 state commit 失败 ⇒ orphan block 允许存在（R-1），但 head 不推进（BC 保证）。
+        if let Some(bs) = &self.block_store {
+            bs.put(&block)
+                .map_err(|e| NodeBlockApplicationError::Pipeline(BlockPipelineError::Storage(e)))?;
+        }
+        // ⑥b 提交前：构造 HeadRecord 并入队（head 与 state 同批共持久化；ADR-0048 OD-7 PRIMARY）。
         // head.state_root = header.state_root（④ 已验证 == 计算 root == commit root，ADR-0030 C-3）。
-        let new_hash = block_hash(&block)
-            .map_err(|e| NodeBlockApplicationError::Pipeline(BlockPipelineError::Decode(e)))?;
         let head_height = self
             .head
             .height
@@ -230,6 +284,41 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
         };
         self.head = next.clone();
         Ok(next)
+    }
+
+    /// 恢复校验：canonical head 指向的 Block 必须存在于 [`BlockStore`] 且与 head 一致（BC-1/R-2..R-4）。
+    ///
+    /// 仅 `block_store` 启用时校验；`head.height == 0`（genesis head —— 非 BlockV1，无 block 实体）
+    /// 或未启用 block storage ⇒ `Ok`（跳过）。
+    ///
+    /// 校验链（任何 mismatch ⇒ [`StorageError::CorruptedState`] fail-closed，不自动跳过）：
+    /// - block 存在（`BlockStore.get` 已 strict decode + `block_hash` 重算 == head.block_hash）；
+    /// - `block.header.height == head.height`；
+    /// - `block.header.state_root == head.state_root`（BC-2）；
+    /// - `block.header.parent_hash == head.parent_hash`（BC 一致性）。
+    pub fn verify_committed_head_block(&self) -> Result<(), NodeBlockApplicationError> {
+        let head = &self.head;
+        if head.height == 0 {
+            return Ok(()); // genesis head：无 BlockV1 实体
+        }
+        let Some(bs) = &self.block_store else {
+            return Ok(()); // 未启用 block storage：无 block 可校验（遗留路径）
+        };
+        let block = bs
+            .get(&head.block_hash)
+            .map_err(|e| NodeBlockApplicationError::Pipeline(BlockPipelineError::Storage(e)))?
+            .ok_or(NodeBlockApplicationError::Pipeline(
+                BlockPipelineError::Storage(StorageError::CorruptedState),
+            ))?;
+        if block.header.height != head.height
+            || block.header.state_root != *head.state_root.as_bytes()
+            || block.header.parent_hash != head.parent_hash
+        {
+            return Err(NodeBlockApplicationError::Pipeline(
+                BlockPipelineError::Storage(StorageError::CorruptedState),
+            ));
+        }
+        Ok(())
     }
 
     /// 解析 block 内全部 sender key；任一未知 ⇒ 整块拒绝（禁止 skip）。
@@ -798,5 +887,113 @@ mod tests {
             "rollback: state root unchanged"
         );
         assert_eq!(adapter.head(), &head_before, "head unchanged");
+    }
+
+    /// 临时 block 存储目录（test-only）。
+    fn temp_block_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static C: AtomicU64 = AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "nova_ba_bs_{}_{}",
+            std::process::id(),
+            C.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// BC-TEST-15：block durable（BlockStore.put）后 state commit 失败 ⇒ head 不推进；
+    /// orphan block 允许存在（R-1），但不得成为 canonical head。
+    #[test]
+    fn bc_15_block_durable_then_state_failure_head_unchanged() {
+        let chain_id = 1001;
+        let genesis_hash = [0xaa; 32];
+        let max_gas = 1_000_000;
+        let kp = KeyPair::generate().unwrap();
+        let sender = NovaAddress::from_verifying_key(
+            kp.verifying_key(),
+            AddressType::UserAccount,
+            NetworkId::Mainnet,
+        )
+        .unwrap();
+        let receiver = addr([0xbb; 32]);
+        let registry = MemoryKeyRegistry::with([(sender, *kp.verifying_key())]);
+
+        // fail_after=2：genesis（1 put）后真实 store puts=1；④ clone 重算全过；⑥ 第 2 put 失败。
+        let backend = FailAfterBackend {
+            inner: MemoryBackend::new(),
+            fail_after: 2,
+            puts: 0,
+        };
+        let mut store = StateStore::new(backend);
+        store
+            .apply(&[nova_runtime::AccountChange {
+                address: sender,
+                new_balance: 1_000_000,
+                new_nonce: 0,
+                created: true,
+            }])
+            .unwrap();
+        let genesis_root = store.state_root();
+        let head = ChainHead::genesis(genesis_hash, genesis_root);
+        let bs = BlockStore::open(&temp_block_dir()).unwrap();
+        let mut adapter = NodeBlockAdapter::with_block_store(
+            store,
+            registry,
+            chain_id,
+            genesis_hash,
+            max_gas,
+            0,
+            head,
+            NetworkId::Mainnet,
+            Some(bs),
+        );
+        let root_before = adapter.store().state_root();
+        let head_before = adapter.head().clone();
+
+        // 期望 root：用同 genesis 的 MemoryBackend 孪生计算（与 execution 语义一致）
+        let mut twin = StateStore::new(MemoryBackend::new());
+        twin.apply(&[nova_runtime::AccountChange {
+            address: sender,
+            new_balance: 1_000_000,
+            new_nonce: 0,
+            created: true,
+        }])
+        .unwrap();
+        let tx = signed_tx(sender, receiver, 0, 100, kp.signing_key(), chain_id);
+        let parent = ParentContext {
+            parent_height: 0,
+            parent_hash: genesis_hash,
+        };
+        let expected_root = expected_state_root(&twin, &tx, 1_000_000, 0, false, 0, 0);
+        let block = make_valid_block(chain_id, 1, &parent, tx, expected_root, &kp);
+        let block_hash = nova_runtime::block_hash(&block).unwrap();
+        let wire = encode_block(&block).unwrap();
+
+        // ⑥a BlockStore.put 成功（block durable）→ ⑥b state commit 失败 ⇒ Err + head/state 不变。
+        let err = adapter.apply_block(&wire, kp.verifying_key()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NodeBlockApplicationError::Pipeline(BlockPipelineError::Storage(
+                    StorageError::BackendFailure
+                ))
+            ),
+            "state commit failure surfaces as Storage"
+        );
+        assert_eq!(adapter.store().state_root(), root_before, "state unchanged");
+        assert_eq!(adapter.head(), &head_before, "head unchanged (未推进)");
+        // orphan block 已 durable（R-1：允许存在；不 canonical）
+        assert!(
+            adapter
+                .block_store()
+                .unwrap()
+                .contains(&block_hash)
+                .unwrap(),
+            "block durable（orphan，允许）"
+        );
+        // 恢复校验不因 orphan 而错误推进（head 仍 genesis ⇒ verify Ok）
+        adapter.verify_committed_head_block().unwrap();
+        assert_eq!(adapter.head(), &head_before, "verify 不推进 head");
     }
 }
