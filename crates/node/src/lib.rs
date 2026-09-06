@@ -75,6 +75,12 @@ pub mod block_builder;
 /// finality-authorized（finality→commit 归未来 STEP）。
 pub mod block_inbound;
 
+/// Node-level Block Inbound Dispatch（STEP 10-19-10-A）：GossipBlock / SyncBlockResponse
+/// payload → adapter 真实只读上下文 → `block_inbound::validate_block_inbound` → typed verdict。
+/// **只读观测**：不 commit / 不写 BlockStore / 不推进 ChainHead；CanonicalNextCandidate 非
+/// finality-authorized。wire 收集 seam 在 `wiring::NodeConsensusHandler`。
+pub mod block_dispatch;
+
 /// Node-local Proposer orchestration（STEP 10-19-2）：ProposalRef 装配（ADR-0050 `select_proposer`
 /// 判定 + deterministic placeholder commitment）；ProposerService ≠ BlockBuilder / ValidatorActor /
 /// NetworkService / Storage / ConsensusState。

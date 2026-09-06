@@ -74,6 +74,22 @@ pub enum NodeConsensusCommand {
     InboundQc(QuorumCertificate),
 }
 
+/// Node 层 block inbound 消息（STEP 10-19-10-A；**只收集 payload，不做语义验证**）。
+///
+/// 由 NetworkService classify 出的 `GossipBlock` / `SyncBlockResponse` NetworkEvent 转成 owned
+/// payload，经本队列交给 Runtime / dispatch 层（`block_inbound::validate_block_inbound` seam）。
+/// - `GossipBlock(payload)`：payload = 单个 BlockV1 wire（`encode_block` 输出）。
+/// - `SyncBlockResponse(payload)`：payload = `SyncBlockResponse` codec（decode 在 dispatch 层）。
+/// - 本枚举不 decode / 不验证 / 不 commit —— 只搬运 Network → Node dispatch seam。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockInboundMessage {
+    GossipBlock(Vec<u8>),
+    SyncBlockResponse(Vec<u8>),
+}
+
+/// block inbound 队列有界容量（Node-local；满 ⇒ drop + 计数，防无界内存）。
+const BLOCK_INBOUND_CAP: usize = 256;
+
 /// Node 层 EventLoop handler（Option A）：decode/classify → command queue。
 ///
 /// **不拥有 / 不引用** Driver / Runtime / NetworkService / Transport / NetworkSigner /
@@ -82,14 +98,20 @@ pub struct NodeConsensusHandler {
     commands: VecDeque<NodeConsensusCommand>,
     /// 非 consensus 事件计数（Ping/gossip/sync/status/timer/block…；future handler seam）。
     non_consensus_seen: u64,
+    /// block inbound payload 队列（GossipBlock / SyncBlockResponse；bounded）。
+    block_inbound: VecDeque<BlockInboundMessage>,
+    /// 因队列满而 drop 的 block inbound payload 数。
+    block_inbound_dropped: u64,
 }
 
 impl NodeConsensusHandler {
-    /// 构造（空 command 队列）。
+    /// 构造（空 command / block 队列）。
     pub fn new() -> Self {
         Self {
             commands: VecDeque::new(),
             non_consensus_seen: 0,
+            block_inbound: VecDeque::new(),
+            block_inbound_dropped: 0,
         }
     }
 
@@ -106,6 +128,31 @@ impl NodeConsensusHandler {
     /// 取走全部待处理 command（FIFO；owned；同步；deterministic）。
     pub fn take_commands(&mut self) -> Vec<NodeConsensusCommand> {
         self.commands.drain(..).collect()
+    }
+
+    /// block inbound 队列当前深度。
+    pub fn block_inbound_len(&self) -> usize {
+        self.block_inbound.len()
+    }
+
+    /// 因队列满而 drop 的 block inbound payload 数（诊断）。
+    pub fn block_inbound_dropped(&self) -> u64 {
+        self.block_inbound_dropped
+    }
+
+    /// 取走全部待处理 block inbound payload（FIFO；owned）。消费方（Runtime / dispatch）负责
+    /// 用 `block_inbound::validate_block_inbound` seam 处理；本 handler **不验证 / 不 commit**。
+    pub fn take_block_inbound(&mut self) -> Vec<BlockInboundMessage> {
+        self.block_inbound.drain(..).collect()
+    }
+
+    /// 收集一条 block inbound payload（bounded：满 ⇒ drop + 计数）。
+    fn collect_block_inbound(&mut self, msg: BlockInboundMessage) {
+        if self.block_inbound.len() >= BLOCK_INBOUND_CAP {
+            self.block_inbound_dropped += 1;
+            return;
+        }
+        self.block_inbound.push_back(msg);
     }
 
     // ---------- decode/classify（无 driver / 无 verify） ----------
@@ -149,8 +196,21 @@ impl EventHandler for NodeConsensusHandler {
             NodeEvent::Network(NetworkEvent::ConsensusQc { payload, .. }) => {
                 self.decode_qc(payload)
             }
-            // 非 consensus：gossip/sync/status/handshake/ping/pong/timer/internal/block ——
-            // future handler seam；不产生 command（尤其 Block Sync 不得借 ConsensusNode 伪装）。
+            // STEP 10-19-10-A：block inbound（GossipBlock / SyncBlockResponse）→ Node dispatch
+            // 队列（payload opaque 收集；语义验证在 dispatch/block_inbound seam —— 非本 handler）。
+            // 仍计入 non_consensus（保持既有计数语义）；另存 payload 供 Runtime 消费。
+            NodeEvent::Network(NetworkEvent::GossipBlock { payload, .. }) => {
+                self.non_consensus_seen += 1;
+                self.collect_block_inbound(BlockInboundMessage::GossipBlock(payload.clone()));
+                Ok(())
+            }
+            NodeEvent::Network(NetworkEvent::SyncBlockResponse { payload, .. }) => {
+                self.non_consensus_seen += 1;
+                self.collect_block_inbound(BlockInboundMessage::SyncBlockResponse(payload.clone()));
+                Ok(())
+            }
+            // 其它非 consensus：status/handshake/ping/pong/timer/internal/block —— future
+            // handler seam；不产生 command（尤其 Block Sync 不得借 ConsensusNode 伪装）。
             _ => {
                 self.non_consensus_seen += 1;
                 Ok(())

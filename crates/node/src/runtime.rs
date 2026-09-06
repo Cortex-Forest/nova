@@ -18,6 +18,7 @@
 //!   **目录分离**，绝不混用；SafetyStore recover 失败 = validator mode 启动失败（fail closed）。
 //! - full-node（`validator_enabled=false`）：跳过 key / safety / validator，不触碰 Provider。
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use nova_consensus::dag::Dag;
@@ -33,6 +34,8 @@ use nova_storage::persistent::PersistentBackend;
 
 use crate::assembly::ConsensusNode;
 use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter};
+use crate::block_dispatch::{dispatch_gossip_block, dispatch_sync_block_response};
+use crate::block_inbound::{InboundBlockError, InboundBlockVerdict};
 use crate::bootstrap::{self, NodeConfig, NodeStartupError};
 use crate::driver::{DriverError, NodeConsensusDriver};
 use crate::key_provider::{KeyProvider, KeyProviderError};
@@ -42,10 +45,15 @@ use crate::proposer::{ProposalBuild, ProposerError, build_proposal};
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
 use crate::validator::{ValidatorActor, ValidatorActorError};
-use crate::wiring::{NodeConsensusCommand, NodeConsensusHandler, process_command};
+use crate::wiring::{
+    BlockInboundMessage, NodeConsensusCommand, NodeConsensusHandler, process_command,
+};
 
 /// ValidatorActor 的签名能力类型（Phase 1：trait object）。
 type DynSigner = Box<dyn SigningCapability>;
+
+/// block inbound 观测队列有界容量（Node-local；满则丢最早 —— 不累积无限历史）。
+const BLOCK_INBOUND_OUTCOME_CAP: usize = 128;
 
 /// Node-local proposer step（STEP 10-19-6 OPT-1）：本节点为当前 proposer 时经真实 BlockBuilder
 /// 产出 Block + ProposalRef → submit ProposalRef。
@@ -203,6 +211,14 @@ pub struct NodeRuntime {
     proposal_timestamp: u64,
     /// 最近一次本地出块产物（本地保留；不持久化 / 不推进 head）。
     last_proposal: Option<ProposalBuild>,
+    /// 协议最大块字节（来自 genesis `protocol_parameters`；block inbound validation 上限；
+    /// 不修改协议参数 —— 只读供 `block_dispatch` context 使用）。
+    max_block_bytes: usize,
+    /// block inbound dispatch 的 typed 观测（STEP 10-19-10-A；bounded，满则丢最早）。
+    /// 只读验证结果；**不 commit / 不写存储 / 不推进 head**。
+    block_inbound_outcomes: VecDeque<Result<InboundBlockVerdict, InboundBlockError>>,
+    /// 无 canonical 上下文（full-node / 无 adapter）而跳过的 block inbound payload 数。
+    block_inbound_skipped: u64,
 }
 
 impl NodeRuntime {
@@ -305,6 +321,9 @@ impl NodeRuntime {
             }
         });
 
+        // 协议参数（block inbound size 上限；来自 genesis；只读）。
+        let max_block_bytes = genesis.protocol_parameters.max_block_bytes as usize;
+
         Ok(Self {
             chain_identity: identity,
             chain_storage,
@@ -314,6 +333,9 @@ impl NodeRuntime {
             validator_journal,
             proposal_timestamp: 0,
             last_proposal: None,
+            max_block_bytes,
+            block_inbound_outcomes: VecDeque::new(),
+            block_inbound_skipped: 0,
         })
     }
 
@@ -376,6 +398,27 @@ impl NodeRuntime {
     /// 最近一次本地出块产物（本地保留；不持久化 / 不推进 head）。
     pub fn last_proposal(&self) -> Option<&ProposalBuild> {
         self.last_proposal.as_ref()
+    }
+
+    /// 取走 block inbound dispatch 观测（STEP 10-19-10-A；FIFO；bounded）。
+    ///
+    /// 每项 = `Ok(verdict)`（含 `CanonicalNextCandidate` 等分类）或 `Err(reason)`
+    /// （`Oversized`/`Malformed`/`WrongChain`/…/`UnsupportedValidation`）。
+    /// 只读观测：**不 commit / 不写存储 / 不推进 head**。
+    pub fn take_block_inbound_outcomes(
+        &mut self,
+    ) -> Vec<Result<InboundBlockVerdict, InboundBlockError>> {
+        self.block_inbound_outcomes.drain(..).collect()
+    }
+
+    /// 当前 block inbound 观测深度。
+    pub fn block_inbound_outcome_len(&self) -> usize {
+        self.block_inbound_outcomes.len()
+    }
+
+    /// 无 canonical 上下文（full-node）而跳过的 block inbound payload 计数。
+    pub fn block_inbound_skipped(&self) -> u64 {
+        self.block_inbound_skipped
     }
 
     /// 显式设置 step-driven 出块 timestamp（无系统时钟；默认 0；确定性由调用方保证）。
@@ -465,6 +508,31 @@ impl NodeRuntime {
         for command in commands {
             process_command(&mut self.driver, command).map_err(RuntimeError::Driver)?;
         }
+        // STEP 10-19-10-A：Node-level block inbound dispatch —— wiring 收集的 GossipBlock /
+        // SyncBlockResponse payload → block_inbound validator（只读）→ typed verdict 观测。
+        // 不 commit / 不写存储 / 不推进 head（CanonicalNextCandidate 非 finality-authorized）。
+        let block_msgs = stack.el.handler_mut().take_block_inbound();
+        for msg in block_msgs {
+            let outcomes = match (&self.block_production, msg) {
+                (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => {
+                    vec![dispatch_gossip_block(adapter, self.max_block_bytes, &wire)]
+                }
+                (Some(adapter), BlockInboundMessage::SyncBlockResponse(payload)) => {
+                    dispatch_sync_block_response(adapter, self.max_block_bytes, &payload)
+                }
+                (None, _) => {
+                    // full-node / 无 canonical adapter：无法验证（无 state/head 上下文）→ 丢弃并计数。
+                    self.block_inbound_skipped += 1;
+                    Vec::new()
+                }
+            };
+            for outcome in outcomes {
+                if self.block_inbound_outcomes.len() >= BLOCK_INBOUND_OUTCOME_CAP {
+                    self.block_inbound_outcomes.pop_front();
+                }
+                self.block_inbound_outcomes.push_back(outcome);
+            }
+        }
         // STEP 10-19-6 OPT-1：node-local proposer orchestration —— 仅本节点为当前 proposer 且
         // 阶段 Propose 且本轮未提案时，经 BlockBuilder 产出真实 Block + ProposalRef 并提交；
         // 否则幂等 no-op。不自动投票（vote 仍走既有路径）。
@@ -508,6 +576,9 @@ impl NodeRuntime {
             validator_journal: _,
             proposal_timestamp: _,
             last_proposal: _,
+            max_block_bytes: _,
+            block_inbound_outcomes: _,
+            block_inbound_skipped: _,
         } = self;
 
         if let Some(mut stack) = network_stack {
