@@ -4,7 +4,8 @@
 //! 固定启动顺序：`Config → Genesis → ChainIdentity 校验 → chain storage →（validator mode）
 //! KeyProvider → derive ValidatorId → SafetyStore open → strict recover → ValidatorActor →
 //! ConsensusNode → NodeConsensusDriver`（STEP 10-18I-C：Runtime 经 [`crate::driver::NodeConsensusDriver`]
-//! 持有 ConsensusNode + ValidatorActor；Network / EventLoop / NetworkIdentity 为 future 占位）。
+//! 持有 ConsensusNode + ValidatorActor）。Stage C（STEP 10-18I-G）：Network / EventLoop /
+//! NetworkIdentity 以可选 `NetworkStack` 装配（`start` = 网络 disabled；`start_with_network` = 启用）。
 //!
 //! # 边界
 //! - [`NodeRuntime`] **拥有生命周期**（组件创建顺序 / 注入），但：
@@ -22,16 +23,24 @@ use std::path::PathBuf;
 use nova_consensus::dag::Dag;
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_crypto::identity::ChainIdentity;
+use nova_network::event_loop::{EventLoop, EventLoopConfig, EventLoopError};
+use nova_network::message::NetworkError;
+use nova_network::network_service::{NetworkService, NetworkServiceConfig};
+use nova_network::node_id::NodeId;
+use nova_network::transport::Transport;
+use nova_storage::error::StorageError;
 use nova_storage::persistent::PersistentBackend;
 
 use crate::assembly::ConsensusNode;
 use crate::bootstrap::{self, NodeConfig, NodeStartupError};
 use crate::driver::{DriverError, NodeConsensusDriver};
 use crate::key_provider::{KeyProvider, KeyProviderError};
+use crate::network_identity::NetworkSigner;
+use crate::outbound::OutboundConsensusMessage;
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
 use crate::validator::{ValidatorActor, ValidatorActorError};
-use crate::wiring::{NodeConsensusCommand, process_command};
+use crate::wiring::{NodeConsensusCommand, NodeConsensusHandler, process_command};
 
 /// ValidatorActor 的签名能力类型（Phase 1：trait object）。
 type DynSigner = Box<dyn SigningCapability>;
@@ -49,6 +58,56 @@ pub enum NodeRuntimeError {
     Safety(ValidatorSafetyError),
     /// ValidatorActor 构造 / 恢复失败（含 identity mismatch）。
     Validator(ValidatorActorError),
+}
+
+/// Runtime 运行期错误（Stage C `step`；分层、不吞错、不改底层语义）。
+#[derive(Debug)]
+pub enum RuntimeError {
+    /// EventLoop / Network 错误（poll/dispatch 层；NS 错误经 `EventLoopError::Network` 内嵌）。
+    EventLoop(EventLoopError),
+    /// Driver 验证 / transition 门面失败（与网络错误分层 —— 不伪装成 NetworkError）。
+    Driver(DriverError),
+}
+
+/// Runtime 关闭错误（Stage C `shutdown`；仅 Storage 可失败 ——
+/// EventLoop/NetworkService shutdown 均 infallible，Driver 无显式 shutdown）。
+#[derive(Debug)]
+pub enum ShutdownError {
+    /// ChainStorage 关闭失败（`PersistentBackend::close`）。
+    Storage(StorageError),
+}
+
+/// 最小 trait-object transport 适配（Stage C）：使 `Box<dyn Transport>` 满足 `Transport`
+/// bound（network crate 不提供 blanket impl；**不修改** network crate）。
+/// 非 speculative abstraction —— 必要 trait-object 适配（D1 冻结：Runtime 组合层类型擦除）。
+struct BoxTransport(Box<dyn Transport>);
+
+impl Transport for BoxTransport {
+    fn send(&mut self, peer: &NodeId, message: Vec<u8>) -> Result<(), NetworkError> {
+        self.0.send(peer, message)
+    }
+
+    fn try_recv(&mut self) -> Result<Option<(NodeId, Vec<u8>)>, NetworkError> {
+        self.0.try_recv()
+    }
+}
+
+/// Stage C 网络子栈（最小 owned container；非 factory / provider / framework）。
+///
+/// - `ns`：网络状态 owner（own `Transport` / peers / queues；内部经 `Box<dyn Transport>` 注入）。
+/// - `el`：dispatch-only（own handler / queue / timer；**不拥有** `ns` —— poll 经注入借用）。
+/// - `signer`：网络身份（NodeId + envelope 签名；与 validator identity 分离）。
+struct NetworkStack {
+    ns: NetworkService<BoxTransport>,
+    el: EventLoop<NodeConsensusHandler>,
+    signer: Box<dyn NetworkSigner>,
+}
+
+impl NetworkStack {
+    /// 本网络身份 NodeId（= 网络 key pubkey；≠ ValidatorId）。
+    fn node_id(&self) -> NodeId {
+        self.signer.node_id()
+    }
 }
 
 /// 单验证者只读 **compatibility view**（STEP 10-18I-C；非 owning）。
@@ -77,29 +136,60 @@ impl ValidatorView<'_> {
     }
 }
 
-/// 生产节点生命周期装配根（STEP 10-16 Phase 1 骨架；STEP 10-18I-C ownership migration）。
+/// 生产节点生命周期装配根（STEP 10-16 Phase 1 骨架；STEP 10-18I-C ownership migration；
+/// STEP 10-18I-G Stage C Full Composition）。
 ///
 /// - **ConsensusNode + ValidatorActor 的实际 ownership 在 [`NodeConsensusDriver`]**（`driver` 字段）；
 ///   Runtime **不再**独立持有 ConsensusNode / ValidatorActor（避免 duplication，ADR-0057）。
-/// - Runtime 只负责 composition / lifecycle / accessor delegation。
+/// - 网络（NetworkService / EventLoop / NetworkSigner）以可选 [`NetworkStack`] 装配：
+///   `start()` ⇒ `None`（网络 disabled，不生成网络身份）；`start_with_network()` ⇒ `Some`。
+/// - Runtime 只负责 composition / lifecycle / accessor delegation（最终 lifecycle coordinator）。
 pub struct NodeRuntime {
     chain_identity: ChainIdentity,
     chain_storage: PersistentBackend,
     driver: NodeConsensusDriver<DynSigner>,
+    /// 可选网络子栈（Stage C；`start` ⇒ `None`）。
+    network_stack: Option<NetworkStack>,
     /// validator 元数据（safety journal 路径；actor 本体在 driver）。full-node ⇒ `None`。
     validator_journal: Option<PathBuf>,
 }
 
 impl NodeRuntime {
-    /// 启动：固定顺序（§模块 doc）。任何安全失败 ⇒ `Err`（fail closed）。
-    ///
-    /// - `key_provider`：validator mode 时**必须**提供（None ⇒ `KeyNotProvisioned`）；
-    ///   full-node 时忽略。
-    /// - SafetyStore 打开 / recover 仍在 Runtime lifecycle（`build_validator`）；
-    ///   Driver 只接收已构造好的 `ConsensusNode` + `ValidatorActor(s)`。
+    /// 启动（网络 disabled）：Consensus + Storage（+ validator）正常启动；**不**装配
+    /// NetworkStack（不生成网络身份）。行为与 Stage C 前完全兼容。
     pub fn start(
         config: &NodeConfig,
         key_provider: Option<&dyn KeyProvider>,
+    ) -> Result<Self, NodeRuntimeError> {
+        Self::start_inner(config, key_provider, None)
+    }
+
+    /// 启动（Stage C Full Composition）：在 `start` 基础上注入网络 assets ——
+    /// `transport: Box<dyn Transport>`（MemoryTransport test/dev；未来 production adapter 注入）
+    /// 与 `network_identity: Box<dyn NetworkSigner>`（网络身份；**不得**用 validator key）。
+    ///
+    /// 顺序保证：`NetworkIdentity → node_id() → NetworkService::new(self_id, transport)`；
+    /// `NodeId = NetworkSigner::node_id()`（≠ ValidatorId）。
+    pub fn start_with_network(
+        config: &NodeConfig,
+        key_provider: Option<&dyn KeyProvider>,
+        transport: Box<dyn Transport>,
+        network_identity: Box<dyn NetworkSigner>,
+    ) -> Result<Self, NodeRuntimeError> {
+        Self::start_inner(config, key_provider, Some((transport, network_identity)))
+    }
+
+    /// 内部启动：固定顺序（§模块 doc）。任何安全失败 ⇒ `Err`（fail closed）。
+    ///
+    /// - `key_provider`：validator mode 时**必须**提供（None ⇒ `KeyNotProvisioned`）；
+    ///   full-node 时忽略。
+    /// - `network_assets`：`Some((transport, network_identity))` ⇒ 装配 NetworkStack。
+    /// - SafetyStore 打开 / recover 仍在 Runtime lifecycle（`build_validator`）；
+    ///   Driver 只接收已构造好的 `ConsensusNode` + `ValidatorActor(s)`。
+    fn start_inner(
+        config: &NodeConfig,
+        key_provider: Option<&dyn KeyProvider>,
+        network_assets: Option<(Box<dyn Transport>, Box<dyn NetworkSigner>)>,
     ) -> Result<Self, NodeRuntimeError> {
         // 2/3. Genesis + ChainIdentity validation（expected hash/chain/network）。
         let (genesis, identity) =
@@ -135,10 +225,27 @@ impl NodeRuntime {
             (driver, None)
         };
 
+        // Stage C：网络资产注入 ⇒ NetworkStack（identity → node_id → NetworkService）。
+        let network_stack = network_assets.map(|(transport, network_identity)| {
+            let self_id = network_identity.node_id();
+            let ns = NetworkService::new(
+                NetworkServiceConfig::default(),
+                self_id,
+                BoxTransport(transport),
+            );
+            let el = EventLoop::new(EventLoopConfig::default(), NodeConsensusHandler::new());
+            NetworkStack {
+                ns,
+                el,
+                signer: network_identity,
+            }
+        });
+
         Ok(Self {
             chain_identity: identity,
             chain_storage,
             driver,
+            network_stack,
             validator_journal,
         })
     }
@@ -197,6 +304,19 @@ impl NodeRuntime {
         &self.driver
     }
 
+    /// 网络身份 NodeId（`start_with_network` 启用时 `Some`）。
+    /// NodeId 来自网络 key pubkey（≠ ValidatorId；Network/Validator identity 分离）。
+    pub fn network_node_id(&self) -> Option<NodeId> {
+        self.network_stack.as_ref().map(NetworkStack::node_id)
+    }
+
+    /// 取走 Driver 验证 PASS 后待广播的 consensus outbound **semantic**。
+    /// 本阶段不 broadcast（production egress deferred）；由上层 / future egress 消费。
+    /// 网络 disabled 亦可调用（outbound 在 Driver，独立于 NetworkStack）。
+    pub fn take_consensus_outbound(&mut self) -> Vec<OutboundConsensusMessage> {
+        self.driver.take_outbound()
+    }
+
     /// consensus orchestration 入口（STEP 10-18I-D-A Option A）：把 node 层 consensus command
     /// （EventLoop → Handler decode queue → Runtime 承接）交给 Driver 的既有安全门面。
     /// - verify/decode/transition 门面 FAIL 原样以 `DriverError` 传出（不吞错、不改状态）。
@@ -229,6 +349,58 @@ impl NodeRuntime {
             journal_path: journal.as_path(),
             actor,
         })
+    }
+
+    /// 一轮运行时驱动（Stage C）：网络 disabled（`start`）⇒ `Ok(())`（不产生网络 identity）；
+    /// 启用网络（`start_with_network`）⇒ EventLoop poll NetworkService → dispatch →
+    /// Handler 产 **owned** `NodeConsensusCommand` → Runtime drain → `process_command` →
+    /// Driver（既有验证门面）→ ConsensusNode / ValidatorActor。
+    ///
+    /// borrow-safe：`poll_once` 临时借 `stack.el` + `stack.ns`（同栈内 disjoint 字段）；
+    /// `take_commands()` 返回 owned commands 后即释放 EventLoop 借用；随后才 `&mut self.driver`。
+    /// 无 `Handler → &mut Driver/Runtime`、无 self-reference（无 Rc/RefCell/Arc/unsafe/async）。
+    pub fn step(&mut self) -> Result<(), RuntimeError> {
+        let Some(stack) = &mut self.network_stack else {
+            return Ok(());
+        };
+        stack
+            .el
+            .poll_once(&mut stack.ns)
+            .map_err(RuntimeError::EventLoop)?;
+        let commands = stack.el.handler_mut().take_commands();
+        for command in commands {
+            process_command(&mut self.driver, command).map_err(RuntimeError::Driver)?;
+        }
+        Ok(())
+    }
+
+    /// 确定性生命周期终止（D2 冻结；**consuming** `self`）。
+    ///
+    /// 顺序（destructure 一次析构全部字段，显式顺序调用）：
+    /// EventLoop stop → NetworkService stop → Driver 生命周期结束（owns ConsensusNode +
+    /// ValidatorActor）→ `ChainStorage::close(self)`（最后；consuming）。
+    /// - 网络 disabled：跳过 EventLoop/NetworkService；仍 Driver drop + Storage close。
+    /// - `PersistentBackend::close` 是唯一可失败子调用 ⇒ `ShutdownError::Storage`。
+    /// - 不用 Option 化 Storage / Rc / Arc / Mutex / mem::replace（无绕 ownership workaround）。
+    pub fn shutdown(self) -> Result<(), ShutdownError> {
+        let Self {
+            chain_identity: _,
+            chain_storage,
+            driver,
+            network_stack,
+            validator_journal: _,
+        } = self;
+
+        if let Some(mut stack) = network_stack {
+            // EventLoop stop → NetworkService stop（独立 owner；EventLoop 不级联 NS）。
+            stack.el.shutdown();
+            stack.ns.shutdown();
+            // signer（Box<dyn NetworkSigner>）随 stack drop（无显式 shutdown）。
+        }
+        // Driver 生命周期结束（ConsensusNode + ValidatorActor drop；safety 已 durable journal）。
+        drop(driver);
+        // Storage 最后关闭（consuming）。
+        chain_storage.close().map_err(ShutdownError::Storage)
     }
 }
 
