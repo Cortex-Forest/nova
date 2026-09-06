@@ -87,12 +87,23 @@ pub mod block_dispatch;
 /// finality；纯 Node-local 观察状态。
 pub mod intent_ledger;
 
-/// Node-local Sync Request/Response Correlator（STEP 10-19-10-B2 + B3）：`RequestId`（network
-/// `security::RequestId`，canonical 16B）pending correlation —— `register(request_id, target,
-/// deadline_tick)` / consuming `resolve(response.request_id)` / `expire_at(current_tick)`（B3：
-/// **deterministic 逻辑 tick timeout**，非墙钟；幂等；无 retry）。bounded、无网络 I/O、无 eviction。
+/// Node-local Sync Request/Response Correlator（STEP 10-19-10-B2 + B3 + B4）：`RequestId`
+/// （network `security::RequestId`，canonical 16B）pending correlation —— `register(request_id,
+/// target, deadline_tick)` / consuming `resolve(response.request_id)` / `expire_at(current_tick)`
+///（B3：**deterministic 逻辑 tick timeout**，非墙钟；幂等）；B4 **bounded retry lifecycle**：
+/// `expire_with_retry(tick, RetryPolicy)` → `RetryEligible`（caller 显式 `retry`/`abandon`；
+/// retry 计数唯一来源；不自动 register / 不生成 RequestId）。bounded、无网络 I/O、无 eviction。
 /// 匹配只绑定 request，不 imply 块有效/canonical/finality。
 pub mod sync_correlator;
+
+/// Node-local Sync Request Scheduler + Peer Selection（STEP 10-19-10-B5）：确定性
+/// `select_peer`（按 `NodeId` canonical bytes 稳定序 → exclude attempted → take first；
+/// 无随机/墙钟/健康伪造）+ bounded FIFO `SyncRequestScheduler`（`Scheduled`/`Duplicate`/`Full`/
+/// `Unschedulable`）+ `SyncRequestIntent{ request_id(caller-owned), peer(NodeId), target }`
+///（复用 B2/B3/B4 `SyncRequestTarget`）。**Intent ≠ Send**：不调用 NetworkService/Transport；
+/// 不生成 RequestId；无 retry counter（唯一来源 = sync_correlator）；B1 seam 对缺精确 ancestor
+/// 的 intent 诚实返回 `Unschedulable`（不伪造 height/hash）。
+pub mod sync_scheduler;
 
 /// Node-local Proposer orchestration（STEP 10-19-2）：ProposalRef 装配（ADR-0050 `select_proposer`
 /// 判定 + deterministic placeholder commitment）；ProposerService ≠ BlockBuilder / ValidatorActor /
