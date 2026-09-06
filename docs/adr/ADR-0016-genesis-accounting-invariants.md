@@ -1,6 +1,7 @@
 # ADR-0016: Genesis Accounting Invariants
 
-- **Status**: Proposed（待批准）
+- **Status**: FROZEN
+- **Freeze Date**: 2026-09-06（STEP 10-19-FREEZE：正式冻结；正文经济规则不变，仅状态元数据变更）
 - **Date**: 2026-08-26（2026-08-27 STEP 7F 修订：§4 供应上限/cap 语义澄清，关联 ADR-0022）
 - **Deciders**: Nova Chain 架构组
 - **Scope**: PHASE 2 — Cryptography（Genesis canonical data）

@@ -1,6 +1,7 @@
 # ADR-0022: Gas & Fee Accounting V1
 
-- **Status**: Proposed（待批准）
+- **Status**: FROZEN
+- **Freeze Date**: 2026-09-06（STEP 10-19-FREEZE：Design Freeze；F1–F10 语义不变，仅状态元数据变更）
 - **Date**: 2026-08-27
 - **Deciders**: Nova Chain 架构组
 - **Scope**: PHASE 3 — Account / Transaction（Gas / Fee Accounting）
