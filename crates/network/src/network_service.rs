@@ -26,7 +26,7 @@ use crate::session::{
     PeerAuthConfig, PeerSessionState, ReplayCache, ReplayKey, handshake_payload_decode,
     validate_handshake_context,
 };
-use crate::transport::Transport;
+use crate::transport::{BoxTransport, ConnectionDialer, Transport};
 use core::fmt;
 use nova_crypto::signature::VerifyingKey;
 use std::collections::{HashMap, VecDeque};
@@ -107,6 +107,12 @@ pub enum NetworkServiceError {
     PeerNotConnected,
     /// outbound queue 已满。
     QueueFull,
+    /// 尝试 outbound dial 但本服务未注入 dialer。
+    DialerUnavailable,
+    /// single-active connection：已有 connected peer（不静默替换在用 transport）。
+    AlreadyConnected,
+    /// outbound dial 失败（transport 错误透传；不标记 connected / 不自动 retry）。
+    Dial(NetworkError),
 }
 
 impl fmt::Display for NetworkServiceError {
@@ -120,6 +126,9 @@ impl fmt::Display for NetworkServiceError {
             Self::UnknownPeer => write!(f, "unknown peer"),
             Self::PeerNotConnected => write!(f, "peer not connected"),
             Self::QueueFull => write!(f, "outbound queue full"),
+            Self::DialerUnavailable => write!(f, "no connection dialer injected"),
+            Self::AlreadyConnected => write!(f, "already connected (single active)"),
+            Self::Dial(e) => write!(f, "outbound dial failed: {e}"),
         }
     }
 }
@@ -342,14 +351,16 @@ pub struct NetworkService<T: Transport> {
     global_handshake_attempts: u32,
     /// bounded replay cache（握手去重；FIFO 驱逐）。
     replay: ReplayCache,
+    /// 本端网络身份锚（dial 首包 local / 未来 sender 校验）。
+    self_id: NodeId,
+    /// 可选 outbound dialer（NetworkService 拥有 connection lifecycle；None = 无 dial 能力）。
+    dialer: Option<Box<dyn ConnectionDialer>>,
 }
 
 impl<T: Transport> NetworkService<T> {
     /// 构造（Running）。`self_id` = 本节点网络身份（供 outbound envelope sender 校验/诊断；
     /// 私钥不进入本服务）。
     pub fn new(config: NetworkServiceConfig, self_id: NodeId, transport: T) -> Self {
-        // self_id 保留为文档化身份锚（未来 10-18G 可用于拒绝 sender≠self 的 outbound）。
-        let _ = self_id;
         let replay_capacity = config
             .peer_auth
             .map(|a| a.replay_cache_capacity)
@@ -367,6 +378,8 @@ impl<T: Transport> NetworkService<T> {
             handshake_attempts: HashMap::new(),
             global_handshake_attempts: 0,
             replay: ReplayCache::new(replay_capacity),
+            self_id,
+            dialer: None,
         }
     }
 
@@ -405,6 +418,15 @@ impl<T: Transport> NetworkService<T> {
     /// 本服务拥有的 transport（可变；供 EventLoop/测试直接驱动）。
     pub fn transport(&mut self) -> &mut T {
         &mut self.transport
+    }
+
+    /// 注入 outbound dialer（builder seam；不改 `new` 注入语义）。
+    ///
+    /// 仅 `NetworkService<BoxTransport>` 特化的 [`Self::dial_peer`] 使用；`None` =
+    /// `dial_peer` 报 [`NetworkServiceError::DialerUnavailable`]。
+    pub fn with_dialer(mut self, dialer: Box<dyn ConnectionDialer>) -> Self {
+        self.dialer = Some(dialer);
+        self
     }
 
     // ---------- peer ops（network identity only） ----------
@@ -727,6 +749,47 @@ impl<T: Transport> NetworkService<T> {
         } else {
             Err(NetworkServiceError::Stopped)
         }
+    }
+}
+
+impl NetworkService<BoxTransport> {
+    /// 建立一条 outbound connection（**single-active seam**；STEP 10-19-10-B7-A1-D4）。
+    ///
+    /// 成功顺序（§dial success）：`dialer.dial`（真实建连）→ 成功后才装箱替换 transport +
+    /// 登记 `connected`。**绝不先标记 connected 再 dial**。
+    ///
+    /// 错误语义：
+    /// - 已有 connected peer ⇒ `Err(AlreadyConnected)`（不静默替换在用的 transport）。
+    /// - 无注入 dialer ⇒ `Err(DialerUnavailable)`。
+    /// - dial 失败 ⇒ `Err(Dial(NetworkError))`：**不登记 connected / 不建 fake session /
+    ///   不自动 retry / 不自动选 peer**。
+    ///
+    /// 只到 `Connected`：**不做 handshake / nonce / auth / Established**（后续 STEP）。
+    pub fn dial_peer(
+        &mut self,
+        addr: std::net::SocketAddr,
+        remote: NodeId,
+        max_frame: usize,
+        idle_timeout: Option<std::time::Duration>,
+    ) -> Result<(), NetworkServiceError> {
+        self.ensure_running()?;
+        if !self.peers.connected_peers().is_empty() {
+            return Err(NetworkServiceError::AlreadyConnected);
+        }
+        let local = self.self_id;
+        let conn = {
+            let dialer = self
+                .dialer
+                .as_ref()
+                .ok_or(NetworkServiceError::DialerUnavailable)?;
+            dialer
+                .dial(addr, local, remote, max_frame, idle_timeout)
+                .map_err(NetworkServiceError::Dial)?
+        };
+        // dial 成功后才 owns transport + 登记 connected。
+        self.transport = BoxTransport::new(conn);
+        self.peers.connect(remote);
+        Ok(())
     }
 }
 

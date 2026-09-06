@@ -382,6 +382,76 @@ impl Transport for TcpTransport {
     }
 }
 
+// ===== STEP 10-19-10-B7-A1-D4：NetworkService-owned outbound dial seam =====
+//
+// - [`ConnectionDialer`]：object-safe outbound connection factory seam（NetworkService 拥有并编排
+//   connection lifecycle；**Node 不直接 dial**）。
+// - [`TcpDialer`]：真实 TCP dialer —— 内部**复用** `TcpTransport::dial`（不复制 TCP 建连逻辑、
+//   不创建第二套 TCP connection implementation、不改 `TcpTransport::dial` 语义）。
+// - [`BoxTransport`]：`Box<dyn Transport>` 载体（network 层；dial 产物可装箱进 NetworkService
+//   的泛型 transport 槽 —— 仅当 `T = BoxTransport` 时）。
+// - 本段只负责 `dial → Connected` 的 connection primitive；**不做 handshake / nonce / auth /
+//   bootstrap / reconnect policy**（后续 STEP）。
+
+/// dyn transport 载体（network 层 wrapper；`impl Transport` delegate）。
+pub struct BoxTransport(Box<dyn Transport>);
+
+impl BoxTransport {
+    pub fn new(inner: Box<dyn Transport>) -> Self {
+        Self(inner)
+    }
+}
+
+impl Transport for BoxTransport {
+    fn send(&mut self, peer: &NodeId, message: Vec<u8>) -> Result<(), NetworkError> {
+        self.0.send(peer, message)
+    }
+
+    fn try_recv(&mut self) -> Result<Option<(NodeId, Vec<u8>)>, NetworkError> {
+        self.0.try_recv()
+    }
+}
+
+/// outbound connection factory seam（object-safe；NetworkService 拥有并调用）。
+///
+/// 参数复用 `TcpTransport::dial` 的真实签名语义：`addr` = 目标 socket 地址；`local` = 本端
+/// NodeId（dial 首包）；`remote` = 对端预期 NodeId（关联身份）；`max_frame` / `idle_timeout` =
+/// transport frame / idle 参数。返回已连接 transport（dyn 装箱）。
+pub trait ConnectionDialer {
+    fn dial(
+        &self,
+        addr: SocketAddr,
+        local: NodeId,
+        remote: NodeId,
+        max_frame: usize,
+        idle_timeout: Option<Duration>,
+    ) -> Result<Box<dyn Transport>, NetworkError>;
+}
+
+/// 真实 TCP dialer：委托 `TcpTransport::dial`（无状态）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TcpDialer;
+
+impl ConnectionDialer for TcpDialer {
+    fn dial(
+        &self,
+        addr: SocketAddr,
+        local: NodeId,
+        remote: NodeId,
+        max_frame: usize,
+        idle_timeout: Option<Duration>,
+    ) -> Result<Box<dyn Transport>, NetworkError> {
+        // 复用既有 dial —— 禁止出现第二套 TcpStream::connect。
+        Ok(Box::new(TcpTransport::dial(
+            addr,
+            local,
+            remote,
+            max_frame,
+            idle_timeout,
+        )?))
+    }
+}
+
 #[cfg(test)]
 mod tcp_tests {
     use super::*;
