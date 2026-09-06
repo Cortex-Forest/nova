@@ -11,7 +11,9 @@
 //! - [`StateTransition::changes`] 顺序固定：sender → receiver（ADR-0023 G-J 确定性）。
 //! - `StateTransition` **不含 events**（V0.1 无事件机制；Event API 留 WASM Phase）。
 
-use nova_crypto::address::NovaAddress;
+use nova_crypto::address::{
+    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+};
 
 /// 空代码哈希：`SHA-256(empty bytes)`（ADR-0017 §3 冻结）。
 ///
@@ -88,6 +90,23 @@ pub fn decode_account_bytes(bytes: &[u8; 88]) -> AccountState {
 pub trait AccountStateView {
     /// 读取账户；`None` 表示不存在。
     fn account(&self, addr: &NovaAddress) -> Option<AccountState>;
+}
+
+/// 协议保留 Burn 地址（ADR-0060；**单一来源**）。
+///
+/// - `AddressType::UserAccount`（0x01，不新增 Burn variant / 不改 crypto）+ `key_hash = [0u8; 32]`。
+/// - `key_hash = [0;32]` 无任何 pubkey preimage ⇒ 无真实账户可拥有（普通用户无法生成同名地址）。
+/// - payload 含 `network_id` ⇒ 按网络参数化（mainnet/testnet/devnet 各自保留地址）。
+/// - **canonical 语义**：`burned_supply == burn_address(network).balance`（账户 canonical 累计）；
+///   账户不存在 == balance 0 == burned_supply 0（惰性；零 burn 不建 leaf，ADR-0060）。
+/// - 仅 fee-burn 执行路径可写入；普通转账至该地址 ⇒ Reject（execution 层拦截）。
+pub fn burn_address(network: NetworkId) -> NovaAddress {
+    NovaAddress::from_payload(NovaAddressPayload {
+        address_version: ADDRESS_VERSION,
+        address_type: AddressType::UserAccount,
+        network_id: network,
+        key_hash: [0u8; 32],
+    })
 }
 
 /// 单个账户的确定性变更（成功交易产生；供 STEP 8 trie 化）。
@@ -226,6 +245,21 @@ mod tests {
             account_commitment(&base),
             account_commitment(&e),
             "storage_root"
+        );
+    }
+
+    #[test]
+    fn burn_address_canonical_deterministic_per_network() {
+        use nova_crypto::address::NetworkId;
+        let m = burn_address(NetworkId::Mainnet);
+        // canonical 35B payload（SMT key 域）
+        assert_eq!(m.payload().to_bytes().len(), 35);
+        // deterministic：同一 network 同地址
+        assert_eq!(burn_address(NetworkId::Mainnet), m);
+        // per-network：payload network_id 分离
+        assert_ne!(
+            burn_address(NetworkId::Mainnet),
+            burn_address(NetworkId::Testnet)
         );
     }
 }

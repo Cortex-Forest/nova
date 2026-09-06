@@ -3,7 +3,7 @@
 //! 覆盖：成功 transfer 不变量（sender/receiver 余额、nonce、receipt）、self-transfer 单 change、
 //! 失败无副作用。
 
-use nova_core::state::{AccountState, EMPTY_CODE_HASH};
+use nova_core::state::{AccountState, EMPTY_CODE_HASH, burn_address};
 use nova_core::transaction::gas_fee::TRANSFER_INTRINSIC_GAS;
 use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
 use nova_crypto::identity::ChainIdentity;
@@ -114,13 +114,19 @@ proptest! {
         let actual_fee = (TRANSFER_INTRINSIC_GAS as u128) * gas_price;
 
         // sender：扣 amount + actual_fee，nonce+1
-        prop_assert_eq!(out.changes.len(), 2, "sender + receiver");
+        prop_assert_eq!(out.changes.len(), 3, "sender + receiver + burn");
         prop_assert_eq!(out.changes[0].address, sender);
         prop_assert_eq!(out.changes[0].new_balance, sender_balance - amount - actual_fee);
         prop_assert_eq!(out.changes[0].new_nonce, nonce + 1);
         // receiver：加 amount
         prop_assert_eq!(out.changes[1].address, receiver);
         prop_assert_eq!(out.changes[1].new_balance, receiver_balance + amount);
+        // fee-burn（ADR-0060）：burned = actual_fee × 1000 / 10000 = actual_fee / 10
+        let burned = actual_fee / 10;
+        prop_assert_eq!(out.changes[2].address, burn_address(NetworkId::Mainnet));
+        prop_assert_eq!(out.changes[2].new_balance, burned, "burn = actual_fee*bps/10000");
+        prop_assert_eq!(out.changes[2].new_nonce, 0);
+        prop_assert!(out.changes[2].created);
         // receipt 一致性
         prop_assert_eq!(out.receipt.gas_used, TRANSFER_INTRINSIC_GAS);
         prop_assert_eq!(out.receipt.fee_paid, actual_fee);
@@ -151,10 +157,14 @@ proptest! {
         let out = apply_transaction(&st, &tx, kp.verifying_key(), &ctx()).unwrap();
         let actual_fee = (TRANSFER_INTRINSIC_GAS as u128) * gas_price;
 
-        prop_assert_eq!(out.changes.len(), 1, "self-transfer: single change");
+        prop_assert_eq!(out.changes.len(), 2, "self-transfer: sender + burn");
         prop_assert_eq!(out.changes[0].address, sender);
         prop_assert_eq!(out.changes[0].new_balance, sender_balance - actual_fee, "net amount = 0");
         prop_assert_eq!(out.changes[0].new_nonce, nonce + 1);
+        // fee-burn（ADR-0060）：burned = actual_fee / 10
+        prop_assert_eq!(out.changes[1].address, burn_address(NetworkId::Mainnet));
+        prop_assert_eq!(out.changes[1].new_balance, actual_fee / 10);
+        prop_assert!(out.changes[1].created);
     }
 
     // 失败（余额不足）无副作用：state / nonce / fee 全不变

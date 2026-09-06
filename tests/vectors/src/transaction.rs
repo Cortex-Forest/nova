@@ -163,6 +163,10 @@ fn classify(err: &ExecutionError) -> (&'static str, String) {
         ExecutionError::ReceiverOverflow => ("execution", "ReceiverOverflow".to_string()),
         ExecutionError::SenderOverflow => ("execution", "SenderOverflow".to_string()),
         ExecutionError::NonceExhausted => ("nonce", "NonceExhausted".to_string()),
+        ExecutionError::InvalidBurnDestination => {
+            ("execution", "InvalidBurnDestination".to_string())
+        }
+        ExecutionError::BurnOverflow => ("execution", "BurnOverflow".to_string()),
         ExecutionError::Malformed(e) => ("execution", format!("{e:?}")),
     }
 }
