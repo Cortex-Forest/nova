@@ -67,6 +67,8 @@ pub enum RuntimeError {
     EventLoop(EventLoopError),
     /// Driver 验证 / transition 门面失败（与网络错误分层 —— 不伪装成 NetworkError）。
     Driver(DriverError),
+    /// Node Egress 网络签名失败（fail-closed；不吞安全错误）。
+    Egress(crate::egress::EgressError),
 }
 
 /// Runtime 关闭错误（Stage C `shutdown`；仅 Storage 可失败 ——
@@ -310,9 +312,9 @@ impl NodeRuntime {
         self.network_stack.as_ref().map(NetworkStack::node_id)
     }
 
-    /// 取走 Driver 验证 PASS 后待广播的 consensus outbound **semantic**。
-    /// 本阶段不 broadcast（production egress deferred）；由上层 / future egress 消费。
-    /// 网络 disabled 亦可调用（outbound 在 Driver，独立于 NetworkStack）。
+    /// 取走 Driver 验证 PASS 后待广播的 consensus outbound **semantic**（手动提取 / 测试用；
+    /// `step()` 会自行 drain + egress）。网络 disabled 亦可调用（outbound 在 Driver，独立于
+    /// NetworkStack）。
     pub fn take_consensus_outbound(&mut self) -> Vec<OutboundConsensusMessage> {
         self.driver.take_outbound()
     }
@@ -320,7 +322,8 @@ impl NodeRuntime {
     /// consensus orchestration 入口（STEP 10-18I-D-A Option A）：把 node 层 consensus command
     /// （EventLoop → Handler decode queue → Runtime 承接）交给 Driver 的既有安全门面。
     /// - verify/decode/transition 门面 FAIL 原样以 `DriverError` 传出（不吞错、不改状态）。
-    /// - outbound 不在此 egress：验证 PASS 后由更高层 `take_outbound()` 接出（GAP-A deferred）。
+    /// - outbound：验证 PASS 后入 Driver pending（STEP 10-18I-N-IMPL：`step()` 末尾 drain →
+    ///   egress adapter 签名 → `NetworkService` broadcast）；本方法仅承接 command。
     /// - 借用生命周期严格限当前调用（不长期借 Driver；无 self-reference）。
     pub fn process_consensus_command(
         &mut self,
@@ -371,6 +374,17 @@ impl NodeRuntime {
         for command in commands {
             process_command(&mut self.driver, command).map_err(RuntimeError::Driver)?;
         }
+        // STEP 10-18I-N-IMPL：production egress —— drain Driver semantic outbound →
+        // NetworkSigner 编码签名 → NetworkService.broadcast（established-only/queue 由 NS 负责）
+        // → flush（TCP send）。sign 失败 fail-closed；NS broadcast/flush 失败（queue full / 无
+        // established）按 backpressure drop —— 不 panic、不阻塞共识。
+        let outbound = self.driver.take_outbound();
+        for msg in outbound {
+            let envelope = crate::egress::envelope_for(&msg, stack.signer.as_ref())
+                .map_err(RuntimeError::Egress)?;
+            let _ = stack.ns.broadcast(envelope);
+        }
+        let _ = stack.ns.flush_outbound();
         Ok(())
     }
 

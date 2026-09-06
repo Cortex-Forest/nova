@@ -27,9 +27,14 @@ Implementation Status：
 - Production Transport: **implemented**（STEP 10-18I-M，`crates/network/src/transport.rs` 同步
   `std::net` `TcpTransport` + length-prefix frame（bounded / 超限拒绝）+ 连接身份首包 + idle
   timeout；无 async runtime / 无第三方网络库；M-1..M-22 测试）。
-- Secure Egress: **implemented（network 侧）**（`NetworkService` enqueue/broadcast 仅发
-  Established peers；握手例外；M-9/10/11/13 验证）。`semantic → envelope` 转换（node 层
-  `NetworkEgress` production impl）**deferred**（node 冻结；envelope 签名经既有 `sign_message`）。
+- Secure Egress: **implemented**（STEP 10-18I-N-IMPL）——`crates/node/src/egress.rs` Node
+  Production Egress Adapter：Driver semantic outbound（`OutboundConsensusMessage`，仅验证 PASS
+  才 record）→ canonical encoding（`canonical_vote_payload ‖ sig` / `encode_qc` /
+  `encode_proposal_ref`）→ `NetworkSigner` 网络签名 envelope → `NetworkService` broadcast/
+  enqueue（established-only）→ flush。`NodeRuntime::step` egress 编排：drain driver outbound →
+  sign → broadcast → flush（sign 失败 fail-closed；NS 满/无 established 按 backpressure drop）。
+  仅 Driver 已 verify 的 QC 可出（`VerifiedQc`）；envelope 签名用网络身份（≠ validator key；
+  NS-SEC-8）。N-IMPL-1..7 测试。
 - Block sync: **deferred**（SyncBlockRequest/Response primitive 存在，完整 sync 未实现）。
 - Peer discovery / Gossipsub: **deferred**。
 

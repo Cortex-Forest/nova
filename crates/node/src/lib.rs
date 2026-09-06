@@ -57,6 +57,10 @@ pub mod driver;
 /// `NetworkEgress`；生产网络身份签名 DEFERRED。
 pub mod outbound;
 
+/// Node Production Egress Adapter（STEP 10-18I-N-IMPL）：Driver semantic outbound →
+/// `MessageEnvelope`（canonical）+ `NetworkSigner` 签名 → NetworkService。
+pub mod egress;
+
 /// KeyProvider seam（STEP 10-16）：`load_signer() -> Box<dyn SigningCapability>`；ValidatorActor
 /// 不知私钥位置 / 载体（software/HSM/remote/KMS 均为实现）。不修改 `SigningCapability`。
 pub mod key_provider;
