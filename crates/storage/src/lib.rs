@@ -21,6 +21,7 @@
 pub const DATABASE_VERSION: u32 = 1;
 
 pub mod backend;
+pub mod block_store;
 pub mod error;
 pub mod hashing;
 pub mod head;
