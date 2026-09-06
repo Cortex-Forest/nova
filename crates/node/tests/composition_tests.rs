@@ -21,6 +21,8 @@ use nova_crypto::identity::{
 use nova_crypto::key::KeyPair;
 use nova_network::message::{MessageEnvelope, MessageType, encode, sign_message};
 use nova_network::node_id::NodeId;
+use nova_network::security::SessionNonce;
+use nova_network::session::{HandshakeKind, handshake_payload_encode};
 use nova_network::transport::{MemoryTransport, Transport};
 use nova_storage::persistent::PersistentBackend;
 
@@ -136,6 +138,31 @@ fn node_id_of(kp: &KeyPair) -> NodeId {
     NodeId::from_verifying_key(kp.verifying_key())
 }
 
+/// 对端 B 的 Handshake Init envelope（STEP 10-19-10-B7-A1-D5：runtime 装配 peer-auth 后，
+/// 普通消息需 Established sender —— 对端先握手成为 Established）。
+fn b_handshake(b_kp: &KeyPair, genesis_hash: [u8; 32], b_id: NodeId) -> MessageEnvelope {
+    let payload = handshake_payload_encode(
+        HandshakeKind::Init,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        genesis_hash,
+        1,
+        &b_id,
+        &SessionNonce::from_bytes([1; 16]),
+        b"",
+    )
+    .expect("handshake encode");
+    let mut envelope = MessageEnvelope {
+        version: 1,
+        message_type: MessageType::Handshake,
+        payload,
+        sender: b_id,
+        signature: [0u8; 64],
+    };
+    sign_message(b_kp.signing_key(), &mut envelope).expect("sign handshake");
+    envelope
+}
+
 /// 用 test network key 签任意 payload 信封（对端注入帧）。
 fn sign_envelope(
     net_key: &KeyPair,
@@ -210,6 +237,12 @@ fn c2_runtime_step_drives_network_to_driver() {
         NodeRuntime::start_with_network(&config, None, Box::new(tx_a), Box::new(identity))
             .expect("start_with_network 成功");
     assert_eq!(runtime.network_node_id(), Some(a_id));
+
+    // D5：runtime 装配 peer-auth ⇒ 对端 B 先握手（Established），普通消息才放行。
+    let hs_frame = b_handshake(&net_b, env.genesis_hash, b_id);
+    tx_b.send(&a_id, encode(&hs_frame))
+        .expect("inject handshake");
+    runtime.step().expect("step handshake Ok");
 
     // 合法 proposal（proposer = genesis validator —— set 成员）。
     let pr = ProposalRef {

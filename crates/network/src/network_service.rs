@@ -410,6 +410,19 @@ impl<T: Transport> NetworkService<T> {
         )
     }
 
+    /// 当前 Established peers（确定性：NodeId canonical bytes 升序；session owner = NetworkService）。
+    /// 供 Node 层编排核对：authenticated peer 集合 vs configured target（identity match）。
+    pub fn established_peers(&self) -> Vec<NodeId> {
+        let mut peers: Vec<NodeId> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| **s == PeerSessionState::Established)
+            .map(|(id, _)| *id)
+            .collect();
+        peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        peers
+    }
+
     /// per-peer 握手尝试数（诊断 / rate 观察）。
     pub fn handshake_attempts_for(&self, node: NodeId) -> u32 {
         self.handshake_attempts.get(&node).copied().unwrap_or(0)

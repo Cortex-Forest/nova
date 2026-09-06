@@ -25,8 +25,12 @@ use nova_consensus::dag::Dag;
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_crypto::identity::ChainIdentity;
 use nova_network::event_loop::{EventLoop, EventLoopConfig, EventLoopError};
+use nova_network::message::{MessageEnvelope, MessageType};
 use nova_network::network_service::{NetworkService, NetworkServiceConfig, NetworkServiceError};
 use nova_network::node_id::NodeId;
+use nova_network::session::{
+    HandshakeKind, PeerAuthConfig, SessionError, handshake_payload_encode, random_session_nonce,
+};
 use nova_network::transport::{BoxTransport, ConnectionTarget, TcpDialer, Transport};
 use nova_storage::error::StorageError;
 use nova_storage::persistent::PersistentBackend;
@@ -39,7 +43,7 @@ use crate::bootstrap::{self, ConnectionTargetError, NodeConfig, NodeStartupError
 use crate::driver::{DriverError, NodeConsensusDriver};
 use crate::intent_ledger::{BlockInboundSource, MissingAncestorIntentLedger};
 use crate::key_provider::{KeyProvider, KeyProviderError};
-use crate::network_identity::NetworkSigner;
+use crate::network_identity::{NetworkSigner, NetworkSigningError};
 use crate::outbound::OutboundConsensusMessage;
 use crate::proposer::{ProposalBuild, ProposerError, build_proposal};
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
@@ -57,6 +61,9 @@ const BLOCK_INBOUND_OUTCOME_CAP: usize = 128;
 
 /// missing-ancestor intent ledger 有界容量（Node-local；满 ⇒ FIFO evict —— 不无限增长）。
 const MISSING_ANCESTOR_LEDGER_CAP: usize = 256;
+
+/// 网络 peer-auth 协议版本（与 `PeerAuthConfig.protocol_version` 一致；非 genesis 字段）。
+const NETWORK_PROTOCOL_VERSION: u8 = 1;
 
 /// Node-local proposer step（STEP 10-19-6 OPT-1）：本节点为当前 proposer 时经真实 BlockBuilder
 /// 产出 Block + ProposalRef → submit ProposalRef。
@@ -125,6 +132,25 @@ pub enum RuntimeError {
     Validator(ValidatorActorError),
     /// outbound dial 失败（NetworkServiceError 透传；不自动 retry / 不自动换 peer）。
     NetworkDial(NetworkServiceError),
+    /// handshake 构造 / nonce 生成失败（session 域 typed 错误）。
+    Session(SessionError),
+    /// outbound handshake envelope 签名失败（network identity 域）。
+    NetworkSigning(NetworkSigningError),
+    /// NetworkService 未装配 peer-auth（handshake 编排前置缺失；fail-closed）。
+    PeerAuthMissing,
+    /// authenticated remote NodeId ≠ configured peer_id（address 正确 ≠ identity 正确）。
+    IdentityMismatch { configured: NodeId },
+}
+
+/// `establish_configured_peer` 单次推进后的握手判定（Node 只编排；session 验证归 NetworkService）。
+#[derive(Debug, PartialEq, Eq)]
+enum HandshakeOutcome {
+    /// configured peer 已认证（Established）且身份匹配。
+    Established(NodeId),
+    /// 尚未收到对端合法握手（后续 step 再推进；不重发 / 不重 dial）。
+    Pending,
+    /// 收到其它 peer 的合法握手（identity mismatch；fail-closed 断开）。
+    ForeignEstablished(Vec<NodeId>),
 }
 
 /// Runtime 关闭错误（Stage C `shutdown`；仅 Storage 可失败 ——
@@ -199,6 +225,8 @@ pub struct NodeRuntime {
     network_stack: Option<NetworkStack>,
     /// 静态 configured connection targets（STEP 10-19-10-B7-A3；来自 `config.peers`）。
     configured_targets: Vec<ConnectionTarget>,
+    /// 已为本 configured peer 发送过 outbound Handshake Init（防重复发送；每目标一次）。
+    handshake_init_sent_for: Option<NodeId>,
     /// validator 元数据（safety journal 路径；actor 本体在 driver）。full-node ⇒ `None`。
     validator_journal: Option<PathBuf>,
     /// step-driven proposer 出块的显式 timestamp（默认 0；无系统时钟；调用方可配置）。
@@ -311,8 +339,14 @@ impl NodeRuntime {
                 config
                     .validate_network_targets(self_id)
                     .map_err(NodeRuntimeError::NetworkTarget)?;
+                // D5：装配 peer-auth（network/chain/genesis/protocol/caps/rate/replay）——
+                //   使 inbound process_handshake 能执行认证（session owner = NetworkService）。
+                let auth = Self::network_peer_auth(&identity);
                 let ns = NetworkService::new(
-                    NetworkServiceConfig::default(),
+                    NetworkServiceConfig {
+                        peer_auth: Some(auth),
+                        ..Default::default()
+                    },
                     self_id,
                     BoxTransport::new(transport),
                 )
@@ -337,6 +371,7 @@ impl NodeRuntime {
             driver,
             network_stack,
             configured_targets: config.peers.clone(),
+            handshake_init_sent_for: None,
             validator_journal,
             proposal_timestamp: 0,
             last_proposal: None,
@@ -489,6 +524,172 @@ impl NodeRuntime {
         Ok(Some(t.peer_id))
     }
 
+    /// 是否已装配 network peer-auth（`start_with_network` 网络启用时为 `true`）。
+    pub fn network_peer_auth_enabled(&self) -> bool {
+        self.network_stack
+            .as_ref()
+            .map(|s| s.ns.config().peer_auth.is_some())
+            .unwrap_or(false)
+    }
+
+    /// 建立 configured peer（STEP 10-19-10-B7-A1-D5；single-active）。
+    ///
+    /// 只编排（**不实现握手协议** —— 信封签名 / session 验证全归 NetworkSigner 与
+    /// NetworkService `process_handshake`）：dial（若未连）→ 发本端 Handshake Init（每目标一次；
+    /// 每次新 nonce）→ poll 一次推进 → 判定：
+    /// - configured peer `Established` ⇒ `Ok(Some(peer_id))`（authenticated 且 == configured）；
+    /// - 尚无对端握手 ⇒ `Ok(None)`（pending；后续 step 再调本方法推进，不重 dial / 不重发）；
+    /// - 收到**其它** peer 合法握手（identity mismatch）⇒ 断开 + `Err(IdentityMismatch)`
+    ///   （fail-closed：address 正确 ≠ identity 正确）；
+    /// - dial / 构造 / 签名 / 发送失败 ⇒ typed error（不自动 retry / 不自动换 peer / 不 sleep）。
+    pub fn establish_configured_peer(&mut self) -> Result<Option<NodeId>, RuntimeError> {
+        let Some(target) = self.configured_targets.first().copied() else {
+            return Ok(None);
+        };
+        // 0. 已 Established 目标 ⇒ 完成（幂等）。
+        let established_now = self
+            .network_stack
+            .as_ref()
+            .map(|s| s.ns.is_peer_established(target.peer_id))
+            .unwrap_or(false);
+        if established_now {
+            self.handshake_init_sent_for = None;
+            return Ok(Some(target.peer_id));
+        }
+        // 1. dial（无 active connection 时）。
+        let dial_needed = self
+            .network_stack
+            .as_ref()
+            .map(|s| s.ns.connected_peer_count() == 0)
+            .unwrap_or(false);
+        if dial_needed {
+            let (addr, remote, max_frame) = {
+                let Some(stack) = &self.network_stack else {
+                    return Ok(None);
+                };
+                let max_frame = stack.ns.config().max_msg_bytes;
+                (target.address, target.peer_id, max_frame)
+            };
+            let Some(stack) = &mut self.network_stack else {
+                return Ok(None);
+            };
+            stack
+                .ns
+                .dial_peer(addr, remote, max_frame, None)
+                .map_err(RuntimeError::NetworkDial)?;
+        }
+        // 2. 发送本端 Handshake Init（每目标一次；新 nonce）。
+        if self.handshake_init_sent_for != Some(target.peer_id) {
+            let env = {
+                let Some(stack) = &self.network_stack else {
+                    return Ok(None);
+                };
+                let auth = stack
+                    .ns
+                    .config()
+                    .peer_auth
+                    .ok_or(RuntimeError::PeerAuthMissing)?;
+                Self::build_outbound_handshake(stack.signer.as_ref(), &auth)?
+            };
+            let Some(stack) = &mut self.network_stack else {
+                return Ok(None);
+            };
+            stack
+                .ns
+                .enqueue_outbound(target.peer_id, env)
+                .map_err(RuntimeError::NetworkDial)?;
+            let _ = stack.ns.flush_outbound();
+            self.handshake_init_sent_for = Some(target.peer_id);
+        }
+        // 3. poll 一次推进（读对端握手；无 while / 无 sleep）。
+        let outcome = {
+            let Some(stack) = &mut self.network_stack else {
+                return Ok(None);
+            };
+            stack
+                .el
+                .poll_once(&mut stack.ns)
+                .map_err(RuntimeError::EventLoop)?;
+            if stack.ns.is_peer_established(target.peer_id) {
+                HandshakeOutcome::Established(target.peer_id)
+            } else {
+                let foreign: Vec<NodeId> = stack.ns.established_peers();
+                if foreign.is_empty() {
+                    HandshakeOutcome::Pending
+                } else {
+                    HandshakeOutcome::ForeignEstablished(foreign)
+                }
+            }
+        };
+        match outcome {
+            HandshakeOutcome::Established(id) => {
+                self.handshake_init_sent_for = None;
+                Ok(Some(id))
+            }
+            HandshakeOutcome::Pending => Ok(None),
+            HandshakeOutcome::ForeignEstablished(others) => {
+                // address 正确 ≠ identity 正确：收到其它 peer 的合法握手 → fail-closed 断开。
+                if let Some(stack) = &mut self.network_stack {
+                    for o in &others {
+                        let _ = stack.ns.disconnect_peer(*o);
+                    }
+                    let _ = stack.ns.disconnect_peer(target.peer_id);
+                }
+                self.handshake_init_sent_for = None;
+                Err(RuntimeError::IdentityMismatch {
+                    configured: target.peer_id,
+                })
+            }
+        }
+    }
+
+    /// 构造 outbound Handshake Init envelope（本端身份；`claimed = signer.node_id()`，**非**
+    /// configured peer）。复用 session `handshake_payload_encode` + `random_session_nonce`
+    /// （每次新 nonce）+ 既有 `MessageEnvelope` + `NetworkSigner::sign_envelope`。
+    fn build_outbound_handshake(
+        signer: &dyn NetworkSigner,
+        auth: &PeerAuthConfig,
+    ) -> Result<MessageEnvelope, RuntimeError> {
+        let nonce = random_session_nonce().map_err(RuntimeError::Session)?;
+        let local = signer.node_id();
+        let payload = handshake_payload_encode(
+            HandshakeKind::Init,
+            auth.network_id,
+            auth.chain_id,
+            auth.genesis_hash,
+            auth.protocol_version,
+            &local,
+            &nonce,
+            auth.capabilities,
+        )
+        .map_err(RuntimeError::Session)?;
+        let mut env = MessageEnvelope {
+            version: 1,
+            message_type: MessageType::Handshake,
+            payload,
+            sender: local,
+            signature: [0u8; 64],
+        };
+        signer
+            .sign_envelope(&mut env)
+            .map_err(RuntimeError::NetworkSigning)?;
+        Ok(env)
+    }
+
+    /// network peer-auth 配置（ChainIdentity 绑定 network/chain/genesis + 协议常量）。
+    fn network_peer_auth(identity: &ChainIdentity) -> PeerAuthConfig {
+        PeerAuthConfig {
+            network_id: identity.network_id,
+            chain_id: identity.chain_id,
+            genesis_hash: identity.genesis_hash,
+            protocol_version: NETWORK_PROTOCOL_VERSION,
+            capabilities: b"",
+            per_peer_handshake_limit: 8,
+            global_handshake_limit: 128,
+            replay_cache_capacity: 256,
+        }
+    }
+
     /// 取走 Driver 验证 PASS 后待广播的 consensus outbound **semantic**（手动提取 / 测试用；
     /// `step()` 会自行 drain + egress）。网络 disabled 亦可调用（outbound 在 Driver，独立于
     /// NetworkStack）。
@@ -634,6 +835,7 @@ impl NodeRuntime {
             driver,
             network_stack,
             configured_targets: _,
+            handshake_init_sent_for: _,
             validator_journal: _,
             proposal_timestamp: _,
             last_proposal: _,
