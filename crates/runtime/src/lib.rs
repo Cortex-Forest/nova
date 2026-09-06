@@ -14,8 +14,8 @@ pub mod key;
 
 pub use block::{
     BlockPipelineError, BlockValidationFailure, commit_block, decode_block,
-    execute_and_verify_state_root, validate_block_signature, validate_height_parent,
-    validate_transaction_root,
+    execute_and_compute_state_root, execute_and_verify_state_root, validate_block_signature,
+    validate_height_parent, validate_transaction_root,
 };
 pub use key::KeyResolver;
 

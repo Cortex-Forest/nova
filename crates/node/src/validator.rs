@@ -21,7 +21,9 @@ use nova_consensus::round::LockedState;
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_consensus::vote::{ValidatorVote, VoteType, canonical_vote_payload};
 use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
+use nova_runtime::Block;
 
+use crate::block_builder::attach_proposer_signature;
 use crate::safety_store::{ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
 use crate::vote_ledger::{VoteKey, VoteLedger, VoteLedgerError, VotePrepare, VoteRecord};
@@ -43,6 +45,9 @@ pub enum ValidatorActorError {
     Safety(ValidatorSafetyError),
     /// 本地 lock transition 失败（`acquire_lock`；如非 Precommit QC —— lock 不变）。
     Lock(FinalityError),
+    /// 出块（proposer）签名 seam 失败（`block_builder::attach_proposer_signature`；
+    /// STEP 10-19-6 OPT-1）。
+    BlockSigning,
 }
 
 /// 本地投票授权决策。
@@ -214,6 +219,18 @@ impl<S: SigningCapability> ValidatorActor<S> {
 
     pub fn validator_id(&self) -> ValidatorId {
         self.context.validator_id()
+    }
+
+    /// 用本地 signer 对 `block` 的 canonical header 签名（STEP 10-19-6 OPT-1：Proposer→Block
+    /// 签名 seam）。委托 `block_builder::attach_proposer_signature`（payload = canonical_header；
+    /// DomainId::Block + chain_id，ADR-0042）；`signature ∉ block_hash`（不改 hash）。
+    ///
+    /// - `&self` 只读：block 签名不改 VoteLedger / LockedState / Safety journal（出块幂等，
+    ///   非 vote，无 Double-Vote 约束）。
+    /// - 不暴露私钥：`signer` 私有，仅授权「sign block」（不签任意字节；外部不能取得 signer）。
+    pub fn sign_block(&self, block: &mut Block) -> Result<(), ValidatorActorError> {
+        attach_proposer_signature(block, &self.signer)
+            .map_err(|_| ValidatorActorError::BlockSigning)
     }
 
     pub fn locked_state(&self) -> &LockedState {

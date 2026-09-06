@@ -13,6 +13,7 @@ use nova_core::block::{
 };
 use nova_core::state::AccountChange;
 use nova_crypto::signature::VerifyingKey;
+use nova_crypto::transaction::TransactionV1;
 use nova_execution::block::{BlockError, execute_block};
 use nova_execution::state_transition::ExecutionContext;
 use nova_storage::backend::StorageBackend;
@@ -93,10 +94,34 @@ pub fn validate_transaction_root(block: &Block) -> Result<(), BlockPipelineError
         .map_err(|e| BlockPipelineError::Validation(BlockValidationFailure::Block(e)))
 }
 
-/// ④ 执行 + state_root 重算比对（跨层组合：execution 8D + storage 8D）。
+/// ④a BlockBuilder 辅助（STEP 10-19-5 additive）：执行有序 txs + **只读计算** post-state root。
 ///
-/// - `execute_block`（纯计算）→ 收集 `tx_changes` → `calculate_state_root`（只读重算）→
-///   `verify_block_state_root`（比对 `header.state_root`）。
+/// - `execute_block`（纯计算）→ 收集 `tx_changes` → `calculate_state_root`（只读重算）。
+/// - **不比对 header**（组装前尚无 block；root 供 BlockBuilder 填 `header.state_root`）；
+///   **不提交**（commit 归 ⑥）。调用后 `store` 完全不变（ADR-0030 C-1/C-2/C-3）。
+pub fn execute_and_compute_state_root<B: StorageBackend + Clone>(
+    store: &StateStore<B>,
+    txs: &[TransactionV1],
+    sender_keys: &[VerifyingKey],
+    ctx: &ExecutionContext,
+    max_gas_per_block: u64,
+) -> Result<(BlockExecutionResult, NodeHash), BlockPipelineError> {
+    let result = execute_block(store, txs, sender_keys, ctx, max_gas_per_block)
+        .map_err(BlockPipelineError::Execution)?;
+    let tx_changes: Vec<&[AccountChange]> = result
+        .tx_transitions
+        .iter()
+        .map(|t| t.changes.as_slice())
+        .collect();
+    let state_root =
+        calculate_state_root(store, &tx_changes).map_err(BlockPipelineError::Storage)?;
+    Ok((result, state_root))
+}
+
+/// ④ 执行 + state_root 重算比对（跨层组合：execution 8D + storage 8D；复用 ④a helper）。
+///
+/// - 委托 [`execute_and_compute_state_root`]（execute → calculate）→ `verify_block_state_root`
+///   （比对 `header.state_root`）。
 /// - **不提交**（commit 归 ⑥）；只验证执行承诺。
 pub fn execute_and_verify_state_root<B: StorageBackend + Clone>(
     store: &StateStore<B>,
@@ -105,14 +130,13 @@ pub fn execute_and_verify_state_root<B: StorageBackend + Clone>(
     ctx: &ExecutionContext,
     max_gas_per_block: u64,
 ) -> Result<BlockExecutionResult, BlockPipelineError> {
-    let result = execute_block(store, &block.body.txs, sender_keys, ctx, max_gas_per_block)
-        .map_err(BlockPipelineError::Execution)?;
-    let tx_changes: Vec<&[AccountChange]> = result
-        .tx_transitions
-        .iter()
-        .map(|t| t.changes.as_slice())
-        .collect();
-    let computed = calculate_state_root(store, &tx_changes).map_err(BlockPipelineError::Storage)?;
+    let (result, computed) = execute_and_compute_state_root(
+        store,
+        &block.body.txs,
+        sender_keys,
+        ctx,
+        max_gas_per_block,
+    )?;
     let expected = NodeHash::from_bytes(block.header.state_root);
     verify_block_state_root(&expected, &computed)
         .map_err(|e| BlockPipelineError::Validation(BlockValidationFailure::StateRoot(e)))?;

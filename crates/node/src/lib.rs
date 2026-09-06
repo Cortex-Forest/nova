@@ -62,6 +62,13 @@ pub mod outbound;
 /// `MessageEnvelope`（canonical）+ `NetworkSigner` 签名 → NetworkService。
 pub mod egress;
 
+/// Node-local BlockBuilder（STEP 10-19-5 / ADR-0061）：candidate transactions → ADR-0061 canonical
+/// ordering → execution（runtime 只读组合 `execute_and_compute_state_root`）→ post-state root →
+/// transaction root → BlockV1 assembly → block_hash。纯确定性：timestamp / height / parent_hash /
+/// finality_reference / validator_set_hash 由 caller 显式传入（不碰系统时间 / 网络 / 随机 / 私钥 /
+/// 持久化）。签名 seam：`attach_proposer_signature`（`SigningCapability`；signature ∉ block_hash）。
+pub mod block_builder;
+
 /// Node-local Proposer orchestration（STEP 10-19-2）：ProposalRef 装配（ADR-0050 `select_proposer`
 /// 判定 + deterministic placeholder commitment）；ProposerService ≠ BlockBuilder / ValidatorActor /
 /// NetworkService / Storage / ConsensusState。

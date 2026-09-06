@@ -1,13 +1,13 @@
-//! Node Proposer Assembly 集成测试（STEP 10-19-2；P-7/P-8）。
+//! Node Proposer → Real BlockBuilder 集成测试（STEP 10-19-6 OPT-1；P-7/P-8）。
 //!
-//! 复用真实 ValidatorSet / ChainIdentity / ConsensusNode / NodeConsensusDriver：
-//! - P-7：`ProposalRef`（proposer_decision 产出）经 `NodeConsensusDriver::submit_proposal` 进入
-//!   `ConsensusNode`（Applied → Prevote），idempotent（后续 no-op）。
+//! 复用真实 ValidatorSet / ChainIdentity / ConsensusNode / NodeConsensusDriver / NodeBlockAdapter：
+//! - P-7：`build_proposal`（真实 BlockV1 + BlockHash，**非 placeholder**）经 `ValidatorActor::sign_block`
+//!   签名 + `NodeConsensusDriver::submit_proposal` 进入 `ConsensusNode`（Applied → Prevote），
+//!   idempotent（后续 no-op）。
 //! - P-8：proposal 成功后仍走既有 local vote 路径（`submit_local_vote` prevote → quorum 推进），
 //!   未引入第二套 proposer-vote pipeline。
 //!
-//! P-1..P-6 / P-9 / P-10 在 `crates/node/src/proposer.rs` 单测（decision 层：local/non-proposer/
-//! deterministic/duplicate/stale/isolation）。
+//! P-1..P-6 / P-9 / P-10 / OPT-* 在 `crates/node/src/proposer.rs` 单测（判定 + build 层）。
 
 use nova_consensus::dag::{BlockReference, Dag};
 use nova_consensus::integration::TransitionResult;
@@ -22,10 +22,13 @@ use nova_crypto::key::KeyPair;
 use nova_crypto::signature::VerifyingKey;
 
 use nova_node::assembly::ConsensusNode;
+use nova_node::block_adapter::{ChainHead, NoAccountsKeyResolver, NodeBlockAdapter};
 use nova_node::driver::NodeConsensusDriver;
-use nova_node::proposer::proposer_decision;
+use nova_node::proposer::build_proposal;
 use nova_node::signer::SoftwareSigner;
 use nova_node::validator::{LocalVoteRequest, ValidatorActor};
+use nova_storage::memory::MemoryBackend;
+use nova_storage::store::StateStore;
 
 const CHAIN_ID: u64 = 1001;
 const GENESIS_HASH: [u8; 32] = [0x42; 32];
@@ -83,8 +86,13 @@ fn dag1() -> Dag {
     dag
 }
 
-/// 单验证者 driver（consensus key = set 唯一成员；dag 含 AA 根块）。
-fn setup_single() -> NodeConsensusDriver<SoftwareSigner> {
+/// 单验证者 driver + block-production adapter（MemoryBackend；head=genesis；本地为唯一 proposer）。
+/// 返回 `(driver, adapter, verifying_key)`（vk 供签名验证）。
+fn setup_single() -> (
+    NodeConsensusDriver<SoftwareSigner>,
+    NodeBlockAdapter<MemoryBackend, NoAccountsKeyResolver>,
+    VerifyingKey,
+) {
     let kp = KeyPair::generate().unwrap();
     let vk = *kp.verifying_key();
     let set = ValidatorSet::from_genesis(&genesis_with(vec![ValidatorInit {
@@ -95,7 +103,23 @@ fn setup_single() -> NodeConsensusDriver<SoftwareSigner> {
     }]));
     let consensus = ConsensusNode::new(0, 0, CHAIN_ID, set, GENESIS_HASH, dag1());
     let (actor, _) = actor_of(kp);
-    NodeConsensusDriver::new(consensus, vec![actor])
+    let store = StateStore::new(MemoryBackend::new());
+    let root = store.state_root();
+    let adapter = NodeBlockAdapter::new(
+        store,
+        NoAccountsKeyResolver,
+        CHAIN_ID,
+        GENESIS_HASH,
+        100_000_000_000,
+        100,
+        ChainHead::genesis(GENESIS_HASH, root),
+        NetworkId::Mainnet,
+    );
+    (
+        NodeConsensusDriver::new(consensus, vec![actor]),
+        adapter,
+        vk,
+    )
 }
 
 fn prevote_req(target: [u8; 32]) -> LocalVoteRequest {
@@ -109,25 +133,42 @@ fn prevote_req(target: [u8; 32]) -> LocalVoteRequest {
     }
 }
 
-// P-7：ProposalRef（proposer_decision 产出）经 Driver 进入 ConsensusNode。
+// P-7：真实 ProposalBuild（build_proposal 产出）经签名 + Driver 进入 ConsensusNode。
 #[test]
 fn p7_proposal_through_driver_into_consensus() {
-    let mut driver = setup_single();
+    let (mut driver, adapter, vk) = setup_single();
     let local = driver.actor(0).unwrap().validator_id();
 
-    let pr = proposer_decision(local, driver.consensus())
+    let pb = build_proposal(local, driver.consensus(), &adapter, 0)
         .expect("select ok")
         .expect("本地为 (0,0) proposer");
-    let res = driver.submit_proposal(pr);
+    // ProposalRef.block_hash == BlockHash(block)（真实；非 placeholder）
+    assert_eq!(pb.proposal_ref.block_hash, pb.block_hash);
+    assert_eq!(pb.block_hash, nova_runtime::block_hash(&pb.block).unwrap());
+    // 出块签名：signature ∉ block_hash；可由 proposer 公钥验证（core P7-3）
+    let mut signed = pb.block.clone();
+    driver
+        .actor(0)
+        .unwrap()
+        .sign_block(&mut signed)
+        .expect("sign block");
+    assert_eq!(
+        nova_runtime::block_hash(&signed).unwrap(),
+        pb.block_hash,
+        "signature excluded from block hash"
+    );
+    nova_runtime::validate_block_signature(&signed, &vk, CHAIN_ID).expect("signature verifies");
+
+    let res = driver.submit_proposal(pb.proposal_ref);
     assert!(
         matches!(res, TransitionResult::Applied { .. }),
         "proposal Applied"
     );
     assert_eq!(driver.consensus().state().round.step, RoundStep::Prevote);
     assert!(driver.consensus().state().round.proposal.is_some());
-    // 幂等：已提案 ⇒ decision no-op（不重复 SetProposal / 不二次 transition）
+    // 幂等：已提案 ⇒ build no-op（不重复 SetProposal / 不二次 transition）
     assert!(
-        proposer_decision(local, driver.consensus())
+        build_proposal(local, driver.consensus(), &adapter, 0)
             .unwrap()
             .is_none()
     );
@@ -136,13 +177,13 @@ fn p7_proposal_through_driver_into_consensus() {
 // P-8：proposal 成功后仍走既有 local vote 路径（未引入第二套 pipeline）。
 #[test]
 fn p8_proposal_then_existing_local_vote_path() {
-    let mut driver = setup_single();
+    let (mut driver, adapter, _vk) = setup_single();
     let local = driver.actor(0).unwrap().validator_id();
-    let pr = proposer_decision(local, driver.consensus())
+    let pb = build_proposal(local, driver.consensus(), &adapter, 0)
         .unwrap()
         .unwrap();
-    let proposal_hash = pr.block_hash;
-    driver.submit_proposal(pr);
+    let proposal_hash = pb.block_hash;
+    driver.submit_proposal(pb.proposal_ref);
 
     // 既有 vote 路径：ValidatorActor produce → verify_vote_input → submit_verified_vote。
     let res = driver

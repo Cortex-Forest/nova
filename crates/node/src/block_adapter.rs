@@ -250,6 +250,24 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
     }
 }
 
+/// 空账户 KeyResolver（STEP 10-19-6 OPT-1；NodeRuntime 装配用单一 resolver 类型）。
+///
+/// - `resolve` 恒 `None`：V0.1 `NodeRuntime` 不做 block 应用（无 BlockSync / 无账户 key
+///   registry），故无任何 sender key 可解析。若未来出现 block 应用路径，将因
+///   [`NodeBlockApplicationError::KeyResolution`] 整块拒绝（ADR-0046 §6 fail-closed）——
+///   runtime 本轮不应用块，此路径不会触发。
+/// - 目的：固定 `NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>` 装配于
+///   `NodeRuntime`（canonical chain state owner），供 Proposer→BlockBuilder 只读出块；
+///   真实账户 key 解析归未来 BlockSync / KeyManager STEP。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoAccountsKeyResolver;
+
+impl KeyResolver for NoAccountsKeyResolver {
+    fn resolve(&self, _address: NovaAddress) -> Option<VerifyingKey> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

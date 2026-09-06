@@ -327,3 +327,111 @@ fn rt_29_runtime_processes_consensus_command() {
     assert_eq!(state.round.proposal, Some(pr));
     assert_eq!(state.round.step, RoundStep::Prevote);
 }
+
+// ---------- RT-BP : STEP 10-19-6 OPT-1 block-production seam ----------
+
+/// RT-BP-1：validator `step` ⇒ 自动经真实 BlockBuilder 出块（`ProposalRef.block_hash ==
+/// BlockHash(block)`，非 placeholder）；head / store state root 不变（build 只读、不推进 head）。
+#[test]
+fn rt_bp_proposer_produces_real_block_head_unchanged() {
+    let kp = KeyPair::generate().unwrap();
+    let pk = kp.verifying_key().to_bytes();
+    let env = Env::new(&genesis_for(pk));
+    let config = env.config(true, env.genesis_hash);
+    let provider = SoftwareKeyProvider::from_keypair(kp);
+
+    let mut runtime = NodeRuntime::start(&config, Some(&provider)).expect("validator 启动");
+    let head_before = runtime
+        .block_production()
+        .expect("validator 装配 block-production adapter")
+        .head()
+        .clone();
+    let root_before = *runtime
+        .block_production()
+        .unwrap()
+        .store()
+        .state_root()
+        .as_bytes();
+    assert_eq!(head_before.height, 0, "head = genesis");
+    assert_eq!(
+        head_before.block_hash, env.genesis_hash,
+        "head.block_hash = genesis_hash"
+    );
+
+    // step（网络 disabled）⇒ 本地 proposer 自动出块（真实 BlockBuilder；显式 timestamp）。
+    runtime.step().expect("step ok");
+
+    let pb = runtime
+        .last_proposal()
+        .expect("本地 proposer 产出 ProposalBuild")
+        .clone();
+    // ProposalRef.block_hash == BlockHash(block)（真实；非 proposer_seed placeholder）
+    assert_eq!(pb.proposal_ref.block_hash, pb.block_hash);
+    assert_eq!(pb.block_hash, nova_runtime::block_hash(&pb.block).unwrap());
+    // OPT1-6：canonical encode → decode roundtrip（结构往返一致）
+    let wire = nova_runtime::encode_block(&pb.block).unwrap();
+    let decoded = nova_runtime::decode_block(&wire).unwrap();
+    assert_eq!(decoded, pb.block, "encode → decode roundtrip");
+    // 真实 Block 字段：chain / height = head+1 / parent = head / tx_root（空体）/ state_root = parent
+    assert_eq!(pb.block.header.chain_id, CHAIN_ID);
+    assert_eq!(pb.block.header.height, head_before.height + 1);
+    assert_eq!(pb.block.header.parent_hash, head_before.block_hash);
+    assert_eq!(pb.block.header.validator_set_hash, env.genesis_hash);
+    assert!(pb.block.body.txs.is_empty(), "V0.1 candidate = empty set");
+    assert_eq!(
+        pb.block.header.state_root, root_before,
+        "空候选 ⇒ post-state root == parent root"
+    );
+    // consensus 已接收（Prevote；proposal 即真实 hash）
+    let state = runtime.consensus().state();
+    assert_eq!(state.round.step, RoundStep::Prevote);
+    assert_eq!(
+        state.round.proposal.as_ref().expect("proposal").block_hash,
+        pb.block_hash
+    );
+
+    // build 只读：head / store state root 不变（不 commit / 不推进 / 不写 WAL）。
+    let head_after = runtime.block_production().unwrap().head().clone();
+    let root_after = *runtime
+        .block_production()
+        .unwrap()
+        .store()
+        .state_root()
+        .as_bytes();
+    assert_eq!(head_after, head_before, "head unchanged（无 head advance）");
+    assert_eq!(root_after, root_before, "store unchanged（无 commit）");
+
+    // 幂等：已提案（step=Prevote）⇒ 再次 step 不重复出块。
+    runtime.step().expect("step ok");
+    let still = runtime.last_proposal().expect("same proposal");
+    assert_eq!(still.block_hash, pb.block_hash, "幂等：无第二次 proposal");
+}
+
+/// RT-BP-2：timestamp 显式变化 ⇒ BlockHash 变化（无系统时钟；runtime 字段配置）。
+#[test]
+fn rt_bp_timestamp_changes_block_hash() {
+    let kp_a = KeyPair::generate().unwrap();
+    let pk_a = kp_a.verifying_key().to_bytes();
+    let env_a = Env::new(&genesis_for(pk_a));
+    let mut ra = NodeRuntime::start(
+        &env_a.config(true, env_a.genesis_hash),
+        Some(&SoftwareKeyProvider::from_keypair(kp_a)),
+    )
+    .expect("validator A 启动");
+
+    let kp_b = KeyPair::generate().unwrap();
+    let pk_b = kp_b.verifying_key().to_bytes();
+    let env_b = Env::new(&genesis_for(pk_b));
+    let mut rb = NodeRuntime::start(
+        &env_b.config(true, env_b.genesis_hash),
+        Some(&SoftwareKeyProvider::from_keypair(kp_b)),
+    )
+    .expect("validator B 启动");
+
+    ra.step().expect("A step");
+    let ha = ra.last_proposal().expect("A proposal").block_hash;
+    rb.set_proposal_timestamp(5);
+    rb.step().expect("B step");
+    let hb = rb.last_proposal().expect("B proposal").block_hash;
+    assert_ne!(ha, hb, "timestamp 显式变化 ⇒ BlockHash 变化");
+}

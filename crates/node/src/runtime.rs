@@ -32,12 +32,13 @@ use nova_storage::error::StorageError;
 use nova_storage::persistent::PersistentBackend;
 
 use crate::assembly::ConsensusNode;
+use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter};
 use crate::bootstrap::{self, NodeConfig, NodeStartupError};
 use crate::driver::{DriverError, NodeConsensusDriver};
 use crate::key_provider::{KeyProvider, KeyProviderError};
 use crate::network_identity::NetworkSigner;
 use crate::outbound::OutboundConsensusMessage;
-use crate::proposer::proposer_decision;
+use crate::proposer::{ProposalBuild, ProposerError, build_proposal};
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
 use crate::validator::{ValidatorActor, ValidatorActorError};
@@ -46,23 +47,39 @@ use crate::wiring::{NodeConsensusCommand, NodeConsensusHandler, process_command}
 /// ValidatorActor 的签名能力类型（Phase 1：trait object）。
 type DynSigner = Box<dyn SigningCapability>;
 
-/// Node-local proposer step（STEP 10-19-2）：判定本节点是否当前 proposer → submit ProposalRef。
+/// Node-local proposer step（STEP 10-19-6 OPT-1）：本节点为当前 proposer 时经真实 BlockBuilder
+/// 产出 Block + ProposalRef → submit ProposalRef。
 ///
-/// - 纯编排：`driver.consensus()` 只读判定；提交走 `NodeConsensusDriver::submit_proposal`
-///   （`SetProposal` → canonical transition；阶段守卫 + 幂等由 decision 与 consensus 保证）。
-/// - 不自动投票：proposal 成功后 local vote 仍走既有 `submit_local_vote` 路径（ValidatorActor）。
-/// - 无 validator actor ⇒ no-op；decision 错误（非法 ValidatorSet）⇒ `Err`（fail-closed）。
+/// - 纯编排：`build_proposal` 只读判定 + build（真实 BlockHash；**非 placeholder**）；签名走
+///   `ValidatorActor::sign_block`（不暴露私钥）；提交走 `driver.submit_proposal`。
+/// - 高度同步 gate / 阶段守卫 / 幂等由 `build_proposal` 与 consensus 保证（非 proposer /
+///   不同步 / 已提案 ⇒ `Ok(None)`，no-op）。
+/// - 返回 `Some(ProposalBuild)`（本地保留 Block，**不持久化 / 不推进 head**）；无 adapter /
+///   无 actor ⇒ `Ok(None)`。
 fn runtime_propose(
     driver: &mut NodeConsensusDriver<DynSigner>,
-) -> Result<(), nova_consensus::error::ConsensusError> {
-    let Some(local_id) = driver.actor(0).map(|a| a.validator_id()) else {
-        return Ok(());
+    block_production: &Option<NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>>,
+    timestamp: u64,
+) -> Result<Option<ProposalBuild>, RuntimeError> {
+    let Some(adapter) = block_production.as_ref() else {
+        return Ok(None);
     };
-    let decision = proposer_decision(local_id, driver.consensus())?;
-    if let Some(pr) = decision {
-        let _ = driver.submit_proposal(pr);
+    let Some(local_id) = driver.actor(0).map(|a| a.validator_id()) else {
+        return Ok(None);
+    };
+    let proposal = build_proposal(local_id, driver.consensus(), adapter, timestamp)
+        .map_err(RuntimeError::Proposer)?;
+    let Some(mut pb) = proposal else {
+        return Ok(None);
+    };
+    // 出块签名（ValidatorActor 授权；signature ∉ block_hash —— hash 在签名前已定）。
+    if let Some(a) = driver.actor(0) {
+        a.sign_block(&mut pb.block)
+            .map_err(RuntimeError::Validator)?;
     }
-    Ok(())
+    // 提交共识（ProposalRef 64B；只记 hash，不含 Block）。
+    let _ = driver.submit_proposal(pb.proposal_ref.clone());
+    Ok(Some(pb))
 }
 
 /// NodeRuntime 启动错误（node-local；typed；fail closed）。
@@ -89,8 +106,10 @@ pub enum RuntimeError {
     Driver(DriverError),
     /// Node Egress 网络签名失败（fail-closed；不吞安全错误）。
     Egress(crate::egress::EgressError),
-    /// Node-local Proposer orchestration 失败（select_proposer 非法 ValidatorSet；fail-closed）。
-    Proposer(nova_consensus::error::ConsensusError),
+    /// Node-local Proposer orchestration 失败（selection / block build / head；fail-closed）。
+    Proposer(ProposerError),
+    /// ValidatorActor 出块签名失败（`sign_block`；fail-closed）。
+    Validator(ValidatorActorError),
 }
 
 /// Runtime 关闭错误（Stage C `shutdown`；仅 Storage 可失败 ——
@@ -170,12 +189,20 @@ impl ValidatorView<'_> {
 /// - Runtime 只负责 composition / lifecycle / accessor delegation（最终 lifecycle coordinator）。
 pub struct NodeRuntime {
     chain_identity: ChainIdentity,
-    chain_storage: PersistentBackend,
+    /// chain storage owner（full-node 形态：Phase 1 裸 PersistentBackend handle）。validator ⇒ `None`。
+    chain_storage: Option<PersistentBackend>,
+    /// validator-mode 形态：bootstrap 装配的 NodeBlockAdapter（canonical StateStore + ChainHead +
+    /// genesis 参数单一 owner；BlockBuilder 只读出块输入）。full-node ⇒ `None`。
+    block_production: Option<NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>>,
     driver: NodeConsensusDriver<DynSigner>,
     /// 可选网络子栈（Stage C；`start` ⇒ `None`）。
     network_stack: Option<NetworkStack>,
     /// validator 元数据（safety journal 路径；actor 本体在 driver）。full-node ⇒ `None`。
     validator_journal: Option<PathBuf>,
+    /// step-driven proposer 出块的显式 timestamp（默认 0；无系统时钟；调用方可配置）。
+    proposal_timestamp: u64,
+    /// 最近一次本地出块产物（本地保留；不持久化 / 不推进 head）。
+    last_proposal: Option<ProposalBuild>,
 }
 
 impl NodeRuntime {
@@ -219,17 +246,30 @@ impl NodeRuntime {
         let (genesis, identity) =
             bootstrap::load_genesis(config).map_err(NodeRuntimeError::Startup)?;
 
-        // 4. chain storage init（独立目录；PersistentBackend；Phase 1 只打开/持有 handle）。
-        std::fs::create_dir_all(&config.storage_dir)
-            .map_err(|_| NodeRuntimeError::Startup(NodeStartupError::StorageIo))?;
-        let chain_storage = PersistentBackend::open(&config.storage_dir)
-            .map_err(NodeStartupError::Storage)
-            .map_err(NodeRuntimeError::Startup)?;
+        // 4. chain storage owner：
+        //    - validator mode：bootstrap 装配 NodeBlockAdapter（canonical StateStore + ChainHead +
+        //      genesis 参数；首启 bootstrap genesis state，单一 backend owner，不另开裸 handle）。
+        //    - full-node：Phase 1 裸 PersistentBackend handle（现状；不触碰 Provider / validator）。
+        let (chain_storage, block_production, consensus_start_height) = if config.validator_enabled
+        {
+            let adapter = bootstrap::start(NoAccountsKeyResolver, config)
+                .map_err(NodeRuntimeError::Startup)?;
+            let head_height = adapter.head().height;
+            (None, Some(adapter), head_height)
+        } else {
+            std::fs::create_dir_all(&config.storage_dir)
+                .map_err(|_| NodeRuntimeError::Startup(NodeStartupError::StorageIo))?;
+            let backend = PersistentBackend::open(&config.storage_dir)
+                .map_err(NodeStartupError::Storage)
+                .map_err(NodeRuntimeError::Startup)?;
+            (Some(backend), None, 0)
+        };
 
         // 10. ConsensusNode（canonical state owner）——随后装配进 NodeConsensusDriver。
+        //     validator：初始共识高度 = canonical head height（ChainHead 单一高度源）；full-node = 0。
         let set = ValidatorSet::from_genesis(&genesis);
         let consensus = ConsensusNode::new(
-            0,
+            consensus_start_height,
             0,
             identity.chain_id,
             set,
@@ -268,9 +308,12 @@ impl NodeRuntime {
         Ok(Self {
             chain_identity: identity,
             chain_storage,
+            block_production,
             driver,
             network_stack,
             validator_journal,
+            proposal_timestamp: 0,
+            last_proposal: None,
         })
     }
 
@@ -318,9 +361,26 @@ impl NodeRuntime {
         &self.chain_identity
     }
 
-    /// chain storage handle（只读；Phase 1 生命周期 handle）。
-    pub fn chain_storage(&self) -> &PersistentBackend {
-        &self.chain_storage
+    /// chain storage handle（full-node 形态；validator ⇒ `None`）。
+    pub fn chain_storage(&self) -> Option<&PersistentBackend> {
+        self.chain_storage.as_ref()
+    }
+
+    /// validator-mode block-production adapter（canonical store + head + genesis 参数；只读）。
+    pub fn block_production(
+        &self,
+    ) -> Option<&NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>> {
+        self.block_production.as_ref()
+    }
+
+    /// 最近一次本地出块产物（本地保留；不持久化 / 不推进 head）。
+    pub fn last_proposal(&self) -> Option<&ProposalBuild> {
+        self.last_proposal.as_ref()
+    }
+
+    /// 显式设置 step-driven 出块 timestamp（无系统时钟；默认 0；确定性由调用方保证）。
+    pub fn set_proposal_timestamp(&mut self, timestamp: u64) {
+        self.proposal_timestamp = timestamp;
     }
 
     /// NodeConsensusDriver（只读；ConsensusNode + ValidatorActor 的 owner）。
@@ -386,8 +446,15 @@ impl NodeRuntime {
     /// 无 `Handler → &mut Driver/Runtime`、无 self-reference（无 Rc/RefCell/Arc/unsafe/async）。
     pub fn step(&mut self) -> Result<(), RuntimeError> {
         let Some(stack) = &mut self.network_stack else {
-            // 网络 disabled：仍执行 node-local proposer orchestration（无网络 identity 依赖）。
-            runtime_propose(&mut self.driver).map_err(RuntimeError::Proposer)?;
+            // 网络 disabled：node-local proposer orchestration（真实 BlockBuilder；显式 timestamp）。
+            let proposal = runtime_propose(
+                &mut self.driver,
+                &self.block_production,
+                self.proposal_timestamp,
+            )?;
+            if let Some(pb) = proposal {
+                self.last_proposal = Some(pb);
+            }
             return Ok(());
         };
         stack
@@ -398,10 +465,17 @@ impl NodeRuntime {
         for command in commands {
             process_command(&mut self.driver, command).map_err(RuntimeError::Driver)?;
         }
-        // STEP 10-19-2：node-local proposer orchestration —— 仅本节点为当前 proposer 且阶段
-        // Propose 且本轮未提案时提交 ProposalRef；否则幂等 no-op。不触碰 validator 安全；
-        // 不自动投票（vote 仍走既有路径）。
-        runtime_propose(&mut self.driver).map_err(RuntimeError::Proposer)?;
+        // STEP 10-19-6 OPT-1：node-local proposer orchestration —— 仅本节点为当前 proposer 且
+        // 阶段 Propose 且本轮未提案时，经 BlockBuilder 产出真实 Block + ProposalRef 并提交；
+        // 否则幂等 no-op。不自动投票（vote 仍走既有路径）。
+        let proposal = runtime_propose(
+            &mut self.driver,
+            &self.block_production,
+            self.proposal_timestamp,
+        )?;
+        if let Some(pb) = proposal {
+            self.last_proposal = Some(pb);
+        }
         // STEP 10-18I-N-IMPL：production egress —— drain Driver semantic outbound →
         // NetworkSigner 编码签名 → NetworkService.broadcast（established-only/queue 由 NS 负责）
         // → flush（TCP send）。sign 失败 fail-closed；NS broadcast/flush 失败（queue full / 无
@@ -428,9 +502,12 @@ impl NodeRuntime {
         let Self {
             chain_identity: _,
             chain_storage,
+            block_production,
             driver,
             network_stack,
             validator_journal: _,
+            proposal_timestamp: _,
+            last_proposal: _,
         } = self;
 
         if let Some(mut stack) = network_stack {
@@ -441,8 +518,16 @@ impl NodeRuntime {
         }
         // Driver 生命周期结束（ConsensusNode + ValidatorActor drop；safety 已 durable journal）。
         drop(driver);
-        // Storage 最后关闭（consuming）。
-        chain_storage.close().map_err(ShutdownError::Storage)
+        // Storage 最后关闭：
+        // - full-node 形态：显式 `PersistentBackend::close`（flush）。
+        // - validator 形态：block-production adapter drop（bootstrap/apply 已完成同步 flush，
+        //   无待刷写 —— storage crate 无 `StateStore::into_backend` / close seam；BlockStorage STEP
+        //   将补正式 close seam）。
+        drop(block_production);
+        if let Some(storage) = chain_storage {
+            storage.close().map_err(ShutdownError::Storage)?;
+        }
+        Ok(())
     }
 }
 
