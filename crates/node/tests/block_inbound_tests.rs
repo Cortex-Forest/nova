@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
 use nova_crypto::key::KeyPair;
@@ -61,8 +61,8 @@ impl Drop for TempDir {
     }
 }
 
-fn addr(kh: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(kh: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,
@@ -128,7 +128,7 @@ fn empty_block(
 }
 
 /// 手工 TransactionV1（结构合法；signature 由调用方决定——inbound ordering/resolve 阶段不验签）。
-fn raw_tx(sender: NovaAddress, receiver: NovaAddress, nonce: u64) -> TransactionV1 {
+fn raw_tx(sender: YazimaoAddress, receiver: YazimaoAddress, nonce: u64) -> TransactionV1 {
     TransactionV1 {
         version: 1,
         chain_id: CHAIN_ID,

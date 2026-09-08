@@ -9,7 +9,7 @@
 
 use crate::hex;
 use crate::json;
-use nova_crypto::address::{AddressError, NovaAddress, NovaAddressPayload};
+use nova_crypto::address::{AddressError, YazimaoAddress, YazimaoAddressPayload};
 use serde_json::Value;
 
 /// 已注册的 network_id（ADR-0011 Network Registry）。
@@ -119,12 +119,12 @@ pub fn validate_address_vector(input: &str) -> AddressValidation {
     };
 
     // ---- 真实 codec 校验（委托 nova_crypto::address）----
-    let codec_result = NovaAddress::decode(address);
+    let codec_result = YazimaoAddress::decode(address);
 
     match expected {
         "VALID" => match codec_result {
             Ok(addr) => {
-                let p: &NovaAddressPayload = addr.payload();
+                let p: &YazimaoAddressPayload = addr.payload();
                 if p.address_version != ver_u8 {
                     errors.push(format!(
                         "address_version mismatch: expected {ver_u8:#04x}, got {:#04x}",

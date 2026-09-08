@@ -10,7 +10,7 @@ use crate::node::TrieKey;
 
 /// 存储后端抽象（ADR-0028 D-1）。
 ///
-/// 通用 KV：key = `TrieKey`（`NovaAddressPayload` raw 35B），value = 账户 canonical bytes。
+/// 通用 KV：key = `TrieKey`（`YazimaoAddressPayload` raw 35B），value = 账户 canonical bytes。
 pub trait StorageBackend {
     /// 快照句柄（8C MemoryBackend = 账户表深拷贝 clone）。
     type Snapshot: Clone;

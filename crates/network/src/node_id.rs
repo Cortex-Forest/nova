@@ -2,7 +2,7 @@
 //!
 //! - `NodeId([u8; 32])` = **Ed25519 公钥 canonical bytes**（非 `Hash(pubkey)`——
 //!   可直接验证签名、免 key lookup、与 validator identity 体系一致）。
-//! - **NodeId（P2P 身份）≠ NovaAddress（链账户）≠ ValidatorId（共识身份）**，三者禁混用（N-2）。
+//! - **NodeId（P2P 身份）≠ YazimaoAddress（链账户）≠ ValidatorId（共识身份）**，三者禁混用（N-2）。
 
 use core::fmt;
 use nova_crypto::signature::VerifyingKey;

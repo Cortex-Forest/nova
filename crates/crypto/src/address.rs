@@ -5,7 +5,7 @@
 //! **不是 Bitcoin SegWit 地址**，**不声称 BIP-350 兼容**）。
 //!
 //! ```text
-//! NovaAddressPayload { address_version: u8, address_type: u8, network_id: u8, key_hash: [u8;32] }
+//! YazimaoAddressPayload { address_version: u8, address_type: u8, network_id: u8, key_hash: [u8;32] }
 //!
 //! key_hash = SHA-256(canonical_public_key_encoding)
 //! ```
@@ -14,8 +14,8 @@
 //! 地址**不能**从任意 `[u8;32]` hash 直接当作有效账户身份。`key_hash` 必须经
 //! `PublicKey → AlgorithmId → Canonical pubkey encoding → SHA-256 → key_hash → Address`
 //! 路径派生（ADR-0008 / ADR-0012 一致）。
-//! - 公开构造路径：仅 [`NovaAddress::from_verifying_key`]（从公钥派生）与
-//!   [`NovaAddress::decode`]（恢复已验证地址）；`from_payload` 用于编解码内部用途，
+//! - 公开构造路径：仅 [`YazimaoAddress::from_verifying_key`]（从公钥派生）与
+//!   [`YazimaoAddress::decode`]（恢复已验证地址）；`from_payload` 用于编解码内部用途，
 //!   不赋予"有效账户"语义（账户身份由公钥签名验证保证）。
 //!
 //! # 网络 / 类型注册表（ADR-0011 / ADR-0008）
@@ -145,9 +145,9 @@ impl TryFrom<u8> for NetworkId {
     }
 }
 
-/// Nova 地址 payload（35 字节）。
+/// YAZIMAO 地址 payload（35 字节）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NovaAddressPayload {
+pub struct YazimaoAddressPayload {
     /// 地址格式版本（当前 `ADDRESS_VERSION = 0x01`）。
     pub address_version: u8,
     /// 账户/地址语义（ADR-0008；非算法）。
@@ -158,7 +158,7 @@ pub struct NovaAddressPayload {
     pub key_hash: [u8; 32],
 }
 
-impl NovaAddressPayload {
+impl YazimaoAddressPayload {
     /// 35 字节 raw 表示（`version ‖ type ‖ network ‖ key_hash`；ADR-0004 / ADR-0028 D-3）。
     ///
     /// 协议层统一入口（trie key / 地址 canonical bytes）；**禁止 storage 自行 enum→bytes**。
@@ -167,13 +167,13 @@ impl NovaAddressPayload {
     }
 }
 
-/// Nova 地址（Bech32m-derived 文本的规范表示）。
+/// YAZIMAO 地址（Bech32m-derived 文本的规范表示）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NovaAddress {
-    payload: NovaAddressPayload,
+pub struct YazimaoAddress {
+    payload: YazimaoAddressPayload,
 }
 
-impl NovaAddress {
+impl YazimaoAddress {
     /// **从公钥派生地址**（推荐路径）。
     ///
     /// `key_hash = SHA-256(canonical_pubkey_encoding)`；`address_type ↔ algorithm` 显式校验。
@@ -185,7 +185,7 @@ impl NovaAddress {
         validate_type_algorithm(address_type, AlgorithmId::Ed25519)?;
         let key_hash = protocol_hash(&verifying.to_bytes());
         Ok(Self {
-            payload: NovaAddressPayload {
+            payload: YazimaoAddressPayload {
                 address_version: ADDRESS_VERSION,
                 address_type,
                 network_id: network,
@@ -195,7 +195,7 @@ impl NovaAddress {
     }
 
     /// 从已构造 payload 构建（编解码内部用途；不赋予账户语义）。
-    pub fn from_payload(payload: NovaAddressPayload) -> Self {
+    pub fn from_payload(payload: YazimaoAddressPayload) -> Self {
         Self { payload }
     }
 
@@ -230,7 +230,7 @@ impl NovaAddress {
     }
 
     /// 只读访问 payload。
-    pub const fn payload(&self) -> &NovaAddressPayload {
+    pub const fn payload(&self) -> &YazimaoAddressPayload {
         &self.payload
     }
 }
@@ -263,7 +263,7 @@ fn network_from_hrp(hrp: &bech32::Hrp) -> Result<NetworkId, AddressError> {
 }
 
 /// payload → 35 字节（固定顺序：version ‖ type ‖ network ‖ key_hash）。
-fn payload_to_bytes(p: &NovaAddressPayload) -> [u8; 35] {
+fn payload_to_bytes(p: &YazimaoAddressPayload) -> [u8; 35] {
     let mut out = [0u8; 35];
     out[0] = p.address_version;
     out[1] = p.address_type.as_u8();
@@ -273,7 +273,7 @@ fn payload_to_bytes(p: &NovaAddressPayload) -> [u8; 35] {
 }
 
 /// 35 字节 → payload（校验 version / type / network）。
-fn bytes_to_payload(b: &[u8]) -> Result<NovaAddressPayload, AddressError> {
+fn bytes_to_payload(b: &[u8]) -> Result<YazimaoAddressPayload, AddressError> {
     if b.len() != 35 {
         return Err(AddressError::InvalidLength);
     }
@@ -284,7 +284,7 @@ fn bytes_to_payload(b: &[u8]) -> Result<NovaAddressPayload, AddressError> {
     let network_id = NetworkId::try_from(b[2])?;
     let mut key_hash = [0u8; 32];
     key_hash.copy_from_slice(&b[3..35]);
-    Ok(NovaAddressPayload {
+    Ok(YazimaoAddressPayload {
         address_version: b[0],
         address_type,
         network_id,
@@ -297,8 +297,8 @@ mod tests {
     use super::*;
     use crate::key::KeyPair;
 
-    fn sample_payload() -> NovaAddressPayload {
-        NovaAddressPayload {
+    fn sample_payload() -> YazimaoAddressPayload {
+        YazimaoAddressPayload {
             address_version: ADDRESS_VERSION,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,
@@ -311,22 +311,22 @@ mod tests {
     // ------------------------------------------------------------------
     #[test]
     fn encode_decode_roundtrip() {
-        let addr = NovaAddress::from_payload(sample_payload());
+        let addr = YazimaoAddress::from_payload(sample_payload());
         let s = addr.encode().unwrap();
         assert!(s.starts_with("nova1"));
-        let decoded = NovaAddress::decode(&s).unwrap();
+        let decoded = YazimaoAddress::decode(&s).unwrap();
         assert_eq!(decoded.payload(), &sample_payload());
     }
 
     #[test]
     fn canonical_roundtrip() {
-        let addr = NovaAddress::from_payload(sample_payload());
+        let addr = YazimaoAddress::from_payload(sample_payload());
         let s = addr.encode().unwrap();
         // encode(decode(a)) == a_canonical
-        let decoded = NovaAddress::decode(&s).unwrap();
+        let decoded = YazimaoAddress::decode(&s).unwrap();
         assert_eq!(decoded.encode().unwrap(), s);
         // decode(encode(payload)) == payload
-        let back = NovaAddress::decode(&addr.encode().unwrap()).unwrap();
+        let back = YazimaoAddress::decode(&addr.encode().unwrap()).unwrap();
         assert_eq!(*back.payload(), sample_payload());
     }
 
@@ -338,22 +338,22 @@ mod tests {
         let kp = KeyPair::generate().unwrap();
         let vk = kp.verifying_key();
         let addr =
-            NovaAddress::from_verifying_key(vk, AddressType::UserAccount, NetworkId::Mainnet)
+            YazimaoAddress::from_verifying_key(vk, AddressType::UserAccount, NetworkId::Mainnet)
                 .unwrap();
         let expected_hash = protocol_hash(&vk.to_bytes());
         assert_eq!(addr.payload().key_hash, expected_hash);
         // 编码 → 解码 → key_hash 一致（完整链路）
-        let decoded = NovaAddress::decode(&addr.encode().unwrap()).unwrap();
+        let decoded = YazimaoAddress::decode(&addr.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload().key_hash, expected_hash);
     }
 
     #[test]
     fn cannot_construct_from_arbitrary_hash_as_identity() {
-        // NovaAddress 没有从任意 [u8;32] 构造"账户身份"的公开 API。
+        // YazimaoAddress 没有从任意 [u8;32] 构造"账户身份"的公开 API。
         // from_verifying_key 强制从公钥派生 key_hash（此处验证派生正确性已在上方）。
         // 本测试记录意图：任意 hash 不能经 from_verifying_key 注入。
         let kp = KeyPair::generate().unwrap();
-        let addr = NovaAddress::from_verifying_key(
+        let addr = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -368,33 +368,33 @@ mod tests {
     // ------------------------------------------------------------------
     #[test]
     fn wrong_hrp_rejected() {
-        let addr = NovaAddress::from_payload(sample_payload());
+        let addr = YazimaoAddress::from_payload(sample_payload());
         let s = addr.encode().unwrap();
         // 替换 HRP → 仍是合法 bech32m（checksum 匹配原 HRP 会失败）
         let wrong = format!("bitcoin{}", &s[s.find('1').unwrap()..]);
-        assert!(NovaAddress::decode(&wrong).is_err());
+        assert!(YazimaoAddress::decode(&wrong).is_err());
     }
 
     #[test]
     fn wrong_checksum_rejected() {
-        let addr = NovaAddress::from_payload(sample_payload());
+        let addr = YazimaoAddress::from_payload(sample_payload());
         let s = addr.encode().unwrap();
         let mut chars: Vec<char> = s.chars().collect();
         let n = chars.len();
         // 篡改最后一个字符（checksum 区）
         chars[n - 1] = if chars[n - 1] == 'q' { 'p' } else { 'q' };
         let mutated: String = chars.into_iter().collect();
-        assert!(NovaAddress::decode(&mutated).is_err());
+        assert!(YazimaoAddress::decode(&mutated).is_err());
     }
 
     #[test]
     fn wrong_version_rejected() {
         let mut p = sample_payload();
         p.address_version = 0x02;
-        let addr = NovaAddress::from_payload(p);
+        let addr = YazimaoAddress::from_payload(p);
         let s = addr.encode().unwrap();
         // decode 恢复 → bytes_to_payload 版本校验失败
-        assert!(NovaAddress::decode(&s).is_err());
+        assert!(YazimaoAddress::decode(&s).is_err());
     }
 
     #[test]
@@ -436,52 +436,52 @@ mod tests {
 
     #[test]
     fn mixed_and_uppercase_rejected() {
-        let addr = NovaAddress::from_payload(sample_payload());
+        let addr = YazimaoAddress::from_payload(sample_payload());
         let s = addr.encode().unwrap();
         // uppercase
         let up = s.to_uppercase();
-        assert!(NovaAddress::decode(&up).is_err());
+        assert!(YazimaoAddress::decode(&up).is_err());
         // mixed case（改一个字符为大写）
         let bytes: Vec<u8> = s.bytes().collect();
         let mut mixed = bytes.clone();
         let idx = s.find('1').unwrap() + 1;
         mixed[idx] = mixed[idx].to_ascii_uppercase();
         let mixed_s = String::from_utf8(mixed).unwrap();
-        assert!(NovaAddress::decode(&mixed_s).is_err());
+        assert!(YazimaoAddress::decode(&mixed_s).is_err());
     }
 
     #[test]
     fn truncated_and_extra_rejected() {
-        let addr = NovaAddress::from_payload(sample_payload());
+        let addr = YazimaoAddress::from_payload(sample_payload());
         let s = addr.encode().unwrap();
         // truncated：去掉尾部（checksum 失效）
-        assert!(NovaAddress::decode(&s[..s.len() - 4]).is_err());
+        assert!(YazimaoAddress::decode(&s[..s.len() - 4]).is_err());
         // extra：追加字符（checksum 失效）
-        assert!(NovaAddress::decode(&format!("{s}q")).is_err());
+        assert!(YazimaoAddress::decode(&format!("{s}q")).is_err());
     }
 
     #[test]
     fn character_mutation_rejected() {
-        let addr = NovaAddress::from_payload(sample_payload());
+        let addr = YazimaoAddress::from_payload(sample_payload());
         let s = addr.encode().unwrap();
         // 在 data 区改一个字符（checksum 不匹配）
         let idx = s.find('1').unwrap() + 2;
         let mut chars: Vec<char> = s.chars().collect();
         chars[idx] = if chars[idx] == 'q' { 'p' } else { 'q' };
         let mutated: String = chars.into_iter().collect();
-        assert!(NovaAddress::decode(&mutated).is_err());
+        assert!(YazimaoAddress::decode(&mutated).is_err());
     }
 
     #[test]
     fn cross_network_rejection() {
         // mainnet 地址在 testnet HRP 上下文：payload network=mainnet，HRP=novat ⇒ NetworkMismatch
-        let addr = NovaAddress::from_payload(sample_payload()); // mainnet
+        let addr = YazimaoAddress::from_payload(sample_payload()); // mainnet
         let s = addr.encode().unwrap();
         // 用 testnet HRP 替换 mainnet HRP（同 payload 数据，checksum 会失效——因此此测试
         // 验证"解码出的网络与 HRP 一致"；真正的跨网由 decode 的 NetworkMismatch 覆盖）
         let data_part = &s[s.find('1').unwrap() + 1..];
         let fake_testnet = format!("novat1{data_part}");
-        let r = NovaAddress::decode(&fake_testnet);
+        let r = YazimaoAddress::decode(&fake_testnet);
         // 因为 checksum 针对 nova1 计算，novat1... 校验失败（InvalidChecksum）或 NetworkMismatch
         assert!(r.is_err());
     }
@@ -498,11 +498,11 @@ mod tests {
         assert_eq!(NetworkId::Mainnet.hrp(), "nova");
         assert_eq!(NetworkId::Testnet.hrp(), "novat");
         assert_eq!(NetworkId::Devnet.hrp(), "novad");
-        let p = NovaAddressPayload {
+        let p = YazimaoAddressPayload {
             network_id: NetworkId::Testnet,
             ..sample_payload()
         };
-        let s = NovaAddress::from_payload(p).encode().unwrap();
+        let s = YazimaoAddress::from_payload(p).encode().unwrap();
         assert!(s.starts_with("novat1"));
     }
 }

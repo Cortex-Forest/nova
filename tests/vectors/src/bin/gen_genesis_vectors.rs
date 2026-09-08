@@ -8,7 +8,7 @@
 //!   STEP 6 IMPLEMENTATION 后回填）。
 //! - 运行：`cargo run -p nova-test-vectors --bin gen_genesis_vectors`（一次性，固化后不再重跑）。
 
-use nova_crypto::address::{AddressType, NetworkId, NovaAddress};
+use nova_crypto::address::{AddressType, NetworkId, YazimaoAddress};
 use nova_crypto::hash::protocol_hash;
 use nova_crypto::key::KeyPair;
 use nova_test_vectors::hex;
@@ -50,13 +50,13 @@ impl ProtocolParams {
     }
 }
 
-fn addr_from_kp(kp: &KeyPair, net: NetworkId) -> NovaAddress {
-    NovaAddress::from_verifying_key(kp.verifying_key(), AddressType::UserAccount, net)
+fn addr_from_kp(kp: &KeyPair, net: NetworkId) -> YazimaoAddress {
+    YazimaoAddress::from_verifying_key(kp.verifying_key(), AddressType::UserAccount, net)
         .expect("addr from key")
 }
 
 /// 地址的 35B payload bytes（account 排序键，ADR-0015）。
-fn payload_bytes(addr: &NovaAddress) -> Vec<u8> {
+fn payload_bytes(addr: &YazimaoAddress) -> Vec<u8> {
     let p = addr.payload();
     let mut b = vec![p.address_version, p.address_type as u8, p.network_id as u8];
     b.extend_from_slice(&p.key_hash);

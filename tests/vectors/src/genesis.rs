@@ -7,7 +7,7 @@
 
 use crate::hex;
 use crate::json;
-use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
+use nova_crypto::address::{AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload};
 use nova_crypto::identity::{
     AccountInit, EconomicsParamsV1, GenesisError, GenesisV1, ProtocolParamsV1, ValidatorInit,
 };
@@ -185,7 +185,7 @@ pub fn genesis_from_json(input: &str) -> Result<GenesisV1, String> {
             .and_then(Value::as_str)
             .ok_or(format!("{tag} account_address"))?;
         let account_address =
-            NovaAddress::decode(addr_s).map_err(|_| format!("{tag} address decode"))?;
+            YazimaoAddress::decode(addr_s).map_err(|_| format!("{tag} address decode"))?;
         let pk_hex = item
             .get("consensus_public_key")
             .and_then(Value::as_str)
@@ -219,7 +219,8 @@ pub fn genesis_from_json(input: &str) -> Result<GenesisV1, String> {
             .get("address")
             .and_then(Value::as_str)
             .ok_or(format!("{tag} address"))?;
-        let address = NovaAddress::decode(addr_s).map_err(|_| format!("{tag} address decode"))?;
+        let address =
+            YazimaoAddress::decode(addr_s).map_err(|_| format!("{tag} address decode"))?;
         let liquid_balance =
             value_u128(item.get("liquid_balance")).ok_or(format!("{tag} liquid_balance"))?;
         initial_accounts.push(AccountInit {
@@ -311,7 +312,7 @@ pub fn genesis_from_bytes(data: &[u8]) -> Option<GenesisV1> {
         let stake = u128::from_le_bytes(take(&mut pos, 16)?.try_into().ok()?);
         let comm = u16::from_le_bytes(take(&mut pos, 2)?.try_into().ok()?);
         initial_validator_set.push(ValidatorInit {
-            account_address: NovaAddress::from_payload(NovaAddressPayload {
+            account_address: YazimaoAddress::from_payload(YazimaoAddressPayload {
                 address_version: 1,
                 address_type: AddressType::UserAccount,
                 network_id,
@@ -328,7 +329,7 @@ pub fn genesis_from_bytes(data: &[u8]) -> Option<GenesisV1> {
         let kh: [u8; 32] = take(&mut pos, 32)?.try_into().ok()?;
         let liq = u128::from_le_bytes(take(&mut pos, 16)?.try_into().ok()?);
         initial_accounts.push(AccountInit {
-            address: NovaAddress::from_payload(NovaAddressPayload {
+            address: YazimaoAddress::from_payload(YazimaoAddressPayload {
                 address_version: 1,
                 address_type: AddressType::UserAccount,
                 network_id,

@@ -26,7 +26,7 @@
 //! - `chain_id` 双绑：payload 内 `chain_id` 与 signed_bytes 头部 `chain_id` 必须一致（§3）；
 //!   篡改 chain_id ⇒ message_hash 变 ⇒ 签名验证失败。
 
-use crate::address::NovaAddress;
+use crate::address::YazimaoAddress;
 use crate::domain::{
     AlgorithmId, DomainId, SigningMessageHash, build_signed_bytes, hash_signing_message,
 };
@@ -112,8 +112,8 @@ pub struct TransactionV1 {
     pub version: u8,
     pub chain_id: u64,
     pub nonce: u64,
-    pub sender: NovaAddress,
-    pub receiver: NovaAddress,
+    pub sender: YazimaoAddress,
+    pub receiver: YazimaoAddress,
     pub amount: u128,
     pub gas_limit: u64,
     pub gas_price: u128,
@@ -297,7 +297,7 @@ pub fn decode_transaction(bytes: &[u8]) -> Result<TransactionV1, TransactionErro
     })
 }
 
-fn decode_addr(b: &[u8]) -> Result<NovaAddress, TransactionError> {
+fn decode_addr(b: &[u8]) -> Result<YazimaoAddress, TransactionError> {
     let a35: [u8; 35] = b.try_into().map_err(|_| TransactionError::DecodeError)?;
     decode_addr_payload(&a35).map_err(|_| TransactionError::InvalidAddress)
 }
@@ -305,10 +305,10 @@ fn decode_addr(b: &[u8]) -> Result<NovaAddress, TransactionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::address::{AddressType, NetworkId, NovaAddressPayload};
+    use crate::address::{AddressType, NetworkId, YazimaoAddressPayload};
 
-    fn addr(kh: [u8; 32], net: NetworkId) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(kh: [u8; 32], net: NetworkId) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: 1,
             address_type: AddressType::UserAccount,
             network_id: net,
@@ -518,7 +518,7 @@ mod tests {
         let vk = signing.verifying_key();
         let mut tx = sample();
         tx.sender =
-            NovaAddress::from_verifying_key(&vk, AddressType::UserAccount, NetworkId::Mainnet)
+            YazimaoAddress::from_verifying_key(&vk, AddressType::UserAccount, NetworkId::Mainnet)
                 .unwrap();
         sign_transaction(&signing, &mut tx).unwrap();
         (signing, vk, tx)
@@ -667,7 +667,7 @@ mod tests {
         let (_, _, mut tx) = signed_tx();
         let rk = Sk::from_seed([0x77u8; 32]).verifying_key();
         tx.receiver =
-            NovaAddress::from_verifying_key(&rk, AddressType::UserAccount, NetworkId::Mainnet)
+            YazimaoAddress::from_verifying_key(&rk, AddressType::UserAccount, NetworkId::Mainnet)
                 .unwrap();
         assert_eq!(
             verify_transaction_signature(&tx, &rk),

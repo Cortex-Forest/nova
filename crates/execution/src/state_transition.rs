@@ -236,14 +236,14 @@ pub fn apply_transaction<S: AccountStateView>(
 mod tests {
     use super::*;
     use nova_core::state::{AccountState, EMPTY_CODE_HASH, account_commitment};
-    use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
+    use nova_crypto::address::{AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload};
     use nova_crypto::key::KeyPair;
     use nova_crypto::transaction::{TransactionType, sign_transaction};
     use std::collections::HashMap;
 
     /// 内存状态视图（测试用；非协议存储）。
     struct MemState {
-        accounts: HashMap<NovaAddress, AccountState>,
+        accounts: HashMap<YazimaoAddress, AccountState>,
     }
 
     impl MemState {
@@ -252,19 +252,19 @@ mod tests {
                 accounts: HashMap::new(),
             }
         }
-        fn insert(&mut self, addr: NovaAddress, state: AccountState) {
+        fn insert(&mut self, addr: YazimaoAddress, state: AccountState) {
             self.accounts.insert(addr, state);
         }
     }
 
     impl AccountStateView for MemState {
-        fn account(&self, addr: &NovaAddress) -> Option<AccountState> {
+        fn account(&self, addr: &YazimaoAddress) -> Option<AccountState> {
             self.accounts.get(addr).copied()
         }
     }
 
-    fn addr(kh: [u8; 32], net: NetworkId) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(kh: [u8; 32], net: NetworkId) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: 1,
             address_type: AddressType::UserAccount,
             network_id: net,
@@ -317,12 +317,12 @@ mod tests {
         kp: &KeyPair,
         chain_id: u64,
         nonce: u64,
-        receiver: NovaAddress,
+        receiver: YazimaoAddress,
         amount: u128,
         gas_limit: u64,
         gas_price: u128,
     ) -> TransactionV1 {
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn successful_transfer() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn implicit_creation_positive_value() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn zero_value_does_not_create() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -464,7 +464,7 @@ mod tests {
     #[test]
     fn self_transfer_single_change() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -492,7 +492,7 @@ mod tests {
     #[test]
     fn signature_failure_no_side_effect() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -513,7 +513,7 @@ mod tests {
     #[test]
     fn wrong_chain_failure() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn expired_failure() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn nonce_too_low_failure() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn future_nonce_failure() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn balance_insufficient_failure() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -624,7 +624,7 @@ mod tests {
     #[test]
     fn receiver_overflow_failure() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn nonce_exhausted_failure() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -665,7 +665,7 @@ mod tests {
     #[test]
     fn zero_gas_params_failure() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn burn1_zero_burn_no_burn_account() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -712,7 +712,7 @@ mod tests {
     #[test]
     fn burn2_normal_burn_lands_in_burn_account() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -740,7 +740,7 @@ mod tests {
     #[test]
     fn burn3_cumulative_across_transactions() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -768,7 +768,7 @@ mod tests {
     #[test]
     fn burn4_deterministic_same_burn() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -801,7 +801,7 @@ mod tests {
     #[test]
     fn burn5_overflow_fails_closed() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn burn6_ordinary_transfer_to_burn_rejected() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -872,7 +872,7 @@ mod tests {
     #[test]
     fn burn8_atomicity_on_burn_failure() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,

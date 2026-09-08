@@ -5,13 +5,13 @@
 //! 远期 expiration 无共识语义（不产生错误）。
 
 use nova_core::transaction::replay::{ReplayError, check_replay_context};
-use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
+use nova_crypto::address::{AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload};
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::transaction::{TransactionType, TransactionV1};
 use proptest::prelude::*;
 
-fn addr(net: NetworkId) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(net: NetworkId) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: 1,
         address_type: AddressType::UserAccount,
         network_id: net,

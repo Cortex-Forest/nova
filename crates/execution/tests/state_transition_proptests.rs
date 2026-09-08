@@ -5,7 +5,7 @@
 
 use nova_core::state::{AccountState, EMPTY_CODE_HASH, burn_address};
 use nova_core::transaction::gas_fee::TRANSFER_INTRINSIC_GAS;
-use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
+use nova_crypto::address::{AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload};
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::key::KeyPair;
 use nova_crypto::transaction::{TransactionType, TransactionV1, sign_transaction};
@@ -13,8 +13,8 @@ use nova_execution::state_transition::{AccountStateView, ExecutionContext, apply
 use proptest::prelude::*;
 use std::collections::HashMap;
 
-fn addr(kh: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(kh: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: 1,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,
@@ -31,10 +31,10 @@ fn account_state(balance: u128, nonce: u64) -> AccountState {
     }
 }
 
-struct MemState(HashMap<NovaAddress, AccountState>);
+struct MemState(HashMap<YazimaoAddress, AccountState>);
 
 impl AccountStateView for MemState {
-    fn account(&self, addr: &NovaAddress) -> Option<AccountState> {
+    fn account(&self, addr: &YazimaoAddress) -> Option<AccountState> {
         self.0.get(addr).copied()
     }
 }
@@ -51,8 +51,8 @@ fn ctx() -> ExecutionContext {
     }
 }
 
-fn sender_addr(kp: &KeyPair) -> NovaAddress {
-    NovaAddress::from_verifying_key(
+fn sender_addr(kp: &KeyPair) -> YazimaoAddress {
+    YazimaoAddress::from_verifying_key(
         kp.verifying_key(),
         AddressType::UserAccount,
         NetworkId::Mainnet,
@@ -63,7 +63,7 @@ fn sender_addr(kp: &KeyPair) -> NovaAddress {
 fn build_tx(
     kp: &KeyPair,
     nonce: u64,
-    receiver: NovaAddress,
+    receiver: YazimaoAddress,
     amount: u128,
     gas_limit: u64,
     gas_price: u128,

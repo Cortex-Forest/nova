@@ -5,7 +5,7 @@
 //! 向量文件来自 `tests/vectors/address/`（生成器 `gen_address_vectors` 生成真实地址）；
 //! 此处 `include_str!` 内嵌加载（确定性，不依赖文件系统顺序）。
 
-use nova_crypto::address::{ADDRESS_VERSION, AddressError, AddressType, NetworkId, NovaAddress};
+use nova_crypto::address::{ADDRESS_VERSION, AddressError, AddressType, NetworkId, YazimaoAddress};
 use serde_json::Value;
 
 const ADDRESS_VECTORS: &[(&str, &str)] = &[
@@ -109,7 +109,7 @@ fn address_vectors_match_implementation() {
         let ver: u8 = v["address_version"].as_u64().unwrap() as u8;
         let key_hash = decode_hex(field(&v, "key_hash"));
 
-        let result = NovaAddress::decode(address);
+        let result = YazimaoAddress::decode(address);
         if expected == "VALID" {
             let addr = result.unwrap_or_else(|e| {
                 panic!(
@@ -155,7 +155,7 @@ fn address_vectors_reject_invalid() {
         }
         let address = field(&v, "address");
         let expected_error = field(&v, "expected_error");
-        match NovaAddress::decode(address) {
+        match YazimaoAddress::decode(address) {
             Ok(_) => panic!("{id}: expected INVALID but decode accepted"),
             Err(e) => {
                 let name = error_name(&e);

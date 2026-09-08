@@ -13,7 +13,7 @@ use nova_core::state::{
     AccountChange, AccountState, AccountStateView, EMPTY_CODE_HASH, EMPTY_STORAGE_ROOT,
 };
 use nova_core::transaction::gas_fee::TRANSFER_INTRINSIC_GAS;
-use nova_crypto::address::NovaAddress;
+use nova_crypto::address::YazimaoAddress;
 use nova_crypto::signature::VerifyingKey;
 use nova_crypto::transaction::TransactionV1;
 use std::collections::{HashMap, HashSet};
@@ -48,11 +48,11 @@ impl std::error::Error for BlockError {}
 /// 影子状态：base（只读 fallback）+ overlay（本 block 已执行写入；ADR-0029 D-2）。
 struct BlockState<'a, S: AccountStateView> {
     base: &'a S,
-    overlay: HashMap<NovaAddress, AccountState>,
+    overlay: HashMap<YazimaoAddress, AccountState>,
 }
 
 impl<S: AccountStateView> AccountStateView for BlockState<'_, S> {
-    fn account(&self, addr: &NovaAddress) -> Option<AccountState> {
+    fn account(&self, addr: &YazimaoAddress) -> Option<AccountState> {
         self.overlay
             .get(addr)
             .copied()
@@ -61,7 +61,7 @@ impl<S: AccountStateView> AccountStateView for BlockState<'_, S> {
 }
 
 /// 把 change 应用到 overlay（block 内部影子写；最终落盘由 storage 负责）。
-fn apply_change(overlay: &mut HashMap<NovaAddress, AccountState>, c: &AccountChange) {
+fn apply_change(overlay: &mut HashMap<YazimaoAddress, AccountState>, c: &AccountChange) {
     overlay.insert(
         c.address,
         AccountState {
@@ -150,7 +150,7 @@ pub fn execute_block<S: AccountStateView>(
 mod tests {
     use super::*;
     use nova_core::state::AccountState;
-    use nova_crypto::address::{ADDRESS_VERSION, AddressType, NetworkId, NovaAddressPayload};
+    use nova_crypto::address::{ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddressPayload};
     use nova_crypto::identity::ChainIdentity;
     use nova_crypto::key::KeyPair;
     use nova_crypto::signature::SigningKey;
@@ -158,16 +158,16 @@ mod tests {
     use nova_crypto::transaction::sign_transaction;
 
     struct MapState {
-        accounts: HashMap<NovaAddress, AccountState>,
+        accounts: HashMap<YazimaoAddress, AccountState>,
     }
     impl AccountStateView for MapState {
-        fn account(&self, addr: &NovaAddress) -> Option<AccountState> {
+        fn account(&self, addr: &YazimaoAddress) -> Option<AccountState> {
             self.accounts.get(addr).copied()
         }
     }
 
-    fn addr(key_hash: [u8; 32]) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(key_hash: [u8; 32]) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: ADDRESS_VERSION,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,
@@ -176,8 +176,8 @@ mod tests {
     }
 
     fn mk_tx(
-        sender: NovaAddress,
-        receiver: NovaAddress,
+        sender: YazimaoAddress,
+        receiver: YazimaoAddress,
         nonce: u64,
         amount: u128,
         sk: &SigningKey,
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn execute_block_single_success_and_skip() {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,

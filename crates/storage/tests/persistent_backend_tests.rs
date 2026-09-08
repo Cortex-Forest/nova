@@ -12,7 +12,7 @@ use nova_core::state::{
     AccountChange, AccountState, AccountStateView, EMPTY_CODE_HASH, EMPTY_STORAGE_ROOT,
 };
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_storage::backend::StorageBackend;
 use nova_storage::memory::MemoryBackend;
@@ -23,8 +23,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use tempfile::tempdir;
 
-fn addr(key_hash: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(key_hash: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,
@@ -32,7 +32,7 @@ fn addr(key_hash: [u8; 32]) -> NovaAddress {
     })
 }
 
-fn change(a: NovaAddress, balance: u128, nonce: u64) -> AccountChange {
+fn change(a: YazimaoAddress, balance: u128, nonce: u64) -> AccountChange {
     AccountChange {
         address: a,
         new_balance: balance,

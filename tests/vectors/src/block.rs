@@ -8,7 +8,7 @@ use crate::hex;
 use crate::json;
 use crate::transaction::{build_tx, get_str, parse_account};
 use nova_core::state::AccountChange;
-use nova_crypto::address::{NetworkId, NovaAddress};
+use nova_crypto::address::{NetworkId, YazimaoAddress};
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::signature::VerifyingKey;
 use nova_execution::block::{BlockError, execute_block};
@@ -106,7 +106,7 @@ pub fn validate_block_vector(input: &str) -> BlockValidation {
     if let Some(accounts) = value.get("initial_state").and_then(|v| v.get("accounts")) {
         if let Some(obj) = accounts.as_object() {
             for (addr_str, acc) in obj {
-                match NovaAddress::decode(addr_str) {
+                match YazimaoAddress::decode(addr_str) {
                     Ok(addr) => match parse_account(acc) {
                         Ok((balance, nonce)) => seed.push(AccountChange {
                             address: addr,

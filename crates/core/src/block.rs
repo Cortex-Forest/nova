@@ -454,14 +454,14 @@ pub fn verify_height_parent(
 mod tests {
     use super::*;
     use nova_crypto::address::{
-        ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+        ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
     };
     use nova_crypto::key::KeyPair;
     use nova_crypto::signature::sign_message_hash;
     use nova_crypto::transaction::TransactionType;
 
-    fn addr(kh: [u8; 32]) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(kh: [u8; 32]) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: ADDRESS_VERSION,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,

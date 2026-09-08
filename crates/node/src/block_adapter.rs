@@ -6,7 +6,7 @@
 //! - 管线顺序冻结（ADR-0046 §12）：①decode → ②signature → ③tx-root → ④execute+verify-root →
 //!   ⑤height/parent → ⑥commit；**禁止重排 / commit-before-verify / update-head-before-commit**。
 
-use nova_crypto::address::{NetworkId, NovaAddress};
+use nova_crypto::address::{NetworkId, YazimaoAddress};
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::signature::VerifyingKey;
 use nova_runtime::{
@@ -55,7 +55,7 @@ pub enum NodeBlockApplicationError {
     /// runtime 管线错误（decode / validation / execution / storage 4 类，保留底层错误）。
     Pipeline(BlockPipelineError),
     /// sender key 未知 ⇒ 整块拒绝（ADR-0046 §6 / ADR-0047 Security；禁止 skip）。
-    KeyResolution(NovaAddress),
+    KeyResolution(YazimaoAddress),
     /// head 派生失败（如 height 溢出）。
     HeadInvalid,
 }
@@ -352,7 +352,7 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
 pub struct NoAccountsKeyResolver;
 
 impl KeyResolver for NoAccountsKeyResolver {
-    fn resolve(&self, _address: NovaAddress) -> Option<VerifyingKey> {
+    fn resolve(&self, _address: YazimaoAddress) -> Option<VerifyingKey> {
         None
     }
 }
@@ -360,7 +360,7 @@ impl KeyResolver for NoAccountsKeyResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_crypto::address::{ADDRESS_VERSION, AddressType, NovaAddressPayload};
+    use nova_crypto::address::{ADDRESS_VERSION, AddressType, YazimaoAddressPayload};
     use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
     use nova_crypto::key::KeyPair;
     use nova_crypto::signature::{SigningKey, sign_message_hash};
@@ -374,8 +374,8 @@ mod tests {
     use nova_storage::node::TrieKey;
     use std::collections::HashMap;
 
-    fn addr(key_hash: [u8; 32]) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(key_hash: [u8; 32]) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: ADDRESS_VERSION,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,
@@ -384,7 +384,7 @@ mod tests {
     }
 
     /// 初始 store：给 sender 注资 1_000_000（nonce 0），返回 store + genesis root。
-    fn genesis_store(sender: NovaAddress) -> (StateStore<MemoryBackend>, NodeHash) {
+    fn genesis_store(sender: YazimaoAddress) -> (StateStore<MemoryBackend>, NodeHash) {
         let mut store = StateStore::new(MemoryBackend::new());
         store
             .apply(&[nova_runtime::AccountChange {
@@ -400,8 +400,8 @@ mod tests {
 
     /// 构造已签名 transfer tx（gas_price=1，fee_burn_bps=0 ⇒ fee=21_000；expiration 足够大以通过 N13 高度窗）。
     fn signed_tx(
-        sender: NovaAddress,
-        receiver: NovaAddress,
+        sender: YazimaoAddress,
+        receiver: YazimaoAddress,
         nonce: u64,
         amount: u128,
         sk: &SigningKey,
@@ -526,11 +526,11 @@ mod tests {
     /// MemoryKeyRegistry：最小测试实现（ADR-0047 Ownership；cfg(test)）。
     #[derive(Clone, Default)]
     struct MemoryKeyRegistry {
-        map: HashMap<NovaAddress, VerifyingKey>,
+        map: HashMap<YazimaoAddress, VerifyingKey>,
     }
 
     impl MemoryKeyRegistry {
-        fn with(entries: impl IntoIterator<Item = (NovaAddress, VerifyingKey)>) -> Self {
+        fn with(entries: impl IntoIterator<Item = (YazimaoAddress, VerifyingKey)>) -> Self {
             Self {
                 map: entries.into_iter().collect(),
             }
@@ -538,7 +538,7 @@ mod tests {
     }
 
     impl KeyResolver for MemoryKeyRegistry {
-        fn resolve(&self, address: NovaAddress) -> Option<VerifyingKey> {
+        fn resolve(&self, address: YazimaoAddress) -> Option<VerifyingKey> {
             self.map.get(&address).copied()
         }
     }
@@ -546,14 +546,14 @@ mod tests {
     /// 标准测试环境：proposer kp（= sender kp）、sender/receiver、genesis store/root、registry。
     fn test_env() -> (
         KeyPair,
-        NovaAddress,
-        NovaAddress,
+        YazimaoAddress,
+        YazimaoAddress,
         StateStore<MemoryBackend>,
         NodeHash,
         MemoryKeyRegistry,
     ) {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -813,7 +813,7 @@ mod tests {
         let genesis_hash = [0xaa; 32];
         let max_gas = 1_000_000;
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -910,7 +910,7 @@ mod tests {
         let genesis_hash = [0xaa; 32];
         let max_gas = 1_000_000;
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,

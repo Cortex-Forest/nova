@@ -22,7 +22,7 @@ use nova_consensus::round::LockedState;
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_consensus::vote::VoteType;
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_crypto::domain::SigningMessageHash;
 use nova_crypto::identity::{EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit};
@@ -41,8 +41,8 @@ const GENESIS_HASH: [u8; 32] = [0x42; 32];
 
 // ---------- fixtures ----------
 
-fn addr(kh: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(kh: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,

@@ -1,6 +1,6 @@
 //! Sparse Merkle Tree（STEP 8B-3 — State Root Algorithm；ADR-0026 T-1/T-6）。
 //!
-//! - **Binary SMT**，深度 = 280（key = `NovaAddressPayload` raw 35B）。
+//! - **Binary SMT**，深度 = 280（key = `YazimaoAddressPayload` raw 35B）。
 //! - 增量路径更新：insert / update / delete 只影响 leaf → 280 层 path → root（O(280)）。
 //! - 位序：`depth 0` = key[0] 最高位；`bit 1 => right`，`bit 0 => left`。
 //! - **可交换性**：SMT 是**集合承诺**（key→value 映射），非插入序列承诺；同集合 ⇒ 同 root。

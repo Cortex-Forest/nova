@@ -4,7 +4,7 @@ YAZIMAO 核心协议类型（**PHASE 1 占位**）。
 
 ## 状态
 
-- 当前仅定义协议版本常量 `PROTOCOL_VERSION = "0.1"` 与统一错误模型骨架（`NovaError` trait + `ErrorKind` 分类，无具体业务错误）。
+- 当前仅定义协议版本常量 `PROTOCOL_VERSION = "0.1"` 与统一错误模型骨架（`YazimaoError` trait + `ErrorKind` 分类，无具体业务错误）。
 - 交易 / 状态 / 区块等核心类型：`NOT IMPLEMENTED`（待对应 PHASE + ADR）。
 
 ## 依赖方向

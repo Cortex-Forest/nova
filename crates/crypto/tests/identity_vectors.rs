@@ -5,7 +5,7 @@
 //! - tampered / wrong-genesis-hash：`computed != expected`（篡改/错误 hash 检测）。
 //! - 向量文件 `include_str!` 内嵌（确定性）。
 
-use nova_crypto::address::{NetworkId, NovaAddress};
+use nova_crypto::address::{NetworkId, YazimaoAddress};
 use nova_crypto::hash::protocol_hash;
 use nova_crypto::identity::{
     AccountInit, EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit,
@@ -63,7 +63,7 @@ fn json_to_genesis(v: &Value) -> GenesisV1 {
         .iter()
         .map(|item| {
             let addr =
-                NovaAddress::decode(item["account_address"].as_str().unwrap()).expect("addr");
+                YazimaoAddress::decode(item["account_address"].as_str().unwrap()).expect("addr");
             let pk = decode_hex(item["consensus_public_key"].as_str().unwrap());
             assert_eq!(pk.len(), 32);
             let mut consensus_public_key = [0u8; 32];
@@ -81,7 +81,7 @@ fn json_to_genesis(v: &Value) -> GenesisV1 {
         .expect("accs")
         .iter()
         .map(|item| AccountInit {
-            address: NovaAddress::decode(item["address"].as_str().unwrap()).expect("addr"),
+            address: YazimaoAddress::decode(item["address"].as_str().unwrap()).expect("addr"),
             liquid_balance: u128_str(item, "liquid_balance"),
         })
         .collect();

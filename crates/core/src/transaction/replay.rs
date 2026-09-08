@@ -73,10 +73,10 @@ pub fn check_replay_context(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
+    use nova_crypto::address::{AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload};
 
-    fn addr(net: NetworkId) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(net: NetworkId) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: 1,
             address_type: AddressType::UserAccount,
             network_id: net,
@@ -94,8 +94,8 @@ mod tests {
 
     fn tx(
         chain_id: u64,
-        sender: NovaAddress,
-        receiver: NovaAddress,
+        sender: YazimaoAddress,
+        receiver: YazimaoAddress,
         expiration: u64,
     ) -> TransactionV1 {
         TransactionV1 {

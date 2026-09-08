@@ -6,7 +6,7 @@
 //! - 属共识安全域；**ValidatorId ≠ NodeId ≠ Account Address**（身份隔离）。
 
 use core::fmt;
-use nova_crypto::address::NovaAddress;
+use nova_crypto::address::YazimaoAddress;
 use nova_crypto::hash::protocol_hash;
 use nova_crypto::identity::GenesisV1;
 
@@ -48,7 +48,7 @@ pub struct ValidatorInfo {
     /// Ed25519 压缩点。
     pub consensus_public_key: [u8; 32],
     /// 链账户（fee/reward 归属）。
-    pub account_address: NovaAddress,
+    pub account_address: YazimaoAddress,
     /// 投票权重（= genesis bonded_stake，V-2 静态）。
     pub voting_weight: u128,
 }
@@ -137,12 +137,12 @@ impl ValidatorSet {
 mod tests {
     use super::*;
     use nova_crypto::address::{
-        ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+        ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
     };
     use nova_crypto::identity::{EconomicsParamsV1, ProtocolParamsV1, ValidatorInit};
 
-    fn addr(kh: [u8; 32]) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(kh: [u8; 32]) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: ADDRESS_VERSION,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,

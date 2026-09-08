@@ -11,7 +11,7 @@ use nova_core::state::{
     account_commitment,
 };
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_storage::memory::MemoryBackend;
 use nova_storage::state_root::calculate_state_root;
@@ -20,7 +20,7 @@ use proptest::prelude::*;
 use std::collections::HashMap;
 
 fn change(key_hash: [u8; 32], balance: u128, nonce: u64) -> AccountChange {
-    let addr = NovaAddress::from_payload(NovaAddressPayload {
+    let addr = YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,
@@ -91,7 +91,7 @@ proptest! {
             last.insert(kh, (b, n));
         }
         for (kh, (b, n)) in last {
-            let addr = NovaAddress::from_payload(NovaAddressPayload {
+            let addr = YazimaoAddress::from_payload(YazimaoAddressPayload {
                 address_version: ADDRESS_VERSION,
                 address_type: AddressType::UserAccount,
                 network_id: NetworkId::Mainnet,

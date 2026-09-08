@@ -231,7 +231,7 @@ mod tests {
     use nova_consensus::validator::ValidatorId;
     use nova_consensus::vote::{VoteType, canonical_vote_payload};
     use nova_crypto::address::{
-        ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+        ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
     };
     use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
     use nova_crypto::identity::{EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit};
@@ -240,8 +240,8 @@ mod tests {
     use nova_network::message::sign_message;
     use nova_network::node_id::NodeId;
 
-    fn addr(kh: [u8; 32]) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(kh: [u8; 32]) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: ADDRESS_VERSION,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,

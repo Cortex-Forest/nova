@@ -229,7 +229,7 @@ pub fn attach_proposer_signature(
 mod tests {
     use super::*;
     use nova_crypto::address::{
-        ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+        ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
     };
     use nova_crypto::identity::ChainIdentity;
     use nova_crypto::key::KeyPair;
@@ -244,8 +244,8 @@ mod tests {
     const CHAIN_ID: u64 = 1001;
     const MAX_GAS: u64 = 100_000_000;
 
-    fn addr(key_hash: [u8; 32]) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(key_hash: [u8; 32]) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: ADDRESS_VERSION,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,
@@ -253,18 +253,22 @@ mod tests {
         })
     }
 
-    fn sender_addr(sk: &SigningKey) -> NovaAddress {
+    fn sender_addr(sk: &SigningKey) -> YazimaoAddress {
         let vk = sk.verifying_key();
-        NovaAddress::from_verifying_key(&vk, AddressType::UserAccount, NetworkId::Mainnet).unwrap()
+        YazimaoAddress::from_verifying_key(&vk, AddressType::UserAccount, NetworkId::Mainnet)
+            .unwrap()
     }
 
     /// 注资 store（nonce 0；created）。
-    fn seed_store(entries: &[(NovaAddress, u128)]) -> StateStore<MemoryBackend> {
+    fn seed_store(entries: &[(YazimaoAddress, u128)]) -> StateStore<MemoryBackend> {
         seed_store_nonce(entries, 0)
     }
 
     /// 注资 store（指定账户起始 nonce；created）。
-    fn seed_store_nonce(entries: &[(NovaAddress, u128)], nonce: u64) -> StateStore<MemoryBackend> {
+    fn seed_store_nonce(
+        entries: &[(YazimaoAddress, u128)],
+        nonce: u64,
+    ) -> StateStore<MemoryBackend> {
         let mut store = StateStore::new(MemoryBackend::new());
         let changes: Vec<AccountChange> = entries
             .iter()
@@ -304,7 +308,7 @@ mod tests {
     /// 构造已签名 transfer 候选（gas_price=1 ⇒ fee=21_000；expiration 大以通过高度窗）。
     fn signed_candidate(
         sk: &SigningKey,
-        receiver: NovaAddress,
+        receiver: YazimaoAddress,
         nonce: u64,
         amount: u128,
         chain_id: u64,
@@ -450,7 +454,7 @@ mod tests {
         let res = build(&store, &exec_ctx(CHAIN_ID, 0), &candidates);
         let mut expected = vec![sa, sb, sc];
         expected.sort_by_key(address_payload_bytes);
-        let got: Vec<NovaAddress> = res.block.body.txs.iter().map(|t| t.sender).collect();
+        let got: Vec<YazimaoAddress> = res.block.body.txs.iter().map(|t| t.sender).collect();
         assert_eq!(got, expected, "sender payload ASC");
     }
 
@@ -739,8 +743,8 @@ mod tests {
     }
 
     // 测试辅助：BURN_ADDRESS 地址（与 core `burn_address` 同构；node 不直接依赖 core，自建同构引用）。
-    fn crate_burn_address() -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn crate_burn_address() -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: ADDRESS_VERSION,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,

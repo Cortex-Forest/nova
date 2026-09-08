@@ -7,7 +7,7 @@
 //! 生成策略：随机 validator/account 条目 → 去重 + 排序 → **canonical 有序** Genesis，
 //! 再验证编码/哈希性质。
 
-use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
+use nova_crypto::address::{AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload};
 use nova_crypto::identity::{
     AccountInit, EconomicsParamsV1, GenesisError, GenesisV1, MAX_ACCOUNTS, MAX_VALIDATORS,
     ProtocolParamsV1, ValidatorInit, canonical_genesis_bytes, compute_genesis_hash,
@@ -49,7 +49,7 @@ fn entry() -> impl Strategy<Value = (ValidatorInit, AccountInit)> {
         any::<u128>(),
     )
         .prop_map(|(pk, kh, stake, comm, liq)| {
-            let addr = NovaAddress::from_payload(NovaAddressPayload {
+            let addr = YazimaoAddress::from_payload(YazimaoAddressPayload {
                 address_version: 1,
                 address_type: AddressType::UserAccount,
                 network_id: NetworkId::Mainnet,
@@ -174,7 +174,7 @@ proptest! {
 /// 集合超上限 ⇒ CollectionTooLarge（确定性，非随机）。
 #[test]
 fn collection_limit_deterministic() {
-    let addr = NovaAddress::from_payload(NovaAddressPayload {
+    let addr = YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: 1,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,
@@ -185,7 +185,7 @@ fn collection_limit_deterministic() {
     let mut kh = [0u8; 32];
     for i in 0..=MAX_VALIDATORS {
         kh[0..8].copy_from_slice(&(i as u64).to_le_bytes());
-        let a = NovaAddress::from_payload(NovaAddressPayload {
+        let a = YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: 1,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,
@@ -268,8 +268,8 @@ fn valid_genesis() -> GenesisV1 {
     }
 }
 
-fn addr(kh: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(kh: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: 1,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,

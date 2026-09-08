@@ -13,7 +13,7 @@ use crate::hex;
 use crate::json;
 use nova_core::state::{AccountChange, AccountState};
 use nova_core::transaction::gas_fee::TRANSFER_INTRINSIC_GAS;
-use nova_crypto::address::{NetworkId, NovaAddress};
+use nova_crypto::address::{NetworkId, YazimaoAddress};
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::signature::VerifyingKey;
 use nova_crypto::transaction::{
@@ -38,11 +38,11 @@ pub struct TransactionValidation {
 
 /// 内存账户视图（fixture 驱动；STEP 8 之前仅测试用）。
 struct FixtureState {
-    accounts: HashMap<NovaAddress, AccountState>,
+    accounts: HashMap<YazimaoAddress, AccountState>,
 }
 
 impl AccountStateView for FixtureState {
-    fn account(&self, addr: &NovaAddress) -> Option<AccountState> {
+    fn account(&self, addr: &YazimaoAddress) -> Option<AccountState> {
         self.accounts.get(addr).copied()
     }
 }
@@ -73,10 +73,11 @@ pub(crate) fn build_tx(value: &Value) -> Result<TransactionV1, String> {
         .get("nonce")
         .and_then(Value::as_u64)
         .ok_or_else(|| "transaction.nonce".to_string())?;
-    let sender =
-        NovaAddress::decode(get_str(t, "sender").ok_or_else(|| "transaction.sender".to_string())?)
-            .map_err(|e| format!("transaction.sender: {e}"))?;
-    let receiver = NovaAddress::decode(
+    let sender = YazimaoAddress::decode(
+        get_str(t, "sender").ok_or_else(|| "transaction.sender".to_string())?,
+    )
+    .map_err(|e| format!("transaction.sender: {e}"))?;
+    let receiver = YazimaoAddress::decode(
         get_str(t, "receiver").ok_or_else(|| "transaction.receiver".to_string())?,
     )
     .map_err(|e| format!("transaction.receiver: {e}"))?;

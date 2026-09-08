@@ -10,7 +10,7 @@
 //! - `None` 语义（ADR-0046 §6 / ADR-0047 Security）：**整块拒绝**；
 //!   禁止 skip transaction / silent continue / dummy key。
 
-use nova_crypto::address::NovaAddress;
+use nova_crypto::address::YazimaoAddress;
 use nova_crypto::signature::VerifyingKey;
 
 /// Address → PublicKey 解析契约（ADR-0047）。
@@ -20,5 +20,5 @@ use nova_crypto::signature::VerifyingKey;
 ///   否则不同节点将产生不同 execution result ⇒ 不同 state_root（破坏确定性）。
 pub trait KeyResolver {
     /// 解析 `address` 对应的 verifying key；未知 ⇒ `None`。
-    fn resolve(&self, address: NovaAddress) -> Option<VerifyingKey>;
+    fn resolve(&self, address: YazimaoAddress) -> Option<VerifyingKey>;
 }

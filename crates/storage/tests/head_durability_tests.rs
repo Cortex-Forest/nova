@@ -5,7 +5,7 @@
 
 use nova_core::state::{AccountChange, AccountStateView};
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_storage::backend::StorageBackend;
 use nova_storage::error::StorageError;
@@ -16,8 +16,8 @@ use nova_storage::state_root::calculate_state_root;
 use nova_storage::store::StateStore;
 use tempfile::TempDir;
 
-fn addr(key_hash: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(key_hash: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,
@@ -25,7 +25,7 @@ fn addr(key_hash: [u8; 32]) -> NovaAddress {
     })
 }
 
-fn change(a: NovaAddress, balance: u128, nonce: u64) -> AccountChange {
+fn change(a: YazimaoAddress, balance: u128, nonce: u64) -> AccountChange {
     AccountChange {
         address: a,
         new_balance: balance,
@@ -48,7 +48,7 @@ fn head_record(height: u64, root: NodeHash) -> HeadRecord {
 fn commit_block_with_head(
     store: &mut StateStore<PersistentBackend>,
     height: u64,
-    a: NovaAddress,
+    a: YazimaoAddress,
     balance: u128,
     nonce: u64,
 ) -> NodeHash {

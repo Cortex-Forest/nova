@@ -15,7 +15,7 @@ use nova_core::state::{
     AccountChange, AccountState, AccountStateView, EMPTY_CODE_HASH, EMPTY_STORAGE_ROOT,
     account_commitment, canonical_account_bytes, decode_account_bytes,
 };
-use nova_crypto::address::NovaAddress;
+use nova_crypto::address::YazimaoAddress;
 
 /// 区块级快照（trie + backend；D-5）。
 #[derive(Clone)]
@@ -95,7 +95,7 @@ impl<B: StorageBackend> StateStore<B> {
 
     /// 查询 `addr` 在 trie 中的 account_commitment（backend/trie 一致性验证、未来 proof 用；
     /// **非完整状态**——trie 只存 commitment，禁止从 trie decode state，D-2）。
-    pub fn commitment(&self, addr: &NovaAddress) -> Option<ValueHash> {
+    pub fn commitment(&self, addr: &YazimaoAddress) -> Option<ValueHash> {
         let key: TrieKey = addr.payload().to_bytes();
         self.trie.get(&key)
     }
@@ -195,7 +195,7 @@ fn account_state(c: &AccountChange) -> AccountState {
 }
 
 impl<B: StorageBackend> AccountStateView for StateStore<B> {
-    fn account(&self, addr: &NovaAddress) -> Option<AccountState> {
+    fn account(&self, addr: &YazimaoAddress) -> Option<AccountState> {
         let key: TrieKey = addr.payload().to_bytes();
         let bytes = self.backend.get(&key)?;
         let arr: [u8; 88] = bytes.as_slice().try_into().ok()?;
@@ -209,10 +209,10 @@ mod tests {
     use crate::error::StorageError;
     use crate::memory::{MemoryBackend, MemorySnapshot};
     use nova_core::state::{EMPTY_CODE_HASH, EMPTY_STORAGE_ROOT};
-    use nova_crypto::address::{ADDRESS_VERSION, AddressType, NetworkId, NovaAddressPayload};
+    use nova_crypto::address::{ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddressPayload};
 
-    fn addr(key_hash: [u8; 32]) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(key_hash: [u8; 32]) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: ADDRESS_VERSION,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,

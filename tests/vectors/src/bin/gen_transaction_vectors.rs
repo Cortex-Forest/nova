@@ -7,7 +7,7 @@
 //!   canonical_transaction_bytes / txid）由生产实现重算写入；loader 独立重算比对。
 
 use nova_core::state::{AccountState, EMPTY_CODE_HASH};
-use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
+use nova_crypto::address::{AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload};
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::key::KeyPair;
 use nova_crypto::transaction::{
@@ -32,8 +32,8 @@ fn hex(b: &[u8]) -> String {
     encode_lower_hex(b)
 }
 
-fn addr_from_kh(kh: [u8; 32], net: NetworkId) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr_from_kh(kh: [u8; 32], net: NetworkId) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: 1,
         address_type: AddressType::UserAccount,
         network_id: net,
@@ -41,8 +41,8 @@ fn addr_from_kh(kh: [u8; 32], net: NetworkId) -> NovaAddress {
     })
 }
 
-fn sender_addr(kp: &KeyPair, net: NetworkId) -> NovaAddress {
-    NovaAddress::from_verifying_key(kp.verifying_key(), AddressType::UserAccount, net).unwrap()
+fn sender_addr(kp: &KeyPair, net: NetworkId) -> YazimaoAddress {
+    YazimaoAddress::from_verifying_key(kp.verifying_key(), AddressType::UserAccount, net).unwrap()
 }
 
 fn account(balance: u128, nonce: u64) -> AccountState {
@@ -55,10 +55,10 @@ fn account(balance: u128, nonce: u64) -> AccountState {
 }
 
 /// 内存状态视图（生成器用）。
-struct MemState(HashMap<NovaAddress, AccountState>);
+struct MemState(HashMap<YazimaoAddress, AccountState>);
 
 impl AccountStateView for MemState {
-    fn account(&self, addr: &NovaAddress) -> Option<AccountState> {
+    fn account(&self, addr: &YazimaoAddress) -> Option<AccountState> {
         self.0.get(addr).copied()
     }
 }
@@ -101,7 +101,7 @@ fn mk_tx(
     chain_id: u64,
     nonce: u64,
     sender_net: NetworkId,
-    receiver: NovaAddress,
+    receiver: YazimaoAddress,
     amount: u128,
     gas_limit: u64,
     gas_price: u128,

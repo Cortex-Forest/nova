@@ -15,7 +15,7 @@
 use crate::hashing::{STATE_BRANCH, STATE_LEAF, branch_node_hash, empty_node_hash, leaf_node_hash};
 use core::fmt;
 
-/// SMT trie key = `NovaAddressPayload` raw bytes（35B；ADR-0026 T-2 / ADR-0018）。
+/// SMT trie key = `YazimaoAddressPayload` raw bytes（35B；ADR-0026 T-2 / ADR-0018）。
 pub type TrieKey = [u8; 35];
 /// 叶子 value hash = `account_commitment`（32B；ADR-0018）。
 pub type ValueHash = [u8; 32];

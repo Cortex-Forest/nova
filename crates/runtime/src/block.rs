@@ -175,7 +175,7 @@ mod tests {
     };
     use nova_core::transaction::gas_fee::TRANSFER_INTRINSIC_GAS;
     use nova_crypto::address::{
-        ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+        ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
     };
     use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
     use nova_crypto::identity::ChainIdentity;
@@ -185,8 +185,8 @@ mod tests {
     use nova_storage::memory::{MemoryBackend, MemorySnapshot};
     use nova_storage::node::TrieKey;
 
-    fn addr(key_hash: [u8; 32]) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(key_hash: [u8; 32]) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: ADDRESS_VERSION,
             address_type: AddressType::UserAccount,
             network_id: NetworkId::Mainnet,
@@ -207,8 +207,8 @@ mod tests {
     }
 
     fn signed_tx(
-        sender: NovaAddress,
-        receiver: NovaAddress,
+        sender: YazimaoAddress,
+        receiver: YazimaoAddress,
         nonce: u64,
         amount: u128,
         sk: &nova_crypto::signature::SigningKey,
@@ -258,7 +258,7 @@ mod tests {
         KeyPair,
     ) {
         let kp = KeyPair::generate().unwrap();
-        let sender = NovaAddress::from_verifying_key(
+        let sender = YazimaoAddress::from_verifying_key(
             kp.verifying_key(),
             AddressType::UserAccount,
             NetworkId::Mainnet,
@@ -533,7 +533,7 @@ mod tests {
 
         for _ in 0..n_txs {
             let kp = KeyPair::generate().unwrap();
-            let sender = NovaAddress::from_verifying_key(
+            let sender = YazimaoAddress::from_verifying_key(
                 kp.verifying_key(),
                 AddressType::UserAccount,
                 NetworkId::Mainnet,

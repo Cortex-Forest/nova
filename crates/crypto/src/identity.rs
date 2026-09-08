@@ -23,7 +23,7 @@
 //! - 禁止把 `genesis_hash` 放入被 hash 的内容（hash-over-preimage）。
 //! - **不实现**：节点启动 / 共识 / validator/staking/economics runtime / P2P / wallet / RPC。
 
-use crate::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
+use crate::address::{AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload};
 use crate::hash::protocol_hash;
 use crate::signature::VerifyingKey;
 use core::fmt;
@@ -129,7 +129,7 @@ impl std::error::Error for GenesisError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorInit {
     /// 验证者账户地址（bech32m；canonical 编码为 35B payload）。
-    pub account_address: NovaAddress,
+    pub account_address: YazimaoAddress,
     /// Ed25519 公钥（压缩点 32B；不保存 `voting_power`）。
     pub consensus_public_key: [u8; 32],
     /// 从对应账户 liquid 划转的质押（u128 LE）。
@@ -142,7 +142,7 @@ pub struct ValidatorInit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountInit {
     /// 账户地址（bech32m；canonical 编码为 35B payload）。
-    pub address: NovaAddress,
+    pub address: YazimaoAddress,
     /// Genesis 初始化前的 liquid balance（u128 LE）。
     pub liquid_balance: u128,
 }
@@ -186,7 +186,7 @@ pub fn validator_id(consensus_public_key: &[u8; 32]) -> [u8; 32] {
 }
 
 /// 地址的 35B canonical payload bytes（ADR-0015 §2）。
-pub fn address_payload_bytes(addr: &NovaAddress) -> [u8; 35] {
+pub fn address_payload_bytes(addr: &YazimaoAddress) -> [u8; 35] {
     let p = addr.payload();
     let mut b = [0u8; 35];
     b[0] = p.address_version;
@@ -308,9 +308,9 @@ pub struct ChainIdentity {
     pub genesis_hash: [u8; 32],
 }
 
-/// 地址 35B payload → NovaAddress（校验 version/type/network 注册；未知 tag ⇒ 拒绝）。
+/// 地址 35B payload → YazimaoAddress（校验 version/type/network 注册；未知 tag ⇒ 拒绝）。
 /// `pub(crate)`：供 transaction 模块复用（单一来源，ADR-0004）。
-pub(crate) fn decode_addr_payload(b: &[u8; 35]) -> Result<NovaAddress, GenesisError> {
+pub(crate) fn decode_addr_payload(b: &[u8; 35]) -> Result<YazimaoAddress, GenesisError> {
     let version = b[0];
     if version != crate::address::ADDRESS_VERSION {
         return Err(GenesisError::InvalidAddress);
@@ -319,7 +319,7 @@ pub(crate) fn decode_addr_payload(b: &[u8; 35]) -> Result<NovaAddress, GenesisEr
     let network_id = NetworkId::try_from(b[2]).map_err(|_| GenesisError::InvalidAddress)?;
     let mut key_hash = [0u8; 32];
     key_hash.copy_from_slice(&b[3..35]);
-    Ok(NovaAddress::from_payload(NovaAddressPayload {
+    Ok(YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: version,
         address_type,
         network_id,
@@ -605,8 +605,8 @@ mod tests {
     use super::*;
     use crate::key::KeyPair;
 
-    fn addr(kh: [u8; 32], net: NetworkId) -> NovaAddress {
-        NovaAddress::from_payload(NovaAddressPayload {
+    fn addr(kh: [u8; 32], net: NetworkId) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
             address_version: 1,
             address_type: AddressType::UserAccount,
             network_id: net,

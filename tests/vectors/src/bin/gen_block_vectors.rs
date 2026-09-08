@@ -5,7 +5,7 @@
 
 use nova_core::state::AccountChange;
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::key::KeyPair;
@@ -24,8 +24,8 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn addr_from_kh(kh: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr_from_kh(kh: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,
@@ -33,8 +33,8 @@ fn addr_from_kh(kh: [u8; 32]) -> NovaAddress {
     })
 }
 
-fn addr_of(kp: &KeyPair) -> NovaAddress {
-    NovaAddress::from_verifying_key(
+fn addr_of(kp: &KeyPair) -> YazimaoAddress {
+    YazimaoAddress::from_verifying_key(
         kp.verifying_key(),
         AddressType::UserAccount,
         NetworkId::Mainnet,
@@ -43,8 +43,8 @@ fn addr_of(kp: &KeyPair) -> NovaAddress {
 }
 
 fn mk_tx(
-    sender: NovaAddress,
-    receiver: NovaAddress,
+    sender: YazimaoAddress,
+    receiver: YazimaoAddress,
     nonce: u64,
     amount: u128,
     sk: &SigningKey,
@@ -84,7 +84,7 @@ fn emit(
     base: &Path,
     id: &str,
     note: &str,
-    seed: &[(NovaAddress, u128, u64)],
+    seed: &[(YazimaoAddress, u128, u64)],
     txs: &[(TransactionV1, &VerifyingKey)],
     chain_id: u64,
     max_gas: u64,

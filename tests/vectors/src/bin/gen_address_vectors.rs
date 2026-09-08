@@ -9,7 +9,7 @@
 
 use bech32::{Bech32m, Hrp};
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_test_vectors::hex;
 use serde_json::{Value, json};
@@ -36,7 +36,7 @@ fn bech32m_encode(hrp: &str, data: &[u8]) -> String {
 
 /// 用生产 codec 编码（合法地址）。
 fn encode_prod(net: NetworkId, at: AddressType, kh: [u8; 32]) -> String {
-    NovaAddress::from_payload(NovaAddressPayload {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: at,
         network_id: net,

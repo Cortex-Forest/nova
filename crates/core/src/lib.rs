@@ -11,7 +11,7 @@
 //!     / gas 参数校验（F1–F10，`TRANSFER_INTRINSIC_GAS = 21_000`）。
 //! - [`state`]：**STEP 7G 协议类型**——`AccountState` / `AccountChange` / `TransactionReceipt` /
 //!   `StateTransition` / `EMPTY_CODE_HASH`（ADR-0017/0018/0023；执行逻辑在 `nova-execution`）。
-//! - [`error`]：分层错误模型骨架（`NovaError` 根接口 / `ErrorKind` 分类）。
+//! - [`error`]：分层错误模型骨架（`YazimaoError` 根接口 / `ErrorKind` 分类）。
 //!
 //! # 纪律（Master Prompt §9/§23/§54）
 //! - 协议类型/规则的设计先经 ADR 批准（ADR-0021 冻结 7E）。
@@ -25,7 +25,7 @@ pub const PROTOCOL_VERSION: &str = "0.1";
 /// YAZIMAO 统一错误模型（PHASE 1 骨架）。
 ///
 /// # 设计原则：分层边界式（非集中式大杂烩）
-/// - [`NovaError`] 只是**根接口标记**，不承载具体错误数据。
+/// - [`YazimaoError`] 只是**根接口标记**，不承载具体错误数据。
 /// - [`ErrorKind`] 仅作**分类标签**（模块边界标识），不是把所有错误塞进一个枚举。
 /// - 每个 crate 应拥有**自己的具体错误类型**，通过明确的边界（`From`/映射）向上转换。
 /// - 禁止把跨模块错误集中到一个大枚举里（会导致模块强耦合）。
@@ -35,11 +35,11 @@ pub const PROTOCOL_VERSION: &str = "0.1";
 /// - 错误类型必须可分类；禁止吞掉错误、禁止 catch 后进入未知状态。
 /// - 本阶段不实现任何具体业务错误。
 pub mod error {
-    /// Nova 统一错误根接口。
+    /// YAZIMAO 统一错误根接口。
     ///
     /// 未来各 crate 的具体错误类型（CryptoError / StorageError / ...）应实现
-    /// [`std::error::Error`]，并以本 trait 作为 Nova 错误体系的统一入口标记。
-    pub trait NovaError: std::error::Error {}
+    /// [`std::error::Error`]，并以本 trait 作为 YAZIMAO 错误体系的统一入口标记。
+    pub trait YazimaoError: std::error::Error {}
 
     /// YAZIMAO 错误分类（模块边界骨架）。
     ///

@@ -6,7 +6,7 @@
 //!   storage 恢复语义被 Node 正确表面为 fail-closed）。
 
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
 use nova_crypto::identity::{
@@ -36,8 +36,8 @@ const FEE: u128 = TRANSFER_INTRINSIC_GAS as u128;
 // Fixtures（TEST GENESIS ONLY）
 // ---------------------------------------------------------------------------
 
-fn addr(key_hash: [u8; 32], net: NetworkId) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(key_hash: [u8; 32], net: NetworkId) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: AddressType::UserAccount,
         network_id: net,
@@ -169,11 +169,11 @@ static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 /// 最小 KeyResolver（TEST ONLY）：address → verifying key。
 #[derive(Clone, Default)]
 struct TestKeyRegistry {
-    map: HashMap<NovaAddress, VerifyingKey>,
+    map: HashMap<YazimaoAddress, VerifyingKey>,
 }
 
 impl TestKeyRegistry {
-    fn with(entries: impl IntoIterator<Item = (NovaAddress, VerifyingKey)>) -> Self {
+    fn with(entries: impl IntoIterator<Item = (YazimaoAddress, VerifyingKey)>) -> Self {
         Self {
             map: entries.into_iter().collect(),
         }
@@ -181,7 +181,7 @@ impl TestKeyRegistry {
 }
 
 impl KeyResolver for TestKeyRegistry {
-    fn resolve(&self, address: NovaAddress) -> Option<VerifyingKey> {
+    fn resolve(&self, address: YazimaoAddress) -> Option<VerifyingKey> {
         self.map.get(&address).copied()
     }
 }
@@ -215,8 +215,8 @@ fn twin_root(genesis: &GenesisV1, rounds: &[&[AccountChange]]) -> NodeHash {
 // ---------------------------------------------------------------------------
 
 fn signed_tx(
-    sender: NovaAddress,
-    receiver: NovaAddress,
+    sender: YazimaoAddress,
+    receiver: YazimaoAddress,
     nonce: u64,
     amount: u128,
     sk: &SigningKey,
@@ -328,7 +328,8 @@ fn test_2_3_4_restart_preserves_state_and_head() {
     let kp = KeyPair::generate().unwrap();
     // sender 必须由 kp 派生（7D 签名绑定 key_hash == hash(vk)）。
     let sender =
-        NovaAddress::from_verifying_key(kp.verifying_key(), AddressType::UserAccount, net).unwrap();
+        YazimaoAddress::from_verifying_key(kp.verifying_key(), AddressType::UserAccount, net)
+            .unwrap();
     let receiver = addr([0x22; 32], net);
     let genesis = make_genesis(
         net,
@@ -559,7 +560,8 @@ fn test_14_full_restart_continuation() {
     let kp = KeyPair::generate().unwrap();
     // sender 由 kp 派生（7D 签名绑定）。
     let sender =
-        NovaAddress::from_verifying_key(kp.verifying_key(), AddressType::UserAccount, net).unwrap();
+        YazimaoAddress::from_verifying_key(kp.verifying_key(), AddressType::UserAccount, net)
+            .unwrap();
     let receiver = addr([0x22; 32], net);
     let c = addr([0x33; 32], net);
     let genesis = make_genesis(

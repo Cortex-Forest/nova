@@ -8,7 +8,7 @@
 //! - [`signature`]：**STEP 4 已实现**——Ed25519 封装（`sign_message_hash`/`verify_message_hash`，
 //!   仅接受 `SigningMessageHash`，strict canonical verification）。
 //! - [`key`]：**STEP 4 已实现**——`KeyPair` 生成（OS CSPRNG 无 fallback）与密钥材料生命周期保护。
-//! - [`address`]：**STEP 5 已实现**——`NovaAddressPayload`（Bech32m-derived 编码，ADR-0004），
+//! - [`address`]：**STEP 5 已实现**——`YazimaoAddressPayload`（Bech32m-derived 编码，ADR-0004），
 //!   `from_verifying_key` 从公钥派生 `key_hash`（防任意 hash 当账户）。
 //! - [`identity`]：**STEP 6A/6B 已实现**——`GenesisV1` canonical 编码、`decode_genesis_bytes`、
 //!   `validate_genesis`、`ChainIdentity`（ADR-0014/0015/0016）。

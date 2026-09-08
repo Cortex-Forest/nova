@@ -3,7 +3,7 @@
 //! 覆盖：canonical roundtrip（encode→decode→equal）、txid determinism、
 //! mutation changes txid、signature 进入 txid、chain_id 篡改检测。
 
-use nova_crypto::address::{AddressType, NetworkId, NovaAddress, NovaAddressPayload};
+use nova_crypto::address::{AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload};
 use nova_crypto::key::KeyPair;
 use nova_crypto::transaction::{
     TransactionType, TransactionV1, canonical_transaction_bytes, canonical_tx_payload,
@@ -12,8 +12,8 @@ use nova_crypto::transaction::{
 use proptest::collection::vec;
 use proptest::prelude::*;
 
-fn addr(kh: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(kh: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: 1,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,
@@ -135,8 +135,8 @@ proptest! {
 // =====================================================================
 
 /// 从公钥派生 sender 地址（key_hash = SHA-256(canonical_pubkey)）。
-fn sender_addr(vk: &nova_crypto::signature::VerifyingKey) -> NovaAddress {
-    NovaAddress::from_verifying_key(vk, AddressType::UserAccount, NetworkId::Mainnet).unwrap()
+fn sender_addr(vk: &nova_crypto::signature::VerifyingKey) -> YazimaoAddress {
+    YazimaoAddress::from_verifying_key(vk, AddressType::UserAccount, NetworkId::Mainnet).unwrap()
 }
 
 proptest! {

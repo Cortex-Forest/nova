@@ -28,7 +28,7 @@ use nova_consensus::round::{ProposalRef, RoundStep, encode_proposal_ref};
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_consensus::vote::{ValidatorVote, VoteType, canonical_vote_payload, verify_vote_input};
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_crypto::identity::{EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit};
 use nova_crypto::key::KeyPair;
@@ -57,8 +57,8 @@ const MAX_FRAME: usize = 4096;
 
 // ---------- consensus fixtures（复制 driver_tests 单验证者套路） ----------
 
-fn addr(kh: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(kh: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,

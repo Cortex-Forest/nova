@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use nova_consensus::round::{ProposalRef, RoundStep, encode_proposal_ref};
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_crypto::identity::{
     AccountInit, EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit,
@@ -35,8 +35,8 @@ const TARGET: [u8; 32] = [0xAA; 32];
 
 // ---------- fixtures（与 runtime_tests 同套路；此处独立复制以免跨文件依赖） ----------
 
-fn addr(kh: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(kh: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,
