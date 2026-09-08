@@ -1,4 +1,4 @@
-# Nova Chain 日志规范（structured logging）
+# YAZIMAO 日志规范（structured logging）
 
 > **状态**：PHASE 1 定义规范；完整 telemetry subsystem 为后续阶段（Master Prompt §56）。
 > 本文件是**约定规范**，当前无代码实现。

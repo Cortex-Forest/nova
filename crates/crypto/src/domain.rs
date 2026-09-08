@@ -1,4 +1,4 @@
-//! Nova Chain 域分离基础设施（STEP 3 — Domain Separation）。
+//! YAZIMAO 域分离基础设施（STEP 3 — Domain Separation）。
 //!
 //! # 冻结规范（crypto-serialization-v1.md §10）
 //! ```text

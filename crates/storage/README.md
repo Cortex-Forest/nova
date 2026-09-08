@@ -1,6 +1,6 @@
 # nova-storage
 
-Nova Chain 存储层（**PHASE 1 占位**）。
+YAZIMAO 存储层（**PHASE 1 占位**）。
 
 ## 状态
 

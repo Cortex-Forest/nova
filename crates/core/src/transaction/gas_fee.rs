@@ -1,4 +1,4 @@
-//! Nova Chain 交易 Gas / Fee Accounting（STEP 7F）。
+//! YAZIMAO 交易 Gas / Fee Accounting（STEP 7F）。
 //!
 //! 严格依据冻结规范：**ADR-0019 §8/§9**、**ADR-0022**（F1–F10）、ADR-0014（`fee_burn_bps`）、
 //! ADR-0016 §4（供应上限 / burned 累计）。

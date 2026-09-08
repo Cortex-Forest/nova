@@ -1,6 +1,6 @@
 # Signature 测试向量
 
-- **source**: Nova Chain 协议（ADR-0002/0005/0009/0012）
+- **source**: YAZIMAO 协议（ADR-0002/0005/0009/0012）
 - **specification**: `docs/protocols/crypto-serialization-v1.md` §10、`crypto-test-vectors-v1.md` §3/§3b
 - **encoding**: JSON（human-readable 向量格式）；hex 一律**小写**；`chain_id` 为 u64 整数
 - **expected behavior**:

@@ -1,4 +1,4 @@
-//! Nova Chain Ed25519 签名（STEP 4 — Ed25519 Signature）。
+//! YAZIMAO Ed25519 签名（STEP 4 — Ed25519 Signature）。
 //!
 //! # 冻结 API（crypto-serialization-v1.md §10 / ADR-0002 / ADR-0013）
 //! - **不允许 arbitrary message signing**：协议签名只接受 [`SigningMessageHash`]

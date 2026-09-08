@@ -1,4 +1,4 @@
-//! Nova Chain P2P 网络层（STEP 9 — P2P Network；ADR-0032）。
+//! YAZIMAO P2P 网络层（STEP 9 — P2P Network；ADR-0032）。
 //!
 //! # 模块
 //! - [`node_id`]：**STEP 9-2**——`NodeId`（Ed25519 公钥 canonical bytes；P2P 身份，N-2）。

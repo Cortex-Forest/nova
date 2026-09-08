@@ -1,4 +1,4 @@
-# Nova Chain 密码学威胁模型（Cryptographic Threat Model）
+# YAZIMAO 密码学威胁模型（Cryptographic Threat Model）
 
 - **Status**: Proposed（待批准）
 - **Date**: 2026-08-25

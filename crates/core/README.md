@@ -1,6 +1,6 @@
 # nova-core
 
-Nova Chain 核心协议类型（**PHASE 1 占位**）。
+YAZIMAO 核心协议类型（**PHASE 1 占位**）。
 
 ## 状态
 

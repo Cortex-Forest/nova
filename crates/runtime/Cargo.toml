@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Nova Chain block lifecycle coordination layer (P7-4)"
+description = "YAZIMAO block lifecycle coordination layer (P7-4)"
 
 [lints]
 workspace = true

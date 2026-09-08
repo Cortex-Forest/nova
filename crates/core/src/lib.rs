@@ -1,4 +1,4 @@
-//! Nova Chain 核心协议类型与规则。
+//! YAZIMAO 核心协议类型与规则。
 //!
 //! 本 crate 承载：交易有效性 / nonce / replay 等核心协议语义（PHASE 3）。
 //!
@@ -17,12 +17,12 @@
 //! - 协议类型/规则的设计先经 ADR 批准（ADR-0021 冻结 7E）。
 //! - Consensus 规则与本地 Mempool Policy 严格分离；本 crate **不持有**任何 policy 阈值。
 
-/// Nova Chain 协议版本（Protocol Version）。
+/// YAZIMAO 协议版本（Protocol Version）。
 ///
 /// 数据库版本定义于 `nova-storage` crate（`DATABASE_VERSION`），二者相互独立。
 pub const PROTOCOL_VERSION: &str = "0.1";
 
-/// Nova Chain 统一错误模型（PHASE 1 骨架）。
+/// YAZIMAO 统一错误模型（PHASE 1 骨架）。
 ///
 /// # 设计原则：分层边界式（非集中式大杂烩）
 /// - [`NovaError`] 只是**根接口标记**，不承载具体错误数据。
@@ -41,7 +41,7 @@ pub mod error {
     /// [`std::error::Error`]，并以本 trait 作为 Nova 错误体系的统一入口标记。
     pub trait NovaError: std::error::Error {}
 
-    /// Nova Chain 错误分类（模块边界骨架）。
+    /// YAZIMAO 错误分类（模块边界骨架）。
     ///
     /// 用于标识错误所属模块，便于日志聚合与 API 错误码映射。
     /// 仅定义分类，不携带具体错误数据。

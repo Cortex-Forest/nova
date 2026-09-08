@@ -1,4 +1,4 @@
-//! Nova Chain 地址编码（STEP 5 — Address Encoding）。
+//! YAZIMAO 地址编码（STEP 5 — Address Encoding）。
 //!
 //! # 冻结规范（ADR-0004）
 //! Nova Custom Address Format using **Bech32m-derived encoding**（使用 Bech32m 编码与校验机制，

@@ -1,4 +1,4 @@
-# Nova Chain 工具链锁定（ADR-0001）
+# YAZIMAO 工具链锁定（ADR-0001）
 # channel 锁定到当前批准的 stable 版本 1.96.1（含安全修复）。
 # 本地与 CI 统一；此文件由 rustup 遵循（CI 中由 dtolnay/rust-toolchain 使用）。
 [toolchain]

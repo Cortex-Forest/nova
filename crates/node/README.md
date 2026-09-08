@@ -1,6 +1,6 @@
 # nova-node
 
-Nova Chain 节点组装层（**PHASE 1 占位**）。
+YAZIMAO 节点组装层（**PHASE 1 占位**）。
 
 ## 状态
 

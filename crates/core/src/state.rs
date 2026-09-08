@@ -1,4 +1,4 @@
-//! Nova Chain 账户状态与交易结果协议类型（STEP 7G — State Transition）。
+//! YAZIMAO 账户状态与交易结果协议类型（STEP 7G — State Transition）。
 //!
 //! 严格依据冻结规范：**ADR-0017/0018**（AccountState、EMPTY_CODE_HASH）、**ADR-0023**
 //! （G1 / G4 / G-I / G-J）。

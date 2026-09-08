@@ -1,4 +1,4 @@
-//! Nova Chain 钱包核心（PHASE 1 占位）。
+//! YAZIMAO 钱包核心（PHASE 1 占位）。
 //!
 //! 未来承载：密钥管理、交易构造、签名、HD Wallet 派生。
 //!

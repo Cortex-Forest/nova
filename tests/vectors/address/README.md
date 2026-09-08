@@ -1,6 +1,6 @@
 # Address 测试向量
 
-- **source**: Nova Chain 协议（ADR-0004/0008/0011）
+- **source**: YAZIMAO 协议（ADR-0004/0008/0011）
 - **specification**: ADR-0004（地址格式与解码规则）、ADR-0008（address_type）、ADR-0011（network/HRP）
 - **encoding**: `address` 为 Nova Custom Address Format（Bech32m-derived 文本）；JSON 字段为 human-readable 向量格式
 - **expected behavior**:

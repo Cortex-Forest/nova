@@ -1,4 +1,4 @@
-# Nova Chain Benchmarks
+# YAZIMAO Benchmarks
 
 ## 状态
 

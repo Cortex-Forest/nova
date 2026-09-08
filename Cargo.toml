@@ -1,5 +1,5 @@
 # =============================================================================
-# Nova Chain — Cargo Workspace 根
+# YAZIMAO — Cargo Workspace 根
 # PHASE 1: Project Foundation
 #
 # 命名约定（ADR-0001）：
@@ -32,7 +32,7 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.96"
-description = "Nova Chain — a modular Layer1 blockchain for AI & digital creation ecosystem."
+description = "YAZIMAO — a modular Layer1 blockchain for AI & digital creation ecosystem."
 
 # ---------------------------------------------------------------------------
 # Workspace 级 lints（crate 通过 `[lints] workspace = true` 继承）
@@ -66,11 +66,11 @@ getrandom = "0.3"
 # zeroize：密钥材料零化
 zeroize = "1"
 # --- PHASE 2 STEP 5（Address Encoding） ---
-# bech32：Bech32m-derived 编码/校验（0.12；Nova 用自己的 payload，不声称 Bitcoin 兼容）
+# bech32：Bech32m-derived 编码/校验（0.12；YAZIMAO 用自己的 payload，不声称 Bitcoin 兼容）
 bech32 = { version = "0.12", features = ["alloc"] }
 
 # ---------------------------------------------------------------------------
-# Nova Chain 统一版本概念（Software / Protocol / Database / API 四者分离）
+# YAZIMAO 统一版本概念（Software / Protocol / Database / API 四者分离）
 # ---------------------------------------------------------------------------
 [workspace.metadata.nova]
 software-version = "0.1.0"

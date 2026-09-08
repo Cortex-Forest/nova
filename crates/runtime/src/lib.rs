@@ -1,4 +1,4 @@
-//! Nova Chain 运行时协调层（P7-4 — Block Lifecycle）。
+//! YAZIMAO 运行时协调层（P7-4 — Block Lifecycle）。
 //!
 //! - 依赖方向（E1=A 冻结）：`nova-runtime → { nova-core, nova-crypto, nova-execution, nova-storage }`；
 //!   本阶段**不引入 consensus 语义**。

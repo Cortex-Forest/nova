@@ -1,4 +1,4 @@
-# Nova Node Lifecycle Architecture
+# YAZIMAO Node Lifecycle Architecture
 
 > STEP 10-16A — Validator Lifecycle Architecture Design；**STEP 10-16B FROZEN（2026-09-04）**。
 > 基线：HEAD a166077（10-15T + 10-15T-HARDEN OBS-3B 已提交/冻结）。

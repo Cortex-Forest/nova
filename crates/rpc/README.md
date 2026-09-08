@@ -1,6 +1,6 @@
 # nova-rpc
 
-Nova Chain RPC / API 层（**PHASE 1 占位**）。
+YAZIMAO RPC / API 层（**PHASE 1 占位**）。
 
 ## 状态
 

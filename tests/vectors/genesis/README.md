@@ -1,8 +1,8 @@
 # Genesis 测试向量
 
-- **source**: Nova Chain 协议（`docs/protocols/genesis-v1.md`、ADR-0014/0015/0016）
+- **source**: YAZIMAO 协议（`docs/protocols/genesis-v1.md`、ADR-0014/0015/0016）
 - **specification**: genesis-v1.md（GenesisV1 schema、嵌套类型、canonical 编码、genesis_hash、ValidateGenesis）
-- **encoding**: JSON（human-readable 向量格式，**非 Nova 协议编码**）；
+- **encoding**: JSON（human-readable 向量格式，**非 YAZIMAO 协议编码**）；
   `chain_id`/`genesis_timestamp` 为 u64 整数；**u128 字段（`bonded_stake`/`liquid_balance`/
   `total_supply`/`min_validator_stake`）用十进制字符串**（JSON 数字无法安全表示 u128）。
 - **expected behavior**:

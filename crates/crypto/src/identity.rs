@@ -1,4 +1,4 @@
-//! Nova Chain 链身份与 Genesis Canonical Encoding / Validation（STEP 6A + 6B）。
+//! YAZIMAO 链身份与 Genesis Canonical Encoding / Validation（STEP 6A + 6B）。
 //!
 //! 严格依据冻结规范：**ADR-0014**（Genesis Schema V1）、**ADR-0015**（Canonical Encoding）、
 //! **ADR-0016**（Accounting Invariants）、`genesis-v1.md`（§9–§13）、

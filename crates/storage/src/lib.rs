@@ -1,4 +1,4 @@
-//! Nova Chain 存储层（PHASE 4 — STEP 8B/8C SMT + StateStore）。
+//! YAZIMAO 存储层（PHASE 4 — STEP 8B/8C SMT + StateStore）。
 //!
 //! # 模块
 //! - [`hashing`]：**STEP 8B-2**——域分离哈希（`STATE_EMPTY/LEAF/BRANCH`、`EMPTY_NODE_HASH`）。
@@ -15,7 +15,7 @@
 //! - **不引入数据库依赖**（8E 之前）。
 //! - 版本概念：数据库版本与软件/协议/API 版本独立（ADR-0001）。
 
-/// Nova Chain 数据库版本（Database Version）。
+/// YAZIMAO 数据库版本（Database Version）。
 ///
 /// 首次引入状态存储时确定 schema 版本；存储迁移策略由 ADR-0007 定义。
 pub const DATABASE_VERSION: u32 = 1;

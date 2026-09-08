@@ -1,6 +1,6 @@
 # nova-execution
 
-Nova Chain WASM 执行层（**PHASE 1 占位**）。
+YAZIMAO WASM 执行层（**PHASE 1 占位**）。
 
 ## 状态
 

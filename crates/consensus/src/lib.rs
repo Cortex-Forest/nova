@@ -1,4 +1,4 @@
-//! Nova Chain 共识层（STEP 10 — Consensus；ADR-0033/0034/0035）。
+//! YAZIMAO 共识层（STEP 10 — Consensus；ADR-0033/0034/0035）。
 //!
 //! # 模块
 //! - [`validator`]：**STEP 10-2**——`ValidatorId`/`ValidatorInfo`/`ValidatorSet`（ADR-0034 V-1~V-3）。

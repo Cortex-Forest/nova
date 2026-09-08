@@ -1,6 +1,6 @@
 # nova-network
 
-Nova Chain P2P 网络层（**PHASE 1 占位**）。
+YAZIMAO P2P 网络层（**PHASE 1 占位**）。
 
 ## 状态
 

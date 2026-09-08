@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Nova Chain RPC / API layer (PHASE 1 placeholder)"
+description = "YAZIMAO RPC / API layer (PHASE 1 placeholder)"
 
 [lints]
 workspace = true

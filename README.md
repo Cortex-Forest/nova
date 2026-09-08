@@ -1,6 +1,6 @@
-# Nova Chain
+# YAZIMAO
 
-Nova Chain 是一条面向 **AI、数字创作、数字娱乐和开放应用生态**的模块化 Layer1 区块链。核心理念：Creator Economy、AI Applications、Digital Ownership、Open Developer Ecosystem、Mobile-first User Experience、Permissionless Network Participation。
+YAZIMAO 是一条面向 **AI、数字创作、数字娱乐和开放应用生态**的模块化 Layer1 区块链。核心理念：Creator Economy、AI Applications、Digital Ownership、Open Developer Ecosystem、Mobile-first User Experience、Permissionless Network Participation。
 
 > **⚠️ 当前状态：PHASE 2 — Protocol Design COMPLETE / FROZEN；Implementation & Integration In Progress**
 >
@@ -16,7 +16,7 @@ Nova Chain 是一条面向 **AI、数字创作、数字娱乐和开放应用生�
 
 ## 1. 简介
 
-Nova Chain 采用分层架构：
+YAZIMAO 采用分层架构：
 
 ```
 Application Layer

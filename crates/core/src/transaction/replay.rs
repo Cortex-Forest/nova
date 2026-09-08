@@ -1,4 +1,4 @@
-//! Nova Chain 交易 Replay Protection 上下文校验（STEP 7E — Nonce / Replay Protection）。
+//! YAZIMAO 交易 Replay Protection 上下文校验（STEP 7E — Nonce / Replay Protection）。
 //!
 //! 严格依据冻结规范：**ADR-0021** §4–§6（N10/N12/N13/N14）。
 //!

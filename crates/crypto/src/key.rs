@@ -1,4 +1,4 @@
-//! Nova Chain 密钥材料生命周期（STEP 4 — Key Handling 基础）。
+//! YAZIMAO 密钥材料生命周期（STEP 4 — Key Handling 基础）。
 //!
 //! # 生命周期（ADR-0007）
 //! ```text

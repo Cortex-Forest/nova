@@ -1,6 +1,6 @@
 # Domain 测试向量
 
-- **source**: Nova Chain 协议（ADR-0005 Domain Registry / crypto-serialization-v1.md §10）
+- **source**: YAZIMAO 协议（ADR-0005 Domain Registry / crypto-serialization-v1.md §10）
 - **specification**: `docs/protocols/crypto-serialization-v1.md` §10（签名流水线）、ADR-0005
 - **encoding**: 字段为 JSON（仅 human-readable 向量格式，非协议编码）；`canonical_payload`/`signed_bytes`/`message_hash` 为**小写 hex**
 - **expected behavior**:

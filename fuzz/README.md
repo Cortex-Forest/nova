@@ -1,4 +1,4 @@
-# Nova Chain Fuzz（cargo-fuzz 项目，独立 crate）
+# YAZIMAO Fuzz（cargo-fuzz 项目，独立 crate）
 
 ## 状态
 

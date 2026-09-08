@@ -1,4 +1,4 @@
-# Nova Chain 安全文档
+# YAZIMAO 安全文档
 
 ## 状态
 

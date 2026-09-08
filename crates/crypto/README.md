@@ -1,6 +1,6 @@
 # nova-crypto
 
-Nova Chain 密码学基础设施（**PHASE 1 占位**）。
+YAZIMAO 密码学基础设施（**PHASE 1 占位**）。
 
 ## 状态
 

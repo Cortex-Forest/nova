@@ -1,4 +1,4 @@
-# Nova Chain 集成测试
+# YAZIMAO 集成测试
 
 ## 状态
 

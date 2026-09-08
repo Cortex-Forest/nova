@@ -1,4 +1,4 @@
-# Nova Chain Scripts
+# YAZIMAO Scripts
 
 ## 状态
 

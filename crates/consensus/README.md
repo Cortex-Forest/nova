@@ -1,6 +1,6 @@
 # nova-consensus
 
-Nova Chain 共识层（**PHASE 1 占位**）。
+YAZIMAO 共识层（**PHASE 1 占位**）。
 
 ## 状态
 

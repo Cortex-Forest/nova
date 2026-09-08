@@ -1,6 +1,6 @@
 # nova-wallet
 
-Nova Chain 钱包核心（**PHASE 1 占位**）。
+YAZIMAO 钱包核心（**PHASE 1 占位**）。
 
 ## 状态
 

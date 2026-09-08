@@ -1,4 +1,4 @@
-//! Nova Chain 状态转换引擎（STEP 7G — State Transition）。
+//! YAZIMAO 状态转换引擎（STEP 7G — State Transition）。
 //!
 //! 严格依据冻结规范：**ADR-0023**（G1–G3、G-E、G-F、G-I、G-J、G-K）、ADR-0019（四状态）、
 //! ADR-0021（7E nonce/replay）、ADR-0022（7F gas/fee）。

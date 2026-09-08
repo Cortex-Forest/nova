@@ -1,4 +1,4 @@
-//! Nova Chain 节点组装层（PHASE 1 占位 + STEP 11-4 组装）。
+//! YAZIMAO 节点组装层（PHASE 1 占位 + STEP 11-4 组装）。
 //!
 //! 未来承载：节点服务、配置系统、模块组装、启动流程。
 //! 本阶段建立**配置系统骨架**与 **STEP 11-4 Node 组装层**（Vote + RoundTimeout 路径）。

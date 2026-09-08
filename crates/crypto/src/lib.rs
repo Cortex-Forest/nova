@@ -1,4 +1,4 @@
-//! Nova Chain 密码学基础设施。
+//! YAZIMAO 密码学基础设施。
 //!
 //! # 模块
 //! - [`hash`]：**STEP 2 已实现**——`protocol_hash`（SHA-256，协议承诺）与

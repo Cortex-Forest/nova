@@ -1,4 +1,4 @@
-//! Nova Chain 交易 Canonical Serialization + Signature Integration（STEP 7C/7D）。
+//! YAZIMAO 交易 Canonical Serialization + Signature Integration（STEP 7C/7D）。
 //!
 //! 严格依据冻结规范：**ADR-0019**（Transaction Schema V1）、**ADR-0020**（TransactionType
 //! Registry）、`crypto-serialization-v1.md` §13、ADR-0005/0012（signed_bytes）、ADR-0009（签名覆盖）。

@@ -1,4 +1,4 @@
-//! Nova Chain 执行层（PHASE 3 — STEP 7G State Transition）。
+//! YAZIMAO 执行层（PHASE 3 — STEP 7G State Transition）。
 //!
 //! # 模块
 //! - [`state_transition`]：**STEP 7G 已实现**——`apply_transaction`（ADR-0023）：完整

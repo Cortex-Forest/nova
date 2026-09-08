@@ -1,4 +1,4 @@
-//! Nova Chain 哈希（STEP 2 — Hash Infrastructure）。
+//! YAZIMAO 哈希（STEP 2 — Hash Infrastructure）。
 //!
 //! # 冻结 API（ADR-0006 / crypto-serialization-v1.md）
 //! - [`protocol_hash`]：SHA-256，**只能用于 ADR-0006 Protocol Hash Registry 注册的共识协议位置**
