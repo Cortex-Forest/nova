@@ -55,8 +55,16 @@ pub struct SigningKey {
 }
 
 impl SigningKey {
-    /// 从 32B 种子构建（**仅内部**：密钥生成/安全恢复路径使用，不公开）。
-    pub(crate) fn from_seed(seed: [u8; 32]) -> Self {
+    /// 从 32B 种子确定性重建 Ed25519 签名密钥（test/dev-only seam；Owner-authorized D10-C Step 6）。
+    ///
+    /// # 使用约束
+    /// - 供 **deterministic test / development key reconstruction**（同一 seed ⇒ 同一真实私钥），
+    ///   用于 test-only same-key restart 验证 —— 不改变签名算法 / 协议 / production key loading。
+    /// - **不得**作为 production 默认 validator identity、不得写入 production storage、
+    ///   **不得**作为 mainnet key management mechanism；production 密钥仍经
+    ///   [`KeyPair::generate`]（OS CSPRNG）或未来 KeyManager 导入。
+    /// - 不暴露私钥字节；返回 [`SigningKey`] 仍不 `Clone`、Debug 打码、Drop 零化。
+    pub fn from_seed(seed: [u8; 32]) -> Self {
         Self {
             inner: ed25519_dalek::SigningKey::from_bytes(&seed),
         }
