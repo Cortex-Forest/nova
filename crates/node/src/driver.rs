@@ -11,6 +11,10 @@
 //! 4. `process_transition_derived`：从 `TransitionResult::Applied` 提取 `derived.precommit_qc` →
 //!    **显式 `verify_qc`**（`is_some() ≠ 已验证`，STEP 10-15N §11）→ 通过后 **broadcast** 至每个
 //!    本地 `ValidatorActor::on_verified_precommit_qc`（各自 `acquire_lock` L-8；只改自身 LockedState）。
+//! 5. `auto_drive`（D10-A）：**node 层自动推进** —— 读当前 canonical round：`Prevote` 阶段 ⇒ 本地
+//!    Prevote；`Precommit` 阶段 ⇒ 本地 Precommit（幂等；重复调用不 double-vote）；proposer-authority
+//!    gate（本地 `select_proposer` 推导期望当选者）不匹配 ⇒ [`AutoDriveStep::WrongProposer`]，不驱动。
+//!    只编排 —— 不重新实现 consensus / quorum / finality / pacemaker。
 //!
 //! # 边界
 //! - `ConsensusNode` 拥有 canonical `ConsensusState`；`ValidatorActor` 拥有 local validator state；
@@ -22,7 +26,9 @@
 use nova_consensus::error::ConsensusError;
 use nova_consensus::finality::{FinalityError, QuorumCertificate, verify_qc};
 use nova_consensus::integration::{ConsensusEvent, TransitionResult};
+use nova_consensus::proposer::select_proposer;
 use nova_consensus::round::{ProposalRef, RoundStep};
+use nova_consensus::validator::ValidatorId;
 use nova_consensus::vote::{ValidatorVote, VoteType, verify_vote_input};
 
 use crate::assembly::ConsensusNode;
@@ -43,6 +49,25 @@ pub enum DriverError {
     ActorLock(ValidatorActorError),
     /// ValidatorActor 失败（含 Double-Vote 拒绝 —— 同 `(height,round,vote_type)` 已签其它 target）。
     Actor(ValidatorActorError),
+    /// 本地期望 proposer 推导失败（`select_proposer` Err，如空 ValidatorSet）——自动推进不驱动。
+    ProposerSelection(ConsensusError),
+}
+
+/// 一次自动推进（D10-A）的决策结果（node 层 orchestration 决策；非共识错误）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoDriveStep {
+    /// 无可投票阶段（`Propose` / `Finalized` / 无 proposal）——无本地 action。
+    Idle,
+    /// 已对当前 proposal 提交本地 Prevote（`actors` = 实际提交 / 幂等复用的 actor 数）。
+    Prevote { actors: usize },
+    /// 已对当前 proposal 提交本地 Precommit（`actors` = 实际提交 / 幂等复用的 actor 数）。
+    Precommit { actors: usize },
+    /// 当前 round proposal 的 proposer ≠ 本地 `select_proposer` 期望当选者 —— 拒绝驱动
+    /// （不投票 / 不推进；D9 proposer validation 边界在 auto-drive 不绕过）。
+    WrongProposer {
+        actual: ValidatorId,
+        expected: ValidatorId,
+    },
 }
 
 /// Node Consensus Driver：编排「本地投票 → 统一验证 → canonical transition → QC → 本地 lock」。
@@ -272,5 +297,73 @@ impl<S: SigningCapability> NodeConsensusDriver<S> {
             VoteType::Prevote => round.step == RoundStep::Prevote,
             VoteType::Precommit => round.step == RoundStep::Precommit,
         }
+    }
+
+    /// 自动推进（D10-A）：读取当前 canonical round 状态，对本 driver 全部本地 actor 执行当前
+    /// 被授权的 consensus action（node 层 orchestration —— **不重新实现 consensus**）。
+    ///
+    /// 语义（幂等 / 可重复调用）：
+    /// 1. 读 `consensus.state().round`：`step == Prevote` ⇒ 本地 Prevote；`step == Precommit`
+    ///    ⇒ 本地 Precommit；否则（`Propose` / `Finalized` / 无 proposal）⇒ [`AutoDriveStep::Idle`]。
+    /// 2. **Proposer-authority gate**（不绕过 D9 proposer validation）：期望 proposer 由本地
+    ///    `ValidatorSet` 独立推导（`select_proposer(chain_id, round.height, round.round,
+    ///    genesis_hash, set)`，ADR-0050 —— 与 block_dispatch 的 expected-proposer 同一来源）；
+    ///    `round.proposal.proposer` ≠ 期望 ⇒ [`AutoDriveStep::WrongProposer`]，**不投票**。
+    /// 3. 本地 vote 经既有 [`Self::submit_local_vote`] 全链（context 门 → `ValidatorActor::
+    ///    produce_vote` 授权 + DV guard → `verify_vote_input` → `submit_verified_vote` → canonical
+    ///    transition）；每票结果经 [`Self::process_transition_derived`]（`derived.precommit_qc` →
+    ///    `verify_qc` → 各 actor `acquire_lock` + outbound）。重复调用由 actor VoteLedger（同
+    ///    VoteKey 同 target 幂等复用签名，不重复签名）与 consensus accumulator 去重守卫 ——
+    ///    不 double-vote、不改 safety。
+    ///
+    /// `source_block_hash` / `timestamp` 取与 D9 基线一致的占位值（当前轮无见证块源 / 无外部时钟；
+    /// `verify_vote_input` V-5 不校验此二字段；consensus 冻结规则不受影响）。
+    pub fn auto_drive(&mut self) -> Result<AutoDriveStep, DriverError> {
+        let round = self.consensus.state().round.clone();
+        let Some(proposal) = round.proposal.clone() else {
+            return Ok(AutoDriveStep::Idle);
+        };
+        // Proposer-authority gate：本地独立推导期望当选者（只读；不改 consensus）。
+        let expected = select_proposer(
+            self.consensus.chain_id(),
+            round.height,
+            round.round,
+            &self.consensus.genesis_hash(),
+            self.consensus.validator_set(),
+        )
+        .map_err(DriverError::ProposerSelection)?;
+        if proposal.proposer != expected {
+            return Ok(AutoDriveStep::WrongProposer {
+                actual: proposal.proposer,
+                expected,
+            });
+        }
+        let vote_type = match round.step {
+            RoundStep::Prevote => VoteType::Prevote,
+            RoundStep::Precommit => VoteType::Precommit,
+            // Propose / Finalized：无本地投票 action。
+            RoundStep::Propose | RoundStep::Finalized => return Ok(AutoDriveStep::Idle),
+        };
+        let request = LocalVoteRequest {
+            height: round.height,
+            round: round.round,
+            target_block_hash: proposal.block_hash,
+            vote_type,
+            source_block_hash: [0u8; 32],
+            timestamp: 0,
+        };
+        let mut actors = 0usize;
+        for idx in 0..self.actors.len() {
+            // 上下文门 + actor 授权 + DV guard 全在 submit_local_vote / produce_vote 内判定
+            //（幂等：同 VoteKey 同 target 复用既有签名，不重复签名）。
+            if let Some(result) = self.submit_local_vote(idx, &request)? {
+                self.process_transition_derived(&result)?;
+                actors += 1;
+            }
+        }
+        Ok(match vote_type {
+            VoteType::Prevote => AutoDriveStep::Prevote { actors },
+            VoteType::Precommit => AutoDriveStep::Precommit { actors },
+        })
     }
 }
