@@ -103,6 +103,7 @@ impl From<NetworkSecurityError> for SessionError {
             NetworkSecurityError::InvalidNodeId => Self::InvalidNodeId,
             NetworkSecurityError::InvalidSignature => Self::MalformedHandshake,
             NetworkSecurityError::InvalidInput => Self::MalformedHandshake,
+            NetworkSecurityError::RngFailure => Self::RngFailure,
         }
     }
 }

@@ -28,9 +28,11 @@ use nova_network::event_loop::{EventLoop, EventLoopConfig, EventLoopError};
 use nova_network::message::{MessageEnvelope, MessageType};
 use nova_network::network_service::{NetworkService, NetworkServiceConfig, NetworkServiceError};
 use nova_network::node_id::NodeId;
+use nova_network::security::{NetworkSecurityError, random_request_id};
 use nova_network::session::{
     HandshakeKind, PeerAuthConfig, SessionError, handshake_payload_encode, random_session_nonce,
 };
+use nova_network::sync::SyncBlockResponse;
 use nova_network::transport::{BoxTransport, ConnectionTarget, TcpDialer, Transport};
 use nova_storage::error::StorageError;
 use nova_storage::persistent::PersistentBackend;
@@ -48,6 +50,11 @@ use crate::outbound::OutboundConsensusMessage;
 use crate::proposer::{ProposalBuild, ProposerError, build_proposal};
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
+use crate::sync_correlator::{LogicalTick, SyncRequestCorrelator};
+use crate::sync_dispatch::{NetworkSyncDispatcher, dispatch_batch};
+use crate::sync_scheduler::{
+    PeerCandidate, PeerSelectionPolicy, ScheduleResult, SyncRequestScheduler, select_peer,
+};
 use crate::validator::{ValidatorActor, ValidatorActorError};
 use crate::wiring::{
     BlockInboundMessage, NodeConsensusCommand, NodeConsensusHandler, process_command,
@@ -61,6 +68,22 @@ const BLOCK_INBOUND_OUTCOME_CAP: usize = 128;
 
 /// missing-ancestor intent ledger 有界容量（Node-local；满 ⇒ FIFO evict —— 不无限增长）。
 const MISSING_ANCESTOR_LEDGER_CAP: usize = 256;
+
+/// outbound sync request scheduler 有界容量（D8-2；满 ⇒ 丢弃多余 intent —— bounded）。
+const SYNC_SCHEDULER_CAP: usize = 64;
+
+/// outbound sync request correlator 有界容量（D8-2；满 ⇒ register Full 拒 —— bounded）。
+const SYNC_CORRELATOR_CAP: usize = 64;
+
+/// 每 step 从 ledger 调度入 scheduler 的最大 intent 数（bounded；防每 step 无限发送）。
+const SYNC_SCHEDULE_MAX_PER_STEP: usize = 8;
+
+/// 每 step 从 scheduler 出队并 register/dispatch 的最大条数（bounded dispatch）。
+const SYNC_DISPATCH_MAX_PER_STEP: usize = 8;
+
+/// register 用 deadline horizon（D8-3-1：expire release-only —— 悬挂 request 在该 step 数后
+/// 被 `expire_at` 释放；无 retry / 无 backoff；correlator capacity 即有界）。
+const SYNC_DEADLINE_HORIZON: u64 = 64;
 
 /// 网络 peer-auth 协议版本（与 `PeerAuthConfig.protocol_version` 一致；非 genesis 字段）。
 const NETWORK_PROTOCOL_VERSION: u8 = 1;
@@ -140,6 +163,8 @@ pub enum RuntimeError {
     PeerAuthMissing,
     /// authenticated remote NodeId ≠ configured peer_id（address 正确 ≠ identity 正确）。
     IdentityMismatch { configured: NodeId },
+    /// sync RequestId 生成失败（OS CSPRNG 不可用；fail-closed —— 不退回弱随机）。
+    NetworkSecurity(NetworkSecurityError),
 }
 
 /// `establish_configured_peer` 单次推进后的握手判定（Node 只编排；session 验证归 NetworkService）。
@@ -265,6 +290,16 @@ pub struct NodeRuntime {
     /// missing-ancestor intent ledger（STEP 10-19-10-B1；bounded + dedup）。
     /// 仅记录 `FutureMissingAncestor` 观察；**不发送 / 不写存储 / 不触发 finality**。
     missing_ancestor_ledger: MissingAncestorIntentLedger,
+    /// outbound sync request scheduler（D8-2；bounded FIFO；不拥有 transport）。
+    sync_scheduler: SyncRequestScheduler,
+    /// outbound sync request correlator（D8-2；register/resolve/timeout 状态机；不拥有 transport）。
+    sync_correlator: SyncRequestCorrelator,
+    /// sync 编排确定性逻辑 tick（每网络 step 自增；D8-3-1 驱动 expire_at release-only）。
+    sync_tick: LogicalTick,
+    /// 收到且 correlation 成功的 SyncBlockResponse 数（request lifecycle 完成；观测）。
+    sync_resolved_responses: u64,
+    /// 收到但无对应 active request / 结构损坏而被拒的 SyncBlockResponse 数（Unknown；观测）。
+    sync_unknown_responses: u64,
 }
 
 impl NodeRuntime {
@@ -400,6 +435,11 @@ impl NodeRuntime {
             block_inbound_outcomes: VecDeque::new(),
             block_inbound_skipped: 0,
             missing_ancestor_ledger: MissingAncestorIntentLedger::new(MISSING_ANCESTOR_LEDGER_CAP),
+            sync_scheduler: SyncRequestScheduler::new(SYNC_SCHEDULER_CAP),
+            sync_correlator: SyncRequestCorrelator::new(SYNC_CORRELATOR_CAP),
+            sync_tick: 0,
+            sync_resolved_responses: 0,
+            sync_unknown_responses: 0,
         })
     }
 
@@ -495,6 +535,22 @@ impl NodeRuntime {
         &mut self,
     ) -> Vec<crate::intent_ledger::MissingAncestorIntent> {
         self.missing_ancestor_ledger.take_all()
+    }
+
+    /// 收到且 correlation 成功的 SyncBlockResponse 数（D8-3-1；request lifecycle resolve）。
+    pub fn sync_resolved_responses(&self) -> u64 {
+        self.sync_resolved_responses
+    }
+
+    /// 收到但 Unknown / 结构损坏而被拒的 SyncBlockResponse 数（D8-3-1；安全拒绝观测）。
+    pub fn sync_unknown_responses(&self) -> u64 {
+        self.sync_unknown_responses
+    }
+
+    /// 当前 outbound sync correlator 中 active（未 resolve / 未 expire）request 数
+    /// （D8-3-1 观测：request lifecycle register→resolve→release 的 active 深度）。
+    pub fn sync_pending_requests(&self) -> usize {
+        self.sync_correlator.len()
     }
 
     /// 显式设置 step-driven 出块 timestamp（无系统时钟；默认 0；确定性由调用方保证）。
@@ -838,6 +894,90 @@ impl NodeRuntime {
         Ok(())
     }
 
+    /// outbound sync orchestration（STEP 10-19-10-B7-A1-D8-2；同步、确定性、有界；无 self ——
+    /// step 内字段级借用调用，避免与活跃 NetworkStack 借用冲突）。
+    ///
+    /// 每 step 一轮：
+    /// （1）candidate = Established peers（`ns`；D7 建立；无 Established ⇒ 不产生 / 不发送 ——
+    ///      不 dial / 不 handshake / 不 reconnect）；
+    /// （2）有界消费 `ledger` intents（`SYNC_SCHEDULE_MAX_PER_STEP`/step），每条经
+    ///      `schedule_from_missing_ancestor`（ADR-0062：target = { local_head_height + 1,
+    ///      block_hash: None }；**不伪造 ancestor hash / 不猜 head+1 的 hash**）入 scheduler
+    ///      （deterministic peer selection 用候选 Established peers）；
+    /// （3）`dispatch_batch`：correlator.register（**register-before-send**）→ dispatcher
+    ///      （`NetworkSyncDispatcher`：Established gate → SyncBlockRequest → 网络签名 →
+    ///      `NetworkService::enqueue_outbound`）。
+    ///
+    /// 边界：同步 / deterministic / bounded（scheduler/correlator/queue 均 bounded）；不 dial /
+    /// 不自动 retry / 不 backoff / 不重新选 peer；expire 为 **release-only**（释放 active，不重发）；
+    /// SyncBlockResponse → persist/commit 不在此（保持既有 inbound validation / observation）。
+    fn sync_orchestrate(
+        ns: &mut NetworkService<BoxTransport>,
+        signer: &dyn NetworkSigner,
+        scheduler: &mut SyncRequestScheduler,
+        correlator: &mut SyncRequestCorrelator,
+        tick: &mut LogicalTick,
+        ledger: &mut MissingAncestorIntentLedger,
+        head_height: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        // 0. D8-3-1-E：每 step 推进 deterministic tick + expire 到期 active request
+        //    （release-only：无 retry / 无 backoff / 无重新选 peer；correlator capacity 即有界）。
+        *tick = tick.saturating_add(1);
+        let _expired = correlator.expire_at(*tick);
+        // 1. candidate = Established peers（SI-6：只向 Established 发送）。
+        let candidates: Vec<PeerCandidate> = ns
+            .established_peers()
+            .into_iter()
+            .map(|id| PeerCandidate { peer_id: id })
+            .collect();
+        if candidates.is_empty() {
+            // 无 Established peer ⇒ 不产生 request（不 dial / 不 reconnect —— 属 D7 lifecycle）。
+            return Ok(());
+        }
+        let policy = PeerSelectionPolicy::default();
+        // 2. 有界消费 ledger intents（take_all ≤ cap；本 step 上限 SYNC_SCHEDULE_MAX_PER_STEP）。
+        let intents = ledger.take_all();
+        let mut scheduled = 0usize;
+        for intent in intents {
+            if scheduled >= SYNC_SCHEDULE_MAX_PER_STEP {
+                break;
+            }
+            // 陈旧过滤：本地 canonical head 已 ≥ observed 高度 ⇒ 该区间不再待补。
+            if let Some(hh) = head_height
+                && intent.observed_height <= hh
+            {
+                continue;
+            }
+            let peer = match select_peer(&policy, &candidates, &[]) {
+                Ok(p) => p,
+                Err(_) => continue, // 无可用候选（candidates 非空时不发生）
+            };
+            let request_id = random_request_id().map_err(RuntimeError::NetworkSecurity)?;
+            let r = scheduler.schedule_from_missing_ancestor(request_id, peer, &intent);
+            if r == ScheduleResult::Scheduled {
+                scheduled += 1;
+            }
+            // Duplicate / Full：bounded 丢弃（不自动重试；同一 intent 只消费一次 —— T10）。
+        }
+        if scheduler.is_empty() {
+            return Ok(());
+        }
+        // 3. dispatch（register-before-send）：deadline = 当前 tick + horizon（expire 在函数头
+        //    已驱动；D8-3-1 不自动 retry）。
+        let deadline = tick.saturating_add(SYNC_DEADLINE_HORIZON);
+        let mut dispatcher = NetworkSyncDispatcher::new(ns, signer);
+        // dispatch_batch：register-before-send；send 失败（Rejected）⇒ release 该 request（D8-3-1-B）。
+        let report = dispatch_batch(
+            scheduler,
+            correlator,
+            &mut dispatcher,
+            deadline,
+            SYNC_DISPATCH_MAX_PER_STEP,
+        );
+        let _ = report;
+        Ok(())
+    }
+
     /// 构造 outbound Handshake Init envelope（本端身份；`claimed = signer.node_id()`，**非**
     /// configured peer）。复用 session `handshake_payload_encode` + `random_session_nonce`
     /// （每次新 nonce）+ 既有 `MessageEnvelope` + `NetworkSigner::sign_envelope`。
@@ -961,6 +1101,36 @@ impl NodeRuntime {
         // 不 commit / 不写存储 / 不推进 head（CanonicalNextCandidate 非 finality-authorized）。
         let block_msgs = stack.el.handler_mut().take_block_inbound();
         for msg in block_msgs {
+            // D8-3-1-A/C：SyncBlockResponse 先做 request_id correlation —— resolve 匹配的 active
+            // request（释放 active capacity；request lifecycle 完成）；Unknown / 结构损坏 ⇒ 安全
+            // 拒（不 dispatch 未请求数据 / 不 commit / 不改 canonical / 不创建 request / 不 panic）。
+            let msg = match msg {
+                BlockInboundMessage::SyncBlockResponse(payload) => {
+                    let request_id = match SyncBlockResponse::decode(&payload) {
+                        Ok(r) => r.request_id,
+                        Err(_) => {
+                            // 结构损坏：无法取得 request_id ⇒ 拒（记 unknown；不产生 request）。
+                            self.sync_unknown_responses += 1;
+                            continue;
+                        }
+                    };
+                    match self.sync_correlator.resolve(request_id) {
+                        Ok(_target) => {
+                            // resolved：request lifecycle 完成（D8-3-1-C）；block payload 原样交
+                            // 后续阶段（本步只 correlation —— 不验证 / 不持久化 / 不 commit）。
+                            self.sync_resolved_responses += 1;
+                        }
+                        Err(_) => {
+                            // Unknown request：安全拒绝（不改 correlator / 不创建 / 不 panic）。
+                            self.sync_unknown_responses += 1;
+                            continue;
+                        }
+                    }
+                    // resolved ⇒ 继续既有 block inbound（adapter 只读验证观测；不 commit）。
+                    BlockInboundMessage::SyncBlockResponse(payload)
+                }
+                other => other,
+            };
             let (source, outcomes) = match (&self.block_production, msg) {
                 (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => (
                     BlockInboundSource::Gossip,
@@ -989,6 +1159,21 @@ impl NodeRuntime {
                 self.block_inbound_outcomes.push_back(outcome);
             }
         }
+        // STEP 10-19-10-B7-A1-D8-2：outbound sync orchestration —— 消费 bounded missing-ancestor
+        // intents → ADR-0062 height-based target（head+1 / hash=None）→ deterministic peer
+        // selection → scheduler → correlator.register（register-before-send）→ dispatcher →
+        // NetworkService.enqueue_outbound（Established-only）。有界；不 dial / 不 retry / 不
+        // timeout 策略（D8-2 边界）；Response→persist/commit 不属本步。
+        let sync_head = self.block_production.as_ref().map(|a| a.head().height);
+        Self::sync_orchestrate(
+            &mut stack.ns,
+            stack.signer.as_ref(),
+            &mut self.sync_scheduler,
+            &mut self.sync_correlator,
+            &mut self.sync_tick,
+            &mut self.missing_ancestor_ledger,
+            sync_head,
+        )?;
         // STEP 10-19-6 OPT-1：node-local proposer orchestration —— 仅本节点为当前 proposer 且
         // 阶段 Propose 且本轮未提案时，经 BlockBuilder 产出真实 Block + ProposalRef 并提交；
         // 否则幂等 no-op。不自动投票（vote 仍走既有路径）。
@@ -1038,6 +1223,11 @@ impl NodeRuntime {
             block_inbound_outcomes: _,
             block_inbound_skipped: _,
             missing_ancestor_ledger: _,
+            sync_scheduler: _,
+            sync_correlator: _,
+            sync_tick: _,
+            sync_resolved_responses: _,
+            sync_unknown_responses: _,
         } = self;
 
         if let Some(mut stack) = network_stack {

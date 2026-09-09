@@ -6,8 +6,7 @@
 //!
 //! ```text
 //! MissingAncestorIntent（B1）
-//!     ↓ schedule_from_missing_ancestor（B1 seam；缺精确 ancestor ⇒ 诚实 Unschedulable）
-//! caller 提供的 SyncRequestTarget（B2/B3/B4 复用；不伪造 height/hash）
+//!     ↓ schedule_from_missing_ancestor（ADR-0062 height-based：head+1 / hash=None；不伪造）
 //!     ↓ select_peer（deterministic；exclude attempted；NoPeerAvailable 不 panic）
 //!     ↓ SyncRequestIntent{ request_id（caller-owned）‖ peer（NodeId）‖ target }
 //!     ↓ SyncRequestScheduler（bounded FIFO；Duplicate/Full/Scheduled）
@@ -27,9 +26,9 @@
 //!   所有入队都经 caller 注入的 [`SyncRequestIntent`]。
 //! - **retry counter 唯一来源 = B4 correlator**：B5 不创建第二套 retry counter；只负责在
 //!   RetryEligible 时选 peer + 构造 intent（target 不变）。
-//! - **B1 语义限制**：`MissingAncestorIntent` 只含 observed **future block**（height/hash/head），
-//!   不含精确 missing ancestor ⇒ **不把 future hash 当 ancestor / 不猜 head+1** ⇒
-//!   `Unschedulable`（诚实；不制造假 height/hash）。
+//! - **B1 语义（ADR-0062）**：`MissingAncestorIntent` 只含 observed future block
+//!   （height/hash/head）⇒ height-based target = `{ local_head + 1, block_hash: None }`；
+//!   **不把 future hash 当 ancestor、不猜 head+1 的 hash**（信任由响应验证建立）。
 //! - 无墙钟（`Instant`/`SystemTime`）/ 无随机 / 无 async / 无后台线程；bounded（满 ⇒ `Full`）。
 //! - 不消费 BlockStore / StateStore / ChainHead / finality / QC / fork choice。
 //!
@@ -150,26 +149,32 @@ pub enum ScheduleResult {
     Duplicate,
     /// 队列满（bounded；不逐出）。
     Full,
-    /// 无法安全构造调度（如 B1 seam：缺精确 missing ancestor target；不伪造）。
+    /// 无法安全构造调度（保留兼容；`schedule_from_missing_ancestor` 在 ADR-0062 后不再产出 ——
+    /// height-based target 始终可构造）。
     Unschedulable,
 }
 
-/// 从 B1 intent 构造精确 target 失败的 typed 标记（诚实边界；无假字段）。
+/// 从 B1 intent 构造精确 target 失败的 typed 标记（保留兼容；当前无精确 ancestor 来源时
+/// 不再使用 —— 见 [`sync_target_from_missing_ancestor`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MissingAncestorTargetUnavailable;
 
-/// 尝试从 B1 [`MissingAncestorIntent`] 安全构造 [`SyncRequestTarget`]。
+/// ADR-0062 canonical mapping：`FutureMissingAncestor` → height-based `SyncRequestTarget`。
 ///
-/// **恒 `Err`**（§15/§16）：`MissingAncestorIntent` 只记录 observed **future block** 的
-/// `(height, observed_block_hash, local_head_height)`；它不含 missing ancestor 的精确 hash 或
-/// height。把 `observed_block_hash` 当作 ancestor hash、或把 `local_head_height + 1` 猜成缺失
-/// 高度 ⇒ 都属伪造。故当前语义下**无法**构造非伪造 target。
+/// ```text
+/// MissingAncestorIntent { observed_height: H, observed_block_hash: X, local_head_height: L }
+///     ⇒ SyncRequestTarget { height: L + 1, block_hash: None }
+/// ```
 ///
-/// 若未来 B1 携带可信的精确 ancestor 区间信息，此 seam 是唯一扩展点。
-fn target_from_missing_ancestor(
-    _intent: &MissingAncestorIntent,
-) -> Result<SyncRequestTarget, MissingAncestorTargetUnavailable> {
-    Err(MissingAncestorTargetUnavailable)
+/// - `height = local_head_height + 1` = 本地 canonical head 之后第一个待同步高度（**非** H、
+///   非 observed 块自身、非 parent(X)）。
+/// - `block_hash = None`：**不伪造 ancestor hash** —— 把 `observed_block_hash` 当 target hash
+///   或猜 `head+1` 的 hash 均禁止；信任由响应逐块验证建立（ADR-0062 §6/§9）。
+pub fn sync_target_from_missing_ancestor(intent: &MissingAncestorIntent) -> SyncRequestTarget {
+    SyncRequestTarget {
+        height: intent.local_head_height.saturating_add(1),
+        block_hash: None,
+    }
 }
 
 /// bounded、deterministic（FIFO）的 outbound sync request 调度器（§11-14）。
@@ -237,28 +242,26 @@ impl SyncRequestScheduler {
         self.queue.pop_front()
     }
 
-    /// B1 seam（§15/§16）：消费一条 [`MissingAncestorIntent`] 尝试入队。
+    /// B1 seam（ADR-0062）：消费一条 [`MissingAncestorIntent`] → height-based target
+    /// （`height = local_head + 1`，`block_hash = None`）→ 入队（caller 已选 `peer`）。
     ///
-    /// 安全边界：B1 intent 不含精确 missing ancestor target ⇒
-    /// [`target_from_missing_ancestor`] 当前恒 `Err` ⇒ 返回 [`ScheduleResult::Unschedulable`]，
-    /// **不入队 / 不伪造 height/hash / 不把 observed future hash 当 ancestor**。
+    /// 安全边界：不把 observed future hash 当 ancestor hash、不猜 `head+1` 的 hash ——
+    /// target 只携带高度（可安全计算）+ `None` hash（响应验证建信任）。
     ///
-    /// 若 caller 从其它（可信）来源已有精确 [`SyncRequestTarget`]，请直接用 [`Self::schedule`]。
+    /// 仍按 bounded `schedule` 语义返回 `Scheduled` / `Duplicate` / `Full`
+    /// （不再因“缺精确 hash”而 `Unschedulable` —— 那属旧猜 hash seam，ADR-0062 已替代）。
     pub fn schedule_from_missing_ancestor(
         &mut self,
         request_id: RequestId,
         peer: NodeId,
         intent: &MissingAncestorIntent,
     ) -> ScheduleResult {
-        // helper 当前恒 Err；若未来 B1 携带可信精确 ancestor（Ok），此分支显式入队 ——
-        // seam 不会静默猜测 / 伪造 target。
-        match target_from_missing_ancestor(intent) {
-            Ok(target) => {
-                let _ = (request_id, peer, target);
-                ScheduleResult::Unschedulable
-            }
-            Err(_) => ScheduleResult::Unschedulable,
-        }
+        let target = sync_target_from_missing_ancestor(intent);
+        self.schedule(SyncRequestIntent {
+            request_id,
+            peer,
+            target,
+        })
     }
 }
 
@@ -455,18 +458,59 @@ mod tests {
         assert!(s.is_empty());
     }
 
-    // TEST 12 — FutureMissingAncestor 不能伪造 missing ancestor hash（B1 seam 诚实 Unschedulable）
+    // TEST 12 — FutureMissingAncestor → height-based target（ADR-0062；不伪造 ancestor hash）
     #[test]
-    fn b1_intent_cannot_forge_missing_ancestor_target() {
+    fn b1_intent_maps_to_height_based_target() {
         let ma = missing_intent(0xee);
         let mut s = SyncRequestScheduler::new(4);
+        // 原 seam（恒 Unschedulable）已由 ADR-0062 height-based mapping 替代：
+        // target = { local_head(3) + 1 = 4, block_hash: None }。
         assert_eq!(
             s.schedule_from_missing_ancestor(rid(9), peer(0xbb), &ma),
-            ScheduleResult::Unschedulable
+            ScheduleResult::Scheduled
         );
-        assert!(s.is_empty(), "未伪造 target 入队");
-        // helper seam 恒 Err（不把 observed_block_hash 当 ancestor / 不猜 head+1）
-        assert!(target_from_missing_ancestor(&ma).is_err());
+        let got = s.dequeue().unwrap();
+        assert_eq!(got.request_id, rid(9));
+        assert_eq!(got.peer, peer(0xbb));
+        assert_eq!(
+            got.target,
+            SyncRequestTarget {
+                height: 4,
+                block_hash: None,
+            }
+        );
+        // observed_block_hash 绝不作 target hash（T2）
+        assert_eq!(got.target.block_hash, None);
+        assert_ne!(
+            got.target.block_hash,
+            Some(ma.observed_block_hash),
+            "observed hash 不作 ancestor hash"
+        );
+    }
+
+    // T1/T2 — ADR-0062 mapping：head=100、observed=105 ⇒ height=101 / hash=None；
+    // 不产生 observed hash target、不猜 head+1 的 hash。
+    #[test]
+    fn adr0062_mapping_head_plus_one_no_observed_hash() {
+        let ma = MissingAncestorIntent {
+            observed_height: 105,
+            observed_block_hash: [0xAB; 32],
+            local_head_height: 100,
+            source: BlockInboundSource::Gossip,
+            count: 1,
+        };
+        let t = sync_target_from_missing_ancestor(&ma);
+        assert_eq!(t.height, 101, "T1 height = local_head + 1");
+        assert_eq!(t.block_hash, None, "T1/T2 hash = None（不猜 / 不伪造）");
+        assert_ne!(
+            t.height, ma.observed_height,
+            "不用 observed height 当 target"
+        );
+        assert_ne!(
+            t.block_hash,
+            Some(ma.observed_block_hash),
+            "T2 observed hash 不作 ancestor hash"
+        );
     }
 
     // TEST 13 — B4 RetryEligible 可以转换成 request intent（同 target）

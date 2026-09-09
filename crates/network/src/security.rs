@@ -51,6 +51,8 @@ pub enum NetworkSecurityError {
     InvalidSignature,
     /// 输入不合法（结构 / 长度等；fail-closed）。
     InvalidInput,
+    /// OS CSPRNG 不可用（RequestId 生成失败；无 fallback —— 不退回弱随机）。
+    RngFailure,
 }
 
 impl core::fmt::Display for NetworkSecurityError {
@@ -62,6 +64,7 @@ impl core::fmt::Display for NetworkSecurityError {
             Self::InvalidNodeId => write!(f, "NodeId does not match public key"),
             Self::InvalidSignature => write!(f, "invalid network message signature"),
             Self::InvalidInput => write!(f, "invalid network security input"),
+            Self::RngFailure => write!(f, "OS CSPRNG failure"),
         }
     }
 }
@@ -177,7 +180,8 @@ impl SessionNonce {
     }
 }
 
-/// Request id（请求 / 响应绑定；canonical 16B）。不在此生成；仅确定性编码 / 比较。
+/// Request id（请求 / 响应绑定；canonical 16B）。生成归 [`random_request_id`]（OS CSPRNG）；
+/// 本结构仅确定性编码 / 比较。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestId([u8; 16]);
 
@@ -189,6 +193,14 @@ impl RequestId {
     pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
+}
+
+/// 生成新 `RequestId`（OS CSPRNG `getrandom`，无 fallback；不可预测 —— 不用时间戳 / 递增
+/// 计数器；STEP 10-19-10-B7-A1-D8-2）。
+pub fn random_request_id() -> Result<RequestId, NetworkSecurityError> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| NetworkSecurityError::RngFailure)?;
+    Ok(RequestId::from_bytes(bytes))
 }
 
 /// Handshake commitment（纯确定性函数；ADR-0059 Handshake；**不实现** handshake runtime）。
@@ -381,5 +393,21 @@ mod tests {
         let c = handshake_commitment(NetworkId::Testnet, 1, [0x42; 32], 1, &node, &nonce, caps)
             .unwrap();
         assert_ne!(a, c);
+    }
+
+    // T3（D8-2）— RequestId 生产生成：16B、OS CSPRNG、非递增/非时间戳（多次 distinct）。
+    #[test]
+    fn random_request_id_16_bytes_distinct() {
+        let a = random_request_id().unwrap();
+        assert_eq!(a.as_bytes().len(), 16, "wire size 冻结 16B");
+        let b = random_request_id().unwrap();
+        assert_ne!(a, b, "两次不同（不可预测；非递增 / 非时间戳）");
+        // 多次采样均 distinct（非递增计数器 / 非时间戳伪随机）。
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let r = random_request_id().unwrap();
+            assert!(seen.insert(r), "随机采样不重复");
+        }
+        assert_eq!(seen.len(), 16);
     }
 }

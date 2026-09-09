@@ -16,7 +16,7 @@
 //! - **不接收 / 不处理 `SyncBlockResponse`**（无 response handler；无 resolve 消费驱动）。
 //! - **不写 BlockStore / StateStore / 不改 ChainHead / 不做 finality / QC / canonical commit**。
 //! - **不自动 retry / 不自动换 peer / 不 peer discovery / 不 peer connect**（send 失败 ⇒
-//!   [`SyncDispatchResult::Rejected`]，由 caller 显式走 B4 retry/abandon 生命周期）。
+//!   [`SyncDispatchResult::Rejected`] 且 dispatch_batch **立即 release** 该 request —— 见下）。
 //! - **RequestId caller-owned**：本模块不生成 RequestId（无 rand / timestamp / counter）。
 //! - **register-before-send**：correlation 在真正 outbound dispatch 之前完成（见下）。
 //! - **bounded dispatch**：单次处理至多 `max_items`；不 `while let` 无限排空。
@@ -36,9 +36,8 @@
 //! register 先行 ⇒ 避免 "response 到达但 correlator 尚未注册" 的 race。若 register 失败
 //!（Duplicate / Full）⇒ **不 dispatch**（不重复发送 / bounded）。
 //!
-//! send 失败（`Rejected`）时：该 request 已 register（pending 保留于 correlator）。**不自动
-//! retry / 不自动 abandon / 不自动换 peer** —— caller 观察 report 后显式决定（B4 authoritative：
-//! `retry` / `abandon` / 等 timeout）。
+//! send 失败（`Rejected`）时：**立即 `correlator.release(request_id)`**（D8-3-1-B：释放 active
+//! capacity，不永久占用）。**不自动 retry / 不自动换 peer / 不重新 register** —— 不产生新 request。
 //!
 //! # 与现有 NetworkService 的对接（如实）
 //! `nova_network` 已有 outbound 边界：`NetworkService::enqueue_outbound(peer, pre-signed
@@ -47,8 +46,13 @@
 //! 边界）→ `enqueue_outbound(intent.peer, envelope)`。本模块**不携带私钥 / 不建立连接 / 不改
 //! NetworkService**；B6 只定义 seam 与语义，供未来 authenticated peer source 注入的 adapter 实现。
 
+use nova_network::message::{MessageEnvelope, MessageType};
+use nova_network::network_service::NetworkService;
+use nova_network::node_id::NodeId;
 use nova_network::sync::SyncBlockRequest;
+use nova_network::transport::BoxTransport;
 
+use crate::network_identity::NetworkSigner;
 use crate::sync_correlator::{LogicalTick, SyncRequestCorrelator};
 use crate::sync_scheduler::{SyncRequestIntent, SyncRequestScheduler};
 
@@ -70,6 +74,52 @@ pub enum SyncDispatchResult {
 pub trait OutboundSyncDispatcher {
     /// 把一条 intent 送入既有 Node→Network outbound 边界。
     fn dispatch(&mut self, intent: &SyncRequestIntent) -> SyncDispatchResult;
+}
+
+/// 生产 outbound sync dispatcher adapter（STEP 10-19-10-B7-A1-D8-2）。
+///
+/// 把 `SyncRequestIntent` → wire `SyncBlockRequest` → pre-signed `MessageEnvelope`
+/// （`NetworkSigner` 网络身份签名）→ `NetworkService::enqueue_outbound(peer, envelope)`。
+///
+/// 边界（与模块 doc 一致）：
+/// - **Established gate**：发送前要求 peer 已 `Established`（SI-6）；未 Established ⇒
+///   `Rejected`（不发；不 dial / 不 handshake / 不 reconnect —— 属 D7 configured lifecycle）。
+/// - **不 bypass NetworkService**：不直接 socket / TcpTransport / MemoryTransport / BoxTransport。
+/// - 不实现 target inference / consensus / finality / commit。
+/// - 签名失败 / enqueue 失败 ⇒ `Rejected`（register 已由 dispatch_batch 先行 —— 不伪造发送成功）。
+pub struct NetworkSyncDispatcher<'a> {
+    ns: &'a mut NetworkService<BoxTransport>,
+    signer: &'a dyn NetworkSigner,
+}
+
+impl<'a> NetworkSyncDispatcher<'a> {
+    pub fn new(ns: &'a mut NetworkService<BoxTransport>, signer: &'a dyn NetworkSigner) -> Self {
+        Self { ns, signer }
+    }
+}
+
+impl OutboundSyncDispatcher for NetworkSyncDispatcher<'_> {
+    fn dispatch(&mut self, intent: &SyncRequestIntent) -> SyncDispatchResult {
+        // Established gate（SI-6；只向已认证 peer 发送）。
+        if !self.ns.is_peer_established(intent.peer) {
+            return SyncDispatchResult::Rejected;
+        }
+        let request = sync_block_request_from_intent(intent);
+        let mut envelope = MessageEnvelope {
+            version: 1,
+            message_type: MessageType::SyncBlockRequest,
+            payload: request.encode(),
+            sender: NodeId::from_bytes([0; 32]), // sign_envelope 派生 network NodeId
+            signature: [0u8; 64],
+        };
+        if self.signer.sign_envelope(&mut envelope).is_err() {
+            return SyncDispatchResult::Rejected;
+        }
+        match self.ns.enqueue_outbound(intent.peer, envelope) {
+            Ok(()) => SyncDispatchResult::Sent,
+            Err(_) => SyncDispatchResult::Rejected,
+        }
+    }
 }
 
 /// B5 intent → 既有 wire request 的纯转换（§5/§6）。
@@ -96,7 +146,8 @@ pub fn sync_block_request_from_intent(intent: &SyncRequestIntent) -> SyncBlockRe
 pub struct DispatchBatchReport {
     /// 成功送入 Node→Network 边界的条数。
     pub sent: usize,
-    /// 被 dispatcher 拒绝的条数（**不自动 retry / 不自动换 peer**；pending 保留于 correlator）。
+    /// 被 dispatcher 拒绝的条数（**不自动 retry / 不自动换 peer**；已 release 该 request ——
+    /// active capacity 恢复）。
     pub rejected: usize,
     /// correlation register 失败（Duplicate / Full）而未发送的条数（不重复发送 / bounded）。
     pub registration_failed: usize,
@@ -120,8 +171,8 @@ impl DispatchBatchReport {
 ///      `registration_failed += 1`，**不 dispatch**（不重复发送 / bounded）；
 /// 3. `dispatcher.dispatch(&intent)`：
 ///    - `Sent` ⇒ `sent += 1`；
-///    - `Rejected` ⇒ `rejected += 1`（pending 保留于 correlator；caller 显式决定
-///      abandon/retry/timeout —— **本函数不自动 retry / 不自动换 peer**）。
+///    - `Rejected` ⇒ `rejected += 1` 且 **`correlator.release(request_id)`**（D8-3-1-B：send
+///      失败立即释放 active；不自动 retry / 不自动换 peer / 不重新 register）。
 ///
 /// `max_items = 0` ⇒ no-op。空 scheduler ⇒ report 全 0。
 pub fn dispatch_batch(
@@ -148,8 +199,9 @@ pub fn dispatch_batch(
             SyncDispatchResult::Sent => report.sent += 1,
             SyncDispatchResult::Rejected => {
                 report.rejected += 1;
-                // send 失败：不自动 retry / 不自动 abandon / 不自动换 peer（§8）。pending 保留，
-                // caller 观察 report 后显式决定（B4 authoritative retry/abandon）。
+                // D8-3-1-B：send 失败 ⇒ **立即 release 该 request**（释放 active capacity）；
+                // 不自动 retry / 不自动重新选 peer / 不重新 register（caller 显式决定）。
+                let _ = correlator.release(intent.request_id);
             }
         }
     }
@@ -325,7 +377,7 @@ mod tests {
         assert_eq!(d.calls.len(), 1);
     }
 
-    // TEST 8 — send failure ⇒ Rejected（pending 保留；caller 后续显式决定）
+    // TEST 8 — send failure ⇒ Rejected + **release**（D8-3-1-B：active capacity 恢复；不永久占用）
     #[test]
     fn dispatch_send_failure_reported() {
         let mut sched = SyncRequestScheduler::new(4);
@@ -334,12 +386,24 @@ mod tests {
         let mut d = MockDispatcher::new(SyncDispatchResult::Rejected);
         let rep = dispatch_batch(&mut sched, &mut corr, &mut d, FAR, 4);
         assert_eq!(rep.rejected, 1);
-        // pending 保留于 correlator（register 先行 ⇒ 未被自动清除）
-        assert!(corr.contains(&rid(1)));
+        // D8-3-1：send 失败 ⇒ request 已从 correlator release（不永久占 active capacity）。
+        assert!(!corr.contains(&rid(1)), "send failure released");
+        assert!(corr.is_empty(), "active 已释放");
         assert!(sched.is_empty(), "该 intent 已出队（不重入 scheduler）");
+        // 释放后可再 register（capacity 恢复）。
+        corr.register(
+            rid(1),
+            crate::sync_correlator::SyncRequestTarget {
+                height: 5,
+                block_hash: None,
+            },
+            FAR,
+        )
+        .unwrap();
+        assert!(corr.contains(&rid(1)));
     }
 
-    // TEST 9 — send failure 不自动 retry（dispatcher 只被调用一次；无 retry 状态推进）
+    // TEST 9 — send failure 不自动 retry（dispatcher 只被调用一次；request 已释放）
     #[test]
     fn send_failure_does_not_auto_retry() {
         let mut sched = SyncRequestScheduler::new(4);
@@ -349,8 +413,9 @@ mod tests {
         let rep = dispatch_batch(&mut sched, &mut corr, &mut d, FAR, 4);
         assert_eq!(rep.rejected, 1);
         assert_eq!(d.calls.len(), 1, "仅尝试一次（无自动 retry）");
-        // correlator 中该 request 仍在 active（无 retry() 推进 / 无重复 register）
-        assert!(corr.contains(&rid(1)));
+        // correlator 中该 request 已 release（无 active 残留 / 无第二注册）。
+        assert!(!corr.contains(&rid(1)));
+        assert!(corr.is_empty());
     }
 
     // TEST 10 — send failure 不自动选择其他 peer（dispatcher 收到原 intent.peer，仅一次）
@@ -483,12 +548,16 @@ mod tests {
         let i = intent(1, 0xaa, 5);
         let mut d = NoOpRejectDispatcher;
         assert_eq!(d.dispatch(&i), SyncDispatchResult::Rejected);
-        // 完整 dispatch_batch：Rejected（不吞错误；report 反映）
+        // 完整 dispatch_batch：Rejected ⇒ release（D8-3-1-B：不永久占 active；不吞错误）。
         let mut sched = SyncRequestScheduler::new(4);
         let mut corr = SyncRequestCorrelator::new(4);
         seed(&mut sched, &[(1, 0xaa, 5)]);
         let rep = dispatch_batch(&mut sched, &mut corr, &mut d, FAR, 4);
         assert_eq!(rep.rejected, 1);
-        assert!(corr.contains(&rid(1)), "pending 保留；caller 显式决定");
+        assert!(
+            !corr.contains(&rid(1)),
+            "Rejected 已 release（active 不占）"
+        );
+        assert!(corr.is_empty());
     }
 }

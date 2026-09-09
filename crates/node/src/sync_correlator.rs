@@ -309,6 +309,21 @@ impl SyncRequestCorrelator {
         self.eligible.remove(&request_id).is_some()
     }
 
+    /// 无条件释放一个 request（active 或 RetryEligible 均移除）并清理注册序
+    /// （STEP 10-19-10-B7-A1-D8-3-1：send-failure / 显式放弃 active request —— 释放 capacity）。
+    ///
+    /// - 不存在 / 已 resolve / 已 expire ⇒ `false`（幂等；不 panic）。
+    /// - 不自动 retry / 不重新选 peer / 不重新 register（caller 显式决定）。
+    /// - 不改变其它 request（active 数量只减该条）。
+    pub fn release(&mut self, request_id: RequestId) -> bool {
+        let removed = self.active.remove(&request_id).is_some()
+            || self.eligible.remove(&request_id).is_some();
+        if removed {
+            self.order.retain(|id| *id != request_id);
+        }
+        removed
+    }
+
     /// 查询某 request 的 retry 状态（只读；不 mutate）。
     ///
     /// - active 且 `tick < deadline` ⇒ `Pending`；
@@ -792,5 +807,143 @@ mod tests {
             c.register(rid(1), target(7), 30),
             Err(SyncCorrelateError::Duplicate)
         );
+    }
+
+    // ---- STEP 10-19-10-B7-A1-D8-3-1：request lifecycle release / resolve / expire ----
+
+    // T1 — register → resolve ⇒ active 1 → 0（consuming resolve 释放）。
+    #[test]
+    fn d8_3_1_register_then_resolve_releases() {
+        let mut c = SyncRequestCorrelator::new(4);
+        register_far(&mut c, 1, 5);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.resolve(rid(1)).unwrap().height, 5);
+        assert_eq!(c.len(), 0, "active 1 → 0");
+        assert!(c.is_empty());
+    }
+
+    // T2 — duplicate resolve：第二次失败（不二次释放 / 不改变其它）。
+    #[test]
+    fn d8_3_1_duplicate_resolve_rejected() {
+        let mut c = SyncRequestCorrelator::new(4);
+        register_far(&mut c, 1, 5);
+        assert!(c.resolve(rid(1)).is_ok());
+        assert_eq!(
+            c.resolve(rid(1)),
+            Err(SyncCorrelateError::Unknown),
+            "dup fail"
+        );
+        assert_eq!(c.len(), 0, "active 不再变化");
+    }
+
+    // T3 — unknown response：不存在 request_id ⇒ reject + correlator unchanged。
+    #[test]
+    fn d8_3_1_unknown_response_rejected_unchanged() {
+        let mut c = SyncRequestCorrelator::new(4);
+        register_far(&mut c, 1, 5);
+        assert_eq!(c.resolve(rid(9)), Err(SyncCorrelateError::Unknown));
+        assert_eq!(c.len(), 1, "correlator unchanged");
+        assert!(c.contains(&rid(1)));
+        assert_eq!(
+            c.resolve(rid(1)).unwrap().height,
+            5,
+            "原 request 仍可正常 resolve"
+        );
+    }
+
+    // T4 — register → send failure → release：active capacity 恢复。
+    #[test]
+    fn d8_3_1_send_failure_releases() {
+        let mut c = SyncRequestCorrelator::new(2);
+        register_far(&mut c, 1, 5);
+        register_far(&mut c, 2, 6);
+        assert_eq!(c.len(), 2);
+        // send-failure 释放 id 1（release 移除 active）。
+        assert!(c.release(rid(1)), "release active");
+        assert_eq!(c.len(), 1, "active 释放一个");
+        assert!(!c.contains(&rid(1)));
+        // capacity 恢复：可 register 新 request。
+        register_far(&mut c, 3, 7);
+        assert_eq!(c.len(), 2);
+        assert!(c.contains(&rid(2)) && c.contains(&rid(3)));
+    }
+
+    // T5 — register → response → resolve：response request_id 正确释放 request。
+    #[test]
+    fn d8_3_1_response_resolves_correct_request() {
+        let mut c = SyncRequestCorrelator::new(4);
+        register_far(&mut c, 1, 5);
+        register_far(&mut c, 2, 6);
+        assert_eq!(c.resolve(rid(2)).unwrap().height, 6, "response id=2 释放 2");
+        assert!(!c.contains(&rid(2)));
+        assert!(c.contains(&rid(1)), "其它 request 不受影响");
+    }
+
+    // T6 — register → expire：tick 超过 deadline ⇒ 释放（release-only；无 retry 状态）。
+    #[test]
+    fn d8_3_1_expire_releases() {
+        let mut c = SyncRequestCorrelator::new(4);
+        c.register(rid(1), target(5), 10).unwrap();
+        assert!(c.expire_at(9).is_empty(), "deadline 前不释放");
+        assert_eq!(c.expire_at(10), vec![rid(1)], "deadline 到 ⇒ 释放");
+        assert!(c.is_empty());
+    }
+
+    // T7 — expired request cannot resolve（release-only 后 resolve 失败）。
+    #[test]
+    fn d8_3_1_expired_cannot_resolve() {
+        let mut c = SyncRequestCorrelator::new(4);
+        c.register(rid(1), target(5), 10).unwrap();
+        c.expire_at(10);
+        assert_eq!(c.resolve(rid(1)), Err(SyncCorrelateError::Unknown), "T7");
+        assert!(c.is_empty());
+    }
+
+    // T8 — capacity recovery：填满 → 第 N+1 失败；release 一个 → 可再 register。
+    #[test]
+    fn d8_3_1_capacity_recovery_after_release() {
+        let n = 64usize;
+        let mut c = SyncRequestCorrelator::new(n);
+        for i in 0..n as u8 {
+            register_far(&mut c, i, i as u64);
+        }
+        assert_eq!(c.len(), n);
+        assert_eq!(
+            c.register(rid(0xFF), target(200), FAR),
+            Err(SyncCorrelateError::Full),
+            "第 65 个失败"
+        );
+        assert!(c.release(rid(0u8)), "release 一个");
+        assert_eq!(c.len(), n - 1);
+        register_far(&mut c, 0xFF, 200);
+        assert_eq!(c.len(), n, "新 request 可 register");
+    }
+
+    // T9 — duplicate response isolation：resolve A 后重复 resolve A 失败；B 仍 active。
+    #[test]
+    fn d8_3_1_duplicate_response_does_not_affect_other() {
+        let mut c = SyncRequestCorrelator::new(4);
+        register_far(&mut c, 1, 5); // A
+        register_far(&mut c, 2, 6); // B
+        assert!(c.resolve(rid(1)).is_ok());
+        assert_eq!(c.resolve(rid(1)), Err(SyncCorrelateError::Unknown), "dup A");
+        assert!(c.contains(&rid(2)), "B 仍 active");
+        assert_eq!(c.len(), 1);
+    }
+
+    // T10 — multi-peer isolation：peer 不进入 correlator（request_id 绑定）；
+    // resolve A 不触 B（request 独立 lifecycle）。
+    #[test]
+    fn d8_3_1_request_isolation_between_requests() {
+        let mut c = SyncRequestCorrelator::new(4);
+        register_far(&mut c, 1, 5); // peer A 的 request
+        register_far(&mut c, 2, 6); // peer B 的 request
+        assert_eq!(c.resolve(rid(1)).unwrap().height, 5);
+        assert!(
+            c.contains(&rid(2)),
+            "peer B request 仍 active（resolve 只消费匹配 id）"
+        );
+        assert_eq!(c.resolve(rid(2)).unwrap().height, 6);
+        assert!(c.is_empty());
     }
 }

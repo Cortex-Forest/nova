@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use nova_crypto::address::{
-    ADDRESS_VERSION, AddressType, NetworkId, NovaAddress, NovaAddressPayload,
+    ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
 use nova_crypto::identity::{
     AccountInit, EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit,
@@ -26,17 +26,20 @@ use nova_network::session::{
     random_session_nonce,
 };
 use nova_network::transport::{
-    BoxTransport, ConnectionTarget, MemoryTransport, TcpTransport, Transport,
+    BoxTransport, ConnectionTarget, MemoryTransport, TcpDialer, TcpTransport, Transport,
 };
 
 use nova_node::bootstrap::NodeConfig;
-use nova_node::network_identity::SoftwareNetworkIdentity;
+use nova_node::network_identity::{NetworkSigner, SoftwareNetworkIdentity};
 use nova_node::runtime::{NodeRuntime, NodeRuntimeError, PeerEstablishment, PeerStatus};
+use nova_node::sync_correlator::SyncRequestTarget;
+use nova_node::sync_dispatch::{NetworkSyncDispatcher, OutboundSyncDispatcher, SyncDispatchResult};
+use nova_node::sync_scheduler::SyncRequestIntent;
 
 const CHAIN_ID: u64 = 3003;
 
-fn addr(kh: [u8; 32]) -> NovaAddress {
-    NovaAddress::from_payload(NovaAddressPayload {
+fn addr(kh: [u8; 32]) -> YazimaoAddress {
+    YazimaoAddress::from_payload(YazimaoAddressPayload {
         address_version: ADDRESS_VERSION,
         address_type: AddressType::UserAccount,
         network_id: NetworkId::Mainnet,
@@ -911,4 +914,157 @@ fn d7_3_handshake_idempotent_per_peer() {
     drop(rt);
     h_a.join().unwrap();
     h_b.join().unwrap();
+}
+
+// ===== STEP 10-19-10-B7-A1-D8-2：outbound sync orchestration（生产 adapter 集成）=====
+
+/// A 的 outbound Handshake Init（claimed = A network NodeId；仿 runtime build_outbound_handshake）。
+fn a_signed_init(signer: &dyn NetworkSigner, auth: &PeerAuthConfig) -> MessageEnvelope {
+    let nonce = random_session_nonce().unwrap();
+    let local = signer.node_id();
+    let payload = handshake_payload_encode(
+        HandshakeKind::Init,
+        auth.network_id,
+        auth.chain_id,
+        auth.genesis_hash,
+        auth.protocol_version,
+        &local,
+        &nonce,
+        auth.capabilities,
+    )
+    .unwrap();
+    let mut env = MessageEnvelope {
+        version: 1,
+        message_type: MessageType::Handshake,
+        payload,
+        sender: local,
+        signature: [0u8; 64],
+    };
+    signer.sign_envelope(&mut env).unwrap();
+    env
+}
+
+fn sync_intent_for(peer: NodeId, height: u64) -> SyncRequestIntent {
+    SyncRequestIntent {
+        request_id: nova_network::security::random_request_id().unwrap(),
+        peer,
+        target: SyncRequestTarget {
+            height,
+            block_hash: None,
+        },
+    }
+}
+
+/// A 裸 NetworkService（不经 runtime）：dial 每个对端（listener 已由 run_peer_b 监听）→
+/// 发 A Init → poll 至 Established。返回 (ns, signer)。不拥有 transport（NS owner）。
+fn a_ns_established(
+    env: &Env,
+    a_kp: KeyPair,
+    targets: &[(SocketAddr, NodeId)],
+) -> (NetworkService<BoxTransport>, Box<dyn NetworkSigner>) {
+    let a_id = NodeId::from_verifying_key(a_kp.verifying_key());
+    let other = NodeId::from_bytes([0x99; 32]);
+    let transport: Box<dyn Transport> = Box::new(MemoryTransport::pair(a_id, other).0);
+    let signer: Box<dyn NetworkSigner> = Box::new(SoftwareNetworkIdentity::new(a_kp));
+    let mut ns = NetworkService::<BoxTransport>::new(
+        NetworkServiceConfig {
+            peer_auth: Some(env.auth()),
+            ..Default::default()
+        },
+        a_id,
+        BoxTransport::new(transport),
+    )
+    .with_dialer(Box::new(TcpDialer));
+    for (addr, b_id) in targets {
+        let max_frame = ns.config().max_msg_bytes;
+        ns.dial_peer(*addr, *b_id, max_frame, None).unwrap();
+        let init = a_signed_init(signer.as_ref(), &env.auth());
+        ns.enqueue_outbound(*b_id, init).unwrap();
+        ns.flush_outbound().unwrap();
+        let mut done = false;
+        for _ in 0..1000 {
+            ns.poll_transport().unwrap();
+            if ns.is_peer_established(*b_id) {
+                done = true;
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(done, "A 应 Established peer {b_id:?}");
+    }
+    (ns, signer)
+}
+
+// T6/T7 — adapter：Established peer ⇒ SyncBlockRequest → envelope → enqueue_outbound（Sent）；
+// 未 Established/未连接 peer ⇒ no send（Rejected）。
+#[test]
+fn d8_2_sync_dispatcher_established_gate_and_send() {
+    let env = Env::new();
+    let a_kp = KeyPair::generate().unwrap();
+    let (addr_b, b_id, h_b) = spawn_peer_b(&env);
+    let (mut ns, signer) = a_ns_established(&env, a_kp, &[(addr_b, b_id)]);
+    {
+        let mut d = NetworkSyncDispatcher::new(&mut ns, signer.as_ref());
+        // T7 — Established B ⇒ Sent（SyncBlockRequest 经签名 → enqueue_outbound）。
+        let it_b = sync_intent_for(b_id, 101);
+        assert_eq!(
+            d.dispatch(&it_b),
+            SyncDispatchResult::Sent,
+            "T7 Established peer send"
+        );
+        // T6 — 未连接 / 未 Established peer ⇒ Rejected（no outbound send）。
+        let d_id = NodeId::from_bytes([0xdd; 32]);
+        let it_d = sync_intent_for(d_id, 101);
+        assert_eq!(
+            d.dispatch(&it_d),
+            SyncDispatchResult::Rejected,
+            "T6 un-established peer rejected"
+        );
+    }
+    drop(ns);
+    drop(signer);
+    h_b.join().unwrap();
+}
+
+// T8/T9 — 多 peer 各自可达（deterministic selection 由 scheduler tests 覆盖）；disconnect 隔离。
+#[test]
+fn d8_2_sync_dispatcher_multi_peer_disconnect_isolation() {
+    let env = Env::new();
+    let a_kp = KeyPair::generate().unwrap();
+    let (addr_b, b_id, h_b) = spawn_peer_b(&env);
+    let (addr_c, c_id, h_c) = spawn_peer_b(&env);
+    let (mut ns, signer) = a_ns_established(&env, a_kp, &[(addr_b, b_id), (addr_c, c_id)]);
+    // T8 — B、C 两个 Established peer 各自 dispatch 成功（多 peer 不互相干扰）。
+    {
+        let mut d = NetworkSyncDispatcher::new(&mut ns, signer.as_ref());
+        assert_eq!(
+            d.dispatch(&sync_intent_for(b_id, 101)),
+            SyncDispatchResult::Sent
+        );
+        assert_eq!(
+            d.dispatch(&sync_intent_for(c_id, 102)),
+            SyncDispatchResult::Sent
+        );
+    }
+    // T9 — disconnect B ⇒ B Rejected；C 仍 Established ⇒ Sent（单 peer 失败不破坏其它）。
+    ns.disconnect_peer(b_id).unwrap();
+    assert!(!ns.is_peer_established(b_id));
+    assert!(ns.is_peer_established(c_id), "C 不受 B 断开影响");
+    {
+        let mut d = NetworkSyncDispatcher::new(&mut ns, signer.as_ref());
+        assert_eq!(
+            d.dispatch(&sync_intent_for(b_id, 103)),
+            SyncDispatchResult::Rejected,
+            "T9 disconnected B rejected"
+        );
+        assert_eq!(
+            d.dispatch(&sync_intent_for(c_id, 104)),
+            SyncDispatchResult::Sent,
+            "T9 healthy C still sent"
+        );
+    }
+    drop(ns);
+    drop(signer);
+    h_b.join().unwrap();
+    h_c.join().unwrap();
 }
