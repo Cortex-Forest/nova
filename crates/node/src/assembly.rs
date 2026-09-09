@@ -12,14 +12,14 @@
 //! - Proposal / QC ingestion / A11：**DEFERRED**（本模块不实现）。
 //! - Vote 的 V-5 验证边界由 Consensus 保证（MF-2 hard precondition）；调用点归 11-6 明确。
 
-use nova_consensus::dag::Dag;
+use nova_consensus::dag::{BlockReference, Dag};
 use nova_consensus::error::ConsensusError;
 use nova_consensus::finality::FinalityState;
 use nova_consensus::integration::{
     ConsensusEvent, ConsensusState, IntegrationContext, TransitionResult, transition,
 };
 use nova_consensus::round::{ProposalRef, RoundState, decode_proposal_ref};
-use nova_consensus::validator::ValidatorSet;
+use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_consensus::vote::{ValidatorVote, decode_validator_vote, verify_vote_input};
 use nova_crypto::signature::VerifyingKey;
 use nova_network::message::{
@@ -108,6 +108,31 @@ impl ConsensusNode {
     /// DAG（只读；供 `acquire_lock` / `verify_qc` / fork choice 消费）。
     pub fn dag(&self) -> &Dag {
         &self.dag
+    }
+
+    /// 登记一个**已验证 canonical-next** 块承诺为 DAG 节点（node orchestration；D10-A Step 3）。
+    ///
+    /// 以「父高轮」高度登记（与 vote / QC 轮高语义一致：`round.height`；canonical-next 块高 =
+    /// `round.height + 1`），parent 空（V0.1 单层 canonical-next；多块 parent 链由未来 Block
+    /// Commit step 管理）。**幂等**：已登记同一 hash ⇒ `Ok`（不重复 / 不报 DuplicateBlock）。
+    ///
+    /// 不修改任何共识规则 —— 仅把已验证块承诺加入既有 DAG（供 `verify_qc` / finality 消费）；
+    /// 登记是调用方（driver / runtime orchestration）的责任：块必须已通过 D9 proposer 验证。
+    pub fn register_block(
+        &mut self,
+        block_hash: [u8; 32],
+        proposer: ValidatorId,
+    ) -> Result<(), ConsensusError> {
+        if self.dag.contains(&block_hash) {
+            return Ok(());
+        }
+        self.dag.add_block(BlockReference {
+            block_hash,
+            height: self.state.round.height,
+            parents: Vec::new(),
+            proposer,
+        })?;
+        Ok(())
     }
 
     /// 提交 proposal（STEP 10-15O driver 路径）：`ConsensusEvent::SetProposal` → `transition` →

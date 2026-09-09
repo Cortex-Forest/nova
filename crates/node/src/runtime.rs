@@ -39,7 +39,9 @@ use nova_storage::persistent::PersistentBackend;
 
 use crate::assembly::ConsensusNode;
 use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter};
-use crate::block_dispatch::{dispatch_gossip_block, dispatch_sync_block_response};
+use crate::block_dispatch::{
+    dispatch_gossip_block_with_validator_set, dispatch_sync_block_response_with_validator_set,
+};
 use crate::block_inbound::{InboundBlockError, InboundBlockVerdict};
 use crate::bootstrap::{self, ConnectionTargetError, NodeConfig, NodeStartupError};
 use crate::driver::{DriverError, NodeConsensusDriver};
@@ -123,6 +125,18 @@ fn runtime_propose(
     Ok(Some(pb))
 }
 
+/// D10-A Step 3：本地 consensus 自动推进（enabled 网络主循环每 step 调用；free fn —— 不借 Runtime）。
+///
+/// 对当前 canonical round 执行本节点被授权的本地 vote（`NodeConsensusDriver::auto_drive`：
+/// Prevote / Precommit 幂等推进）。错误按 Driver 门面 fail-closed 传出（不 panic）；`Idle`
+/// （Propose / Finalized / 无 proposal）与 `WrongProposer`（外部坏 proposal 已被 driver
+/// proposer-authority gate 拦截 —— 不驱动）均为无本地 action，忽略。auto-drive 只产生**本地**
+/// vote；远端参与仍走既有 `submit_remote_vote` 路径（本 step 不改变）。
+fn drive_local_consensus(driver: &mut NodeConsensusDriver<DynSigner>) -> Result<(), RuntimeError> {
+    driver.auto_drive().map_err(RuntimeError::Driver)?;
+    Ok(())
+}
+
 /// NodeRuntime 启动错误（node-local；typed；fail closed）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRuntimeError {
@@ -165,6 +179,8 @@ pub enum RuntimeError {
     IdentityMismatch { configured: NodeId },
     /// sync RequestId 生成失败（OS CSPRNG 不可用；fail-closed —— 不退回弱随机）。
     NetworkSecurity(NetworkSecurityError),
+    /// 本地已验证 canonical block 登记进共识 DAG 失败（DAG 一致性；Consensus 域）。
+    DagRegister(nova_consensus::error::ConsensusError),
 }
 
 /// `establish_configured_peer` 单次推进后的握手判定（Node 只编排；session 验证归 NetworkService）。
@@ -1100,6 +1116,11 @@ impl NodeRuntime {
         // SyncBlockResponse payload → block_inbound validator（只读）→ typed verdict 观测。
         // 不 commit / 不写存储 / 不推进 head（CanonicalNextCandidate 非 finality-authorized）。
         let block_msgs = stack.el.handler_mut().take_block_inbound();
+        // D10-A Step 3：向 D9 proposer validation 提供本地 ValidatorSet（解除生产 None seam 的
+        // canonical-next 假阻塞）—— 远端 canonical-next 块经本地 `select_proposer` → expected VK
+        // 真实验签；**不 commit / 不推进 head**（block inbound 仍只读观测；远端块自动进入共识 =
+        // D10-D 多节点网络 E2E 授权，本 step 不实施）。
+        let validator_set = self.driver.consensus().validator_set().clone();
         for msg in block_msgs {
             // D8-3-1-A/C：SyncBlockResponse 先做 request_id correlation —— resolve 匹配的 active
             // request（释放 active capacity；request lifecycle 完成）；Unknown / 结构损坏 ⇒ 安全
@@ -1134,11 +1155,21 @@ impl NodeRuntime {
             let (source, outcomes) = match (&self.block_production, msg) {
                 (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => (
                     BlockInboundSource::Gossip,
-                    vec![dispatch_gossip_block(adapter, self.max_block_bytes, &wire)],
+                    vec![dispatch_gossip_block_with_validator_set(
+                        adapter,
+                        self.max_block_bytes,
+                        &wire,
+                        &validator_set,
+                    )],
                 ),
                 (Some(adapter), BlockInboundMessage::SyncBlockResponse(payload)) => (
                     BlockInboundSource::SyncResponse,
-                    dispatch_sync_block_response(adapter, self.max_block_bytes, &payload),
+                    dispatch_sync_block_response_with_validator_set(
+                        adapter,
+                        self.max_block_bytes,
+                        &payload,
+                        &validator_set,
+                    ),
                 ),
                 (None, _) => {
                     // full-node / 无 canonical adapter：无法验证（无 state/head 上下文）→ 丢弃并计数。
@@ -1182,9 +1213,19 @@ impl NodeRuntime {
             &self.block_production,
             self.proposal_timestamp,
         )?;
-        if let Some(pb) = proposal {
-            self.last_proposal = Some(pb);
+        if let Some(pb) = &proposal {
+            // 本地产出（本地接受的真实 canonical block；runtime_propose 已 submit proposal）→
+            // 登记进共识 DAG（幂等；供 verify_qc / finality 消费）。块由本 actor 真实 build +
+            // sign（proposer = 本节点 = select，D9 proposer 边界保持）。
+            self.driver
+                .consensus_mut()
+                .register_block(pb.block_hash, pb.proposal_ref.proposer)
+                .map_err(RuntimeError::DagRegister)?;
+            self.last_proposal = Some(pb.clone());
         }
+        // D10-A Step 3：本地 consensus 自动推进（每 step 幂等 —— 本地产出的 canonical
+        // proposal 自动执行本地 Prevote/Precommit → QC/finality 由既有 transition 产生）。
+        drive_local_consensus(&mut self.driver)?;
         // STEP 10-18I-N-IMPL：production egress —— drain Driver semantic outbound →
         // NetworkSigner 编码签名 → NetworkService.broadcast（established-only/queue 由 NS 负责）
         // → flush（TCP send）。sign 失败 fail-closed；NS broadcast/flush 失败（queue full / 无
