@@ -19,9 +19,10 @@
 //! - full-node（`validator_enabled=false`）：跳过 key / safety / validator，不触碰 Provider。
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nova_consensus::dag::Dag;
+use nova_consensus::proposer::select_proposer;
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::signature::VerifyingKey;
@@ -121,6 +122,14 @@ fn runtime_propose(
         a.sign_block(&mut pb.block)
             .map_err(RuntimeError::Validator)?;
     }
+    // D10-C Step 4：本地 produced block 尽早 durable 进 BlockStore（只写 block；不推进 head /
+    // state / 不提前 commit；同 hash 同 bytes 幂等）—— 使「finality 后 commit 前 crash」时，
+    // restart 可经 BlockStore.get(X) 取回完整 block 由 bridge 完成 commit。
+    if let Some(adapter) = block_production.as_ref()
+        && let Some(bs) = adapter.block_store()
+    {
+        bs.put(&pb.block).map_err(RuntimeError::BlockStore)?;
+    }
     // 提交共识（ProposalRef 64B；只记 hash，不含 Block）。
     let _ = driver.submit_proposal(pb.proposal_ref.clone());
     Ok(Some(pb))
@@ -135,6 +144,48 @@ fn runtime_propose(
 /// vote；远端参与仍走既有 `submit_remote_vote` 路径（本 step 不改变）。
 fn drive_local_consensus(driver: &mut NodeConsensusDriver<DynSigner>) -> Result<(), RuntimeError> {
     driver.auto_drive().map_err(RuntimeError::Driver)?;
+    Ok(())
+}
+
+/// D10-C Step 4 — Finality Advance 后 durable 写 Recovery Fact（**durable-before-bridge**；幂等）。
+///
+/// - 观察 frozen transition ⑥ 产出的 `finalized_reference = Some(X)`（consensus 只读；不制造
+///   finality / QC）；QC 取同一 transition 派生的 PrecommitQC（`qc.target == X` 才写 —— 否则
+///   保守跳过，绝不写 reference-only fact）。
+/// - 幂等：`X` 已持久化 ⇒ no-op（避免每 tick 重写同一 fact）。
+/// - `height` = canonical-next 块高（`qc.context.height + 1`；与 restore 校验一致）。
+/// - 写失败 ⇒ `Err`（fail-closed；bridge 不执行 —— 不进入「finality 未 durable 却 commit」）。
+/// - free fn：step 网络段持有 `network_stack` 可变借用时，经不相交字段引用调用（不整 &mut self）。
+fn persist_finality_fact_if_needed(
+    driver: &NodeConsensusDriver<DynSigner>,
+    identity: &ChainIdentity,
+    path: &Path,
+    persisted: &mut Option<[u8; 32]>,
+) -> Result<(), RuntimeError> {
+    let Some(x) = driver.consensus().state().finality.finalized_reference else {
+        return Ok(());
+    };
+    if *persisted == Some(x) {
+        return Ok(());
+    }
+    let Some(qc) = driver.consensus().last_precommit_qc().cloned() else {
+        return Ok(());
+    };
+    if qc.target != x {
+        return Ok(());
+    }
+    let height = qc.context.height.saturating_add(1);
+    bootstrap::persist_finality_fact(
+        path,
+        identity.network_id,
+        identity.chain_id,
+        identity.genesis_hash,
+        height,
+        x,
+        &qc,
+    )
+    .map_err(RuntimeError::FinalityFact)?;
+    *persisted = Some(x);
     Ok(())
 }
 
@@ -169,20 +220,44 @@ fn finality_commit_bridge(
     if adapter.head().block_hash == x {
         return Ok(());
     }
-    // Gate 3：解析 finalized 块（V0.1 = 本地 last_proposal，strict hash match；否则 NO COMMIT）。
-    let Some(pb) = last_proposal.filter(|pb| pb.block_hash == x) else {
-        return Ok(());
+    // Gate 3：解析 finalized 块 —— D10-C Step 4：优先本地 `last_proposal`（strict hash == X）；
+    //    restart 恢复路径（`last_proposal` 已丢失）⇒ 从 `BlockStore.get(X)` 解析（get 已 strict
+    //    decode + hash 重算 == X）。两者皆失败 ⇒ NO COMMIT（绝不按 height / proposer 猜块）。
+    let (block, proposer) = if let Some(pb) = last_proposal.filter(|pb| pb.block_hash == x) {
+        (pb.block.clone(), pb.proposal_ref.proposer)
+    } else {
+        let set = driver.consensus().validator_set();
+        let Some(bs) = adapter.block_store() else {
+            return Ok(());
+        };
+        let Some(b) = bs.get(&x).map_err(RuntimeError::BlockStore)? else {
+            return Ok(());
+        };
+        // proposer（V0.1 parent-height 语义；与 D9 / rebuild / restore 同源 —— 不新造规则）。
+        let chain_id = driver.consensus().chain_id();
+        let genesis_hash = driver.consensus().genesis_hash();
+        let Some(p) = select_proposer(
+            chain_id,
+            b.header.height.saturating_sub(1),
+            0,
+            &genesis_hash,
+            set,
+        )
+        .ok() else {
+            return Ok(());
+        };
+        (b, p)
     };
     // Gate 4：proposer 验证 key（本地登记 proposer → ValidatorSet.info → VerifyingKey）。
     let set = driver.consensus().validator_set();
-    let Some(info) = set.info(&pb.proposal_ref.proposer) else {
+    let Some(info) = set.info(&proposer) else {
         return Ok(());
     };
     let Ok(vk) = VerifyingKey::from_bytes(&info.consensus_public_key) else {
         return Ok(());
     };
     // Gate 5：encode + 冻结 apply_block（durable commit；错误 fail-closed）。
-    let wire = nova_runtime::encode_block(&pb.block).map_err(RuntimeError::BlockCodec)?;
+    let wire = nova_runtime::encode_block(&block).map_err(RuntimeError::BlockCodec)?;
     adapter
         .apply_block(&wire, &vk)
         .map_err(RuntimeError::BlockCommit)?;
@@ -238,6 +313,10 @@ pub enum RuntimeError {
     BlockCommit(NodeBlockApplicationError),
     /// Finality → Commit：本地 finalized block 编码 wire 失败（结构错误；几乎不可达）。
     BlockCodec(nova_runtime::BlockCodecError),
+    /// D10-C Step 4：BlockStore node 层访问失败（本地 proposal durable put / bridge resolve get）。
+    BlockStore(StorageError),
+    /// D10-C Step 4：Finality Recovery Fact 持久化失败（durable-before-bridge；fail-closed）。
+    FinalityFact(NodeStartupError),
 }
 
 /// `establish_configured_peer` 单次推进后的握手判定（Node 只编排；session 验证归 NetworkService）。
@@ -352,6 +431,10 @@ pub struct NodeRuntime {
     proposal_timestamp: u64,
     /// 最近一次本地出块产物（本地保留；不持久化 / 不推进 head）。
     last_proposal: Option<ProposalBuild>,
+    /// D10-C Step 4 — Finality Recovery Fact 文件路径（chain storage 目录；durable-before-bridge）。
+    finality_fact_path: PathBuf,
+    /// D10-C Step 4 — 已 durable 持久化的 finality reference（幂等：避免每 tick 重写同一 fact）。
+    finality_fact_persisted: Option<[u8; 32]>,
     /// 协议最大块字节（来自 genesis `protocol_parameters`；block inbound validation 上限；
     /// 不修改协议参数 —— 只读供 `block_dispatch` context 使用）。
     max_block_bytes: usize,
@@ -443,12 +526,28 @@ impl NodeRuntime {
         //    persisted 的补偿 seam），使 safety lock / ancestry 判定在重启后可安全继续；重建只读
         //    storage、fail closed。首启（head == genesis）⇒ 仅 genesis 根。full-node（无 adapter）
         //    维持空 DAG（既有语义）。
-        let dag = match block_production.as_ref() {
-            Some(adapter) => bootstrap::rebuild_consensus_dag(adapter, &set)
-                .map_err(NodeRuntimeError::Startup)?,
-            None => Dag::new(),
+        // D10-C Step 4 — Finality Recovery Fact 恢复：在 rebuild 后读取 durable fact；未 commit 的
+        //    finalized 候选经 identity / block / QC / head-relation 全验证后注入 finalized_reference
+        //    （fail-closed；见 bootstrap::restore_finality_fact）。
+        let (dag, restored_finality) = match block_production.as_ref() {
+            Some(adapter) => {
+                let dag = bootstrap::rebuild_consensus_dag(adapter, &set)
+                    .map_err(NodeRuntimeError::Startup)?;
+                let fact_path = config.storage_dir.join(bootstrap::FINALITY_FACT_FILE);
+                bootstrap::restore_finality_fact(
+                    &fact_path,
+                    adapter,
+                    &set,
+                    identity.network_id,
+                    identity.chain_id,
+                    identity.genesis_hash,
+                    dag,
+                )
+                .map_err(NodeRuntimeError::Startup)?
+            }
+            None => (Dag::new(), None),
         };
-        let consensus = ConsensusNode::new(
+        let mut consensus = ConsensusNode::new(
             consensus_start_height,
             0,
             identity.chain_id,
@@ -456,6 +555,10 @@ impl NodeRuntime {
             identity.genesis_hash,
             dag,
         );
+        // 恢复注入（仅当 fact 全验证通过；单调 —— 不回退 / 不覆盖既有 finality）。
+        if let Some(x) = restored_finality {
+            consensus.restore_finalized_reference(x);
+        }
 
         // 5–11. validator mode：KeyProvider → id → SafetyStore → recover → ValidatorActor
         //      （Runtime lifecycle）→ 与 ConsensusNode 一并装配进 NodeConsensusDriver。
@@ -514,6 +617,8 @@ impl NodeRuntime {
             validator_journal,
             proposal_timestamp: 0,
             last_proposal: None,
+            finality_fact_path: config.storage_dir.join(bootstrap::FINALITY_FACT_FILE),
+            finality_fact_persisted: None,
             max_block_bytes,
             block_inbound_outcomes: VecDeque::new(),
             block_inbound_skipped: 0,
@@ -1293,6 +1398,15 @@ impl NodeRuntime {
         // D10-A Step 3：本地 consensus 自动推进（每 step 幂等 —— 本地产出的 canonical
         // proposal 自动执行本地 Prevote/Precommit → QC/finality 由既有 transition 产生）。
         drive_local_consensus(&mut self.driver)?;
+        // D10-C Step 4：Finality → durable Recovery Fact（**durable-before-bridge**；幂等）。
+        // 观察 frozen transition ⑥ 产出的 finalized_reference + 同一 transition 派生的
+        // PrecommitQC（consensus 只读；经不相交字段调用 —— 网络段已持 network_stack 借用）。
+        persist_finality_fact_if_needed(
+            &self.driver,
+            &self.chain_identity,
+            &self.finality_fact_path,
+            &mut self.finality_fact_persisted,
+        )?;
         // D10-B：Finality → Commit Bridge（每 tick 至多 commit 一个共识-finalized 本地块；
         // 复用 NodeBlockAdapter::apply_block 的冻结 durable commit —— 不重新实现 storage）。
         finality_commit_bridge(
@@ -1334,6 +1448,8 @@ impl NodeRuntime {
             validator_journal: _,
             proposal_timestamp: _,
             last_proposal: _,
+            finality_fact_path: _,
+            finality_fact_persisted: _,
             max_block_bytes: _,
             block_inbound_outcomes: _,
             block_inbound_skipped: _,

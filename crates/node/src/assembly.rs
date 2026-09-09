@@ -14,7 +14,7 @@
 
 use nova_consensus::dag::{BlockReference, Dag};
 use nova_consensus::error::ConsensusError;
-use nova_consensus::finality::FinalityState;
+use nova_consensus::finality::{FinalityState, QuorumCertificate};
 use nova_consensus::integration::{
     ConsensusEvent, ConsensusState, IntegrationContext, TransitionResult, transition,
 };
@@ -60,6 +60,10 @@ pub struct ConsensusNode {
     set: ValidatorSet,
     genesis_hash: [u8; 32],
     dag: Dag,
+    /// D10-C Step 4 — 最近一次与当前 `finalized_reference` 一致的 PrecommitQC（node-local 观测；
+    /// 供 Finality Recovery Fact 持久化 —— finality 由 frozen transition ⑥ 产生，本缓存只捕获
+    /// 同一 transition 派生的 QC 证据，不制造 finality / QC）。
+    last_precommit_qc: Option<QuorumCertificate>,
 }
 
 impl ConsensusNode {
@@ -82,6 +86,7 @@ impl ConsensusNode {
             set,
             genesis_hash,
             dag,
+            last_precommit_qc: None,
         }
     }
 
@@ -108,6 +113,29 @@ impl ConsensusNode {
     /// DAG（只读；供 `acquire_lock` / `verify_qc` / fork choice 消费）。
     pub fn dag(&self) -> &Dag {
         &self.dag
+    }
+
+    /// 最近一次与当前 `finalized_reference` 一致的 PrecommitQC（只读；D10-C Step 4）。
+    ///
+    /// 捕获规则：`Applied` transition 且 `derived.precommit_qc` 的 `target == next_state.finality
+    /// .finalized_reference`（即该 QC 正是推进 finality 的 PrecommitQC）。无 ⇒ `None`。
+    pub fn last_precommit_qc(&self) -> Option<&QuorumCertificate> {
+        self.last_precommit_qc.as_ref()
+    }
+
+    /// D10-C Step 4 — 恢复注入 `finalized_reference`（**仅启动恢复路径**；所有 QC / identity /
+    /// block / DAG 验证已在 `bootstrap::restore_finality_fact` 完成 —— 本方法不绕过任何验证）。
+    ///
+    /// 单调守卫：仅当当前 `finalized_reference` 为 `None`（fresh consensus）或与 `reference` 相同
+    /// （幂等）时设置；绝不回退已存在 finality。恢复场景（start 时默认 `None`）⇒ 恒可设。
+    pub fn restore_finalized_reference(&mut self, reference: [u8; 32]) {
+        match self.state.finality.finalized_reference {
+            None => self.state.finality.finalized_reference = Some(reference),
+            Some(existing) => debug_assert!(
+                existing == reference,
+                "恢复不得回退 / 覆盖既有 finality（既有 {existing:?} ≠ {reference:?}）"
+            ),
+        }
     }
 
     /// 登记一个**已验证 canonical-next** 块承诺为 DAG 节点（node orchestration；D10-A Step 3）。
@@ -224,9 +252,22 @@ impl ConsensusNode {
     }
 
     /// `Applied` ⇒ 应用 `next_state`；`Ignored`/`Rejected` ⇒ 不变（MF-12 契约 3）。
+    ///
+    /// D10-C Step 4：`Applied` 且该 transition 派生 PrecommitQC 的 `target == next_state.finality
+    /// .finalized_reference` ⇒ 缓存该 QC（Recovery Fact 数据源；finality 仍只由 frozen ⑥ 产生）。
     fn apply_result(&mut self, result: &TransitionResult) {
-        if let TransitionResult::Applied { next_state, .. } = result {
+        if let TransitionResult::Applied {
+            next_state,
+            derived,
+            ..
+        } = result
+        {
             self.state = next_state.clone();
+            if let Some(qc) = &derived.precommit_qc
+                && next_state.finality.finalized_reference == Some(qc.target)
+            {
+                self.last_precommit_qc = Some(qc.clone());
+            }
         }
     }
 }
