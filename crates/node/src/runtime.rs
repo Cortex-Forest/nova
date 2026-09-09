@@ -438,13 +438,23 @@ impl NodeRuntime {
         // 10. ConsensusNode（canonical state owner）——随后装配进 NodeConsensusDriver。
         //     validator：初始共识高度 = canonical head height（ChainHead 单一高度源）；full-node = 0。
         let set = ValidatorSet::from_genesis(&genesis);
+        // D10-C Step 2 — DAG Restart Rebuild：validator（bootstrap 装配 canonical BlockStore）在
+        //    restart 后沿 canonical head → parent 链重建 Consensus DAG ancestry（consensus DAG 不
+        //    persisted 的补偿 seam），使 safety lock / ancestry 判定在重启后可安全继续；重建只读
+        //    storage、fail closed。首启（head == genesis）⇒ 仅 genesis 根。full-node（无 adapter）
+        //    维持空 DAG（既有语义）。
+        let dag = match block_production.as_ref() {
+            Some(adapter) => bootstrap::rebuild_consensus_dag(adapter, &set)
+                .map_err(NodeRuntimeError::Startup)?,
+            None => Dag::new(),
+        };
         let consensus = ConsensusNode::new(
             consensus_start_height,
             0,
             identity.chain_id,
             set,
             identity.genesis_hash,
-            Dag::new(),
+            dag,
         );
 
         // 5–11. validator mode：KeyProvider → id → SafetyStore → recover → ValidatorActor

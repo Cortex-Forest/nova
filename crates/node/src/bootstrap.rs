@@ -13,9 +13,14 @@
 //! - 不触碰 runtime / execution / consensus / storage backend internals / WAL。
 //! - 不修改 runtime ⑥ / `ExecutionContext` 语义 / 协议。
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use nova_consensus::dag::{BlockReference, Dag};
+use nova_consensus::error::ConsensusError;
+use nova_consensus::proposer::select_proposer;
+use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_crypto::address::NetworkId;
 use nova_crypto::identity::{
     AccountInit, ChainIdentity, GenesisError, GenesisV1, decode_genesis_bytes,
@@ -32,7 +37,9 @@ use nova_storage::state_root::calculate_state_root;
 use nova_storage::store::StateStore;
 use nova_storage::trie::EMPTY_STATE_ROOT;
 
-use crate::block_adapter::{ChainHead, NodeBlockAdapter, NodeBlockApplicationError};
+use crate::block_adapter::{
+    ChainHead, NoAccountsKeyResolver, NodeBlockAdapter, NodeBlockApplicationError,
+};
 use crate::key_provider::KeyProviderConfig;
 
 /// 节点启动配置（F-3 最小；Node-local，非协议）。
@@ -116,6 +123,14 @@ pub enum NodeStartupError {
     NetworkIdMismatch,
     /// head 缺失但 state 非空（legacy / 异常）：不 bootstrap，拒绝启动（R-6）。
     MissingHeadWithState,
+    /// DAG 重建：canonical head > genesis 但 adapter 无 BlockStore（装配不一致；fail closed）。
+    DagRebuildNoBlockStore,
+    /// DAG 重建失败（共识规则 / proposer 推导；consensus 错误原样传递；fail closed）。
+    DagRebuild(ConsensusError),
+    /// DAG 重建：canonical ancestry 中某块缺失（head / 祖先块不在 BlockStore；fail closed）。
+    DagRebuildMissingAncestor([u8; 32]),
+    /// DAG 重建：parent 链成环（未达 genesis；fail closed）。
+    DagRebuildCycle([u8; 32]),
 }
 
 /// 完整节点启动：first-start bootstrap 或 restart recovery，返回已构造的适配器。
@@ -244,4 +259,99 @@ fn genesis_changes(accounts: &[AccountInit]) -> Vec<AccountChange> {
             created: true,
         })
         .collect()
+}
+
+/// D10-C Step 2 — restart 后 Consensus DAG 重建（canonical ancestry；consensus-not-persisted seam）。
+///
+/// 从 canonical head 沿 committed BlockStore 的 parent 链回溯至 genesis，重建 frozen `Dag`：
+/// genesis 根（height 0；无 block 文件）+ 每个 canonical committed 块的 [`BlockReference`]
+/// （真实 `header.height` + 单 parent 边 + `proposer` 由 `select_proposer(chain_id, height-1, 0,
+/// genesis_hash, set)` 推导 —— 父高轮，与 vote / QC 轮高语义及 block_adapter V0.1 一致）。
+/// reference 按自底向上（genesis → … → head）顺序加入 ⇒ 复用 frozen `Dag::add_block` 校验
+/// （parent 已存在 / `parent.height < height`），**不改共识层**。
+///
+/// - **fail closed**：head / 祖先块缺失 ⇒ `DagRebuildMissingAncestor`；BlockStore 记录损坏
+///   （strict decode / hash 重算失败）⇒ `Storage(CorruptedState)`；parent 链成环（未达 genesis）
+///   ⇒ `DagRebuildCycle`；高度 / parent 不合法（add_block 拒）或 proposer 推导失败 ⇒
+///   `DagRebuild(ConsensusError)`。无 skip / 无 partial / 无 fallback。
+/// - **幂等**：每次重建全新 `Dag`（同输入 ⇒ 同结果；构造 `ConsensusNode::new(…, dag)` 前调用）。
+/// - 不扫全 BlockStore / 不混 fork：只沿 `head → parent → … → genesis` 单条 canonical 链。
+/// - head == genesis（首启 / 无 committed block）⇒ **空 `Dag`**（与既有 fresh-start 语义完全一致）；
+///   仅当存在 committed canonical 块时才加 genesis 根 + 回溯链。
+pub fn rebuild_consensus_dag(
+    adapter: &NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>,
+    set: &ValidatorSet,
+) -> Result<Dag, NodeStartupError> {
+    let genesis_hash = adapter.genesis_hash();
+    let chain_id = adapter.chain_id();
+    let head = adapter.head();
+
+    // 首启 / 无 committed canonical block ⇒ 空 DAG（保持既有行为；无历史可重建）。
+    if head.height == 0 {
+        return Ok(Dag::new());
+    }
+
+    let mut dag = Dag::new();
+    // genesis 根：无对应 block 文件（协议初始承诺）；height 0、parent 空。
+    // proposer 用占位（genesis 非投票 / lock 目标 —— 仅供 DAG 结构锚，不参与 authorize）。
+    dag.add_block(BlockReference {
+        block_hash: genesis_hash,
+        height: 0,
+        parents: Vec::new(),
+        proposer: ValidatorId::from_bytes([0u8; 32]),
+    })
+    .map_err(NodeStartupError::DagRebuild)?;
+
+    let block_store = adapter
+        .block_store()
+        .ok_or(NodeStartupError::DagRebuildNoBlockStore)?;
+
+    // 1. 沿 parent 链回溯收集 canonical ancestry（head → … → 最低 committed 块）；
+    //    祖先缺失 / 成环 ⇒ fail closed（get 本身对损坏记录 strict decode ⇒ CorruptedState）。
+    let mut ancestry = vec![head.block_hash];
+    let mut visited: HashSet<[u8; 32]> = HashSet::from([head.block_hash]);
+    let mut cur = head.block_hash;
+    loop {
+        let block = match block_store.get(&cur).map_err(NodeStartupError::Storage)? {
+            Some(b) => b,
+            None => return Err(NodeStartupError::DagRebuildMissingAncestor(cur)),
+        };
+        // 最低 committed 块：其 parent 即 genesis（回溯终止；genesis 不在 BlockStore）。
+        if block.header.parent_hash == genesis_hash {
+            break;
+        }
+        let parent = block.header.parent_hash;
+        if !visited.insert(parent) {
+            return Err(NodeStartupError::DagRebuildCycle(parent));
+        }
+        ancestry.push(parent);
+        cur = parent;
+    }
+
+    // 2. 自底向上（最低 committed → head）逐个登记：parent（更低层）已先入 ⇒
+    //    `Dag::add_block` 的 parent 存在 + `parent.height < height` 校验通过
+    //    （高度不合法 ⇒ 拒 ⇒ fail closed）。
+    for &hash in ancestry.iter().rev() {
+        let block = match block_store.get(&hash).map_err(NodeStartupError::Storage)? {
+            Some(b) => b,
+            None => return Err(NodeStartupError::DagRebuildMissingAncestor(hash)),
+        };
+        // proposer 推导：该块是 round = header.height - 1 的 canonical-next（V0.1 父高轮语义）。
+        let proposer = select_proposer(
+            chain_id,
+            block.header.height.saturating_sub(1),
+            0,
+            &genesis_hash,
+            set,
+        )
+        .map_err(NodeStartupError::DagRebuild)?;
+        dag.add_block(BlockReference {
+            block_hash: hash,
+            height: block.header.height,
+            parents: vec![block.header.parent_hash],
+            proposer,
+        })
+        .map_err(NodeStartupError::DagRebuild)?;
+    }
+    Ok(dag)
 }
