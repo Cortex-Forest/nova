@@ -24,6 +24,7 @@ use std::path::PathBuf;
 use nova_consensus::dag::Dag;
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_crypto::identity::ChainIdentity;
+use nova_crypto::signature::VerifyingKey;
 use nova_network::event_loop::{EventLoop, EventLoopConfig, EventLoopError};
 use nova_network::message::{MessageEnvelope, MessageType};
 use nova_network::network_service::{NetworkService, NetworkServiceConfig, NetworkServiceError};
@@ -38,7 +39,7 @@ use nova_storage::error::StorageError;
 use nova_storage::persistent::PersistentBackend;
 
 use crate::assembly::ConsensusNode;
-use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter};
+use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter, NodeBlockApplicationError};
 use crate::block_dispatch::{
     dispatch_gossip_block_with_validator_set, dispatch_sync_block_response_with_validator_set,
 };
@@ -137,6 +138,57 @@ fn drive_local_consensus(driver: &mut NodeConsensusDriver<DynSigner>) -> Result<
     Ok(())
 }
 
+/// D10-B — Finality → Commit Bridge（每 tick 幂等；一个 tick 至多 commit 一个 finalized block）。
+///
+/// 从共识读取 `finalized_reference`（**只读**；finality 只由 frozen consensus transition ⑥ 产生，
+/// 本桥不制造 finality / QC / votes）。Gate（**全部满足**才 commit）：
+/// 1. `finalized_reference = Some(X)`（无 finality ⇒ NO COMMIT）；
+/// 2. `X != adapter.head().block_hash`（幂等锚：已 commit ⇒ no-op —— stale / duplicate 安全）；
+/// 3. X 解析为完整块且 `block_hash(block) == X`（**严格 match**；V0.1 seam = 本地 `last_proposal`；
+///    不 match ⇒ NO COMMIT，绝不 fallback 任意块）；
+/// 4. proposer 解析 = 本地登记 proposer（`proposal_ref.proposer` → `ValidatorSet.info` →
+///    `VerifyingKey`；复用 D9 expected-proposer 同款推导）；
+/// 5. `adapter.apply_block(wire, vk)`（复用冻结 ①~⑥ durable commit：height/parent 线性防护、
+///    block durable-first、state+head 同 WAL 批、head 仅 ⑥ 成功推进）。
+///
+/// 任何 gate 不满足 ⇒ 安全 no-op（不 commit / 不改 head / 无 partial）。**只处理共识-finalized
+/// 的 canonical block**：remote valid-but-unfinalized inbound block 从不进入（block inbound 只读）。
+fn finality_commit_bridge(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    adapter: Option<&mut NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>>,
+    last_proposal: Option<&ProposalBuild>,
+) -> Result<(), RuntimeError> {
+    let Some(adapter) = adapter else {
+        return Ok(()); // full-node / 无 canonical adapter ⇒ 无 commit
+    };
+    // Gate 1：无 finality ⇒ NO COMMIT。
+    let Some(x) = driver.consensus().state().finality.finalized_reference else {
+        return Ok(());
+    };
+    // Gate 2：已 commit（head 已 == X）⇒ 幂等 no-op（stale / duplicate tick 安全）。
+    if adapter.head().block_hash == x {
+        return Ok(());
+    }
+    // Gate 3：解析 finalized 块（V0.1 = 本地 last_proposal，strict hash match；否则 NO COMMIT）。
+    let Some(pb) = last_proposal.filter(|pb| pb.block_hash == x) else {
+        return Ok(());
+    };
+    // Gate 4：proposer 验证 key（本地登记 proposer → ValidatorSet.info → VerifyingKey）。
+    let set = driver.consensus().validator_set();
+    let Some(info) = set.info(&pb.proposal_ref.proposer) else {
+        return Ok(());
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&info.consensus_public_key) else {
+        return Ok(());
+    };
+    // Gate 5：encode + 冻结 apply_block（durable commit；错误 fail-closed）。
+    let wire = nova_runtime::encode_block(&pb.block).map_err(RuntimeError::BlockCodec)?;
+    adapter
+        .apply_block(&wire, &vk)
+        .map_err(RuntimeError::BlockCommit)?;
+    Ok(())
+}
+
 /// NodeRuntime 启动错误（node-local；typed；fail closed）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRuntimeError {
@@ -181,6 +233,11 @@ pub enum RuntimeError {
     NetworkSecurity(NetworkSecurityError),
     /// 本地已验证 canonical block 登记进共识 DAG 失败（DAG 一致性；Consensus 域）。
     DagRegister(nova_consensus::error::ConsensusError),
+    /// Finality → Commit：`apply_block`（冻结 ①~⑥ durable commit 管线）失败 ⇒ fail-closed
+    /// （head 不推进 / 无 partial canonical commit —— adapter 保证）。
+    BlockCommit(NodeBlockApplicationError),
+    /// Finality → Commit：本地 finalized block 编码 wire 失败（结构错误；几乎不可达）。
+    BlockCodec(nova_runtime::BlockCodecError),
 }
 
 /// `establish_configured_peer` 单次推进后的握手判定（Node 只编排；session 验证归 NetworkService）。
@@ -1226,6 +1283,13 @@ impl NodeRuntime {
         // D10-A Step 3：本地 consensus 自动推进（每 step 幂等 —— 本地产出的 canonical
         // proposal 自动执行本地 Prevote/Precommit → QC/finality 由既有 transition 产生）。
         drive_local_consensus(&mut self.driver)?;
+        // D10-B：Finality → Commit Bridge（每 tick 至多 commit 一个共识-finalized 本地块；
+        // 复用 NodeBlockAdapter::apply_block 的冻结 durable commit —— 不重新实现 storage）。
+        finality_commit_bridge(
+            &mut self.driver,
+            self.block_production.as_mut(),
+            self.last_proposal.as_ref(),
+        )?;
         // STEP 10-18I-N-IMPL：production egress —— drain Driver semantic outbound →
         // NetworkSigner 编码签名 → NetworkService.broadcast（established-only/queue 由 NS 负责）
         // → flush（TCP send）。sign 失败 fail-closed；NS broadcast/flush 失败（queue full / 无

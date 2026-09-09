@@ -522,15 +522,39 @@ fn d8_3_1_t11_runtime_sync_request_response_correlation() {
         1,
         "T11-A 不产生第二次 resolve"
     );
-    // STEP13 — canonical head / state root 不变（无提前 commit）。
+    // STEP13 — D10-B 后语义：本地 validator 经 consensus 获得 finality 后，production runtime
+    //         经 Finality → Commit Bridge（NodeBlockAdapter::apply_block）可推进 canonical head
+    //         —— 这是**本地 auto-finality commit**（非 inbound / sync commit）。
+    //         保留的 D8 安全不变量：inbound / sync block 本身绝不因收到 / 验证通过就 commit；
+    //         `finality` 是唯一 commit 授权；head 只可能 = genesis 或本地共识 finalized 块。
     let head_after = {
         let a = rt.block_production().expect("validator adapter");
         (a.head().block_hash, a.head().height, a.store().state_root())
     };
-    assert_eq!(
-        head_before, head_after,
-        "STEP13 canonical state 不变（不 commit）"
-    );
+    let finalized = rt.consensus().state().finality.finalized_reference;
+    if head_after.1 == head_before.1 {
+        // 本流程未产生本地 auto-finality commit ⇒ head 保持 genesis（未 commit）。
+        assert_eq!(
+            head_after.0, head_before.0,
+            "未产生本地 finality commit ⇒ canonical head 不变"
+        );
+    } else {
+        // 本地 auto-finality 已把 canonical head 推进到 finalized 块：head 推进**仅**由
+        // consensus finality 授权（bridge），绝不因 inbound / sync block 而 commit。
+        assert_eq!(
+            head_after.1,
+            head_before.1 + 1,
+            "线性推进恰好一个高度（本地 finalized block）"
+        );
+        assert_eq!(
+            finalized,
+            Some(head_after.0),
+            "canonical head == 本地 consensus finalized 块（finality 是唯一 commit 授权）"
+        );
+    }
+    // (b) inbound/sync 安全：B 注入的 future block（height>head+1，从未 finality）在整个流程中
+    //     只被观测为 FutureMissingAncestor（未注册 / 未 submit / 未 commit）—— canonical head
+    //     绝不因任何 inbound/sync block 到达而推进（上文已证 head 仅 = genesis 或本地 finalized 块）。
 
     *phase.lock().unwrap() = 99;
     drop(rt);
