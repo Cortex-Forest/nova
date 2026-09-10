@@ -541,10 +541,13 @@ fn d8_3_1_t11_runtime_sync_request_response_correlation() {
     } else {
         // 本地 auto-finality 已把 canonical head 推进到 finalized 块：head 推进**仅**由
         // consensus finality 授权（bridge），绝不因 inbound / sync block 而 commit。
-        assert_eq!(
-            head_after.1,
-            head_before.1 + 1,
-            "线性推进恰好一个高度（本地 finalized block）"
+        // D10-C Step 7-B：同一 runtime 可持续推进多个高度（不再限制为「恰好 +1」）；
+        // 保留的 D8 安全不变量：head 单调推进，且 head ∈ {genesis} ∪ {本地 consensus finalized 块}。
+        assert!(
+            head_after.1 > head_before.1,
+            "head 单调推进（仅由本地 consensus finality 授权；{} → {}）",
+            head_before.1,
+            head_after.1
         );
         assert_eq!(
             finalized,

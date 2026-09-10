@@ -323,11 +323,22 @@ fn d10_s3_r1_single_validator_runtime_auto_finality() {
         Some(pb.block_hash),
         "Runtime 自动推进 → finalized == 本地真实 block（由 transition 产生，非手设）"
     );
+    // D10-C Step 7-B：finality（且同 tick 内 bridge commit）后 Node 以 durable head 推进到
+    // **下一高度轮**（不再停在单块 Finalized 终态）。
+    let head = runtime.block_production().unwrap().head().clone();
+    assert_eq!(head.height, 1, "A 已 commit");
+    let round = &runtime.consensus().state().round;
     assert_eq!(
-        runtime.consensus().state().round.step,
-        RoundStep::Finalized,
-        "consensus 终态 Finalized"
+        round.height, head.height,
+        "Step 7-B：consensus 高度 == durable canonical head 高度"
     );
+    assert_eq!(round.round, 0, "新高度轮从 round 0 开始");
+    assert_eq!(
+        round.step,
+        RoundStep::Propose,
+        "已进入下一高度轮（Propose）"
+    );
+    assert!(round.proposal.is_none(), "新高度轮无 stale proposal");
 }
 
 // ---------------------------------------------------------------------------
@@ -367,7 +378,7 @@ fn d10_s3_r2_runtime_step_calls_auto_drive() {
         "runtime step 内 auto-drive 已投本地 prevote（propose 只到 Prevote）"
     );
 
-    // step #2：auto-drive precommit ⇒ QC + Finality。
+    // step #2：auto-drive precommit ⇒ QC + Finality（同 tick bridge commit ⇒ Step 7-B 推进高度）。
     runtime.step().expect("step2 ok");
     let pb = runtime.last_proposal().expect("proposal").clone();
     assert_eq!(
@@ -375,7 +386,21 @@ fn d10_s3_r2_runtime_step_calls_auto_drive() {
         Some(pb.block_hash),
         "第二次 step 经 auto-drive precommit 达成 finality"
     );
-    assert_eq!(runtime.consensus().state().round.step, RoundStep::Finalized);
+    let head = runtime.block_production().unwrap().head().clone();
+    assert_eq!(
+        pb.block_hash, head.block_hash,
+        "finalized 块已被 bridge commit"
+    );
+    assert_eq!(
+        runtime.consensus().state().round.height,
+        head.height,
+        "Step 7-B：consensus 高度已跟进 durable head（下一高度轮）"
+    );
+    assert_eq!(
+        runtime.consensus().state().round.step,
+        RoundStep::Propose,
+        "已进入下一高度轮（Propose）"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -404,25 +429,50 @@ fn d10_s3_r3_runtime_repeated_tick_safety() {
     )
     .expect("启动");
 
-    // 8 个连续 tick：全 Ok；最终 Finalized；后续 tick 稳定（不重复推进 / 不 double）。
+    // 8 个连续 tick：全 Ok；本地 finality + bridge commit + Step 7-B 高度推进持续进行。
     for _ in 0..8 {
         runtime.step().expect("连续 tick 均 Ok（无 panic）");
     }
-    let pb = runtime.last_proposal().expect("proposal").clone();
-    assert_eq!(runtime.consensus().state().round.step, RoundStep::Finalized);
-    assert_eq!(
-        runtime.consensus().state().finality.finalized_reference,
-        Some(pb.block_hash),
-        "finality 稳定（未因重复 tick 改变）"
+    let head = runtime.block_production().unwrap().head().clone();
+    assert!(
+        head.height >= 1,
+        "本地 consensus finality 已 commit 至少一个块"
     );
-    // 稳定：再多 tick 不改变 canonical 状态。
-    let stable_round = runtime.consensus().state().round.step;
-    let stable_finality = runtime.consensus().state().finality.finalized_reference;
-    runtime.step().expect("step ok");
-    assert_eq!(runtime.consensus().state().round.step, stable_round);
+    let finalized = runtime
+        .consensus()
+        .state()
+        .finality
+        .finalized_reference
+        .expect("finality 存在");
     assert_eq!(
-        runtime.consensus().state().finality.finalized_reference,
-        stable_finality
+        finalized, head.block_hash,
+        "canonical head == 最新本地 finalized 块（finality 是唯一 commit 授权）"
+    );
+    assert_eq!(
+        runtime.consensus().state().round.height,
+        head.height,
+        "Step 7-B：consensus 高度跟随 durable head（不回退 / 不滞后）"
+    );
+    // 再多 tick：无 panic；head 单调不回退；finality 不回退。
+    let before = (head.height, head.block_hash, finalized);
+    runtime.step().expect("step ok");
+    let after = runtime.block_production().unwrap().head().clone();
+    assert!(
+        after.height >= before.0,
+        "head 单调不回退（{} → {}）",
+        before.0,
+        after.height
+    );
+    let finalized_after = runtime
+        .consensus()
+        .state()
+        .finality
+        .finalized_reference
+        .expect("finality 存在");
+    let dag = runtime.consensus().dag();
+    assert!(
+        finalized_after == before.2 || dag.is_ancestor(&before.2, &finalized_after),
+        "finality 单调（不回退到无关分支）"
     );
 }
 

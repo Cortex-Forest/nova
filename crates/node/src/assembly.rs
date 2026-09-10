@@ -192,6 +192,32 @@ impl ConsensusNode {
         Ok(())
     }
 
+    /// D10-C Step 7-B — 按 canonical head 高度进入**下一高度轮**（node orchestration；
+    /// **不新增 / 不修改任何共识规则**）。
+    ///
+    /// 语义（单调 / 幂等）：
+    /// - `height <= self.state.round.height` ⇒ `false`（no-op；重复调用不重复清空 round/proposal）。
+    /// - `height > self.state.round.height` ⇒ 重建 round 为 `RoundState::new(height, 0)`
+    ///   （`step = Propose`、`proposal = None`、prevote/precommit accumulator 空）并以
+    ///   `IntegrationContext::new(height, 0)` 重建 context（`round_evidence` bound 重置 ⇒
+    ///   旧高度证据不再参与 QC 组装）⇒ `true`。
+    ///
+    /// **保留（safety-critical，绝不清除）**：`finality`（已 finalized 的引用单调保留 ——
+    /// 下一高度的 Applicability 仍需其 ancestry）、`dag`、`set`、`chain_id`、`genesis_hash`；
+    /// node 层 BlockStore / SafetyStore / VoteLedger / LockedState 不被本方法触碰。
+    ///
+    /// 调用契约（Runtime orchestration）：**仅在 canonical commit 成功之后**、以 durable head
+    /// 驱动调用（`commit → head durable → advance`，绝不 advance-before-commit）；本方法是
+    /// 纯内存确定性状态转移（无 storage I/O），不参与 commit 成败，无 rollback 语义。
+    pub fn advance_to_height(&mut self, height: u64) -> bool {
+        if height <= self.state.round.height {
+            return false;
+        }
+        self.state.round = RoundState::new(height, 0);
+        self.context = IntegrationContext::new(height, 0);
+        true
+    }
+
     /// 提交 proposal（STEP 10-15O driver 路径）：`ConsensusEvent::SetProposal` → `transition` →
     /// 应用 `next_state`；返回完整 `TransitionResult`（derived 保留，供 driver 消费）。
     pub fn submit_proposal(&mut self, proposal_ref: ProposalRef) -> TransitionResult {

@@ -1421,6 +1421,19 @@ impl NodeRuntime {
             self.block_production.as_mut(),
             self.last_proposal.as_ref(),
         )?;
+        // D10-C Step 7-B：commit 成功后，以 **durable canonical head** 推进 consensus 到下一高度轮
+        //（`finality → commit → head durable → advance`；绝不 advance-before-commit）。
+        // head 未超过当前 consensus 高度（== 或 <）⇒ no-op（幂等；每 tick 调用安全，不重复清空
+        // round/proposal）。advance 为纯内存确定性转移（不触碰 storage）；commit 已 durable，
+        // advance 不参与其成败（无「advance 失败 ⇒ 假装 commit 失败」路径）。
+        // 同进程内 bridge 每 tick 至多 commit 一个 finalized 块（apply_block ⑤ 强制
+        // `height == head.height + 1`）⇒ 高度每次 +1；本调用不做 catch-up 协议。
+        let head_height = self.block_production.as_ref().map(|a| a.head().height);
+        if let Some(head_height) = head_height
+            && head_height > self.driver.consensus().state().round.height
+        {
+            self.driver.consensus_mut().advance_to_height(head_height);
+        }
         // STEP 10-18I-N-IMPL：production egress —— drain Driver semantic outbound →
         // NetworkSigner 编码签名 → NetworkService.broadcast（established-only/queue 由 NS 负责）
         // → flush（TCP send）。sign 失败 fail-closed；NS broadcast/flush 失败（queue full / 无

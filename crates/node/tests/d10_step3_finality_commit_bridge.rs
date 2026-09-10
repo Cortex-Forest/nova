@@ -282,26 +282,36 @@ fn d10_b2_t4_duplicate_tick_idempotent_no_regression() {
     let head1 = runtime.block_production().unwrap().head().clone();
     assert_eq!(head1.block_hash, pb.block_hash);
 
-    // 更多 tick：finality 仍 = X（已 commit）⇒ bridge 幂等 no-op；head/state 稳定无回归。
+    // 更多 tick：D10-C Step 7-B 后同一 runtime 继续产块（head 单调推进），**无重复 destructive
+    // commit / 无回退**：已 commit 的 A 保持 durable，且始终是后续 head 的祖先。
     for _ in 0..5 {
         runtime.step().expect("step ok");
     }
-    assert_eq!(
-        runtime.block_production().unwrap().head().block_hash,
-        pb.block_hash,
-        "重复 tick：无重复 destructive commit / 无 head 变化"
+    let head_after = runtime.block_production().unwrap().head().clone();
+    assert!(
+        head_after.height >= 1,
+        "head 不回退（A 仍为已 commit 前缀；实际 height {}）",
+        head_after.height
     );
-    assert_eq!(
-        runtime.block_production().unwrap().head().height,
-        1,
-        "head 稳定（height 1，无回归）"
+    let dag = runtime.consensus().dag();
+    assert!(dag.contains(&pb.block_hash), "A 仍在 DAG");
+    assert!(
+        head_after.block_hash == pb.block_hash
+            || dag.is_ancestor(&pb.block_hash, &head_after.block_hash),
+        "A 仍是后续 head 的祖先（无 rollback / 无 destructive re-commit）"
     );
-    assert_eq!(
-        runtime.consensus().state().finality.finalized_reference,
-        Some(pb.block_hash),
-        "stale finality 不造成 regression / 不重复 commit"
+    // finality 单调：当前 finalized 块必须以 A 为祖先（或 == A）。
+    let finalized = runtime
+        .consensus()
+        .state()
+        .finality
+        .finalized_reference
+        .expect("finality");
+    assert!(
+        finalized == pb.block_hash || dag.is_ancestor(&pb.block_hash, &finalized),
+        "finality 单调（不回退 / 不切到无关分支）"
     );
-    // 幂等：BlockStore 中该块只一份（head 块存在）。
+    // 幂等：BlockStore 中已 commit 的 A 仍存在（durable，未被覆盖 / 未 rollback）。
     assert!(
         runtime
             .block_production()
@@ -310,7 +320,7 @@ fn d10_b2_t4_duplicate_tick_idempotent_no_regression() {
             .unwrap()
             .contains(&pb.block_hash)
             .unwrap_or(false),
-        "committed block durable in BlockStore"
+        "committed block A durable in BlockStore"
     );
 }
 
