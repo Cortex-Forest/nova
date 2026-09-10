@@ -138,26 +138,55 @@ impl ConsensusNode {
         }
     }
 
-    /// 登记一个**已验证 canonical-next** 块承诺为 DAG 节点（node orchestration；D10-A Step 3）。
+    /// 登记一个**已验证 canonical-next** 块承诺为 DAG 节点（node orchestration；D10-A Step 3；
+    /// D10-C Step 7-A 修正 registration mapping）。
     ///
-    /// 以「父高轮」高度登记（与 vote / QC 轮高语义一致：`round.height`；canonical-next 块高 =
-    /// `round.height + 1`），parent 空（V0.1 单层 canonical-next；多块 parent 链由未来 Block
-    /// Commit step 管理）。**幂等**：已登记同一 hash ⇒ `Ok`（不重复 / 不报 DuplicateBlock）。
+    /// 以块**真实** `header.height` 与 `header.parent_hash` 登记 DAG reference：
+    /// `height = block.header.height`、`parents = [block.header.parent_hash]`（genesis / `height == 0`
+    /// 时 `parents = []`）—— 使 `A(height=H) → B(height=H+1, parent=A)` 在 DAG 中真实成边，
+    /// `dag.is_ancestor(A, B) == true`（frozen lock applicability 据此判定 descendant）。
     ///
-    /// 不修改任何共识规则 —— 仅把已验证块承诺加入既有 DAG（供 `verify_qc` / finality 消费）；
-    /// 登记是调用方（driver / runtime orchestration）的责任：块必须已通过 D9 proposer 验证。
+    /// - **round semantics 不变**：本方法不读取 / 不推进 `state.round`（`round.height` 仍为父高轮；
+    ///   canonical-next 块高 = `round.height + 1`，由调用方从 block header 提供）。
+    /// - **首块 genesis 根**：若 parent（= genesis hash）尚未在 DAG（首启 `rebuild` 空 DAG）⇒ 先补
+    ///   genesis 根 reference（height 0 / parents 空）再登记；非 genesis 的未知 parent ⇒
+    ///   `InvalidDagReference`（fail-closed，不跳过）。
+    /// - **幂等**：已登记同一 hash ⇒ `Ok`（不重复 / 不报 DuplicateBlock）。
+    /// - 不修改任何共识规则（`Dag::add_block` 全验证保留）；块必须已通过 D9 proposer 验证。
     pub fn register_block(
         &mut self,
         block_hash: [u8; 32],
+        height: u64,
+        parent_hash: [u8; 32],
         proposer: ValidatorId,
     ) -> Result<(), ConsensusError> {
         if self.dag.contains(&block_hash) {
             return Ok(());
         }
+        let parents = if height == 0 {
+            // genesis / 无 parent block：合法空 parent reference。
+            Vec::new()
+        } else {
+            if !self.dag.contains(&parent_hash) {
+                if parent_hash == self.genesis_hash {
+                    // 首块：DAG 无 genesis 根（首启 rebuild 空）⇒ 补根（node 层 orchestration）。
+                    self.dag.add_block(BlockReference {
+                        block_hash: self.genesis_hash,
+                        height: 0,
+                        parents: Vec::new(),
+                        proposer: ValidatorId::from_bytes([0u8; 32]),
+                    })?;
+                } else {
+                    // 非 genesis 未知 parent ⇒ fail-closed（不猜测 / 不断链）。
+                    return Err(ConsensusError::InvalidDagReference);
+                }
+            }
+            vec![parent_hash]
+        };
         self.dag.add_block(BlockReference {
             block_hash,
-            height: self.state.round.height,
-            parents: Vec::new(),
+            height,
+            parents,
             proposer,
         })?;
         Ok(())

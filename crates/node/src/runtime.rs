@@ -1389,9 +1389,16 @@ impl NodeRuntime {
             // 本地产出（本地接受的真实 canonical block；runtime_propose 已 submit proposal）→
             // 登记进共识 DAG（幂等；供 verify_qc / finality 消费）。块由本 actor 真实 build +
             // sign（proposer = 本节点 = select，D9 proposer 边界保持）。
+            // D10-C Step 7-A：以块**真实** height/parent 登记（canonical-next B 成为前块 child ⇒
+            // lock descendant 判定正确）。
             self.driver
                 .consensus_mut()
-                .register_block(pb.block_hash, pb.proposal_ref.proposer)
+                .register_block(
+                    pb.block_hash,
+                    pb.block.header.height,
+                    pb.block.header.parent_hash,
+                    pb.proposal_ref.proposer,
+                )
                 .map_err(RuntimeError::DagRegister)?;
             self.last_proposal = Some(pb.clone());
         }

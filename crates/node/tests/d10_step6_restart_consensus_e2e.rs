@@ -7,10 +7,10 @@
 //!   Genesis → A commit → REAL RESTART（同 storage + 同 seed）→ …
 //! 以及 crash-after-prevote / conflicting-vote / lock / finality-fact 恢复。
 //!
-//! 诚实边界（见实现报告）：V0.1 production `register_block` 以空 parent + round-height 登记
-//! canonical-next ⇒ 存在 lock 后**跨块**（A→B）runtime 续产被 LockConflict 保守阻断 —— 本文件
-//! 对单块 commit / 单块恢复 / 同 key prevote 续接 / lock / finality crash 提供真实 PASS 测试，
-//! 并以探针测试如实记录跨块缺口（跨块 seam 属 D10-C Step 7 / 生产授权，不在此伪造 PASS）。
+//! D10-C Step 7-A 后更新：`register_block` 已改为以块**真实** `height`/`parent_hash` 登记
+//! canonical-next（不再空 parent + round-height），故 **A → REAL RESTART → B** 现为真实 PASS
+//! （B 成为 A 的 DAG child ⇒ lock descendant 判定正确）。本文件保留单块 commit / restart 恢复 /
+//! 同 key prevote 幂等 / conflicting vote / lock / finality crash 的真实 PASS 测试。
 
 use std::path::PathBuf;
 
@@ -343,12 +343,13 @@ fn d10_c6_t3_restart_recovers_a() {
 }
 
 // ---------------------------------------------------------------------------
-// T4 probe — 跨块（A→B）runtime 续产真实缺口记录（不伪造 PASS）
-//   当前 V0.1 register_block 空 parent 登记 ⇒ lock=A 后 B 的 prevote 被 LockConflict 保守阻断。
+// T4 — A → REAL RESTART → B（D10-C Step 7-A：register_block 真实 height/parent ⇒ 真实 PASS）
+//   restart 后 B 成为 A 的 DAG child ⇒ lock=A 下 B 的 prevote 合法 ⇒ prevote/precommit/
+//   finality/commit 达成；head 推进到 B。
 // ---------------------------------------------------------------------------
 
 #[test]
-fn d10_c6_t4_probe_cross_block_continuation_gap() {
+fn d10_c6_t4_cross_block_after_restart_commits() {
     let env = Env::new(TEST_VALIDATOR_SEED);
     let config = env.config();
     let mut r1 = build_test_runtime(&config, TEST_VALIDATOR_SEED);
@@ -356,18 +357,25 @@ fn d10_c6_t4_probe_cross_block_continuation_gap() {
     let a_hash = r1.block_production().unwrap().head().block_hash;
     r1.shutdown().unwrap();
 
+    // REAL RESTART：lock=A / ledger 恢复；B 作为 A 的 canonical-next 继续共识。
     let mut r2 = build_test_runtime(&config, TEST_VALIDATOR_SEED);
     assert_eq!(r2.block_production().unwrap().head().block_hash, a_hash);
-    for _ in 0..14 {
-        r2.step()
-            .expect("step 不报错（LockConflict 为保守 no-op，非错误）");
-    }
+    step_until_head_height(&mut r2, 2);
     let head = r2.block_production().unwrap().head().clone();
-    assert_eq!(
-        head.block_hash, a_hash,
-        "跨块 A→B 续产被 V0.1 register_block 空 parent + lock 保守阻断（D10-C Step 7 seam）"
-    );
-    assert_eq!(head.height, 1);
+    assert_eq!(head.height, 2, "B committed（restart 后跨块续产）");
+    let b_hash = head.block_hash;
+    assert_ne!(b_hash, a_hash, "B != A");
+    // B 真实 parent == A（durable block header）。
+    let bs =
+        nova_storage::block_store::BlockStore::open(&config.storage_dir.join("blocks")).unwrap();
+    let b = bs.get(&b_hash).unwrap().expect("B block durable");
+    assert_eq!(b.header.height, 2);
+    assert_eq!(b.header.parent_hash, a_hash, "B.parent == A");
+    // DAG：A → B 真实边 + 全传递 ancestry。
+    let dag = r2.consensus().dag();
+    assert!(dag.contains(&a_hash), "DAG contains A");
+    assert!(dag.contains(&b_hash), "DAG contains B");
+    assert!(dag.is_ancestor(&a_hash, &b_hash), "A ancestor of B");
     r2.shutdown().unwrap();
 }
 
