@@ -5,9 +5,10 @@
 ## 1. 当前架构状态
 
 - **PHASE**: PHASE 2 — Protocol Design COMPLETE / FROZEN；Implementation & Integration In Progress
-- 工程基础、代码质量工具、CI、文档体系与 ADR 治理框架（ADR-0001~0060 tracked）已完成；Crypto / Genesis / Consensus 协议规范已冻结。
-- 实现已推进至节点运行时 / 集成层、validator 安全持久化与 Storage 持久化（详见 §6）。
+- 工程基础、代码质量工具、CI、文档体系与 ADR 治理框架（ADR-0001~0063 tracked）已完成；Crypto / Genesis / Consensus 协议规范已冻结。
+- 实现已推进至节点运行时 / 集成层、node-driven consensus（production auto-drive / finality commit bridge / DAG restart rebuild / finality recovery）、网络运行时基础设施（出站握手 / 配置化连接目标 / 多 peer 生命周期 / sync 握手集成）与 Storage 持久化（详见 §6）。
 - **完整可运行区块链尚未发布**；Devnet / Testnet / Mainnet：`NOT RELEASED`。
+- **命名**：公开品牌为 **YAZIMAO**，内部开发代号 **Nova**；`nova-*` crate / package 名按 ADR-0063（ACCEPTED）保留。
 
 ## 2. 总体分层
 
@@ -57,10 +58,10 @@ Infrastructure (crypto)
 
 ## 6. 实现状态（防止误解）
 
-- **Consensus**：协议设计 FINAL FROZEN；纯计算核心 + node-driven consensus + validator 安全持久化（fail-closed）/ 重启恢复已实现；**生产鉴权出站网络路径不完整**。
-- **Node**：运行时 / 集成层已实现（NodeRuntime / driver / ValidatorActor / bootstrap / restart recovery / egress / block / sync 等），integration hardening 中。
+- **Consensus**：协议设计 FINAL FROZEN；纯计算核心 + node-driven consensus + production consensus auto-drive + finality commit bridge + DAG restart rebuild / finality recovery + canonical commit 已实现（D9 / D10 E2E 通过）。
+- **Node**：运行时 / 集成层已实现（NodeRuntime / driver / ValidatorActor / bootstrap / restart recovery / egress / block / sync / follower sync persistence 等），持续 integration hardening。
 - **Storage**：StateStore / SMT + PersistentBackend（8E）+ chain head persistence + block store（crash-consistent）已实现；进一步集成 / 加固中（非"生产已认证"）。
-- **Network / P2P**：运行时基础设施已实现（message / transport / security / session / network_service / event_loop / gossip / sync）；**libp2p 未采用；生产鉴权出站运行时 BLOCKED**。
+- **Network / P2P**：运行时基础设施已实现（message / transport / security / session / network_service / event_loop / gossip / sync）；**出站握手 initiation、配置化连接目标、多 peer 生命周期、sync 握手集成已完成**；**libp2p 未采用**。
 - **WASM 执行**：`NOT IMPLEMENTED`（state transition / block 执行纯计算已实现）。
 - **RPC**：占位（placeholder），非生产就绪。
 - **钱包 / Explorer / 官网**：`PLANNED`。
