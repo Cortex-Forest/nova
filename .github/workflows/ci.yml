@@ -1,5 +1,5 @@
 # =============================================================================
-# Nova Chain CI Pipeline
+# YAZIMAO CI Pipeline
 # PHASE 1：Format → Check → Clippy → Unit Tests → Build
 # 任何 PR 未通过 CI 不得合并（Master Prompt §51）。
 # 安全：权限最小化（contents: read），不使用自托管 runner。
