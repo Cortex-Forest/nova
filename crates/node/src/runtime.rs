@@ -264,6 +264,54 @@ fn finality_commit_bridge(
     Ok(())
 }
 
+/// D10-C Step 8 — 远端**已验证** canonical-next block ⇒ durable store + 共识 DAG 登记（node orchestration）。
+///
+/// - 前置（调用契约）：`wire` 已经 `block_dispatch` 用**本地** `ValidatorSet` 推导期望 proposer 并完成
+///   真实签名验证（verdict = `CanonicalNextCandidate`；即 `height == head.height + 1` /
+///   `parent_hash == head.block_hash`）—— 本函数**不**重复评价该语义，也不信任将未验证 payload。
+/// - 顺序：**durable-first**（`BlockStore::put`，同 hash 同 bytes 幂等；冲突 ⇒ `CorruptedState`）→
+///   `register_block`（真实 height / parent；未知非 genesis parent ⇒ `InvalidDagReference` fail-closed）。
+/// - **不** commit / **不** 推进 head / **不** 产生 finality / **不** 授予任何 vote 权限：本函数只使该
+///   已到达的 canonical block 具备「可被 frozen `verify_qc`（target ∈ DAG）与 commit bridge
+///   （`BlockStore.get`）消费」的前提；是否 finality / commit 仍完全由 frozen transition 与
+///   `finality_commit_bridge`（finality 唯一 commit 授权）决定。
+/// - proposer 推导与 `block_dispatch` / `finality_commit_bridge` **同源**（parent-height 语义：
+///   `select_proposer(chain_id, height - 1, 0, genesis_hash, set)`）—— 不新造规则。
+/// - Gossip 与 SyncResponse 共用本函数（统一处理；两者均先经同一 validator seam）。
+fn register_remote_canonical_block(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    adapter: &NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>,
+    wire: &[u8],
+) -> Result<(), RuntimeError> {
+    let block = nova_runtime::decode_block(wire).map_err(RuntimeError::BlockDecode)?;
+    let height = block.header.height;
+    if height == 0 {
+        // genesis / 非 canonical-next：verdict 语义保证不至此处；保守 no-op（不猜 / 不登记）。
+        return Ok(());
+    }
+    // 登记键取**实际解码字节**重算的 hash（单一来源；不依赖 verdict 携带值）。
+    let block_hash = nova_runtime::block_hash(&block).map_err(RuntimeError::BlockCodec)?;
+    let chain_id = driver.consensus().chain_id();
+    let genesis_hash = driver.consensus().genesis_hash();
+    let proposer = select_proposer(
+        chain_id,
+        height.saturating_sub(1),
+        0,
+        &genesis_hash,
+        driver.consensus().validator_set(),
+    )
+    .map_err(RuntimeError::DagRegister)?;
+    // durable-first：与本地 proposal 路径同语义（幂等；不推进 head / state）。
+    if let Some(bs) = adapter.block_store() {
+        bs.put(&block).map_err(RuntimeError::BlockStore)?;
+    }
+    driver
+        .consensus_mut()
+        .register_block(block_hash, height, block.header.parent_hash, proposer)
+        .map_err(RuntimeError::DagRegister)?;
+    Ok(())
+}
+
 /// NodeRuntime 启动错误（node-local；typed；fail closed）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRuntimeError {
@@ -315,6 +363,8 @@ pub enum RuntimeError {
     BlockCodec(nova_runtime::BlockCodecError),
     /// D10-C Step 4：BlockStore node 层访问失败（本地 proposal durable put / bridge resolve get）。
     BlockStore(StorageError),
+    /// D10-C Step 8：远端 canonical block wire decode 失败（结构错误；fail-closed —— 不落盘 / 不登记）。
+    BlockDecode(nova_runtime::BlockPipelineError),
     /// D10-C Step 4：Finality Recovery Fact 持久化失败（durable-before-bridge；fail-closed）。
     FinalityFact(NodeStartupError),
 }
@@ -1324,7 +1374,7 @@ impl NodeRuntime {
                 }
                 other => other,
             };
-            let (source, outcomes) = match (&self.block_production, msg) {
+            let (source, outcomes, wires) = match (&self.block_production, msg) {
                 (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => (
                     BlockInboundSource::Gossip,
                     vec![dispatch_gossip_block_with_validator_set(
@@ -1333,31 +1383,47 @@ impl NodeRuntime {
                         &wire,
                         &validator_set,
                     )],
+                    vec![Some(wire)],
                 ),
-                (Some(adapter), BlockInboundMessage::SyncBlockResponse(payload)) => (
-                    BlockInboundSource::SyncResponse,
-                    dispatch_sync_block_response_with_validator_set(
+                (Some(adapter), BlockInboundMessage::SyncBlockResponse(payload)) => {
+                    let outcomes = dispatch_sync_block_response_with_validator_set(
                         adapter,
                         self.max_block_bytes,
                         &payload,
                         &validator_set,
-                    ),
-                ),
+                    );
+                    // D10-C Step 8：逐块 wire（与 outcomes **同序**；结构损坏 ⇒ 单条 None，
+                    // 对应 `Err(Malformed)` —— 不登记 / 不落盘）。
+                    let wires = match SyncBlockResponse::decode(&payload) {
+                        Ok(r) => r.blocks.iter().map(|b| Some(b.0.clone())).collect(),
+                        Err(_) => vec![None],
+                    };
+                    (BlockInboundSource::SyncResponse, outcomes, wires)
+                }
                 (None, _) => {
                     // full-node / 无 canonical adapter：无法验证（无 state/head 上下文）→ 丢弃并计数。
                     self.block_inbound_skipped += 1;
                     continue;
                 }
             };
-            for outcome in outcomes {
+            for (idx, outcome) in outcomes.into_iter().enumerate() {
                 // observation（bounded outcomes；保留既有语义）
                 if self.block_inbound_outcomes.len() >= BLOCK_INBOUND_OUTCOME_CAP {
                     self.block_inbound_outcomes.pop_front();
                 }
-                // STEP 10-19-10-B1：FutureMissingAncestor → intent ledger（bounded + dedup；
-                // 只记录，不发送 / 不写存储 / 不触发 finality）。
                 if let Ok(verdict) = &outcome {
+                    // STEP 10-19-10-B1：FutureMissingAncestor → intent ledger（bounded + dedup；
+                    // 只记录，不发送 / 不触发 finality）。
                     self.missing_ancestor_ledger.observe(verdict, source);
+                    // D10-C Step 8：远端**已验证** canonical-next block ⇒ durable store + 共识 DAG 登记
+                    //（node orchestration；不 commit / 不推进 head / 不授予 finality —— 仅使其可被
+                    // frozen `verify_qc` 与 commit bridge 消费）。Gossip 与 SyncResponse 统一。
+                    if matches!(verdict, InboundBlockVerdict::CanonicalNextCandidate { .. })
+                        && let Some(Some(wire)) = wires.get(idx)
+                        && let Some(adapter) = self.block_production.as_ref()
+                    {
+                        register_remote_canonical_block(&mut self.driver, adapter, wire)?;
+                    }
                 }
                 self.block_inbound_outcomes.push_back(outcome);
             }
