@@ -191,6 +191,7 @@ fn biv_1_valid_canonical_next_and_no_mutation() {
         sender_resolver: &NoAccountsKeyResolver,
         expected_proposer_vk: Some(kp.verifying_key()),
         expected_hash: None,
+        dag: None,
     };
     let verdict = validate_block_inbound(&wire, &ctx).unwrap();
 
@@ -233,6 +234,7 @@ fn base_ctx<'a>(
         sender_resolver: &NoAccountsKeyResolver,
         expected_proposer_vk: None,
         expected_hash: None,
+        dag: None,
     }
 }
 

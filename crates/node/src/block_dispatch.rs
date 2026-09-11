@@ -53,6 +53,7 @@ fn inbound_context_with_proposer<'a, B: StorageBackend + Clone>(
     adapter: &'a NodeBlockAdapter<B, NoAccountsKeyResolver>,
     max_block_bytes: usize,
     expected_proposer_vk: Option<&'a VerifyingKey>,
+    dag: Option<&'a nova_consensus::dag::Dag>,
 ) -> InboundBlockContext<'a, B> {
     InboundBlockContext {
         network_id: adapter.network_id(),
@@ -67,6 +68,7 @@ fn inbound_context_with_proposer<'a, B: StorageBackend + Clone>(
         sender_resolver: &NoAccountsKeyResolver,
         expected_proposer_vk,
         expected_hash: None,
+        dag,
     }
 }
 
@@ -114,7 +116,7 @@ pub fn dispatch_gossip_block<B: StorageBackend + Clone>(
     max_block_bytes: usize,
     wire: &[u8],
 ) -> Result<InboundBlockVerdict, InboundBlockError> {
-    let ctx = inbound_context_with_proposer(adapter, max_block_bytes, None);
+    let ctx = inbound_context_with_proposer(adapter, max_block_bytes, None, None);
     validate_block_inbound(wire, &ctx)
 }
 
@@ -131,8 +133,23 @@ pub fn dispatch_gossip_block_with_validator_set<B: StorageBackend + Clone>(
     wire: &[u8],
     set: &ValidatorSet,
 ) -> Result<InboundBlockVerdict, InboundBlockError> {
+    dispatch_gossip_block_with_validator_set_and_dag(adapter, max_block_bytes, wire, set, None)
+}
+
+/// 同 [`dispatch_gossip_block_with_validator_set`]，并注入**本地 DAG**（D9 Step 8A G1）。
+///
+/// `dag = Some(&local_dag)` ⇒ 已落盘但不在 DAG 的块**不**短路为 `AlreadyKnown`，而是走完
+/// ⑥/⑦ 全验证后给出 `CanonicalNextCandidate`，使调用方可幂等补登记（**不** commit / **不**
+/// 推进 head / **不**产生 finality）。`dag = None` ⇒ 与既有 4 参版本完全等价。
+pub fn dispatch_gossip_block_with_validator_set_and_dag<B: StorageBackend + Clone>(
+    adapter: &NodeBlockAdapter<B, NoAccountsKeyResolver>,
+    max_block_bytes: usize,
+    wire: &[u8],
+    set: &ValidatorSet,
+    dag: Option<&nova_consensus::dag::Dag>,
+) -> Result<InboundBlockVerdict, InboundBlockError> {
     let expected_vk = resolve_expected_proposer_vk(adapter, set)?;
-    let ctx = inbound_context_with_proposer(adapter, max_block_bytes, Some(&expected_vk));
+    let ctx = inbound_context_with_proposer(adapter, max_block_bytes, Some(&expected_vk), dag);
     validate_block_inbound(wire, &ctx)
 }
 
@@ -149,7 +166,7 @@ pub fn dispatch_sync_block_response<B: StorageBackend + Clone>(
         Ok(r) => r,
         Err(_) => return vec![Err(InboundBlockError::Malformed)],
     };
-    let ctx = inbound_context_with_proposer(adapter, max_block_bytes, None);
+    let ctx = inbound_context_with_proposer(adapter, max_block_bytes, None, None);
     response
         .blocks
         .iter()
@@ -173,6 +190,26 @@ pub fn dispatch_sync_block_response_with_validator_set<B: StorageBackend + Clone
     payload: &[u8],
     set: &ValidatorSet,
 ) -> Vec<Result<InboundBlockVerdict, InboundBlockError>> {
+    dispatch_sync_block_response_with_validator_set_and_dag(
+        adapter,
+        max_block_bytes,
+        payload,
+        set,
+        None,
+    )
+}
+
+/// 同 [`dispatch_sync_block_response_with_validator_set`]，并注入**本地 DAG**（D9 Step 8A G1）。
+///
+/// 语义与 gossip 侧 `_and_dag` 完全对称：已落盘但不在 DAG 的块走完 ⑥/⑦ 全验证（**不**短路），
+/// 使调用方可幂等补登记；`dag = None` ⇒ 与既有 4 参版本完全等价。
+pub fn dispatch_sync_block_response_with_validator_set_and_dag<B: StorageBackend + Clone>(
+    adapter: &NodeBlockAdapter<B, NoAccountsKeyResolver>,
+    max_block_bytes: usize,
+    payload: &[u8],
+    set: &ValidatorSet,
+    dag: Option<&nova_consensus::dag::Dag>,
+) -> Vec<Result<InboundBlockVerdict, InboundBlockError>> {
     let response = match SyncBlockResponse::decode(payload) {
         Ok(r) => r,
         Err(_) => return vec![Err(InboundBlockError::Malformed)],
@@ -185,7 +222,8 @@ pub fn dispatch_sync_block_response_with_validator_set<B: StorageBackend + Clone
                 Ok(vk) => vk,
                 Err(e) => return Err(e),
             };
-            let ctx = inbound_context_with_proposer(adapter, max_block_bytes, Some(&expected_vk));
+            let ctx =
+                inbound_context_with_proposer(adapter, max_block_bytes, Some(&expected_vk), dag);
             validate_block_inbound(&block_payload.0, &ctx)
         })
         .collect()

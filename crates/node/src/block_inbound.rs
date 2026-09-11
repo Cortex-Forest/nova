@@ -75,6 +75,15 @@ pub struct InboundBlockContext<'a, B: StorageBackend + Clone> {
     pub expected_proposer_vk: Option<&'a VerifyingKey>,
     /// 请求方声称的 block hash（如 `SyncBlockRequest.block_hash` 上下文）；`None` = 无声称。
     pub expected_hash: Option<[u8; 32]>,
+    /// 本地 consensus DAG（**只读**；D9 Step 8A G1）。
+    ///
+    /// 用途单一：判定 `already-known` 是否为终态。已落盘但 **不在 DAG**（典型：crash 于
+    /// finality/commit 之前 ⇒ restart 后 DAG 仅由 canonical head 祖先链重建，该块不在其中）
+    /// 时不得短路 —— 必须继续 ⑥/⑦ 全验证，使调用方可幂等补登记（仍不 commit / 不推进 head /
+    /// 不产生 finality）。
+    ///
+    /// `None` = 调用方不提供 DAG ⇒ 保持既有语义（`BlockStore.contains` ⇒ 终态 `AlreadyKnown`）。
+    pub dag: Option<&'a nova_consensus::dag::Dag>,
 }
 
 /// 本节点当前无法验证的项（诚实：不跳过 / 不信任远端 / 不 fake resolver）。
@@ -250,13 +259,22 @@ pub fn validate_block_inbound<B: StorageBackend + Clone>(
         return Err(InboundBlockError::HashMismatch { claimed, computed });
     }
     // ⑤ already-known（只读 BlockStore.contains；本模块绝不写入）
+    //
+    // D9 Step 8A（G1 fix）：仅当 **DAG 亦已含该块** 时才是终态 AlreadyKnown（真幂等 no-op）。
+    // 已落盘但 DAG 不含（例：crash 于 finality/commit 前 ⇒ restart 后 DAG 只重建 canonical
+    // head 祖先链）⇒ **不短路**：继续 ⑥/⑦ 全验证（canonical-next 关系 / ordering / tx-root /
+    // proposer 签名 / state-root 全部照旧执行），使调用方可幂等补登记。
+    // 注意：本分支**不**放宽任何验证；`ctx.dag = None` 时保持既有语义不变。
     if let Some(bs) = ctx.block_store
         && bs.contains(&computed).map_err(InboundBlockError::Storage)?
     {
-        return Ok(InboundBlockVerdict::AlreadyKnown {
-            height: block.header.height,
-            block_hash: computed,
-        });
+        let dag_contains = ctx.dag.is_some_and(|d| d.contains(&computed));
+        if ctx.dag.is_none() || dag_contains {
+            return Ok(InboundBlockVerdict::AlreadyKnown {
+                height: block.header.height,
+                block_hash: computed,
+            });
+        }
     }
     // ⑥ head 关系分类
     let head = ctx.head;

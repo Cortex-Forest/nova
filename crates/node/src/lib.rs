@@ -132,6 +132,13 @@ pub mod network_identity;
 /// 无用例时不启用（`NodeConfig::listen_addr = None` ⇒ 现行为完全不变）。
 pub mod inbound;
 
+/// Production Sync Responder（D9 Step 8A；node-only）：入站 `SyncBlockRequest`
+/// （Established-only，既有 envelope/auth）→ `BlockStore` **只读**查找（hash 优先 / 无 hash
+/// 时从 canonical head 沿 parent 回走，≤ `MAX_SYNC_WALK`）→ 既有 `SyncBlockResponse` codec
+/// （单块；`request_id` 原样回带）→ 既有 `NetworkSigner` + 既有 `NetworkService::enqueue_outbound`。
+/// **不新增协议 / 不直接写 socket / 绝不产生 finality / commit / head 推进。**
+pub mod sync_responder;
+
 /// Validator Safety Store（STEP 10-15T；Restart Safety）：独立 fail-closed 的 validator-local
 /// durable journal（VoteIntent / VoteSigned / LockedState + identity header）。Option B —— 与
 /// canonical `PersistentBackend` state WAL 分离；不持久化私钥。

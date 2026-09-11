@@ -43,7 +43,8 @@ use nova_storage::persistent::PersistentBackend;
 use crate::assembly::ConsensusNode;
 use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter, NodeBlockApplicationError};
 use crate::block_dispatch::{
-    dispatch_gossip_block_with_validator_set, dispatch_sync_block_response_with_validator_set,
+    dispatch_gossip_block_with_validator_set_and_dag,
+    dispatch_sync_block_response_with_validator_set_and_dag,
 };
 use crate::block_inbound::{InboundBlockError, InboundBlockVerdict};
 use crate::bootstrap::{self, ConnectionTargetError, NodeConfig, NodeStartupError};
@@ -61,6 +62,7 @@ use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyS
 use crate::signer::SigningCapability;
 use crate::sync_correlator::{LogicalTick, SyncRequestCorrelator};
 use crate::sync_dispatch::{NetworkSyncDispatcher, dispatch_batch};
+use crate::sync_responder::{SyncRespondDiagnostics, serve_requests as serve_sync_requests};
 use crate::sync_scheduler::{
     PeerCandidate, PeerSelectionPolicy, ScheduleResult, SyncRequestScheduler, select_peer,
 };
@@ -615,6 +617,8 @@ pub struct NodeRuntime {
     /// D9 Step 7：入站连接握手 pending（peer 字节键 → 接受时 tick；Established / 失败 / 超时后移除）。
     /// 键用 `[u8; 32]`（`NodeId` 无 `Ord`）⇒ 确定性字典序与 inbound 连接表一致。
     inbound_pending: BTreeMap<[u8; 32], u64>,
+    /// D9 Step 8A：Production Sync Responder 观测（只读计数；非协议）。
+    sync_respond: SyncRespondDiagnostics,
 }
 
 impl NodeRuntime {
@@ -807,6 +811,7 @@ impl NodeRuntime {
             sync_unknown_responses: 0,
             inbound_tick: 0,
             inbound_pending: BTreeMap::new(),
+            sync_respond: SyncRespondDiagnostics::default(),
         })
     }
 
@@ -1017,6 +1022,11 @@ impl NodeRuntime {
             .and_then(|s| s.inbound.as_ref())
             .map(|i| i.connection_count())
             .unwrap_or(0)
+    }
+
+    /// D9 Step 8A：Production Sync Responder 观测（只读；不含敏感性字段）。
+    pub fn sync_respond_diagnostics(&self) -> SyncRespondDiagnostics {
+        self.sync_respond
     }
 
     /// 建立 configured peer（STEP 10-19-10-B7-A1-D5；single-active）。
@@ -1558,20 +1568,24 @@ impl NodeRuntime {
             let (source, outcomes, wires) = match (&self.block_production, msg) {
                 (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => (
                     BlockInboundSource::Gossip,
-                    vec![dispatch_gossip_block_with_validator_set(
+                    vec![dispatch_gossip_block_with_validator_set_and_dag(
                         adapter,
                         self.max_block_bytes,
                         &wire,
                         &validator_set,
+                        // D9 Step 8A（G1）：注入本地 DAG ⇒ 已落盘但不在 DAG 的块不短路为
+                        // AlreadyKnown，走完 ⑥/⑦ 全验证 ⇒ 可幂等补登记（不 commit / 不推 head）。
+                        Some(self.driver.consensus().dag()),
                     )],
                     vec![Some(wire)],
                 ),
                 (Some(adapter), BlockInboundMessage::SyncBlockResponse(payload)) => {
-                    let outcomes = dispatch_sync_block_response_with_validator_set(
+                    let outcomes = dispatch_sync_block_response_with_validator_set_and_dag(
                         adapter,
                         self.max_block_bytes,
                         &payload,
                         &validator_set,
+                        Some(self.driver.consensus().dag()),
                     );
                     // D10-C Step 8：逐块 wire（与 outcomes **同序**；结构损坏 ⇒ 单条 None，
                     // 对应 `Err(Malformed)` —— 不登记 / 不落盘）。
@@ -1608,6 +1622,25 @@ impl NodeRuntime {
                 }
                 self.block_inbound_outcomes.push_back(outcome);
             }
+        }
+        // D9 Step 8A — Production Sync Responder：入站 `SyncBlockRequest`（**Established-only**，
+        // 非 Established 已由 `NetworkService` 对非 Handshake 消息 fail-closed 丢弃）→ 每 step
+        // 有界 serve（`MAX_SYNC_RESPONSES_PER_STEP`）：BlockStore **只读**查找 → 既有
+        // `SyncBlockResponse` codec（单块；`request_id` 原样回带）→ 既有 `NetworkSigner` →
+        // 既有 `enqueue_outbound`（本 step 末尾既有 flush 负责真实发送）。
+        // **不**产生 finality / **不** commit / **不**推进 head / **不**直接写 socket。
+        let requests = stack
+            .el
+            .handler_mut()
+            .take_sync_requests_bounded(crate::sync_responder::MAX_SYNC_RESPONSES_PER_STEP);
+        if !requests.is_empty() {
+            serve_sync_requests(
+                self.block_production.as_ref(),
+                &mut stack.ns,
+                stack.signer.as_ref(),
+                requests,
+                &mut self.sync_respond,
+            );
         }
         // STEP 10-19-10-B7-A1-D8-2：outbound sync orchestration —— 消费 bounded missing-ancestor
         // intents → ADR-0062 height-based target（head+1 / hash=None）→ deterministic peer
@@ -1737,6 +1770,7 @@ impl NodeRuntime {
             sync_unknown_responses: _,
             inbound_tick: _,
             inbound_pending: _,
+            sync_respond: _,
         } = self;
 
         if let Some(mut stack) = network_stack {

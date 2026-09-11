@@ -36,6 +36,7 @@ use nova_consensus::round::{ProposalRef, decode_proposal_ref};
 use nova_consensus::vote::{ValidatorVote, decode_validator_vote};
 use nova_network::event_loop::{EventHandler, EventLoopError, NodeEvent};
 use nova_network::network_service::NetworkEvent;
+use nova_network::node_id::NodeId;
 use std::collections::VecDeque;
 
 use crate::driver::{DriverError, NodeConsensusDriver};
@@ -90,6 +91,12 @@ pub enum BlockInboundMessage {
 /// block inbound 队列有界容量（Node-local；满 ⇒ drop + 计数，防无界内存）。
 const BLOCK_INBOUND_CAP: usize = 256;
 
+/// D9 Step 8A：入站 `SyncBlockRequest` 队列（**bounded**；满 ⇒ drop + 计数）。
+///
+/// 只搬 `(sender, payload)`（不 decode / 不验证 / 不响应）；serve 由 Runtime 经
+/// `sync_responder` 在既有 outbound 路径上执行。
+const SYNC_REQUEST_CAP: usize = crate::sync_responder::MAX_PENDING_SYNC_REQUESTS;
+
 /// Node 层 EventLoop handler（Option A）：decode/classify → command queue。
 ///
 /// **不拥有 / 不引用** Driver / Runtime / NetworkService / Transport / NetworkSigner /
@@ -102,6 +109,10 @@ pub struct NodeConsensusHandler {
     block_inbound: VecDeque<BlockInboundMessage>,
     /// 因队列满而 drop 的 block inbound payload 数。
     block_inbound_dropped: u64,
+    /// D9 Step 8A：入站 `SyncBlockRequest`（sender, payload）队列（bounded）。
+    sync_requests: VecDeque<(NodeId, Vec<u8>)>,
+    /// 因队列满而 drop 的入站 sync 请求数（诊断）。
+    sync_requests_dropped: u64,
 }
 
 impl NodeConsensusHandler {
@@ -112,6 +123,8 @@ impl NodeConsensusHandler {
             non_consensus_seen: 0,
             block_inbound: VecDeque::new(),
             block_inbound_dropped: 0,
+            sync_requests: VecDeque::new(),
+            sync_requests_dropped: 0,
         }
     }
 
@@ -153,6 +166,31 @@ impl NodeConsensusHandler {
             return;
         }
         self.block_inbound.push_back(msg);
+    }
+
+    /// D9 Step 8A：入站 sync 请求队列深度。
+    pub fn sync_requests_len(&self) -> usize {
+        self.sync_requests.len()
+    }
+
+    /// D9 Step 8A：因队列满而 drop 的入站 sync 请求数（诊断）。
+    pub fn sync_requests_dropped(&self) -> u64 {
+        self.sync_requests_dropped
+    }
+
+    /// D9 Step 8A：取走**至多** `max` 条入站 `SyncBlockRequest`（FIFO；其余留在队列下一 step 处理）。
+    pub fn take_sync_requests_bounded(&mut self, max: usize) -> Vec<(NodeId, Vec<u8>)> {
+        let take = max.min(self.sync_requests.len());
+        self.sync_requests.drain(..take).collect()
+    }
+
+    /// 收集一条入站 `SyncBlockRequest`（bounded：满 ⇒ drop + 计数）。
+    fn collect_sync_request(&mut self, sender: NodeId, payload: Vec<u8>) {
+        if self.sync_requests.len() >= SYNC_REQUEST_CAP {
+            self.sync_requests_dropped += 1;
+            return;
+        }
+        self.sync_requests.push_back((sender, payload));
     }
 
     // ---------- decode/classify（无 driver / 无 verify） ----------
@@ -207,6 +245,14 @@ impl EventHandler for NodeConsensusHandler {
             NodeEvent::Network(NetworkEvent::SyncBlockResponse { payload, .. }) => {
                 self.non_consensus_seen += 1;
                 self.collect_block_inbound(BlockInboundMessage::SyncBlockResponse(payload.clone()));
+                Ok(())
+            }
+            // D9 Step 8A：入站 `SyncBlockRequest`（**Established-only** —— NetworkService 已对
+            // 非 Established 的非 Handshake 消息 fail-closed 丢弃）→ 有界队列 → Runtime serve。
+            // 本 handler 只搬 payload（不 decode / 不查存储 / 不响应 ⇒ 不产生任何 consensus 语义）。
+            NodeEvent::Network(NetworkEvent::SyncBlockRequest { sender, payload }) => {
+                self.non_consensus_seen += 1;
+                self.collect_sync_request(*sender, payload.clone());
                 Ok(())
             }
             // 其它非 consensus：status/handshake/ping/pong/timer/internal/block —— future
