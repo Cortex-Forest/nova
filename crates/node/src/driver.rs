@@ -77,7 +77,8 @@ pub enum AutoDriveStep {
 pub struct NodeConsensusDriver<S: SigningCapability> {
     consensus: ConsensusNode,
     actors: Vec<ValidatorActor<S>>,
-    /// 待广播的 consensus **semantic** output（只装验证 PASS 的 outbound；Driver 不负责发送）。
+    /// 待广播的 consensus **semantic** output（验证 PASS 的 vote/QC + **本地生产**的
+    /// proposal/block（D9 Egress）；Driver 不负责发送）。
     pending_outbound: Vec<OutboundConsensusMessage>,
 }
 
@@ -251,6 +252,24 @@ impl<S: SigningCapability> NodeConsensusDriver<S> {
     /// 当前待广播 semantic output 数量。
     pub fn outbound_pending_len(&self) -> usize {
         self.pending_outbound.len()
+    }
+
+    /// D9 Egress — 登记**本地生产**的 canonical proposal + block 到 outbound（node orchestration seam）。
+    ///
+    /// 调用契约（由 `runtime_propose` / `NodeRuntime::step` 侧保证；Driver 不重复判定 consensus 语义）：
+    /// - proposal 已 `submit_proposal` 且 block 已 `register_block` **成功**（任一失败 ⇒ 调用方不调用
+    ///   ⇒ 无 outbound；绝不广播半成品）；
+    /// - `proposal.block_hash` == `block_hash(&block)`（`build_proposal` 同一 `result.block_hash`
+    ///   单一来源；**不复制 hash 算法**）；
+    /// - **仅本地生产路径**调用：remote 到达的 proposal 不重播（relay 不在本步范围）。
+    ///
+    /// 同批入队（egress 同批签名广播）：`Proposal(ref)` → `GossipBlock(wire)`。有界沿用既有
+    /// `pending_outbound`（每 step 由 egress drain；生产速率 = 每 `(height, round)` 至多一次）。
+    pub fn record_local_proposal(&mut self, proposal: ProposalRef, block_wire: Vec<u8>) {
+        self.pending_outbound
+            .push(OutboundConsensusMessage::Proposal(proposal));
+        self.pending_outbound
+            .push(OutboundConsensusMessage::GossipBlock(block_wire));
     }
 
     /// 处理**网络到达**的 QC（STEP 10-18G-1 inbound QC）。

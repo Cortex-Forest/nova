@@ -7,6 +7,10 @@
 //!   `ProposalRef`）——不重新发明 consensus encoding。
 //! - **只有**通过既有验证门面（`verify_vote_input` / `verify_qc`）的消息才会被
 //!   [`crate::driver::NodeConsensusDriver`] 放入 outbound（unverified never outbound）。
+//! - D9 Egress 例外（**仅本地生产**）：`Proposal` / `GossipBlock` 由 `runtime_propose` 在
+//!   `submit_proposal` + `register_block` **成功之后**登记（proposal 已入 canonical transition；
+//!   block 已由本 actor 签名并入 DAG）—— 这两者不适用 `verify_*`（无远端证据可验，也绝不重播
+//!   remote 到达的 proposal）；其余一切 outbound 仍必须经验证门面。
 //!
 //! # NetworkEgress seam
 //! - 把 Driver 产出的 outbound intent 接出的**最小抽象 seam**（本 trait 自身仍未实现 impl；
@@ -39,9 +43,12 @@ pub enum OutboundConsensusMessage {
     },
     /// 已验证 precommit QC（`derived.precommit_qc` 经 `verify_qc` PASS 后才被 Driver record）。
     VerifiedQc(QuorumCertificate),
-    /// 本地 proposal（`ProposalRef`；本 STEP 无 ProposerService ⇒ **无自动 source**，仅保留
-    /// semantic seam 供未来 proposer 使用；不人为构造）。
+    /// 本地 proposal（`ProposalRef`；D9 Egress 由 `runtime_propose` 在注册成功后登记；
+    /// remote 到达的 proposal **不**重播）。
     Proposal(ProposalRef),
+    /// 本地生产的 canonical block **wire**（= `nova_runtime::encode_block` 输出；与 inbound
+    /// `GossipBlock` payload / `MessageType::GossipBlock` 同一格式 —— **不新建第二套序列化**）。
+    GossipBlock(Vec<u8>),
 }
 
 /// 出站 egress seam：把 Driver 产出的 consensus semantic output 接出（**抽象 seam**；

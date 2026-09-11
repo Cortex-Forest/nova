@@ -905,6 +905,8 @@ impl NetworkEgress for TestEgress {
                 OutboundConsensusMessage::Proposal(pr) => {
                     (MessageType::ConsensusProposal, encode_proposal_ref(&pr))
                 }
+                // D9 Egress：block wire 原样透传（与 `egress::encode_semantic` 同映射）。
+                OutboundConsensusMessage::GossipBlock(wire) => (MessageType::GossipBlock, wire),
             };
             let sender = NodeId::from_verifying_key(self.key.verifying_key());
             let mut envelope = MessageEnvelope {

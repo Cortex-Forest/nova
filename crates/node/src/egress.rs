@@ -52,6 +52,8 @@ impl core::error::Error for EgressError {}
 ///   inbound decode 对称）。
 /// - `Proposal`→ `ConsensusProposal`：canonical `ProposalRef`（block_hash 32B ‖ proposer 32B）。
 /// - `VerifiedQc` → `ConsensusQc`：canonical `QuorumCertificate`（仅 Driver 已 verify 的 QC）。
+/// - `GossipBlock` → `GossipBlock`：**已编码** block wire 原样透传（发送侧不重编码 / 不二次序列化；
+///   与 inbound 同一 wire 格式，由生产方经 `nova_runtime::encode_block` 产出）。
 ///
 /// 不做任何 verify；只做确定性编码。
 pub fn encode_semantic(msg: &OutboundConsensusMessage) -> (MessageType, Vec<u8>) {
@@ -65,6 +67,7 @@ pub fn encode_semantic(msg: &OutboundConsensusMessage) -> (MessageType, Vec<u8>)
             (MessageType::ConsensusProposal, encode_proposal_ref(pr))
         }
         OutboundConsensusMessage::VerifiedQc(qc) => (MessageType::ConsensusQc, encode_qc(qc)),
+        OutboundConsensusMessage::GossipBlock(wire) => (MessageType::GossipBlock, wire.clone()),
     }
 }
 

@@ -169,6 +169,8 @@ fn envelope_for(net_key: &KeyPair, msg: &OutboundConsensusMessage) -> MessageEnv
         OutboundConsensusMessage::Proposal(pr) => {
             (MessageType::ConsensusProposal, encode_proposal_ref(pr))
         }
+        // D9 Egress：block wire 原样透传（与 `egress::encode_semantic` 同映射）。
+        OutboundConsensusMessage::GossipBlock(wire) => (MessageType::GossipBlock, wire.clone()),
     };
     sign_envelope(net_key, message_type, payload)
 }

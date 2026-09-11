@@ -1466,6 +1466,15 @@ impl NodeRuntime {
                     pb.proposal_ref.proposer,
                 )
                 .map_err(RuntimeError::DagRegister)?;
+            // D9 Egress：本地 canonical proposal + block → outbound（**仅登记成功之后**）。
+            // 顺序固定：build/sign → BlockStore.put → submit_proposal → register_block → queue
+            //（proposal 先入队，block 后入队；同一 hash 来源由 `build_proposal` 保证）。
+            // 失败（encode 失败）⇒ `?` 返回 ⇒ **不进入** outbound（无半成品）；
+            // 入队仅本 tick（`build_proposal` 幂等守卫 + 每 step drain ⇒ 不重复广播）。
+            let block_wire =
+                nova_runtime::encode_block(&pb.block).map_err(RuntimeError::BlockCodec)?;
+            self.driver
+                .record_local_proposal(pb.proposal_ref.clone(), block_wire);
             self.last_proposal = Some(pb.clone());
         }
         // D10-A Step 3：本地 consensus 自动推进（每 step 幂等 —— 本地产出的 canonical
