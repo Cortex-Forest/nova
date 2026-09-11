@@ -305,6 +305,45 @@ impl TcpTransport {
         Ok(t)
     }
 
+    /// 包装**调用方已 accept** 的 `TcpStream`（server 侧 inbound listener seam）。
+    ///
+    /// 语义与 [`TcpTransport::accept`] **完全一致**（同一 `Self::new` 传输状态 —— 同一
+    /// `read_poll` / `write_timeout` / `max_frame` / idle / EOF 语义 + 同一 32B dialer NodeId
+    /// 首包读取）。唯一区别：`listener.accept()` 已由调用方完成（nonblocking listener 需要
+    /// 自行 `set_nonblocking(true)` + `accept()` 后再交入本函数）。
+    ///
+    /// - **不新增** framing / timeout / idle / EOF 语义；`frame_encode` / `frame_decode_buf` /
+    ///   `poll_read` / `send` / `try_recv` 全部复用（本函数只做「已连接 stream → 传输状态」）。
+    /// - `TcpTransport::accept` **未改动**（既有行为不变）。
+    /// - 前置：`stream` 来自 `listener.accept()`（TCP 已连接）。本函数把 stream 置为 **blocking**
+    ///   （与 `dial` / `accept` 的 `read_timeout` 语义一致），随后 `read_exact` 32B 首包；
+    ///   首包读取失败 ⇒ `Err(NetworkError::TransportIo)`（调用方负责 drop 该连接；不 panic）。
+    pub fn from_accepted(
+        stream: TcpStream,
+        local: NodeId,
+        max_frame: usize,
+        idle_timeout: Option<Duration>,
+    ) -> Result<Self, NetworkError> {
+        // 调用方可能把 listener 设为 nonblocking（accept() 继承 nonblocking 标志）——
+        // 传输层读语义依赖 blocking + read_timeout 轮询粒度 ⇒ 此处显式恢复 blocking。
+        let _ = stream.set_nonblocking(false);
+        let mut t = Self::new(
+            stream,
+            local,
+            NodeId::from_bytes([0; 32]),
+            max_frame,
+            Self::DEFAULT_READ_POLL,
+            Self::DEFAULT_WRITE_TIMEOUT,
+            idle_timeout,
+        );
+        let mut head = [0u8; Self::NODE_ID_HEADER_LEN];
+        t.stream
+            .read_exact(&mut head)
+            .map_err(|_| NetworkError::TransportIo)?;
+        t.remote = NodeId::from_bytes(head);
+        Ok(t)
+    }
+
     /// 主动关闭（shutdown + 标记 closed；幂等）。
     pub fn close(&mut self) {
         if !self.closed {

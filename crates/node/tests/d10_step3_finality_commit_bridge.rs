@@ -132,6 +132,7 @@ impl Env {
             safety_dir: self.safety_dir.clone(),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::Software,
             peers: Vec::new(),
+            listen_addr: None,
         }
     }
 }

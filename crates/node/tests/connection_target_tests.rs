@@ -32,6 +32,7 @@ fn config(peers: Vec<ConnectionTarget>) -> NodeConfig {
         safety_dir: PathBuf::from("dummy-safety"),
         key_provider_config: KeyProviderConfig::Software,
         peers,
+        listen_addr: None,
     }
 }
 

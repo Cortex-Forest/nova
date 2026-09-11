@@ -69,6 +69,14 @@ pub struct NodeConfig {
     /// 静态 configured connection targets（STEP 10-19-10-B7-A3；`[]` = 无网络 peer，合法）。
     /// 仅 initial connection targets（不 discovery / 不自动连接策略）。
     pub peers: Vec<ConnectionTarget>,
+    /// 入站 listener 绑定地址（D9 Step 7；node-local，非协议）。
+    ///
+    /// - `None`（默认）⇒ **不启用** listener：节点行为与 D9 Step 7 之前**完全一致**（无 bind /
+    ///   无 accept / 注入 transport 原样使用）。
+    /// - `Some(addr)` ⇒ 启用 node-only 入站 listener（nonblocking + 每 step 有界 accept）；
+    ///   仅在**网络已装配**（`start_with_network`）时生效 —— 无 `NetworkService` 时忽略。
+    /// - 绑定失败（地址占用 / 权限）⇒ 启动 fail-closed（`NodeRuntimeError::InboundListener`）。
+    pub listen_addr: Option<SocketAddr>,
 }
 
 /// configured connection target 校验错误（node-local config 域；dial **前**失败，fail-closed）。

@@ -125,6 +125,13 @@ pub mod key_provider;
 /// Network Identity seam（STEP 10-18I-A）：`NetworkIdentityProvider` / `NetworkSigner`
 /// （NodeId + envelope 签名）；网络身份与 validator 身份分离；生产网络 key DEFERRED。
 pub mod network_identity;
+
+/// Inbound Listener（D9 Step 7；node-only）：`TcpListener`（nonblocking + 每 step 有界 accept）
+/// → `TcpTransport::from_accepted`（复用 frozen transport 语义）→ 确定性 multiplex
+/// （`impl Transport`）→ 既有 `NetworkService`（握手 / 认证 / session 全归 service）。
+/// 无用例时不启用（`NodeConfig::listen_addr = None` ⇒ 现行为完全不变）。
+pub mod inbound;
+
 /// Validator Safety Store（STEP 10-15T；Restart Safety）：独立 fail-closed 的 validator-local
 /// durable journal（VoteIntent / VoteSigned / LockedState + identity header）。Option B —— 与
 /// canonical `PersistentBackend` state WAL 分离；不持久化私钥。
@@ -138,6 +145,7 @@ pub mod runtime;
 /// Consensus inbound/outbound wiring adapter（STEP 10-18G-1）：`NodeEvent → Driver` 的 node 层
 /// decode seam + outbound semantic egress（NetworkService/EventLoop 不解析 consensus）。
 pub mod wiring;
+
 pub use block_adapter::{ChainHead, NodeBlockAdapter, NodeBlockApplicationError};
 pub use bootstrap::{NodeConfig, NodeStartupError, start};
 

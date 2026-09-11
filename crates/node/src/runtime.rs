@@ -18,7 +18,8 @@
 //!   **目录分离**，绝不混用；SafetyStore recover 失败 = validator mode 启动失败（fail closed）。
 //! - full-node（`validator_enabled=false`）：跳过 key / safety / validator，不触碰 Provider。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use nova_consensus::dag::Dag;
@@ -47,6 +48,10 @@ use crate::block_dispatch::{
 use crate::block_inbound::{InboundBlockError, InboundBlockVerdict};
 use crate::bootstrap::{self, ConnectionTargetError, NodeConfig, NodeStartupError};
 use crate::driver::{DriverError, NodeConsensusDriver};
+use crate::inbound::{
+    InboundDiagnostics, InboundListenerError, InboundListenerState, InboundMultiplexTransport,
+    peer_key,
+};
 use crate::intent_ledger::{BlockInboundSource, MissingAncestorIntentLedger};
 use crate::key_provider::{KeyProvider, KeyProviderError};
 use crate::network_identity::{NetworkSigner, NetworkSigningError};
@@ -91,6 +96,13 @@ const SYNC_DEADLINE_HORIZON: u64 = 64;
 
 /// 网络 peer-auth 协议版本（与 `PeerAuthConfig.protocol_version` 一致；非 genesis 字段）。
 const NETWORK_PROTOCOL_VERSION: u8 = 1;
+
+/// D9 Step 7 — 入站连接握手 pending 超时（逻辑 step 数）。
+///
+/// 接受连接后若在 N 个 step 内既未 Established 也未失败 ⇒ 关闭连接 + `disconnect_peer`
+/// （防未认证连接长期占用槽位）。逻辑 step 计数 = `NodeRuntime::inbound_tick`（每网络 step +1；
+/// 无系统时钟依赖，确定性）。
+const INBOUND_PENDING_TIMEOUT_STEPS: u64 = 1000;
 
 /// Node-local proposer step（STEP 10-19-6 OPT-1）：本节点为当前 proposer 时经真实 BlockBuilder
 /// 产出 Block + ProposalRef → submit ProposalRef。
@@ -312,9 +324,98 @@ fn register_remote_canonical_block(
     Ok(())
 }
 
+/// D9 Step 7 — 入站 listener 前半段（accept → KEEP-FIRST 判定 → connect → 本端 Handshake Init）。
+///
+/// - accept 由 node-only multiplex 执行（nonblocking；每 step ≤ `MAX_ACCEPT_PER_STEP`；达连接
+///   上限立即关闭不注册）——**不在** `NetworkService` 内、**不改** frozen transport。
+/// - **KEEP-FIRST**：peer 已 `connected` 或已 `Established` ⇒ 丢弃新入站连接（不替换 / 不迁移
+///   session / 不断开既有）——与 frozen `dial_peer` 的 `AlreadyConnected` 拒绝语义一致。
+/// - `connect_peer` 只标记 **connected**（**≠ 认证**）：唯一目的满足 frozen `enqueue_outbound`
+///   的 connected 前置。**Established 仍然只能来自 frozen `process_handshake`**
+///   （本函数不新增任何认证 / session / replay 逻辑）。
+/// - 本端 Handshake Init 复用既有 `build_outbound_handshake`（同 network/chain/genesis/protocol /
+///   新 nonce / real envelope 签名 / `MessageType::Handshake` 豁免路径）；**每连接恰好一次**
+///   （不重发 ⇒ 不消耗 frozen per-peer handshake rate limit）。
+/// - 无 `Err` 传播：入站维护失败只计数（不中断共识 step；与既有 egress `let _ =` 一致）。
+fn inbound_accept_and_greet(
+    inbound: Option<&InboundListenerState>,
+    ns: &mut NetworkService<BoxTransport>,
+    signer: &dyn NetworkSigner,
+    pending: &mut BTreeMap<[u8; 32], u64>,
+    tick: u64,
+) {
+    let Some(inbound) = inbound else {
+        return;
+    };
+    for peer in inbound.accept_bounded() {
+        if ns.is_connected(peer) || ns.is_peer_established(peer) {
+            let _ = inbound.drop_peer(peer);
+            continue;
+        }
+        if ns.connect_peer(peer).is_err() {
+            let _ = inbound.drop_peer(peer);
+            continue;
+        }
+        if let Some(auth) = ns.config().peer_auth
+            && let Ok(env) = NodeRuntime::build_outbound_handshake(signer, &auth)
+            && ns.enqueue_outbound(peer, env).is_ok()
+        {
+            let _ = ns.flush_outbound();
+        }
+        pending.insert(peer_key(&peer), tick);
+    }
+}
+
+/// D9 Step 7 — 入站 listener 后半段（EOF 清理 + pending 状态机）；**poll 之后**调用。
+///
+/// 1. EOF / 读错误 / 写失败关闭 ⇒ 移除连接 + `disconnect_peer`（session / connected 同步清理
+///    ⇒ 无 stale connected / established / transport）。
+/// 2. pending：`Established` ⇒ 完成（保留连接 —— 它就是 consensus 出站路由）；
+///    被 frozen `close_peer`（认证失败：`sessions.remove` + `peers.disconnect`）⇒ 回收连接 +
+///    移出 pending；超过 `INBOUND_PENDING_TIMEOUT_STEPS` ⇒ 回收连接 + `disconnect_peer`。
+/// - 无 `Err` 传播（入站维护不得中断共识 step）。
+fn inbound_reconcile(
+    inbound: Option<&InboundListenerState>,
+    ns: &mut NetworkService<BoxTransport>,
+    pending: &mut BTreeMap<[u8; 32], u64>,
+    tick: u64,
+) {
+    let Some(inbound) = inbound else {
+        return;
+    };
+    for peer in inbound.sweep_closed() {
+        let _ = ns.disconnect_peer(peer);
+        pending.remove(&peer_key(&peer));
+    }
+    let peers: Vec<NodeId> = pending.keys().map(|k| NodeId::from_bytes(*k)).collect();
+    for peer in peers {
+        let key = peer_key(&peer);
+        let Some(accepted_tick) = pending.get(&key).copied() else {
+            continue;
+        };
+        if ns.is_peer_established(peer) {
+            pending.remove(&key);
+            continue;
+        }
+        if !ns.is_connected(peer) {
+            // frozen 握手失败路径（`close_peer`）⇒ 回收入站连接（不残留 pending）。
+            let _ = inbound.drop_peer(peer);
+            pending.remove(&key);
+            continue;
+        }
+        if tick.saturating_sub(accepted_tick) > INBOUND_PENDING_TIMEOUT_STEPS {
+            let _ = inbound.drop_peer(peer);
+            let _ = ns.disconnect_peer(peer);
+            pending.remove(&key);
+        }
+    }
+}
+
 /// NodeRuntime 启动错误（node-local；typed；fail closed）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRuntimeError {
+    /// D9 Step 7：入站 listener 绑定失败（bind / nonblocking；fail-closed）。
+    InboundListener(InboundListenerError),
     /// genesis / storage / identity 校验失败（复用 bootstrap NodeStartupError）。
     Startup(NodeStartupError),
     /// validator mode 但未提供 KeyProvider（fail closed：不默认生成不稳定密钥）。
@@ -417,6 +518,9 @@ struct NetworkStack {
     ns: NetworkService<BoxTransport>,
     el: EventLoop<NodeConsensusHandler>,
     signer: Box<dyn NetworkSigner>,
+    /// D9 Step 7：入站 listener（`None` = 未启用：`NodeConfig::listen_addr = None`）。
+    /// 与注入 `ns` 的 `InboundMultiplexTransport` **共享同一状态**（单线程 `Rc<RefCell<..>>`）。
+    inbound: Option<InboundListenerState>,
 }
 
 impl NetworkStack {
@@ -506,6 +610,11 @@ pub struct NodeRuntime {
     sync_resolved_responses: u64,
     /// 收到但无对应 active request / 结构损坏而被拒的 SyncBlockResponse 数（Unknown；观测）。
     sync_unknown_responses: u64,
+    /// D9 Step 7：入站 listener 逻辑 step 计数（每网络 step +1；pending 超时基准；无系统时钟）。
+    inbound_tick: u64,
+    /// D9 Step 7：入站连接握手 pending（peer 字节键 → 接受时 tick；Established / 失败 / 超时后移除）。
+    /// 键用 `[u8; 32]`（`NodeId` 无 `Ord`）⇒ 确定性字典序与 inbound 连接表一致。
+    inbound_pending: BTreeMap<[u8; 32], u64>,
 }
 
 impl NodeRuntime {
@@ -634,20 +743,38 @@ impl NodeRuntime {
                 // D5：装配 peer-auth（network/chain/genesis/protocol/caps/rate/replay）——
                 //   使 inbound process_handshake 能执行认证（session owner = NetworkService）。
                 let auth = Self::network_peer_auth(&identity);
-                let ns = NetworkService::new(
-                    NetworkServiceConfig {
-                        peer_auth: Some(auth),
-                        ..Default::default()
-                    },
-                    self_id,
-                    BoxTransport::new(transport),
-                )
-                .with_dialer(Box::new(TcpDialer));
+                let ns_config = NetworkServiceConfig {
+                    peer_auth: Some(auth),
+                    ..Default::default()
+                };
+                // D9 Step 7：入站 listener（仅 `config.listen_addr = Some`）。`max_frame` 与出站
+                // dial **同源**（`NetworkServiceConfig::max_msg_bytes`）⇒ 双向 frame 上限一致；
+                // 绑定失败 ⇒ 启动 fail-closed（不静默降级为无 listener）。
+                let inbound = match config.listen_addr {
+                    Some(addr) => Some(
+                        InboundListenerState::bind(addr, self_id, ns_config.max_msg_bytes)
+                            .map_err(NodeRuntimeError::InboundListener)?,
+                    ),
+                    None => None,
+                };
+                // 注入 transport：无 listener ⇒ **原样注入**（D9 Step 7 之前行为完全不变）；
+                // 有 listener ⇒ 入站 multiplex（`fallback` = 原注入 transport ⇒ 既有注入 /
+                // 测试语义保留：非入站 peer 仍走原 transport）。
+                let injected: Box<dyn Transport> = match &inbound {
+                    Some(state) => {
+                        let mux: InboundMultiplexTransport = state.transport(Some(transport));
+                        Box::new(mux)
+                    }
+                    None => transport,
+                };
+                let ns = NetworkService::new(ns_config, self_id, BoxTransport::new(injected))
+                    .with_dialer(Box::new(TcpDialer));
                 let el = EventLoop::new(EventLoopConfig::default(), NodeConsensusHandler::new());
                 Some(NetworkStack {
                     ns,
                     el,
                     signer: network_identity,
+                    inbound,
                 })
             }
             None => None,
@@ -678,6 +805,8 @@ impl NodeRuntime {
             sync_tick: 0,
             sync_resolved_responses: 0,
             sync_unknown_responses: 0,
+            inbound_tick: 0,
+            inbound_pending: BTreeMap::new(),
         })
     }
 
@@ -861,6 +990,33 @@ impl NodeRuntime {
             .as_ref()
             .map(|s| s.ns.config().peer_auth.is_some())
             .unwrap_or(false)
+    }
+
+    /// D9 Step 7：入站 listener 实际绑定地址（`None` = 未启用 / 未装配网络）。
+    ///
+    /// `NodeConfig::listen_addr` 用 port 0（测试）时返回内核分配的真实端口。
+    pub fn network_listen_addr(&self) -> Option<SocketAddr> {
+        self.network_stack
+            .as_ref()
+            .and_then(|s| s.inbound.as_ref())
+            .and_then(|i| i.local_addr())
+    }
+
+    /// D9 Step 7：入站 listener 只读观测（`None` = 未启用）。
+    pub fn network_inbound_diagnostics(&self) -> Option<InboundDiagnostics> {
+        self.network_stack
+            .as_ref()
+            .and_then(|s| s.inbound.as_ref())
+            .map(|i| i.diagnostics())
+    }
+
+    /// D9 Step 7：当前并存入站连接数（未启用 ⇒ 0）。
+    pub fn network_inbound_connection_count(&self) -> usize {
+        self.network_stack
+            .as_ref()
+            .and_then(|s| s.inbound.as_ref())
+            .map(|i| i.connection_count())
+            .unwrap_or(0)
     }
 
     /// 建立 configured peer（STEP 10-19-10-B7-A1-D5；single-active）。
@@ -1326,10 +1482,35 @@ impl NodeRuntime {
             }
             return Ok(());
         };
+        // D9 Step 7 — 入站 listener 前半段（1. inbound accept/greet；bounded；nonblocking）。
+        // - `begin_step` 重置本 step 入站帧预算（≤ MAX_INBOUND_FRAMES_PER_POLL）。
+        // - accept ≤ MAX_ACCEPT_PER_STEP；KEEP-FIRST；connect_peer（connected ≠ authenticated）；
+        //   本端 Handshake Init（复用既有原语；每连接一次）。
+        // - 失败只计数（无 Err 传播）⇒ 不中断共识 step。
+        self.inbound_tick = self.inbound_tick.wrapping_add(1);
+        if let Some(inbound) = stack.inbound.as_ref() {
+            inbound.begin_step();
+        }
+        inbound_accept_and_greet(
+            stack.inbound.as_ref(),
+            &mut stack.ns,
+            stack.signer.as_ref(),
+            &mut self.inbound_pending,
+            self.inbound_tick,
+        );
         stack
             .el
             .poll_once(&mut stack.ns)
             .map_err(RuntimeError::EventLoop)?;
+        // D9 Step 7 — 入站 listener 后半段（EOF 清理 + pending 状态机；基于 poll 后最新状态）。
+        // 顺序：accept/greet（poll 前）→ poll → reconcile（poll 后）—— 保持既有 step 顺序不变，
+        // 只在最小位置插入入站生命周期。
+        inbound_reconcile(
+            stack.inbound.as_ref(),
+            &mut stack.ns,
+            &mut self.inbound_pending,
+            self.inbound_tick,
+        );
         let commands = stack.el.handler_mut().take_commands();
         for command in commands {
             process_command(&mut self.driver, command).map_err(RuntimeError::Driver)?;
@@ -1554,9 +1735,15 @@ impl NodeRuntime {
             sync_tick: _,
             sync_resolved_responses: _,
             sync_unknown_responses: _,
+            inbound_tick: _,
+            inbound_pending: _,
         } = self;
 
         if let Some(mut stack) = network_stack {
+            // D9 Step 7：关闭入站 listener + 全部入站连接（幂等；先于 NetworkService shutdown）。
+            if let Some(inbound) = stack.inbound.as_ref() {
+                inbound.shutdown();
+            }
             // EventLoop stop → NetworkService stop（独立 owner；EventLoop 不级联 NS）。
             stack.el.shutdown();
             stack.ns.shutdown();

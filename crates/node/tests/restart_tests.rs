@@ -154,6 +154,7 @@ impl TestNode {
             safety_dir: self.dir.join("safety"),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::default(),
             peers: Vec::new(),
+            listen_addr: None,
         }
     }
 }
