@@ -18,7 +18,7 @@
 //!   **目录分离**，绝不混用；SafetyStore recover 失败 = validator mode 启动失败（fail closed）。
 //! - full-node（`validator_enabled=false`）：跳过 key / safety / validator，不触碰 Provider。
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -112,6 +112,28 @@ const PENDING_EXTERNAL_QC_CAP: usize = 8;
 
 /// P1-A.7 — 每 step 最多尝试采纳的外部 QC 数（bounded work；其余留待下一 step）。
 const EXTERNAL_QC_ADOPT_MAX_PER_STEP: usize = 2;
+
+// ---------------------------------------------------------------------------
+// P1-A.8 — Configured peer lifecycle / reconnect backoff（node-local；零新依赖）
+// ---------------------------------------------------------------------------
+//
+// 目的：一个不可达（黑洞）configured peer **不得**每个 runtime round 都阻塞 `TcpTransport`
+// 的 `connect_timeout`（2s）—— 否则 step 速率从 ~1000/s 塔到 ~0.5/s，直接放大 P1-A.6 的
+// logical round-timeout 墙钟时长。
+//
+// 时钟：**逻辑 peer tick**（每次 `establish_configured_peers()` 入口 +1；无 Instant / 无墙钟 /
+// 无 RNG）—— 与 P1-A.6 的 consensus round timer **完全独立**（不互读写）。
+
+/// 退避基准（逻辑 tick）：首次失败 ⇒ `delay(1) = 2`。
+const BASE_BACKOFF_TICKS: u64 = 2;
+/// 退避上限（逻辑 tick）：`delay(n ≥ 12) = 4096`（冻结公式的 bounded 上界）。
+const MAX_BACKOFF_TICKS: u64 = 4096;
+/// 失败计数饱和上限（u32）：达 12 后**不再增长**（对应 delay 饱和于 4096）。
+const MAX_FAILURE_COUNT: u32 = 12;
+/// 移位上限：`BASE << shift ≤ 2 << 11 = 4096 = MAX`（防位移溢出 / 防无界增长）。
+const BACKOFF_SHIFT_CAP: u32 = MAX_FAILURE_COUNT - 1;
+/// 每轮（每次 `establish_configured_peers()`）最多允许的 dial 次数（bounded work）。
+const MAX_DIAL_ATTEMPTS_PER_CALL: usize = 1;
 
 /// 网络 peer-auth 协议版本（与 `PeerAuthConfig.protocol_version` 一致；非 genesis 字段）。
 const NETWORK_PROTOCOL_VERSION: u8 = 1;
@@ -979,6 +1001,17 @@ pub enum PeerStatus {
     Pending,
     /// 本 peer 建立失败（dial / Init / 签名 typed error；**不阻塞其它 peer**）。
     Failed(RuntimeError),
+    /// P1-A.8 — 该 peer 处于**重连退避**中（本轮**未 dial**；逻辑 tick 门控；不阻塞其它 peer）。
+    ///
+    /// `failure_count` = 连续失败次数（saturating ≤ 12）；`remaining_ticks` = 距离下次允许尝试的
+    /// 剩余逻辑 tick（`next_allowed_attempt_tick - peer_tick`，≥ 1）。首次 dial **不会**进入本状态
+    /// （无 state ⇒ 立即尝试）；dial **成功**后失败历史被清除。
+    Backoff {
+        /// 连续 dial/准备失败次数（saturating ≤ 12）。
+        failure_count: u32,
+        /// 距离下次允许 dial 的剩余逻辑 tick（≥ 1）。
+        remaining_ticks: u64,
+    },
     /// 网络未启用（无 NetworkStack）。
     Unavailable,
 }
@@ -988,6 +1021,48 @@ pub enum PeerStatus {
 pub struct PeerEstablishment {
     pub peer_id: NodeId,
     pub status: PeerStatus,
+}
+
+/// P1-A.8 — per-peer 重连退避状态（node-local；**纯整数逻辑 tick**，无墙钟）。
+///
+/// 仅当该 peer 出现**真正的失败**（dial / 准备错误；**不含** `AlreadyConnected` 幂等信号）时插入；
+/// dial 成功 ⇒ 移除（失败历史清零，下一失败序列从 0 起）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerLifecycleState {
+    /// 连续失败次数（saturating ≤ [`MAX_FAILURE_COUNT`]）。
+    pub failure_count: u32,
+    /// 下次允许 dial 的逻辑 tick（`peer_tick` 达此值才允许重试）。
+    pub next_allowed_attempt_tick: u64,
+}
+
+/// P1-A.8 — 退避延迟（逻辑 tick）。
+///
+/// 冻结公式：`delay(n) = min(BASE_BACKOFF_TICKS << min(n - 1, BACKOFF_SHIFT_CAP), MAX_BACKOFF_TICKS)`
+///
+/// ```text
+/// 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 4096, …
+/// ```
+/// `n == 0` ⇒ 0（无失败 ⇒ 无延迟）。使用 `checked_shl` + `min` + 入口饱和 ⇒ **无 panic /
+/// 无位移溢出 / 无无界增长**。
+fn backoff_delay_ticks(failure_count: u32) -> u64 {
+    if failure_count == 0 {
+        return 0;
+    }
+    let shift = failure_count.saturating_sub(1).min(BACKOFF_SHIFT_CAP);
+    BASE_BACKOFF_TICKS
+        .checked_shl(shift)
+        .unwrap_or(MAX_BACKOFF_TICKS)
+        .min(MAX_BACKOFF_TICKS)
+}
+
+/// P1-A.8 — 单 peer 在本轮 `establish_configured_peers()` 中的处理结果（内部）。
+enum PeerStep {
+    /// 已执行既有 `establish_prepare`（`Some` = 该 peer 本轮失败；`None` = 正常/幂等）。
+    Prepared(Option<RuntimeError>),
+    /// 本轮**未 dial**：失败后处于退避（或 dial 刚失败并进入退避）。
+    Backoff(PeerLifecycleState),
+    /// 本轮**未 dial**：dial 预算已用尽（非退避；后续轮再试）。
+    Deferred,
 }
 
 /// Runtime 关闭错误（Stage C `shutdown`；仅 Storage 可失败 ——
@@ -1148,6 +1223,16 @@ pub struct NodeRuntime {
     pending_external_qc: VecDeque<PendingExternalQc>,
     /// P1-A.7 — 最近一次**采纳**的外部 QC（供既有 durable fact 持久化同源取用；无则 `None`）。
     last_adopted_qc: Option<QuorumCertificate>,
+    /// P1-A.8 — peer lifecycle 逻辑 tick（每次 `establish_configured_peers()` 入口 saturating +1）。
+    /// **与 P1-A.6 consensus round timer 完全独立**（不互读写；无墙钟）。
+    peer_tick: u64,
+    /// P1-A.8 — per-peer 重连退避状态（key = `NodeId` 字节；基数 ≤ configured peers；
+    /// 每次调用 prune ⇒ **不随重试次数增长**）。
+    peer_lifecycle: BTreeMap<[u8; 32], PeerLifecycleState>,
+    /// P1-A.8 — dial 尝试总次数（saturating；只读观测）。
+    peer_dial_attempts_total: u64,
+    /// P1-A.8 — dial 失败总次数（saturating；只读观测）。
+    peer_dial_failures_total: u64,
 }
 
 impl NodeRuntime {
@@ -1374,6 +1459,10 @@ impl NodeRuntime {
             external_finality_rejected: 0,
             pending_external_qc: VecDeque::new(),
             last_adopted_qc: None,
+            peer_tick: 0,
+            peer_lifecycle: BTreeMap::new(),
+            peer_dial_attempts_total: 0,
+            peer_dial_failures_total: 0,
         })
     }
 
@@ -1679,6 +1768,31 @@ impl NodeRuntime {
         self.sync_respond.qc_serve_skipped
     }
 
+    /// P1-A.8：peer lifecycle 逻辑 tick（每次 `establish_configured_peers()` +1；只读）。
+    pub fn peer_tick(&self) -> u64 {
+        self.peer_tick
+    }
+
+    /// P1-A.8：当前 peer lifecycle 状态条目数（≤ configured peer 数；只读）。
+    pub fn peer_lifecycle_len(&self) -> usize {
+        self.peer_lifecycle.len()
+    }
+
+    /// P1-A.8：某 peer 的退避状态（`None` = 无失败历史；只读）。
+    pub fn peer_lifecycle(&self, peer_id: NodeId) -> Option<PeerLifecycleState> {
+        self.peer_lifecycle.get(peer_id.as_bytes()).copied()
+    }
+
+    /// P1-A.8：dial 尝试总次数（saturating；只读观测）。
+    pub fn peer_dial_attempts_total(&self) -> u64 {
+        self.peer_dial_attempts_total
+    }
+
+    /// P1-A.8：dial 失败总次数（saturating；只读观测）。
+    pub fn peer_dial_failures_total(&self) -> u64 {
+        self.peer_dial_failures_total
+    }
+
     /// 建立 configured peer（STEP 10-19-10-B7-A1-D5；single-active）。
     ///
     /// 只编排（**不实现握手协议** —— 信封签名 / session 验证全归 NetworkSigner 与
@@ -1843,6 +1957,11 @@ impl NodeRuntime {
     /// （无自动 reconnect / 无 retry / 无 timer）即可重建。
     pub fn establish_configured_peers(&mut self) -> Result<Vec<PeerEstablishment>, RuntimeError> {
         let targets: Vec<ConnectionTarget> = self.configured_targets.clone();
+        // ===== P1-A.8 — peer lifecycle（逻辑 tick；无墙钟 / 无 RNG）=====
+        // 1. 逻辑 tick 推进（每次调用 +1；与 P1-A.6 consensus tick 无关）。
+        self.peer_tick = self.peer_tick.saturating_add(1);
+        // 2. state 基数恒定以 configured peers 为界（配置不可变，但仍显式 prune）。
+        self.prune_peer_lifecycle(&targets);
         if self.network_stack.is_none() {
             return Ok(targets
                 .iter()
@@ -1852,12 +1971,76 @@ impl NodeRuntime {
                 })
                 .collect());
         }
-        // A. per-peer 准备（dial / Init）；错误隔离：单 peer 失败记入其 status，继续其它。
-        let mut prepare: Vec<Option<RuntimeError>> = Vec::with_capacity(targets.len());
+        // A. per-peer 准备（dial / Init）；错误隔离 + **per-peer 退避门控** + **每轮 dial 预算**。
+        //    顺序 = `configured_targets` 配置顺序（确定性；不随机选 peer）。
+        let mut prepare: Vec<PeerStep> = Vec::with_capacity(targets.len());
+        let mut dial_budget = MAX_DIAL_ATTEMPTS_PER_CALL;
         for t in &targets {
+            let key = *t.peer_id.as_bytes();
+            let established = self
+                .network_stack
+                .as_ref()
+                .map(|s| s.ns.is_peer_established(t.peer_id))
+                .unwrap_or(false);
+            let connected = self
+                .network_stack
+                .as_ref()
+                .map(|s| s.ns.is_connected(t.peer_id))
+                .unwrap_or(false);
+            // 已认证 / 已连接：**不 dial**（不在退避门控范围；由既有 prepare 内部跳过 dial）。
+            if established || connected {
+                match self.establish_prepare(t.peer_id, t.address) {
+                    Ok(()) => prepare.push(PeerStep::Prepared(None)),
+                    Err(e) => prepare.push(PeerStep::Prepared(Some(e))),
+                }
+                continue;
+            }
+            // 需要 dial：先过**退避门**（`peer_tick < next_allowed_attempt_tick` ⇒ NO DIAL）。
+            let state = self.peer_lifecycle.get(&key).copied();
+            if let Some(s) = state
+                && self.peer_tick < s.next_allowed_attempt_tick
+            {
+                prepare.push(PeerStep::Backoff(s));
+                continue;
+            }
+            // 再过**预算门**（每轮 ≤ MAX_DIAL_ATTEMPTS_PER_CALL；其余本轮不 dial）。
+            if dial_budget == 0 {
+                prepare.push(PeerStep::Deferred);
+                continue;
+            }
+            dial_budget -= 1;
+            self.peer_dial_attempts_total = self.peer_dial_attempts_total.saturating_add(1);
             match self.establish_prepare(t.peer_id, t.address) {
-                Ok(()) => prepare.push(None),
-                Err(e) => prepare.push(Some(e)),
+                Ok(()) => {
+                    // dial 成功 ⇒ **清除**该 peer 失败历史（下一失败序列从 0 起）。
+                    self.peer_lifecycle.remove(&key);
+                    prepare.push(PeerStep::Prepared(None));
+                }
+                Err(RuntimeError::NetworkDial(NetworkServiceError::AlreadyConnected)) => {
+                    // KEEP-FIRST 幂等信号：**不是**失败（不计失败 / 不进退避 / 不计数失败）。
+                    prepare.push(PeerStep::Prepared(None));
+                }
+                Err(e) => {
+                    let failures = state
+                        .map_or(0, |s| s.failure_count)
+                        .saturating_add(1)
+                        .min(MAX_FAILURE_COUNT);
+                    let delay = backoff_delay_ticks(failures);
+                    let next = PeerLifecycleState {
+                        failure_count: failures,
+                        next_allowed_attempt_tick: self.peer_tick.saturating_add(delay),
+                    };
+                    self.peer_dial_failures_total = self.peer_dial_failures_total.saturating_add(1);
+                    self.peer_lifecycle.insert(key, next);
+                    match e {
+                        // dial 失败 ⇒ 报 `Backoff`（含 failure_count 与剩余 tick；本轮确实**尝试过**）。
+                        RuntimeError::NetworkDial(NetworkServiceError::Dial(_)) => {
+                            prepare.push(PeerStep::Backoff(next));
+                        }
+                        // 其余准备错误（Init / 签名 / auth 装配）⇒ 同样计入退避，但保留错误详情。
+                        other => prepare.push(PeerStep::Prepared(Some(other))),
+                    }
+                }
             }
         }
         // B. 一次 bounded poll（推进全部连接的握手；无 while / 无 sleep / 无 async）。
@@ -1867,25 +2050,27 @@ impl NodeRuntime {
                 .poll_once(&mut stack.ns)
                 .map_err(RuntimeError::EventLoop)?;
         }
-        // C. 观察每 target 状态（Established / Pending / prepare 错误）。
+        // C. 观察每 target 状态（Established / Pending / Failed / Backoff）。
         let mut out = Vec::with_capacity(targets.len());
-        for (i, t) in targets.iter().enumerate() {
-            if let Some(e) = prepare[i].take() {
-                out.push(PeerEstablishment {
-                    peer_id: t.peer_id,
-                    status: PeerStatus::Failed(e),
-                });
-                continue;
-            }
-            let established = self
-                .network_stack
-                .as_ref()
-                .map(|s| s.ns.is_peer_established(t.peer_id))
-                .unwrap_or(false);
-            let status = if established {
-                PeerStatus::Established
-            } else {
-                PeerStatus::Pending
+        for (t, step) in targets.iter().zip(prepare) {
+            let status = match step {
+                PeerStep::Prepared(Some(e)) => PeerStatus::Failed(e),
+                PeerStep::Backoff(s) => PeerStatus::Backoff {
+                    failure_count: s.failure_count,
+                    remaining_ticks: s.next_allowed_attempt_tick.saturating_sub(self.peer_tick),
+                },
+                PeerStep::Deferred | PeerStep::Prepared(None) => {
+                    let established = self
+                        .network_stack
+                        .as_ref()
+                        .map(|s| s.ns.is_peer_established(t.peer_id))
+                        .unwrap_or(false);
+                    if established {
+                        PeerStatus::Established
+                    } else {
+                        PeerStatus::Pending
+                    }
+                }
             };
             out.push(PeerEstablishment {
                 peer_id: t.peer_id,
@@ -1893,6 +2078,16 @@ impl NodeRuntime {
             });
         }
         Ok(out)
+    }
+
+    /// P1-A.8 — `peer_lifecycle` 基数保证：只保留当前 configured peers 对应的条目
+    /// （确定性；防无界增长）。配置本不可变，但**不因此省略该保护**。
+    fn prune_peer_lifecycle(&mut self, targets: &[ConnectionTarget]) {
+        if self.peer_lifecycle.is_empty() {
+            return;
+        }
+        let keep: BTreeSet<[u8; 32]> = targets.iter().map(|t| *t.peer_id.as_bytes()).collect();
+        self.peer_lifecycle.retain(|k, _| keep.contains(k));
     }
 
     /// 单 target 的 dial / Init 准备（D7-Implementation-3；per-peer；不 poll）。
@@ -2517,6 +2712,10 @@ impl NodeRuntime {
             external_finality_rejected: _,
             pending_external_qc: _,
             last_adopted_qc: _,
+            peer_tick: _,
+            peer_lifecycle: _,
+            peer_dial_attempts_total: _,
+            peer_dial_failures_total: _,
         } = self;
 
         if let Some(mut stack) = network_stack {
@@ -2556,6 +2755,34 @@ pub fn derive_validator_id(public_key: &[u8; 32]) -> ValidatorId {
 mod tests {
     use super::*;
     use nova_crypto::identity::validator_id as crypto_validator_id;
+
+    // -----------------------------------------------------------------------
+    // P1-A.8 — peer reconnect backoff（冻结公式 + 溢出安全）
+    // -----------------------------------------------------------------------
+
+    /// T2（公式层）— 冻结延迟序列 `2,4,8,…,2048,4096,4096,…`；无溢出 / 无 panic / 有界。
+    #[test]
+    fn p1a8_backoff_delay_table_is_frozen_and_bounded() {
+        let expected = [
+            2u64, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 4096, 4096,
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            let n = (i as u32) + 1;
+            assert_eq!(backoff_delay_ticks(n), *want, "delay({n})");
+        }
+        assert_eq!(backoff_delay_ticks(0), 0, "无失败 ⇒ 无延迟");
+        // 饱和 / 溢出安全：极大 n 仍为 MAX（不 panic）。
+        assert_eq!(backoff_delay_ticks(MAX_FAILURE_COUNT), MAX_BACKOFF_TICKS);
+        assert_eq!(backoff_delay_ticks(u32::MAX), MAX_BACKOFF_TICKS);
+        // 严格非降 + 始终有界。
+        let mut prev = 0u64;
+        for n in 1..=64u32 {
+            let d = backoff_delay_ticks(n);
+            assert!(d >= prev, "delay 非降");
+            assert!(d <= MAX_BACKOFF_TICKS, "delay 有界");
+            prev = d;
+        }
+    }
     use nova_crypto::key::KeyPair;
 
     /// 单一来源一致性：derive_validator_id == consensus impl == crypto identity::validator_id。

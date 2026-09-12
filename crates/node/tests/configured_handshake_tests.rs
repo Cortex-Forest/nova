@@ -679,8 +679,15 @@ fn d7_3_first_peer_failure_does_not_block_second() {
     let res = drive_until_settled(&mut rt, 500);
     assert_eq!(res.len(), 2);
     assert!(
-        matches!(res[0].status, PeerStatus::Failed(_)),
-        "T5 peer A dial failure recorded, not blocking others: {res:?}"
+        matches!(
+            res[0].status,
+            PeerStatus::Failed(_)
+                | PeerStatus::Backoff {
+                    failure_count: 1..=12,
+                    ..
+                }
+        ),
+        "T5 peer A dial failure recorded（Failed 或 P1-A.8 Backoff）, not blocking others: {res:?}"
     );
     assert!(
         matches!(res[1].status, PeerStatus::Established),
@@ -718,7 +725,17 @@ fn d7_3_middle_peer_failure_does_not_block_later() {
     let res = drive_until_settled(&mut rt, 800);
     assert_eq!(res.len(), 3);
     assert!(matches!(res[0].status, PeerStatus::Established), "{res:?}");
-    assert!(matches!(res[1].status, PeerStatus::Failed(_)), "{res:?}");
+    assert!(
+        matches!(
+            res[1].status,
+            PeerStatus::Failed(_)
+                | PeerStatus::Backoff {
+                    failure_count: 1..=12,
+                    ..
+                }
+        ),
+        "T6 middle peer failure（Failed 或 P1-A.8 Backoff）不得阻塞后序 peer: {res:?}"
+    );
     assert!(matches!(res[2].status, PeerStatus::Established), "{res:?}");
     drop(rt);
     h1.join().unwrap();
@@ -862,16 +879,35 @@ fn d7_3_no_automatic_retry_on_dial_failure() {
             address: bad_addr(),
         }],
     );
-    // 单次 orchestration 调用（不循环）：dial 失败 ⇒ Failed（不 hang / 不内部 retry）。
+    // 单次 orchestration 调用（不循环）：dial 失败 ⇒ 记录失败（P1-A.8：失败即进入退避；
+    // 不 hang / 无内部自动 retry）。
     let res = rt.establish_configured_peers().expect("调用返回");
     assert_eq!(res.len(), 1);
     assert!(
-        matches!(res[0].status, PeerStatus::Failed(_)),
-        "T10 dial failure ⇒ Failed once（无自动 retry）: {res:?}"
+        matches!(
+            res[0].status,
+            PeerStatus::Failed(_)
+                | PeerStatus::Backoff {
+                    failure_count: 1,
+                    ..
+                }
+        ),
+        "T10 dial failure ⇒ 单次尝试后记录失败（无自动 retry）: {res:?}"
     );
-    // 显式再次调用仍 Failed（不自动转成功 / 不自动换 peer）。
+    assert_eq!(rt.peer_dial_attempts_total(), 1, "单次调用恰好 1 次 dial");
+    // 显式再次调用仍不重 dial（P1-A.8 退避内：不自动转成功 / 不自动换 peer / 不重复 2s 阻塞）。
     let res2 = rt.establish_configured_peers().expect("调用返回");
-    assert!(matches!(res2[0].status, PeerStatus::Failed(_)));
+    assert!(
+        matches!(
+            res2[0].status,
+            PeerStatus::Backoff {
+                failure_count: 1,
+                ..
+            }
+        ),
+        "T10 退避内不重 dial（无自动 retry）: {res2:?}"
+    );
+    assert_eq!(rt.peer_dial_attempts_total(), 1, "退避内 dial 次数不得增长");
 }
 
 // T11 — handshake idempotency per peer：A/B Established 后重复 orchestration ⇒
