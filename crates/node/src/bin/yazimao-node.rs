@@ -1,17 +1,20 @@
-//! YAZIMAO Node — production executable skeleton（**P1-A.1**）。
+//! YAZIMAO Node — production executable skeleton（**P1-A.2**）。
 //!
-//! # 本轮边界（P1-A.1 = CLI + genesis pre-flight + NodeConfig 组装）
+//! # 本轮边界（P1-A.2 = seed 装载 + 身份 + 基座 transport + runtime 装配验证）
 //! ```text
 //! process start
 //!   → main()
 //!   → 最小 CLI 解析（std::env::args；零新依赖；严格 fail-closed）
 //!   → genesis pre-flight（read → decode → compute hash → 比对锚 → validate → ValidatorSet）
-//!   → NodeConfig 组装（**不新增 / 不修改任何 NodeConfig 字段**）
-//!   → STOP（runtime 装配 / 事件循环未实现 ⇒ P1-A.2 / P1-A.3）
+//!   → seed 装载（严格 hex64；只读；不回显；hex 读缓冲与临时 seed buffer 均经正式 `zeroize` 清零）
+//!   → 身份装配（network identity；validator 模式：身份分离 + 成员预检 + KeyProvider）
+//!   → 基座 transport（IdleTransport）+ NodeRuntime 装配（既有 `start_with_network`）
+//!   → 装配断言（NodeId / peer-auth / listener / 入站连接数）→ 既有 `shutdown`
+//!   → STOP（事件循环 / 拨号 / 信号属 P1-A.3）
 //! ```
 //!
-//! **本 build 明确不是可运行节点**：不启动 `NodeRuntime`、不绑定 TCP、不读取 seed / 私钥、
-//! 不连接 peer、不进入事件循环、不处理信号、不写日志。成功路径只做“配置门校验 + 组装”。
+//! **本 build 仍不是可长期运行的节点**：装配并验证后即有序释放退出（无事件循环、无拨号、
+//! 无信号处理、无日志/遥测）。
 //!
 //! # 诚实声明（help 文案同步）
 //! - `bootstrap / devnet / testnet oriented`；**NOT MAINNET READY**。
@@ -29,23 +32,34 @@
 //! - 只读使用既有公开 API：`nova_crypto::{identity,address}` / `nova_consensus::validator` /
 //!   `nova_network::{node_id,transport}` / `nova_node::{bootstrap,key_provider}`。
 //! - **未修改**：`crates/{consensus,core,crypto,storage,network}`、D8 frozen node 文件、
-//!   `Cargo.toml` / `Cargo.lock`、`docs/**`、`README.md`、任何既有 node 模块。
-//! - **未新增任何依赖**（不引入 CLI 解析库 / 信号处理库 / 日志框架）。
+//!   `docs/**`、`README.md`、任何既有 node 模块。
+//! - **依赖变化仅 1 项（P1-A.2b，Owner 批准 Option B）**：`crates/node/Cargo.toml` 增
+//!   `zeroize.workspace = true`；`Cargo.lock` 预期且唯一变化 = `nova-node` 依赖列表 +1 行
+//!   `+ "zeroize",`（`zeroize 1.9.0` 已由 `nova-crypto` 引入并已在 lockfile，无版本 / feature 漂移）。
+//!   用途仅限 secret 内存清零；**不引入** CLI 解析库 / 信号处理库 / 日志框架。
 
+use std::cell::RefCell;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use nova_consensus::validator::ValidatorSet;
+use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_crypto::address::NetworkId;
+use nova_crypto::domain::SigningMessageHash;
 use nova_crypto::identity::{
     ChainIdentity, compute_genesis_hash, decode_genesis_bytes, validate_genesis_with_expected,
 };
+use nova_crypto::signature::{Signature, SigningKey, VerifyingKey, sign_message_hash};
+use nova_network::message::{MessageEnvelope, NetworkError, sign_message};
 use nova_network::node_id::NodeId;
-use nova_network::transport::ConnectionTarget;
+use nova_network::transport::{ConnectionTarget, Transport};
 use nova_node::bootstrap::NodeConfig;
-use nova_node::key_provider::KeyProviderConfig;
+use nova_node::key_provider::{KeyProvider, KeyProviderConfig, KeyProviderError};
+use nova_node::network_identity::{NetworkSigner, NetworkSigningError};
+use nova_node::runtime::{NodeRuntime, NodeRuntimeError};
+use nova_node::signer::{SigningCapability, SigningError};
+use zeroize::{Zeroize, Zeroizing};
 
 /// 程序名（help / version 输出）。
 const PROGRAM: &str = "yazimao-node";
@@ -63,10 +77,11 @@ bootstrap/devnet/testnet oriented executable skeleton
 
 NOT MAINNET READY
 
-P1-A.1 scope: CLI parsing + genesis pre-flight validation + NodeConfig assembly ONLY.
-Runtime assembly, TCP listener/dialer wiring, validator/network key loading and the
-bounded event loop are NOT implemented in this build (deferred to P1-A.2 / P1-A.3).
-This build validates configuration and exits; it does not run a node.
+P1-A.2 scope: CLI parsing + genesis pre-flight validation + NodeConfig assembly +
+seed-based network/validator identities + runtime assembly verification.
+The bounded event loop, peer dialing, signal handling and graceful shutdown policy
+are NOT implemented in this build (deferred to P1-A.3): this build assembles the
+runtime, verifies it, shuts it down and exits; it does not keep running as a node.
 
 Networking model (current architecture):
   configured peers only
@@ -155,13 +170,57 @@ enum PreflightError {
     EmptyValidatorSet,
 }
 
-/// 入口层错误（CLI / pre-flight / 输出写失败）。
+/// seed 文件错误（binary-local；fail-closed；**绝不携带 seed 内容**）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeedError {
+    /// 文件不可读（不存在 / 权限）。
+    Read,
+    /// 文件内容非 UTF-8。
+    NotUtf8,
+    /// 文件以 UTF-8 BOM 开头（禁止）。
+    Bom,
+    /// 非 64 位十六进制（长度错误 / 非 hex / 多余非空白内容 / 空内容）。
+    Malformed,
+}
+
+/// 身份装配错误（binary-local；fail-closed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityError {
+    /// 网络身份与验证者身份派生公钥相同（禁止同一 key 兼任两种身份）。
+    NetworkAndValidatorIdentityMustDiffer,
+    /// validator 身份不在 genesis ValidatorSet 中。
+    ValidatorNotInValidatorSet,
+    /// runtime 未装配网络层（逻辑错误；应为 `Some`）。
+    NetworkStackMissing,
+    /// runtime 报告的 NodeId ≠ 由 network seed 派生的 NodeId。
+    NetworkNodeIdMismatch,
+    /// peer-auth 未启用（应为 `true`）。
+    PeerAuthDisabled,
+    /// `--listen` 指定但 runtime 未报告真实监听地址。
+    ListenNotBound,
+    /// 未指定 `--listen` 但 runtime 报告了监听地址。
+    UnexpectedListener,
+    /// 未拨号 / 未 accept 前出现入站连接（应为 0）。
+    UnexpectedInboundConnections,
+}
+
+/// 入口层错误（CLI / pre-flight / seed / 身份 / runtime 装配 / 输出）。
+///
+/// 注：`Shutdown` 不携带 `ShutdownError` 细节（该类型未实现 `PartialEq`）；仅以非零退出码揭示失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StartupError {
     /// CLI 解析 / 交叉校验失败。
     Cli(CliError),
     /// genesis pre-flight 失败。
     Preflight(PreflightError),
+    /// seed 文件读取 / 解析失败。
+    Seed(SeedError),
+    /// 身份装配 / 运行时断言失败。
+    Identity(IdentityError),
+    /// `NodeRuntime` 装配失败（既有 typed 错误透传）。
+    Runtime(NodeRuntimeError),
+    /// 既有 `NodeRuntime::shutdown` 失败（D-A2-1 ② 资源释放）。
+    Shutdown,
     /// CLI 契约输出写失败（stdout）。
     OutputWrite,
 }
@@ -446,7 +505,7 @@ fn parse_args(args: &[String]) -> Result<Cli, CliError> {
 /// 启动前 genesis 校验：read → decode → hash → 锚比对 → 全量校验 → chain/network → ValidatorSet。
 ///
 /// `--genesis-hash` 是**外部信任锚**：绝不从文件推导、绝不自动生成。
-fn preflight(cli: &Cli) -> Result<ChainIdentity, PreflightError> {
+fn preflight(cli: &Cli) -> Result<(ChainIdentity, ValidatorSet), PreflightError> {
     let bytes = std::fs::read(&cli.genesis).map_err(|_| PreflightError::GenesisRead)?;
     let genesis = decode_genesis_bytes(&bytes).map_err(|_| PreflightError::GenesisDecode)?;
     let computed =
@@ -473,7 +532,7 @@ fn preflight(cli: &Cli) -> Result<ChainIdentity, PreflightError> {
     if set.is_empty() {
         return Err(PreflightError::EmptyValidatorSet);
     }
-    Ok(identity)
+    Ok((identity, set))
 }
 
 // ---------------------------------------------------------------------------
@@ -502,14 +561,206 @@ fn build_node_config(cli: &Cli) -> NodeConfig {
     }
 }
 
-/// **P1-A.1 终点**：runtime 装配与事件循环 **未实现**（P1-A.2 / P1-A.3）。
+// ---------------------------------------------------------------------------
+// P1-A.2：seed 装载 / 身份 / 基座 transport / NodeRuntime 装配（**不含事件循环**）
+// ---------------------------------------------------------------------------
+
+/// 读取 seed 文件：严格 64 位十六进制（允许尾部空白；禁止 BOM / 空 / 非 hex / 多余内容）。
 ///
-/// 此处是后续阶段的唯一注入点：P1-A.2 完成“身份装载 + 网络装配”，P1-A.3 完成
-/// “有界事件循环 + 信号优雅停机”。对应 API 属后续阶段（**本文件刻意不引用**，以免被误认为已接线）。
+/// 只读；**不**自动生成 / 不写回 / 不回显（错误类型不携带任何 seed 内容）。
+/// hex 读缓冲为 `zeroize::Zeroizing<Vec<u8>>` ⇒ **全部**返回路径（含所有 early return /
+/// BOM / 非 UTF-8 / 长度 / 非 hex 错误）都在 Drop 时正式清零（volatile 语义）。
+fn read_seed_file(path: &Path) -> Result<[u8; 32], SeedError> {
+    let bytes = Zeroizing::new(std::fs::read(path).map_err(|_| SeedError::Read)?);
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return Err(SeedError::Bom);
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| SeedError::NotUtf8)?;
+    parse_hex32(text.trim_end()).ok_or(SeedError::Malformed)
+}
+
+/// 32B → 小写 hex（仅用于**非敏感**输出，如 NodeId）。
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 网络身份（binary-local）：仅持有 network seed 派生的 `SigningKey`。
 ///
-/// 本函数**刻意为空**：不启动 runtime、不开 socket、不读 seed、不落盘。
-fn deferred_runtime_assembly(_config: &NodeConfig, _identity: &ChainIdentity, _idle_ms: u64) {
-    // 见上：P1-A.1 到此为止（不伪装为可运行节点）。
+/// `node_id()` = `NodeId::from_verifying_key(...)`（与生产同源）；`sign_envelope` 直接调用
+/// `nova_network::message::sign_message`（**不重新实现**信封签名算法）。
+struct SeedNetworkIdentity {
+    signing: SigningKey,
+}
+
+impl NetworkSigner for SeedNetworkIdentity {
+    fn node_id(&self) -> NodeId {
+        NodeId::from_verifying_key(&self.signing.verifying_key())
+    }
+
+    fn sign_envelope(&self, envelope: &mut MessageEnvelope) -> Result<(), NetworkSigningError> {
+        sign_message(&self.signing, envelope).map_err(NetworkSigningError::Sign)
+    }
+}
+
+/// validator 签名器（binary-local）：语义与 `SoftwareSigner` **逐字节同源**
+///（同一 `sign_message_hash` 原语；不复制签名算法 / 不暴露私钥）。
+struct SeedSigner {
+    signing: SigningKey,
+}
+
+impl SigningCapability for SeedSigner {
+    fn public_key(&self) -> VerifyingKey {
+        self.signing.verifying_key()
+    }
+
+    fn sign(&self, message_hash: &SigningMessageHash) -> Result<Signature, SigningError> {
+        Ok(sign_message_hash(&self.signing, message_hash))
+    }
+}
+
+/// validator KeyProvider（binary-local）：take-once（与 `SoftwareKeyProvider` 同语义；
+/// 第二次 `load_signer` ⇒ `AlreadyProvisioned`）。
+struct SeedKeyProvider {
+    signing: RefCell<Option<SigningKey>>,
+}
+
+impl SeedKeyProvider {
+    fn from_signing_key(signing: SigningKey) -> Self {
+        Self {
+            signing: RefCell::new(Some(signing)),
+        }
+    }
+}
+
+impl KeyProvider for SeedKeyProvider {
+    fn load_signer(&self) -> Result<Box<dyn SigningCapability>, KeyProviderError> {
+        let signing = self
+            .signing
+            .borrow_mut()
+            .take()
+            .ok_or(KeyProviderError::AlreadyProvisioned)?;
+        Ok(Box::new(SeedSigner { signing }))
+    }
+}
+
+/// production 基座 transport（binary-local）：**诚实失败**的空实现。
+///
+/// 真实流量路径：(a) 入站 TCP 由 runtime 的 `InboundListenerState` + multiplex 承载；
+/// (b) configured peer 出站由 `NetworkService` 的 `TcpDialer` 连接承载。
+/// 本基座仅满足注入参数；**不静默成功**（`TransportIo`）——**不使用**测试语义的 `MemoryTransport`。
+struct IdleTransport;
+
+impl Transport for IdleTransport {
+    fn send(&mut self, _peer: &NodeId, _message: Vec<u8>) -> Result<(), NetworkError> {
+        Err(NetworkError::TransportIo)
+    }
+
+    fn try_recv(&mut self) -> Result<Option<(NodeId, Vec<u8>)>, NetworkError> {
+        Ok(None)
+    }
+
+    fn is_closed(&self) -> bool {
+        false
+    }
+}
+
+/// 装配结果（仅**非敏感**可观测值；用于 CLI 契约输出与测试断言）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeReport {
+    node_id: NodeId,
+    listen_addr: Option<SocketAddr>,
+    peer_auth_enabled: bool,
+    inbound_connections: usize,
+}
+
+/// **P1-A.2 主体**：seed 装载 → 身份 → 基座 transport → `NodeRuntime` 装配 → 断言 → shutdown。
+///
+/// 边界：**不**进入事件循环（P1-A.3）；**不**拨号（属 P1-A.3）；**不**修改 runtime / provider /
+/// identity 既有实现（全部经公开 trait 在 binary 内实现）。
+fn assemble_and_verify_runtime(
+    cli: &Cli,
+    set: &ValidatorSet,
+) -> Result<RuntimeReport, StartupError> {
+    // 1. 网络身份（必填 seed；只读；派生后立即清零临时 buffer）。
+    //    `Zeroizing` 同时覆盖所有 early return（`?`）路径 —— 不留栈残留。
+    let mut net_seed =
+        Zeroizing::new(read_seed_file(&cli.network_seed_file).map_err(StartupError::Seed)?);
+    let net_signing = SigningKey::from_seed(*net_seed);
+    net_seed.zeroize();
+    let net_vk_bytes = net_signing.verifying_key().to_bytes();
+    let network_identity = SeedNetworkIdentity {
+        signing: net_signing,
+    };
+    let expected_node_id = network_identity.node_id();
+
+    // 2. validator 身份（仅 validator 模式）：身份分离 + 成员预检 + KeyProvider。
+    let provider = if cli.validator {
+        let path = cli
+            .validator_seed_file
+            .as_ref()
+            .ok_or(StartupError::Cli(CliError::ValidatorRequiresSeedFile))?;
+        let mut val_seed = Zeroizing::new(read_seed_file(path).map_err(StartupError::Seed)?);
+        let val_signing = SigningKey::from_seed(*val_seed);
+        val_seed.zeroize();
+        let val_vk_bytes = val_signing.verifying_key().to_bytes();
+        if val_vk_bytes == net_vk_bytes {
+            return Err(StartupError::Identity(
+                IdentityError::NetworkAndValidatorIdentityMustDiffer,
+            ));
+        }
+        let validator_id = ValidatorId::from_consensus_public_key(&val_vk_bytes);
+        if !set.contains(&validator_id) {
+            return Err(StartupError::Identity(
+                IdentityError::ValidatorNotInValidatorSet,
+            ));
+        }
+        Some(SeedKeyProvider::from_signing_key(val_signing))
+    } else {
+        None
+    };
+
+    // 3. 既有 NodeConfig 组装（无新字段）+ 既有 `start_with_network`（**不改 runtime**）。
+    let config = build_node_config(cli);
+    let runtime = NodeRuntime::start_with_network(
+        &config,
+        provider.as_ref().map(|p| p as &dyn KeyProvider),
+        Box::new(IdleTransport),
+        Box::new(network_identity),
+    )
+    .map_err(StartupError::Runtime)?;
+
+    // 4. 装配断言（全部经公开只读访问器；未进入事件循环 ⇒ 无 `step()`）。
+    let node_id = runtime
+        .network_node_id()
+        .ok_or(StartupError::Identity(IdentityError::NetworkStackMissing))?;
+    if node_id != expected_node_id {
+        return Err(StartupError::Identity(IdentityError::NetworkNodeIdMismatch));
+    }
+    if !runtime.network_peer_auth_enabled() {
+        return Err(StartupError::Identity(IdentityError::PeerAuthDisabled));
+    }
+    let listen_addr = runtime.network_listen_addr();
+    match (cli.listen_addr, listen_addr) {
+        (Some(_), None) => return Err(StartupError::Identity(IdentityError::ListenNotBound)),
+        (None, Some(_)) => return Err(StartupError::Identity(IdentityError::UnexpectedListener)),
+        _ => {}
+    }
+    let inbound_connections = runtime.network_inbound_connection_count();
+    if inbound_connections != 0 {
+        return Err(StartupError::Identity(
+            IdentityError::UnexpectedInboundConnections,
+        ));
+    }
+    let report = RuntimeReport {
+        node_id,
+        listen_addr,
+        peer_auth_enabled: true,
+        inbound_connections,
+    };
+
+    // 5. D-A2-1 ②：装配验证结束后调用**既有** `shutdown`（仅资源释放；非新关机机制）。
+    runtime.shutdown().map_err(|_| StartupError::Shutdown)?;
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -534,19 +785,24 @@ fn main() -> Result<(), StartupError> {
             write_stdout(&line)
         }
         Action::Run(cli) => {
-            let identity = preflight(&cli).map_err(StartupError::Preflight)?;
-            let config = build_node_config(&cli);
-            deferred_runtime_assembly(&config, &identity, cli.idle_ms);
+            let (_identity, set) = preflight(&cli).map_err(StartupError::Preflight)?;
+            let report = assemble_and_verify_runtime(&cli, &set)?;
             write_stdout(&format!(
-                "{PROGRAM}: configuration validated (P1-A.1 skeleton; \
-                 runtime assembly deferred to P1-A.2)\n"
+                "{PROGRAM}: configuration validated + runtime assembled (P1-A.2); \
+                 node_id={} listen={:?} peer_auth={} inbound_connections={}; \
+                 runtime shut down; event loop deferred to P1-A.3\n",
+                hex32(report.node_id.as_bytes()),
+                report.listen_addr,
+                report.peer_auth_enabled,
+                report.inbound_connections,
             ))
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Tests（纯解析 / 组装；无 TCP / 无 NodeRuntime / 无文件系统）
+// Tests（解析 / pre-flight / 组装；**不主动拨号**；仅 T39 在 127.0.0.1:0 真实绑定监听，
+//        无任何入站连接；T24–T39 的 fixture 写入系统临时目录并在 Drop 时清理）
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -967,7 +1223,7 @@ mod tests {
         assert_eq!(config.listen_addr, Some("0.0.0.0:7000".parse().unwrap()));
     }
 
-    // T23 — genesis pre-flight 错误面（文件 / 解码；不依赖 fixture 内容）
+    // T23 — genesis pre-flight 错误面（文件；不依赖 fixture 内容）
     #[test]
     fn t23_preflight_missing_file_fails_closed() {
         let cli = parse(&valid_base()).expect("parse ok");
@@ -976,6 +1232,399 @@ mod tests {
             genesis: missing,
             ..cli
         };
-        assert_eq!(preflight(&cli), Err(PreflightError::GenesisRead));
+        assert!(matches!(preflight(&cli), Err(PreflightError::GenesisRead)));
+    }
+
+    // -----------------------------------------------------------------------
+    // P1-A.2 tests（T24–T39）：seed / 身份 / transport / 装配（无事件循环、无拨号、无 sleep）
+    // -----------------------------------------------------------------------
+
+    use nova_crypto::address::{
+        ADDRESS_VERSION, AddressType, YazimaoAddress, YazimaoAddressPayload,
+    };
+    use nova_crypto::identity::{
+        AccountInit, EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit,
+        canonical_genesis_bytes, validator_id,
+    };
+
+    /// 确定性测试 seed（仅测试用；不写入仓库 / 不外显）。
+    const TEST_SEED_NET: [u8; 32] = [0x11; 32];
+    const TEST_SEED_VAL: [u8; 32] = [0x22; 32];
+    /// 与 genesis 不匹配的第三个 seed（T30 用）。
+    const TEST_SEED_OTHER: [u8; 32] = [0x33; 32];
+
+    fn addr(kh: [u8; 32]) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
+            address_version: ADDRESS_VERSION,
+            address_type: AddressType::UserAccount,
+            network_id: NetworkId::Devnet,
+            key_hash: kh,
+        })
+    }
+
+    /// 最小合法 genesis（单验证者；canonical 约束：validator 升序 / 账户升序 /
+    /// total_supply == Σ liquid）。
+    fn test_genesis(validator_pk: [u8; 32]) -> GenesisV1 {
+        let acc_v = AccountInit {
+            address: addr([0x11; 32]),
+            liquid_balance: 1_000_000,
+        };
+        let acc_a = AccountInit {
+            address: addr([0x22; 32]),
+            liquid_balance: 1_000_000,
+        };
+        let mut vals = vec![(validator_id(&validator_pk), validator_pk, acc_v.address)];
+        vals.sort_by_key(|v| v.0);
+        GenesisV1 {
+            network_id: NetworkId::Devnet,
+            chain_id: 1001,
+            genesis_timestamp: 1,
+            initial_validator_set: vals
+                .into_iter()
+                .map(|(_, pk, a)| ValidatorInit {
+                    account_address: a,
+                    consensus_public_key: pk,
+                    bonded_stake: 100,
+                    commission_bps: 0,
+                })
+                .collect(),
+            initial_accounts: vec![acc_v, acc_a],
+            protocol_parameters: ProtocolParamsV1 {
+                max_tx_bytes: 64 * 1024,
+                max_block_bytes: 8 * 1024 * 1024,
+                max_gas_per_block: 1_000_000,
+                max_contract_code_bytes: 1024,
+                max_contract_storage_bytes: 1024,
+                epoch_length_blocks: 1_000,
+                snapshot_interval_blocks: 10_000,
+            },
+            economics_parameters: EconomicsParamsV1 {
+                total_supply: 2_000_000,
+                min_validator_stake: 100,
+                unbonding_period_seconds: 1_000,
+                fee_burn_bps: 0,
+            },
+        }
+    }
+
+    fn vk_bytes(seed: [u8; 32]) -> [u8; 32] {
+        SigningKey::from_seed(seed).verifying_key().to_bytes()
+    }
+
+    /// 测试用临时目录（仅测试进程私有；Drop 时清理；不触碰仓库 / 用户文件）。
+    struct TempEnv {
+        dir: PathBuf,
+    }
+
+    impl TempEnv {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("yazimao_p1a2_{}_{}", std::process::id(), tag));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self { dir }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.join(name)
+        }
+
+        fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let p = self.path(name);
+            std::fs::write(&p, bytes).expect("write temp file");
+            p
+        }
+
+        fn write_seed(&self, name: &str, seed: [u8; 32]) -> PathBuf {
+            self.write(name, hex32(&seed).as_bytes())
+        }
+    }
+
+    impl Drop for TempEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 构造装配用合法 CLI（genesis/hash/storage/network seed 已就位）。
+    fn assembly_cli(env: &TempEnv, genesis_hash: [u8; 32], extra: &[String]) -> Cli {
+        let mut items = vec![
+            "--genesis".to_string(),
+            env.path("genesis.bin").to_string_lossy().to_string(),
+            "--genesis-hash".to_string(),
+            hex32(&genesis_hash),
+            "--chain-id".to_string(),
+            "1001".to_string(),
+            "--network-id".to_string(),
+            "devnet".to_string(),
+            "--storage-dir".to_string(),
+            env.path("chain").to_string_lossy().to_string(),
+            "--network-seed-file".to_string(),
+            env.path("net.seed").to_string_lossy().to_string(),
+        ];
+        items.extend_from_slice(extra);
+        parse_args(&items).expect("valid assembly CLI")
+    }
+
+    fn write_valid_genesis(env: &TempEnv, validator_pk: [u8; 32]) -> [u8; 32] {
+        let genesis = test_genesis(validator_pk);
+        let bytes = canonical_genesis_bytes(&genesis).expect("canonical genesis bytes");
+        env.write("genesis.bin", &bytes);
+        compute_genesis_hash(&genesis).expect("genesis hash")
+    }
+
+    // T24 — network seed 文件不存在 ⇒ fail-closed
+    #[test]
+    fn t24_network_seed_missing() {
+        let env = TempEnv::new("t24");
+        assert_eq!(read_seed_file(&env.path("nope.seed")), Err(SeedError::Read));
+    }
+
+    // T25 — network seed 长度错误 ⇒ fail-closed
+    #[test]
+    fn t25_network_seed_wrong_length() {
+        let env = TempEnv::new("t25");
+        let p = env.write("short.seed", b"abcd");
+        assert_eq!(read_seed_file(&p), Err(SeedError::Malformed));
+    }
+
+    // T26 — network seed 非 hex ⇒ fail-closed
+    #[test]
+    fn t26_network_seed_invalid_hex() {
+        let env = TempEnv::new("t26");
+        let mut bad = [b'z'; 64];
+        bad[0] = b'a';
+        let p = env.write("bad.seed", &bad);
+        assert_eq!(read_seed_file(&p), Err(SeedError::Malformed));
+    }
+
+    // T27 — network seed 带 BOM ⇒ fail-closed
+    #[test]
+    fn t27_network_seed_bom() {
+        let env = TempEnv::new("t27");
+        let mut content = vec![0xEF, 0xBB, 0xBF];
+        content.extend_from_slice(hex32(&TEST_SEED_NET).as_bytes());
+        let p = env.write("bom.seed", &content);
+        assert_eq!(read_seed_file(&p), Err(SeedError::Bom));
+    }
+
+    // T28 — validator seed 文件不存在（validator 模式）⇒ fail-closed
+    #[test]
+    fn t28_validator_seed_missing() {
+        let env = TempEnv::new("t28");
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let genesis = test_genesis(vk_bytes(TEST_SEED_VAL));
+        let set = ValidatorSet::from_genesis(&genesis);
+        let cli = assembly_cli(
+            &env,
+            [0u8; 32],
+            &[
+                "--validator".to_string(),
+                "--safety-dir".to_string(),
+                env.path("safety").to_string_lossy().to_string(),
+                "--validator-seed-file".to_string(),
+                env.path("missing-val.seed").to_string_lossy().to_string(),
+            ],
+        );
+        let err = assemble_and_verify_runtime(&cli, &set).expect_err("must fail-closed");
+        assert!(
+            matches!(err, StartupError::Seed(SeedError::Read)),
+            "{err:?}"
+        );
+    }
+
+    // T29 — validator seed 格式非法 ⇒ fail-closed
+    #[test]
+    fn t29_validator_seed_malformed() {
+        let env = TempEnv::new("t29");
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let val_path = env.write("val.seed", b"not-hex-not-64");
+        let genesis = test_genesis(vk_bytes(TEST_SEED_VAL));
+        let set = ValidatorSet::from_genesis(&genesis);
+        let cli = assembly_cli(
+            &env,
+            [0u8; 32],
+            &[
+                "--validator".to_string(),
+                "--safety-dir".to_string(),
+                env.path("safety").to_string_lossy().to_string(),
+                "--validator-seed-file".to_string(),
+                val_path.to_string_lossy().to_string(),
+            ],
+        );
+        let err = assemble_and_verify_runtime(&cli, &set).expect_err("must fail-closed");
+        assert!(
+            matches!(err, StartupError::Seed(SeedError::Malformed)),
+            "{err:?}"
+        );
+    }
+
+    // T30 — validator 身份不在 genesis ValidatorSet ⇒ fail-closed
+    #[test]
+    fn t30_validator_not_in_validator_set() {
+        let env = TempEnv::new("t30");
+        env.write_seed("net.seed", TEST_SEED_NET);
+        // genesis 登记的 validator = TEST_SEED_VAL；实际提供 TEST_SEED_OTHER
+        let val_path = env.write_seed("val.seed", TEST_SEED_OTHER);
+        let genesis = test_genesis(vk_bytes(TEST_SEED_VAL));
+        let set = ValidatorSet::from_genesis(&genesis);
+        let cli = assembly_cli(
+            &env,
+            [0u8; 32],
+            &[
+                "--validator".to_string(),
+                "--safety-dir".to_string(),
+                env.path("safety").to_string_lossy().to_string(),
+                "--validator-seed-file".to_string(),
+                val_path.to_string_lossy().to_string(),
+            ],
+        );
+        let err = assemble_and_verify_runtime(&cli, &set).expect_err("must fail-closed");
+        assert!(
+            matches!(
+                err,
+                StartupError::Identity(IdentityError::ValidatorNotInValidatorSet)
+            ),
+            "{err:?}"
+        );
+    }
+
+    // T31 — network seed == validator seed ⇒ fail-closed（身份分离）
+    #[test]
+    fn t31_network_and_validator_identity_must_differ() {
+        let env = TempEnv::new("t31");
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let val_path = env.write_seed("val.seed", TEST_SEED_NET);
+        let genesis = test_genesis(vk_bytes(TEST_SEED_NET));
+        let set = ValidatorSet::from_genesis(&genesis);
+        let cli = assembly_cli(
+            &env,
+            [0u8; 32],
+            &[
+                "--validator".to_string(),
+                "--safety-dir".to_string(),
+                env.path("safety").to_string_lossy().to_string(),
+                "--validator-seed-file".to_string(),
+                val_path.to_string_lossy().to_string(),
+            ],
+        );
+        let err = assemble_and_verify_runtime(&cli, &set).expect_err("must fail-closed");
+        assert!(
+            matches!(
+                err,
+                StartupError::Identity(IdentityError::NetworkAndValidatorIdentityMustDiffer)
+            ),
+            "{err:?}"
+        );
+    }
+
+    // T32/T33 — SeedKeyProvider：首次 load PASS；第二次 ⇒ AlreadyProvisioned
+    #[test]
+    fn t32_t33_seed_key_provider_take_once() {
+        let provider = SeedKeyProvider::from_signing_key(SigningKey::from_seed(TEST_SEED_VAL));
+        let signer = provider.load_signer().expect("first load ok");
+        assert_eq!(
+            signer.public_key().to_bytes(),
+            vk_bytes(TEST_SEED_VAL),
+            "provider 公钥 == seed 派生公钥"
+        );
+        assert_eq!(
+            provider.load_signer().err(),
+            Some(KeyProviderError::AlreadyProvisioned),
+            "第二次 load ⇒ AlreadyProvisioned"
+        );
+    }
+
+    // T34 — 同一 network seed ⇒ 稳定 NodeId；不同 seed ⇒ 不同 NodeId
+    #[test]
+    fn t34_network_node_id_deterministic() {
+        let a = SeedNetworkIdentity {
+            signing: SigningKey::from_seed(TEST_SEED_NET),
+        };
+        let b = SeedNetworkIdentity {
+            signing: SigningKey::from_seed(TEST_SEED_NET),
+        };
+        let c = SeedNetworkIdentity {
+            signing: SigningKey::from_seed(TEST_SEED_VAL),
+        };
+        assert_eq!(a.node_id(), b.node_id(), "同 seed ⇒ 同 NodeId");
+        assert_ne!(a.node_id(), c.node_id(), "不同 seed ⇒ 不同 NodeId");
+        assert_eq!(
+            a.node_id(),
+            NodeId::from_verifying_key(&SigningKey::from_seed(TEST_SEED_NET).verifying_key()),
+            "NodeId == from_verifying_key(seed 派生 VK)"
+        );
+    }
+
+    // T35/T36 — IdleTransport：send ⇒ TransportIo；try_recv ⇒ None；非 closed
+    #[test]
+    fn t35_t36_idle_transport_semantics() {
+        let mut t = IdleTransport;
+        assert_eq!(
+            t.send(&NodeId::from_bytes([0x99; 32]), vec![1, 2, 3]),
+            Err(NetworkError::TransportIo)
+        );
+        assert_eq!(t.try_recv(), Ok(None));
+        assert!(!t.is_closed());
+    }
+
+    // T37 — 合法 full-node 装配（真实 genesis/seed 临时文件；无拨号 / 无事件循环）
+    #[test]
+    fn t37_valid_full_node_assembly() {
+        let env = TempEnv::new("t37");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let cli = assembly_cli(&env, genesis_hash, &[]);
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let report = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+        assert_eq!(
+            report.node_id,
+            NodeId::from_verifying_key(&SigningKey::from_seed(TEST_SEED_NET).verifying_key())
+        );
+        assert!(report.peer_auth_enabled, "peer-auth 已启用");
+        assert_eq!(report.listen_addr, None, "未指定 --listen ⇒ 无 listener");
+        assert_eq!(report.inbound_connections, 0, "未拨号 ⇒ 无入站连接");
+    }
+
+    // T38 — 合法 validator 装配（成员命中；safety dir 自动创建）
+    #[test]
+    fn t38_valid_validator_assembly() {
+        let env = TempEnv::new("t38");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let val_path = env.write_seed("val.seed", TEST_SEED_VAL);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &[
+                "--validator".to_string(),
+                "--safety-dir".to_string(),
+                env.path("safety").to_string_lossy().to_string(),
+                "--validator-seed-file".to_string(),
+                val_path.to_string_lossy().to_string(),
+            ],
+        );
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let report = assemble_and_verify_runtime(&cli, &set).expect("validator assembly ok");
+        assert!(report.peer_auth_enabled);
+        assert_eq!(report.inbound_connections, 0);
+    }
+
+    // T39 — --listen ⇒ runtime 报告真实监听地址
+    #[test]
+    fn t39_listen_address_bound() {
+        let env = TempEnv::new("t39");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &["--listen".to_string(), "127.0.0.1:0".to_string()],
+        );
+        assert_eq!(cli.listen_addr, Some("127.0.0.1:0".parse().unwrap()));
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let report = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+        let bound = report.listen_addr.expect("runtime 必须报告真实监听地址");
+        assert_ne!(bound.port(), 0, "port 0 已解析为实际端口");
     }
 }

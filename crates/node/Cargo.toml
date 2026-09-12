@@ -30,3 +30,4 @@ nova-crypto = { path = "../crypto" }
 # storage 仅用于 Backend / StateStore 构造接口。禁止 node → execution。
 nova-runtime = { path = "../runtime" }
 nova-storage = { path = "../storage" }
+zeroize.workspace = true

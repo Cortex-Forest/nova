@@ -578,6 +578,7 @@ dependencies = [
  "nova-network",
  "nova-runtime",
  "nova-storage",
+ "zeroize",
 ]
 
 [[package]]
