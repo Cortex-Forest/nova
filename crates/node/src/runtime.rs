@@ -612,6 +612,12 @@ pub struct NodeRuntime {
     sync_resolved_responses: u64,
     /// 收到但无对应 active request / 结构损坏而被拒的 SyncBlockResponse 数（Unknown；观测）。
     sync_unknown_responses: u64,
+    /// P1-A.4：**入站（peer 提供）** consensus command 被 Driver 拒绝的计数（观测）。
+    ///
+    /// 只统计 `take_commands() → process_command(..)` 这条**网络来源**路径；本地路径
+    /// （`drive_local_consensus` / proposer / commit bridge / DAG 登记 / egress）仍 fail-closed。
+    /// 拒绝 = 该命令**零 canonical 变更**（driver verify-then-transition；无 lock / 无 outbound）。
+    inbound_consensus_rejected: u64,
     /// D9 Step 7：入站 listener 逻辑 step 计数（每网络 step +1；pending 超时基准；无系统时钟）。
     inbound_tick: u64,
     /// D9 Step 7：入站连接握手 pending（peer 字节键 → 接受时 tick；Established / 失败 / 超时后移除）。
@@ -809,6 +815,7 @@ impl NodeRuntime {
             sync_tick: 0,
             sync_resolved_responses: 0,
             sync_unknown_responses: 0,
+            inbound_consensus_rejected: 0,
             inbound_tick: 0,
             inbound_pending: BTreeMap::new(),
             sync_respond: SyncRespondDiagnostics::default(),
@@ -917,6 +924,13 @@ impl NodeRuntime {
     /// 收到但 Unknown / 结构损坏而被拒的 SyncBlockResponse 数（D8-3-1；安全拒绝观测）。
     pub fn sync_unknown_responses(&self) -> u64 {
         self.sync_unknown_responses
+    }
+
+    /// P1-A.4：被拒的**入站** consensus command 数（peer 提供内容；观测）。
+    ///
+    /// 仅计数（不携带 payload / 签名 / 错误文本）；本地路径错误不以本计数表达。
+    pub fn inbound_consensus_rejected(&self) -> u64 {
+        self.inbound_consensus_rejected
     }
 
     /// 当前 outbound sync correlator 中 active（未 resolve / 未 expire）request 数
@@ -1522,8 +1536,18 @@ impl NodeRuntime {
             self.inbound_tick,
         );
         let commands = stack.el.handler_mut().take_commands();
+        // P1-A.4：**入站（peer 提供）consensus command** 的 Driver 拒绝边界。
+        //
+        // 与本地路径（`drive_local_consensus` / proposer / commit bridge / DAG 登记 / egress）
+        // **故意不同**：本路径的输入完全由已认证 peer 提供，必须为「拒绝 + 计数 + 继续」而非致命
+        // 错误 —— 否则任何一个 peer 都能用一条非法 vote 或不可应用（target ∉ 本节点 DAG）的 QC
+        // 远程终止本节点。拒绝语义本身不变：driver 先验证后转移（verify-then-transition），失败
+        // ⇒ 零 canonical 变更 / 无 lock / 无 outbound；被拒命令仅被丢弃，不产生任何状态变更。
         for command in commands {
-            process_command(&mut self.driver, command).map_err(RuntimeError::Driver)?;
+            if process_command(&mut self.driver, command).is_err() {
+                // 不记录错误文本 / payload / 签名（避免运行期材料外泄）；至少一次计数、不 panic。
+                self.inbound_consensus_rejected = self.inbound_consensus_rejected.saturating_add(1);
+            }
         }
         // STEP 10-19-10-A：Node-level block inbound dispatch —— wiring 收集的 GossipBlock /
         // SyncBlockResponse payload → block_inbound validator（只读）→ typed verdict 观测。
@@ -1768,6 +1792,7 @@ impl NodeRuntime {
             sync_tick: _,
             sync_resolved_responses: _,
             sync_unknown_responses: _,
+            inbound_consensus_rejected: _,
             inbound_tick: _,
             inbound_pending: _,
             sync_respond: _,
