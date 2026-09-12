@@ -139,6 +139,12 @@ pub mod inbound;
 /// **不新增协议 / 不直接写 socket / 绝不产生 finality / commit / head 推进。**
 pub mod sync_responder;
 
+/// Per-height PrecommitQC history（P1-A.7；ADR-0064）：把本地已产出并经 `verify_qc` PASS 的
+/// PrecommitQC 按高度持久化（`storage_dir/qc_history/{height:020}.qcf`），供既有 sync 响应路径
+/// 附发（既有 `MessageType::ConsensusQc`；**零 wire 变更**）。
+/// **不产生 finality / 不 commit / 不推进 head**；retention 有界；同高度冲突 fail-closed。
+pub mod qc_history;
+
 /// Validator Safety Store（STEP 10-15T；Restart Safety）：独立 fail-closed 的 validator-local
 /// durable journal（VoteIntent / VoteSigned / LockedState + identity header）。Option B —— 与
 /// canonical `PersistentBackend` state WAL 分离；不持久化私钥。

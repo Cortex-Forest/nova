@@ -14,7 +14,10 @@
 
 use nova_consensus::dag::{BlockReference, Dag};
 use nova_consensus::error::ConsensusError;
-use nova_consensus::finality::{FinalityState, QuorumCertificate};
+use nova_consensus::finality::{
+    Applicability, FinalityError, FinalityState, InapplicableReason, QuorumCertificate, UpdateMode,
+    check_finality_applicability, update_finalized_reference,
+};
 use nova_consensus::integration::{
     ConsensusEvent, ConsensusState, IntegrationContext, TransitionResult, transition,
 };
@@ -25,6 +28,21 @@ use nova_crypto::signature::VerifyingKey;
 use nova_network::message::{
     MessageEnvelope, MessageType, NetworkError, validate_consensus_envelope,
 };
+
+/// P1-A.7（ADR-0064）— Verified External Finality Adoption 的结果（node-local；无新共识语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionOutcome {
+    /// `Applicable::Advance` ⇒ `finalized_reference` 已推进到 `qc.target`。
+    Adopted,
+    /// 同 target（幂等；零状态变更）。
+    Idempotent,
+    /// `qc.target` 是现有 finality 的 ancestor（过时；零状态变更）。
+    Stale,
+    /// 与现有 finality 无 ancestry 关系（**非错误**；零状态变更，绝不 rollback）。
+    Conflict,
+    /// frozen 强制拒绝（例如非 PrecommitQC）。
+    Rejected(FinalityError),
+}
 
 /// Vote wire payload 常量（11-1 §3）：`canonical_vote_payload(121B) ‖ signature(64B)`。
 const VOTE_PAYLOAD_LEN: usize = 121;
@@ -121,6 +139,55 @@ impl ConsensusNode {
     /// .finalized_reference`（即该 QC 正是推进 finality 的 PrecommitQC）。无 ⇒ `None`。
     pub fn last_precommit_qc(&self) -> Option<&QuorumCertificate> {
         self.last_precommit_qc.as_ref()
+    }
+
+    /// P1-A.7（ADR-0064）— **Verified External Finality Adoption** 的 node 层**薄 facade**。
+    ///
+    /// 只复用 **frozen public API**（与 frozen transition ⑥ 同源同序）：
+    /// `check_finality_applicability(qc, finalized, dag)` → `update_finalized_reference(..)`。
+    ///
+    /// # 前置契约（调用方保证；本方法**不**重复验证）
+    /// - `qc` 已经过既有 `verify_qc`（`target ∈ DAG` / validator_set_id / evidence 升序 / 无重复 /
+    ///   逐条签名 / quorum 全 PASS）；
+    /// - `qc.target` 对应块已在本地 DAG，且为 local canonical head 的**严格 child**
+    ///   （`parent_hash == head.block_hash` ∧ `height == head.height + 1`）；
+    /// - `qc.context.height + 1 == block.height` ∧ `qc.target == block_hash`。
+    ///
+    /// # 语义（**不新增共识规则**）
+    /// - `Advance` ⇒ `finalized_reference = qc.target`（并镜像既有 `last_precommit_qc` 捕获规则，
+    ///   使既有 durable-before-bridge fact 持久化路径可继续使用同一 QC）；
+    /// - `Idempotent` / `Stale` / `Conflict` ⇒ **零状态变更**（frozen `update_finalized_reference` 语义）；
+    /// - 非 PrecommitQC ⇒ `Rejected`（frozen 代码级强制）。
+    ///
+    /// **绝不**触碰 `ChainHead` / BlockStore / StateStore / WAL：head 推进只属既有
+    /// `finality_commit_bridge → apply_block`。
+    pub fn adopt_verified_external_finality(&mut self, qc: &QuorumCertificate) -> AdoptionOutcome {
+        let applicability = check_finality_applicability(
+            qc,
+            self.state.finality.finalized_reference.as_ref(),
+            &self.dag,
+        );
+        if let Err(e) = update_finalized_reference(&mut self.state.finality, qc, applicability) {
+            return AdoptionOutcome::Rejected(e);
+        }
+        match applicability {
+            Applicability::Applicable {
+                mode: UpdateMode::Advance,
+            } => {
+                // 与 frozen transition ⑥ 的节点侧捕获同规则：该 QC 正是推进 finality 的 QC。
+                self.last_precommit_qc = Some(qc.clone());
+                AdoptionOutcome::Adopted
+            }
+            Applicability::Applicable {
+                mode: UpdateMode::Idempotent,
+            } => AdoptionOutcome::Idempotent,
+            Applicability::Inapplicable {
+                reason: InapplicableReason::Stale,
+            } => AdoptionOutcome::Stale,
+            Applicability::Inapplicable {
+                reason: InapplicableReason::Conflict,
+            } => AdoptionOutcome::Conflict,
+        }
     }
 
     /// D10-C Step 4 — 恢复注入 `finalized_reference`（**仅启动恢复路径**；所有 QC / identity /
@@ -348,6 +415,7 @@ fn classify_vote_payload(payload: &[u8]) -> Result<(ValidatorVote, [u8; 64]), No
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nova_consensus::finality::QcContext;
     use nova_consensus::round::{ProposalRef, RoundStep, encode_proposal_ref};
     use nova_consensus::validator::ValidatorId;
     use nova_consensus::vote::{VoteType, canonical_vote_payload};
@@ -723,5 +791,78 @@ mod tests {
             }
         ));
         let _ = (set, genesis_hash);
+    }
+
+    /// T7（ADR-0064）— **Verified External Finality Adoption** 的 facade 语义：
+    /// 只 Advance 前进；`Idempotent` / `Stale` / `Conflict` / 非 Precommit **零状态变更**，
+    /// 且**绝不 rollback / 绝不覆盖**；不触碰 `round`（即不直接修改 head）。
+    #[test]
+    fn p1a7_adoption_is_monotonic_and_never_rolls_back() {
+        let (mut node, _kp, _set, gh) = setup();
+        let a = [0x11u8; 32];
+        let b = [0x22u8; 32];
+        let proposer = ValidatorId::from_bytes([0x33; 32]);
+        // DAG：genesis 根 + 两个同父兄弟 A / B（height 1）⇒ A 与 B **无 ancestry**（Conflict 语义）。
+        node.register_block(a, 1, gh, proposer).unwrap();
+        node.register_block(b, 1, gh, proposer).unwrap();
+        assert!(node.dag().contains(&a) && node.dag().contains(&b));
+
+        let qc = |height: u64, target: [u8; 32], vote_type: VoteType| QuorumCertificate {
+            context: QcContext {
+                chain_id: 1001,
+                height,
+                round: 0,
+                vote_type,
+            },
+            target,
+            validator_set_id: gh,
+            evidence: Vec::new(),
+        };
+
+        // Advance：finality 前进到 A。
+        assert_eq!(
+            node.adopt_verified_external_finality(&qc(0, a, VoteType::Precommit)),
+            AdoptionOutcome::Adopted
+        );
+        assert_eq!(node.state().finality.finalized_reference, Some(a));
+
+        // 幂等：同 target 重复采纳 ⇒ 无变化。
+        assert_eq!(
+            node.adopt_verified_external_finality(&qc(0, a, VoteType::Precommit)),
+            AdoptionOutcome::Idempotent
+        );
+        assert_eq!(node.state().finality.finalized_reference, Some(a));
+
+        // Conflict（无 ancestry）⇒ 拒绝且**绝不 rollback / 绝不 overwrite**。
+        assert_eq!(
+            node.adopt_verified_external_finality(&qc(0, b, VoteType::Precommit)),
+            AdoptionOutcome::Conflict
+        );
+        assert_eq!(
+            node.state().finality.finalized_reference,
+            Some(a),
+            "conflict 不得 rollback / 不得 overwrite"
+        );
+
+        // Stale（target 是当前 finality 的 ancestor）⇒ 拒绝且不回退。
+        assert_eq!(
+            node.adopt_verified_external_finality(&qc(0, gh, VoteType::Precommit)),
+            AdoptionOutcome::Stale
+        );
+        assert_eq!(node.state().finality.finalized_reference, Some(a));
+
+        // 非 PrecommitQC ⇒ frozen 代码级拒绝。
+        assert!(matches!(
+            node.adopt_verified_external_finality(&qc(0, b, VoteType::Prevote)),
+            AdoptionOutcome::Rejected(_)
+        ));
+        assert_eq!(node.state().finality.finalized_reference, Some(a));
+
+        // 不直接修改 head：round / height 不变。
+        assert_eq!(
+            node.state().round.height,
+            0,
+            "facade 不得直接修改 head/round"
+        );
     }
 }

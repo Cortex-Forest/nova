@@ -23,11 +23,12 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use nova_consensus::dag::Dag;
-use nova_consensus::finality::FinalityError;
+use nova_consensus::finality::{FinalityError, QuorumCertificate};
 use nova_consensus::integration::{ConsensusState, TransitionResult};
 use nova_consensus::proposer::select_proposer;
 use nova_consensus::round::{RoundStep, RoundTimeoutConfig};
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
+use nova_consensus::vote::VoteType;
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::signature::VerifyingKey;
 use nova_network::event_loop::{EventLoop, EventLoopConfig, EventLoopError};
@@ -43,7 +44,7 @@ use nova_network::transport::{BoxTransport, ConnectionTarget, TcpDialer, Transpo
 use nova_storage::error::StorageError;
 use nova_storage::persistent::PersistentBackend;
 
-use crate::assembly::ConsensusNode;
+use crate::assembly::{AdoptionOutcome, ConsensusNode};
 use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter, NodeBlockApplicationError};
 use crate::block_dispatch::{
     dispatch_gossip_block_with_validator_set_and_dag,
@@ -56,11 +57,14 @@ use crate::inbound::{
     InboundDiagnostics, InboundListenerError, InboundListenerState, InboundMultiplexTransport,
     peer_key,
 };
-use crate::intent_ledger::{BlockInboundSource, MissingAncestorIntentLedger};
+use crate::intent_ledger::{
+    BlockInboundSource, MissingAncestorIntent, MissingAncestorIntentLedger,
+};
 use crate::key_provider::{KeyProvider, KeyProviderError};
 use crate::network_identity::{NetworkSigner, NetworkSigningError};
 use crate::outbound::OutboundConsensusMessage;
 use crate::proposer::{ProposalBuild, ProposerError, build_proposal};
+use crate::qc_history::{QcHistory, QcHistoryError};
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
 use crate::sync_correlator::{LogicalTick, SyncRequestCorrelator};
@@ -98,6 +102,16 @@ const SYNC_DISPATCH_MAX_PER_STEP: usize = 8;
 /// register 用 deadline horizon（D8-3-1：expire release-only —— 悬挂 request 在该 step 数后
 /// 被 `expire_at` 释放；无 retry / 无 backoff；correlator capacity 即有界）。
 const SYNC_DEADLINE_HORIZON: u64 = 64;
+
+/// P1-A.7 — 入站 QC 的**有界** pending 缓冲上限（ADR-0064）。
+///
+/// 当入站 QC 的 `target` 当前不在本节点 DAG（既有 `UnknownTarget` = **不适用**）时，把该 QC
+/// 暂存至多 8 条（dedup key = `qc.target`；满 ⇒ FIFO 逐出最旧），等对应 block 落 DAG/
+/// BlockStore 后再做**采纳前置检查**。无无界增长 / 无 retry storm / 无阻塞等待。
+const PENDING_EXTERNAL_QC_CAP: usize = 8;
+
+/// P1-A.7 — 每 step 最多尝试采纳的外部 QC 数（bounded work；其余留待下一 step）。
+const EXTERNAL_QC_ADOPT_MAX_PER_STEP: usize = 2;
 
 /// 网络 peer-auth 协议版本（与 `PeerAuthConfig.protocol_version` 一致；非 genesis 字段）。
 const NETWORK_PROTOCOL_VERSION: u8 = 1;
@@ -407,6 +421,231 @@ fn drive_round_timeout(
         elapsed_ticks: 1,
         window_ticks: round_timeout_window_ticks(config, after.round),
     });
+}
+
+/// P1-A.7 — pending external QC 条目（ADR-0064）。
+///
+/// `verified` = 该 QC 是否已经过**既有 driver 门面**（`verify_qc` + 每 actor `acquire_lock`）。
+/// 只有 `verified == true` 的条目才允许进入采纳前置检查与 facade（**不绕过 `verify_qc`**）。
+pub(crate) struct PendingExternalQc {
+    qc: QuorumCertificate,
+    verified: bool,
+}
+
+/// P1-A.7 — **有界**入队（dedup by `qc.target`；满 ⇒ FIFO 逐出最旧）。
+///
+/// - 同 target 已在 pending：若新到达为 `verified == true` ⇒ 升级该条目（幂等不增长）。
+/// - 返回 `false` = 未新增条目（重复 / 升级）。
+fn defer_external_qc(
+    pending: &mut VecDeque<PendingExternalQc>,
+    qc: QuorumCertificate,
+    verified: bool,
+) -> bool {
+    if let Some(existing) = pending.iter_mut().find(|p| p.qc.target == qc.target) {
+        if verified {
+            existing.verified = true;
+            existing.qc = qc;
+        }
+        return false;
+    }
+    if pending.len() >= PENDING_EXTERNAL_QC_CAP {
+        // 满：FIFO 逐出最旧（确定性；无扫描 / 无排序）—— 保证新证据总有槽位。
+        let _ = pending.pop_front();
+    }
+    pending.push_back(PendingExternalQc { qc, verified });
+    true
+}
+
+/// P1-A.7 — **bounded** external finality adoption（每 step ≤ [`EXTERNAL_QC_ADOPT_MAX_PER_STEP`]）。
+///
+/// 前置检查（**全部**满足才调 `assembly` facade）：
+/// 0. **`verify_qc` 必经**：`verified == false` 的条目（入站时 `UnknownTarget`）在 target 进入
+///    本地 DAG 后，经**既有** driver 门面（`verify_qc` + `acquire_lock`）重新验证；
+///    仅 `Ok(())` 才继续（**不重实现任何 QC 验证**）；
+/// 1. `qc.target ∈ 本地 DAG`（未到达 ⇒ **保留 pending**，等 block 登记）；
+/// 2. `BlockStore::get(qc.target)` 命中（durable；未落盘 ⇒ **保留 pending**）；
+/// 3. `block.height == head.height + 1` ∧ `block.parent_hash == head.block_hash`（**严格
+///    canonical-next**；不跳高度 / 不回退）；
+/// 4. `qc.context.height + 1 == block.height`（与 ADR-0064 / frozen fact 同一严格关系）；
+/// 5. `qc.target == block_hash(block)`（由 `BlockStore::get` 的 strict decode + hash 重算保证）。
+///
+/// 任一失败 ⇒ **drop**（不保留）+ `rejected += 1`、**零 canonical 变更 / 无 head 修改 /
+/// 无 finality 修改 / 无 outbound**。
+/// 满足 ⇒ [`ConsensusNode::adopt_verified_external_finality`]；仅 `Adopted` 计 adopted 并记录 QC
+/// （供既有 durable fact 路径使用）；`Idempotent`/`Stale`/`Conflict`/`Rejected` 计 rejected 并 drop。
+fn adopt_pending_external_finality(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    adapter: &NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>,
+    pending: &mut VecDeque<PendingExternalQc>,
+    adopted: &mut u64,
+    rejected: &mut u64,
+    last_adopted: &mut Option<QuorumCertificate>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let head = adapter.head();
+    let mut kept: VecDeque<PendingExternalQc> = VecDeque::with_capacity(pending.len());
+    let mut attempts = 0usize;
+    while let Some(mut entry) = pending.pop_front() {
+        if attempts >= EXTERNAL_QC_ADOPT_MAX_PER_STEP {
+            kept.push_back(entry);
+            continue;
+        }
+        // 1. target ∉ DAG ⇒ 证据尚不可验证（等 block）；**保留**（bounded）。
+        if !driver.consensus().dag().contains(&entry.qc.target) {
+            kept.push_back(entry);
+            continue;
+        }
+        attempts += 1;
+        // 0. 未验证条目：经既有 driver 门面验证（`verify_qc` + `acquire_lock`；不绕过）。
+        if !entry.verified {
+            match driver.submit_inbound_qc(entry.qc.clone()) {
+                Ok(()) => entry.verified = true,
+                Err(DriverError::QcVerification(FinalityError::UnknownTarget)) => {
+                    kept.push_back(entry);
+                    continue;
+                }
+                Err(_) => {
+                    *rejected = rejected.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+        // 2. durable block（未落盘 ⇒ 保留等待；不猜 / 不按高度取块）。
+        let block = adapter
+            .block_store()
+            .and_then(|bs| bs.get(&entry.qc.target).ok().flatten());
+        let Some(block) = block else {
+            kept.push_back(entry);
+            continue;
+        };
+        // 3/4. 严格 canonical-next + 高度关系（跳高度 / parent 不符 ⇒ drop + 计数）。
+        let canonical_next = block.header.height == head.height.saturating_add(1)
+            && block.header.parent_hash == head.block_hash;
+        let height_ok = entry.qc.context.height.saturating_add(1) == block.header.height;
+        if !canonical_next || !height_ok {
+            *rejected = rejected.saturating_add(1);
+            continue;
+        }
+        match driver
+            .consensus_mut()
+            .adopt_verified_external_finality(&entry.qc)
+        {
+            AdoptionOutcome::Adopted => {
+                *adopted = adopted.saturating_add(1);
+                *last_adopted = Some(entry.qc.clone());
+            }
+            AdoptionOutcome::Idempotent
+            | AdoptionOutcome::Stale
+            | AdoptionOutcome::Conflict
+            | AdoptionOutcome::Rejected(_) => {
+                *rejected = rejected.saturating_add(1);
+            }
+        }
+    }
+    *pending = kept;
+}
+
+/// P1-A.7 — durable **per-height PrecommitQC history** 写入（ADR-0064）。
+///
+/// 调用点紧随既有 `persist_finality_fact_if_needed`（⇒ **persist-before-broadcast**：egress
+/// 物理发送在本 step 末；本函数在该之前）。
+///
+/// - 只写与当前 `finalized_reference` **一致**的 PrecommitQC（`qc.target == x`）；
+/// - 同一 reference 已写 ⇒ no-op（in-memory 锚 + store 自身幂等双重）；
+/// - 失败 ⇒ `Err`（**不**设锚 ⇒ 下一 step 重试）；**调用方**（runtime）将其计为观测失败。
+///
+/// 失败**不** halting consensus：QC history 是**对端服务能力**（不参与本地 safety / finality /
+/// commit 不变式）；且 `QcHistoryError` 无法上升为 `RuntimeError` —— 后者为 bin 穷尽匹配类型
+/// （`run_fault_kind` 强制新增变体必须改 bin，而 bin 不在本轮 scope）。因此本地 fail-closed 的
+/// 语义由**存储 API**保证（冲突永不覆盖、损坏拒绝服务），而写入失败仅计观测 + 重试。
+fn persist_qc_history_if_needed(
+    history: &mut Option<QcHistory>,
+    finalized: Option<[u8; 32]>,
+    qc: Option<&QuorumCertificate>,
+    persisted: &mut Option<[u8; 32]>,
+    written: &mut u64,
+) -> Result<(), QcHistoryError> {
+    let Some(history) = history.as_mut() else {
+        return Ok(());
+    };
+    let Some(x) = finalized else {
+        return Ok(());
+    };
+    if *persisted == Some(x) {
+        return Ok(());
+    }
+    let Some(qc) = qc else {
+        return Ok(());
+    };
+    if qc.target != x {
+        return Ok(());
+    }
+    let height = qc.context.height.saturating_add(1);
+    history.put(height, qc)?;
+    *written = written.saturating_add(1);
+    *persisted = Some(x);
+    Ok(())
+}
+
+/// P1-A.7 — **入站共识命令统一处理入口**（step 网络路径与内部/测试直接调用**同一语义**）。
+///
+/// 保持既有契约：`DriverError` 原样传出（不吞错 / 不改 canonical 状态）。附加（仅 ADR-0064）：
+/// - `Ok(())`（已验证 QC）⇒ 交采纳检查点（`pending_external_qc`，`verified = true`）；
+/// - `Err(QcVerification(UnknownTarget))`（既有「不适用」语义）⇒ 计 `inbound_qc_deferred`、
+///   以**更高高度证据**复用既有 intent ledger 触发 `local_head + 1` 请求、并有界缓冲
+///   （`verified = false`，待 target 落 DAG 后由检查点经**既有** driver 门面重新验证）；
+/// - 其余 `Err` ⇒ 仅原样传出（**不**缓冲 —— fail-closed）。
+///
+/// free fn + 不相交字段引用（`step` 网络段已持 `network_stack` 可变借用）。
+fn process_inbound_consensus_command(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    block_production: &Option<NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>>,
+    ledger: &mut MissingAncestorIntentLedger,
+    pending: &mut VecDeque<PendingExternalQc>,
+    deferred: &mut u64,
+    command: NodeConsensusCommand,
+) -> Result<(), DriverError> {
+    let inbound_qc = match &command {
+        NodeConsensusCommand::InboundQc(qc) => Some(qc.clone()),
+        _ => None,
+    };
+    match process_command(driver, command) {
+        Ok(()) => {
+            if let Some(qc) = inbound_qc {
+                let _ = defer_external_qc(pending, qc, true);
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if let Some(qc) = inbound_qc
+                && derived_qc_not_applicable(&err)
+            {
+                *deferred = deferred.saturating_add(1);
+                // tip hint / 更高高度证据 ⇒ 复用**既有** intent ledger 触发 `local_head + 1`
+                // 请求（**不建第二套发送机制**；source 用既有变体）。
+                if qc.context.vote_type == VoteType::Precommit {
+                    let observed_height = qc.context.height.saturating_add(1);
+                    let head = block_production
+                        .as_ref()
+                        .map(|a| a.head().height)
+                        .unwrap_or(0);
+                    if observed_height > head {
+                        ledger.record(MissingAncestorIntent {
+                            observed_height,
+                            observed_block_hash: qc.target,
+                            local_head_height: head,
+                            source: BlockInboundSource::SyncResponse,
+                            count: 1,
+                        });
+                    }
+                }
+                let _ = defer_external_qc(pending, qc, false);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// D10-C Step 4 — Finality Advance 后 durable 写 Recovery Fact（**durable-before-bridge**；幂等）。
@@ -890,6 +1129,25 @@ pub struct NodeRuntime {
     inbound_pending: BTreeMap<[u8; 32], u64>,
     /// D9 Step 8A：Production Sync Responder 观测（只读计数；非协议）。
     sync_respond: SyncRespondDiagnostics,
+    /// P1-A.7 — per-height PrecommitQC history（ADR-0064；有 canonical adapter 时才装配）。
+    /// **只服务**（供既有 sync 响应附发）；**不产生** finality / commit / head 推进。
+    qc_history: Option<QcHistory>,
+    /// P1-A.7 — 已写入 qc_history 的 reference（幂等锚；避免每 step 重写同一高度）。
+    qc_history_persisted: Option<[u8; 32]>,
+    /// P1-A.7 — 已写入 QC history 的次数（观测）。
+    qc_history_written: u64,
+    /// P1-A.7 — QC history 写入**失败**次数（观测；不 halting consensus，下一 step 重试）。
+    qc_history_write_failed: u64,
+    /// P1-A.7 — 入站 QC 「target ∉ DAG」而被**有界**暂存的次数（观测；含 tip hint 驱动）。
+    inbound_qc_deferred: u64,
+    /// P1-A.7 — 成功采纳外部 finality 的次数（仅 `Adopted`；观测）。
+    external_finality_adopted: u64,
+    /// P1-A.7 — 外部 QC **未**被采纳的次数（前置检查失败 / 幂等 / 过时 / 冲突 / frozen 拒绝；观测）。
+    external_finality_rejected: u64,
+    /// P1-A.7 — 有界 pending external QC（dedup by target；≤ [`PENDING_EXTERNAL_QC_CAP`]）。
+    pending_external_qc: VecDeque<PendingExternalQc>,
+    /// P1-A.7 — 最近一次**采纳**的外部 QC（供既有 durable fact 持久化同源取用；无则 `None`）。
+    last_adopted_qc: Option<QuorumCertificate>,
 }
 
 impl NodeRuntime {
@@ -1058,6 +1316,25 @@ impl NodeRuntime {
         // 协议参数（block inbound size 上限；来自 genesis；只读）。
         let max_block_bytes = genesis.protocol_parameters.max_block_bytes as usize;
 
+        // P1-A.7：per-height PrecommitQC history（ADR-0064）。
+        // - 仅在有 canonical adapter（能验证 / 提交）时装配 —— full-node 不产生无主 artifact。
+        // - tip 由本地 finality fact 高度**播种**（单文件读取；**不扫描** `qc_history/`）。
+        let mut qc_history = block_production.as_ref().map(|_| {
+            QcHistory::open(
+                &config.storage_dir,
+                identity.network_id,
+                identity.chain_id,
+                identity.genesis_hash,
+            )
+        });
+        if let Some(history) = qc_history.as_mut()
+            && let Ok(Some((height, _))) = bootstrap::read_finality_fact(
+                &config.storage_dir.join(bootstrap::FINALITY_FACT_FILE),
+            )
+        {
+            history.note_tip(height);
+        }
+
         Ok(Self {
             chain_identity: identity,
             chain_storage,
@@ -1088,6 +1365,15 @@ impl NodeRuntime {
             inbound_tick: 0,
             inbound_pending: BTreeMap::new(),
             sync_respond: SyncRespondDiagnostics::default(),
+            qc_history,
+            qc_history_persisted: None,
+            qc_history_written: 0,
+            qc_history_write_failed: 0,
+            inbound_qc_deferred: 0,
+            external_finality_adopted: 0,
+            external_finality_rejected: 0,
+            pending_external_qc: VecDeque::new(),
+            last_adopted_qc: None,
         })
     }
 
@@ -1346,6 +1632,51 @@ impl NodeRuntime {
     /// D9 Step 8A：Production Sync Responder 观测（只读；不含敏感性字段）。
     pub fn sync_respond_diagnostics(&self) -> SyncRespondDiagnostics {
         self.sync_respond
+    }
+
+    /// P1-A.7：被**有界暂存**（target ∉ DAG）的入站 QC 次数（观测）。
+    pub fn inbound_qc_deferred(&self) -> u64 {
+        self.inbound_qc_deferred
+    }
+
+    /// P1-A.7：成功采纳外部 finality 的次数（仅 `Adopted`；观测）。
+    pub fn external_finality_adopted(&self) -> u64 {
+        self.external_finality_adopted
+    }
+
+    /// P1-A.7：外部 QC 未被采纳的次数（前置检查失败 / 幂等 / 过时 / 冲突 / frozen 拒绝；观测）。
+    pub fn external_finality_rejected(&self) -> u64 {
+        self.external_finality_rejected
+    }
+
+    /// P1-A.7：已写入 per-height QC history 的次数（观测）。
+    pub fn qc_history_written(&self) -> u64 {
+        self.qc_history_written
+    }
+
+    /// P1-A.7：QC history 写入失败次数（观测；不 halting consensus）。
+    pub fn qc_history_write_failed(&self) -> u64 {
+        self.qc_history_write_failed
+    }
+
+    /// P1-A.7：当前 pending external QC 条数（bounded ≤ 8）。
+    pub fn pending_external_qc_len(&self) -> usize {
+        self.pending_external_qc.len()
+    }
+
+    /// P1-A.7：QC history 当前 tip 高度（`None` = 未知；不扫描目录）。
+    pub fn qc_history_tip_height(&self) -> Option<u64> {
+        self.qc_history.as_ref().and_then(|h| h.tip_height())
+    }
+
+    /// P1-A.7：已附发的历史 Q C 数（既有 `ConsensusQc`；含对应高度 QC 与 tip hint；观测）。
+    pub fn qc_served(&self) -> u64 {
+        self.sync_respond.qc_served
+    }
+
+    /// P1-A.7：QC 附发被跳过的次数（超尺寸 / 签名失败 / artifact 损坏；观测）。
+    pub fn qc_serve_skipped(&self) -> u64 {
+        self.sync_respond.qc_serve_skipped
     }
 
     /// 建立 configured peer（STEP 10-19-10-B7-A1-D5；single-active）。
@@ -1765,7 +2096,14 @@ impl NodeRuntime {
         &mut self,
         command: NodeConsensusCommand,
     ) -> Result<(), DriverError> {
-        process_command(&mut self.driver, command)
+        process_inbound_consensus_command(
+            &mut self.driver,
+            &self.block_production,
+            &mut self.missing_ancestor_ledger,
+            &mut self.pending_external_qc,
+            &mut self.inbound_qc_deferred,
+            command,
+        )
     }
 
     /// canonical consensus node handle（只读）—— **delegate** `driver.consensus()`（不复制）。
@@ -1856,7 +2194,18 @@ impl NodeRuntime {
         //  `drive_local_consensus`；`inbound_consensus_rejected` 与 `derived_qc_not_applicable`
         //  是两个独立计数，不互相混合。）
         for command in commands {
-            if process_command(&mut self.driver, command).is_err() {
+            // P1-A.4：**入站（peer 提供）** consensus command 的 Driver 拒绝边界（拒绝 + 计数 + 继续）。
+            // P1-A.7：同一入口内附加有界 pending / defer 计数 / 恢复 hint（见 free fn doc）。
+            if process_inbound_consensus_command(
+                &mut self.driver,
+                &self.block_production,
+                &mut self.missing_ancestor_ledger,
+                &mut self.pending_external_qc,
+                &mut self.inbound_qc_deferred,
+                command,
+            )
+            .is_err()
+            {
                 // 不记录错误文本 / payload / 签名（避免运行期材料外泄）；至少一次计数、不 panic。
                 self.inbound_consensus_rejected = self.inbound_consensus_rejected.saturating_add(1);
             }
@@ -1959,6 +2308,21 @@ impl NodeRuntime {
                 self.block_inbound_outcomes.push_back(outcome);
             }
         }
+        // ===== P1-A.7 — bounded External Finality Adoption（ADR-0064）=====
+        // 顺序固定：入站 commands（verify_qc + acquire_lock + pending）→ block inbound
+        //（register_remote_canonical_block）→ **本采纳检查点** → sync 编排 → round timeout →
+        // 提案 → 本地 consensus → finality fact → QC history → commit bridge → advance → egress。
+        // 前置检查全部满足才调 `assembly` facade；其余 drop + 计数（不跳高度 / 不改 head）。
+        if let Some(adapter) = self.block_production.as_ref() {
+            adopt_pending_external_finality(
+                &mut self.driver,
+                adapter,
+                &mut self.pending_external_qc,
+                &mut self.external_finality_adopted,
+                &mut self.external_finality_rejected,
+                &mut self.last_adopted_qc,
+            );
+        }
         // D9 Step 8A — Production Sync Responder：入站 `SyncBlockRequest`（**Established-only**，
         // 非 Established 已由 `NetworkService` 对非 Handshake 消息 fail-closed 丢弃）→ 每 step
         // 有界 serve（`MAX_SYNC_RESPONSES_PER_STEP`）：BlockStore **只读**查找 → 既有
@@ -1976,6 +2340,7 @@ impl NodeRuntime {
                 stack.signer.as_ref(),
                 requests,
                 &mut self.sync_respond,
+                self.qc_history.as_ref(),
             );
         }
         // STEP 10-19-10-B7-A1-D8-2：outbound sync orchestration —— 消费 bounded missing-ancestor
@@ -2053,6 +2418,23 @@ impl NodeRuntime {
             &self.finality_fact_path,
             &mut self.finality_fact_persisted,
         )?;
+        // ===== P1-A.7 — durable per-height PrecommitQC history（ADR-0064）=====
+        // 与 fact 同点（**persist-before-broadcast**：egress 物理发送在本 step 末）。
+        // QC 来源：采纳的外部 QC（`last_adopted_qc`）优先，否则既有本地派生 QC（同一 transition）。
+        // 失败：计观测 + 不设锚（下一 step 重试）；**不** halting consensus（纯服务能力）。
+        if persist_qc_history_if_needed(
+            &mut self.qc_history,
+            self.driver.consensus().state().finality.finalized_reference,
+            self.last_adopted_qc
+                .as_ref()
+                .or_else(|| self.driver.consensus().last_precommit_qc()),
+            &mut self.qc_history_persisted,
+            &mut self.qc_history_written,
+        )
+        .is_err()
+        {
+            self.qc_history_write_failed = self.qc_history_write_failed.saturating_add(1);
+        }
         // D10-B：Finality → Commit Bridge（每 tick 至多 commit 一个共识-finalized 本地块；
         // 复用 NodeBlockAdapter::apply_block 的冻结 durable commit —— 不重新实现 storage）。
         finality_commit_bridge(
@@ -2126,6 +2508,15 @@ impl NodeRuntime {
             inbound_tick: _,
             inbound_pending: _,
             sync_respond: _,
+            qc_history: _,
+            qc_history_persisted: _,
+            qc_history_written: _,
+            qc_history_write_failed: _,
+            inbound_qc_deferred: _,
+            external_finality_adopted: _,
+            external_finality_rejected: _,
+            pending_external_qc: _,
+            last_adopted_qc: _,
         } = self;
 
         if let Some(mut stack) = network_stack {

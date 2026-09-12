@@ -23,6 +23,7 @@
 //! - 单块响应（`MAX_SYNC_BLOCKS_PER_RESPONSE = 1`）；若单块响应超出 `max_msg_bytes` ⇒ fail-closed
 //!   （不发、计数），**不截断**。
 
+use nova_consensus::finality::QuorumCertificate;
 use nova_network::message::{MessageEnvelope, MessageType};
 use nova_network::network_service::NetworkService;
 use nova_network::node_id::NodeId;
@@ -32,6 +33,8 @@ use nova_runtime::Block;
 
 use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter};
 use crate::network_identity::NetworkSigner;
+use crate::outbound::OutboundConsensusMessage;
+use crate::qc_history::QcHistory;
 use nova_storage::backend::StorageBackend;
 
 /// 单条 `SyncBlockResponse` 最多携带块数（本轮最小实现：**只支持单块**）。
@@ -95,6 +98,13 @@ pub struct SyncRespondDiagnostics {
     pub malformed: u64,
     pub send_rejected: u64,
     pub signing_failed: u64,
+    /// P1-A.7：已附发的历史 PrecommitQC 数（既有 `ConsensusQc` 消息；含对应高度 QC 与 tip hint）。
+    pub qc_served: u64,
+    /// P1-A.7：QC 附发被跳过数（超 `max_msg_bytes` / 签名失败 / artifact 损坏 / 本地无该高度）。
+    ///
+    /// 注：本地**无**该高度历史 QC（超出 retention / 未持久化）不计入 skipped（无可用证据）；
+    /// 结构损坏 / checksum 不符 / 同高度冲突 ⇒ 计入（fail-closed 拒绝服务）。
+    pub qc_serve_skipped: u64,
 }
 
 impl SyncRespondDiagnostics {
@@ -112,6 +122,94 @@ impl SyncRespondDiagnostics {
             SyncServeOutcome::SigningFailed => self.signing_failed += 1,
         }
     }
+
+    fn record_qc(&mut self, tally: QcServeTally) {
+        self.qc_served = self.qc_served.saturating_add(tally.served);
+        self.qc_serve_skipped = self.qc_serve_skipped.saturating_add(tally.skipped);
+    }
+}
+
+/// P1-A.7 — 单次请求的 QC 附发统计（node-local；非协议字段）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct QcServeTally {
+    served: u64,
+    skipped: u64,
+}
+
+/// 构造一条**已签名**的 `ConsensusQc` 信封（复用既有 `egress::envelope_for`；**零 wire 变更**）。
+///
+/// - payload = `encode_qc(qc)`（既有 codec）；超出 `max_msg_bytes` ⇒ `Err`（**不截断**）。
+/// - 签名失败 ⇒ `Err`（fail-closed；不发不完整消息）。
+fn build_qc_envelope(
+    signer: &dyn NetworkSigner,
+    qc: &QuorumCertificate,
+    max_msg_bytes: usize,
+) -> Result<MessageEnvelope, ()> {
+    let envelope =
+        crate::egress::envelope_for(&OutboundConsensusMessage::VerifiedQc(qc.clone()), signer)
+            .map_err(|_| ())?;
+    if envelope.payload.len() > max_msg_bytes {
+        return Err(());
+    }
+    Ok(envelope)
+}
+
+/// P1-A.7 — 在 block 响应之后附发历史 QC（**既有** `MessageType::ConsensusQc`；不新增消息）。
+///
+/// 顺序与上限：
+/// 1. **请求高度对应 QC**（追赶必需；来源 `qc_history.get(requested_height)`）；
+/// 2. **tip hint ≤ 1 条**（来源 `qc_history.tip_height()` 的**直接** `get`；**不扫描目录** /
+///    不遍历历史）；仅当与已发高度不同。
+///
+/// 边界：只发本地**已持久化**的 QC；缺失 ⇒ 不发（fail-closed 由对端自行验证）；
+/// 超尺寸 / 签名失败 / artifact 损坏 ⇒ 不发 + 计数（不截断 / 不猜测 / 不跨高度借）。
+fn serve_qc(
+    ns: &mut NetworkService<BoxTransport>,
+    signer: &dyn NetworkSigner,
+    peer: NodeId,
+    max_msg_bytes: usize,
+    qc_history: Option<&QcHistory>,
+    requested_height: u64,
+) -> QcServeTally {
+    let mut tally = QcServeTally::default();
+    let Some(store) = qc_history else {
+        return tally;
+    };
+    let mut sent_height: Option<u64> = None;
+    match store.get(requested_height) {
+        Ok(Some(qc)) => match build_qc_envelope(signer, &qc, max_msg_bytes) {
+            Ok(envelope) => match ns.enqueue_outbound(peer, envelope) {
+                Ok(()) => {
+                    tally.served += 1;
+                    sent_height = Some(requested_height);
+                }
+                Err(_) => tally.skipped += 1,
+            },
+            Err(()) => tally.skipped += 1,
+        },
+        Ok(None) => {}
+        Err(_) => tally.skipped += 1,
+    }
+    // tip hint：≤ 1；**直接路径**查询（不扫描 / 不遍历）。
+    if let Some(tip) = store.tip_height()
+        && sent_height != Some(tip)
+    {
+        match store.get(tip) {
+            Ok(Some(qc)) => match build_qc_envelope(signer, &qc, max_msg_bytes) {
+                Ok(envelope) => {
+                    if ns.enqueue_outbound(peer, envelope).is_ok() {
+                        tally.served += 1;
+                    } else {
+                        tally.skipped += 1;
+                    }
+                }
+                Err(()) => tally.skipped += 1,
+            },
+            Ok(None) => {}
+            Err(_) => tally.skipped += 1,
+        }
+    }
+    tally
 }
 
 /// **只读**块查找（不写存储 / 不改 head / 不产生 finality）。
@@ -208,13 +306,23 @@ pub fn serve_requests<B: StorageBackend + Clone>(
     signer: &dyn NetworkSigner,
     requests: Vec<(NodeId, Vec<u8>)>,
     diagnostics: &mut SyncRespondDiagnostics,
+    qc_history: Option<&QcHistory>,
 ) -> usize {
     let max_msg_bytes = ns.config().max_msg_bytes;
     let mut handled = 0usize;
     for (peer, payload) in requests.into_iter().take(MAX_SYNC_RESPONSES_PER_STEP) {
         handled += 1;
-        let outcome = serve_one(adapter, ns, signer, peer, &payload, max_msg_bytes);
+        let (outcome, qc_tally) = serve_one(
+            adapter,
+            ns,
+            signer,
+            peer,
+            &payload,
+            max_msg_bytes,
+            qc_history,
+        );
         diagnostics.record(outcome);
+        diagnostics.record_qc(qc_tally);
     }
     handled
 }
@@ -226,35 +334,44 @@ fn serve_one<B: StorageBackend + Clone>(
     peer: NodeId,
     payload: &[u8],
     max_msg_bytes: usize,
-) -> SyncServeOutcome {
+    qc_history: Option<&QcHistory>,
+) -> (SyncServeOutcome, QcServeTally) {
     // ① 结构：既有 codec 解码（失败 ⇒ 不响应；不 panic）。
     let Ok(request) = SyncBlockRequest::decode(payload) else {
-        return SyncServeOutcome::Malformed;
+        return (SyncServeOutcome::Malformed, QcServeTally::default());
     };
     // ② 防御性 Established 检查（NetworkService 已对非 Established 的**非 Handshake** 消息
     //    fail-closed 丢弃；此处再确认一次，保证 responder 自身不依赖上游隐含条件）。
     if !ns.is_peer_established(peer) {
-        return SyncServeOutcome::NotEstablished;
+        return (SyncServeOutcome::NotEstablished, QcServeTally::default());
     }
     // ③ 只读查找（无 adapter / 无 BlockStore ⇒ 明确不响应）。
     let Some(adapter) = adapter else {
-        return SyncServeOutcome::NoBlockStore;
+        return (SyncServeOutcome::NoBlockStore, QcServeTally::default());
     };
     let block = match lookup_block(adapter, &request) {
         SyncLookup::Found(block) => block,
-        SyncLookup::Missing => return SyncServeOutcome::Missing,
-        SyncLookup::WalkExceeded => return SyncServeOutcome::WalkExceeded,
-        SyncLookup::NoBlockStore => return SyncServeOutcome::NoBlockStore,
+        SyncLookup::Missing => return (SyncServeOutcome::Missing, QcServeTally::default()),
+        SyncLookup::WalkExceeded => {
+            return (SyncServeOutcome::WalkExceeded, QcServeTally::default());
+        }
+        SyncLookup::NoBlockStore => {
+            return (SyncServeOutcome::NoBlockStore, QcServeTally::default());
+        }
     };
     // ④ 既有 codec + 既有签名构造响应（request_id 原样回带；超限 fail-closed）。
     let envelope = match build_response_envelope(signer, request.request_id, &block, max_msg_bytes)
     {
         Ok(env) => env,
-        Err(outcome) => return outcome,
+        Err(outcome) => return (outcome, QcServeTally::default()),
     };
     // ⑤ 既有 outbound 路径（Established-only 队列；不直接写 socket）。
     match ns.enqueue_outbound(peer, envelope) {
-        Ok(()) => SyncServeOutcome::Served,
-        Err(_) => SyncServeOutcome::SendRejected,
+        Ok(()) => {
+            // ⑥ P1-A.7：block 已入队 ⇒ 附发历史 QC（请求高度 + ≤1 tip hint；既有 ConsensusQc）。
+            let tally = serve_qc(ns, signer, peer, max_msg_bytes, qc_history, request.height);
+            (SyncServeOutcome::Served, tally)
+        }
+        Err(_) => (SyncServeOutcome::SendRejected, QcServeTally::default()),
     }
 }

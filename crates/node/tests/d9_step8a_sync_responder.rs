@@ -568,10 +568,43 @@ fn d9s8a_t1_real_tcp_two_runtime_sync_roundtrip() {
     )
     .expect("proposer 签名有效（sync 不绕过验证）");
 
-    // §17 不变式：sync 响应 **不是** finality evidence，**不**推进 head。
-    assert_eq!(head_height(&b2), 0, "sync 不推进 head");
-    assert_eq!(head_hash(&b2), env.genesis_hash, "B2 head 仍为 genesis");
-    assert_eq!(head_finality(&b2), None, "sync 不产生 finality");
+    // §17 不变式（P1-A.7 / ADR-0064 精确定义）：
+    // **block sync 本身不授予 finality** —— `SyncBlockResponse` 只提供 block；若无独立验证通过的
+    // 历史 PrecommitQC，则 head 不推进、finality 不产生（见本文件后续 fixture-only 测试）。
+    //
+    // A7：production responder 在 block 响应之后**附发同一高度的已持久化 PrecommitQC**
+    //（既有 `MessageType::ConsensusQc`；零 wire 变更）⇒ 本节点经 **Verified External Finality
+    // Adoption** 采纳该外部 finality，并由**既有** durable commit bridge 提交 ⇒ head = 1。
+    // 关键区别：推进 head 的不是 block，而是**独立验证通过**的外部 QC。
+    let advanced = wait_until(|| {
+        let _ = a.step();
+        let _ = b.step();
+        let _ = b2.step();
+        head_height(&b2) >= 1
+    });
+    assert!(
+        advanced,
+        "A7：已验证外部 QC 未推进 head（adopted={} deferred={} served={}）",
+        b2.external_finality_adopted(),
+        b2.inbound_qc_deferred(),
+        a.sync_respond_diagnostics().qc_served
+    );
+    assert_eq!(
+        head_height(&b2),
+        1,
+        "A7：外部 QC 经既有 bridge 推进 head 至 1"
+    );
+    assert_eq!(head_hash(&b2), block1_hash, "A7：head == 外部 QC 所指块");
+    assert_eq!(
+        head_finality(&b2),
+        Some(block1_hash),
+        "A7：finalized_reference == 已验证外部 QC 的 target"
+    );
+    assert!(
+        b2.external_finality_adopted() >= 1,
+        "A7：采纳计数（实测 {}）",
+        b2.external_finality_adopted()
+    );
 
     let _ = block1; // A 侧同一块（已用于断言 hash 关联）
     drop(b2);
@@ -995,10 +1028,16 @@ fn d9s8a_t5_restart_reregisters_stored_but_unregistered_block() {
         idempotent,
         "重复投递应命中真 AlreadyKnown（DAG 已含 ⇒ 幂等 no-op）"
     );
-    // §17 不变式：G1 补登记 **不** commit / **不**推进 head / **不**产生 finality。
-    assert_eq!(head_height(&f2), 0, "补登记不推进 head");
+    // §17 不变式（**保留并强化**）：**只有 block、没有 QC** ⇒ **不产生 finality**。
+    // 本测试的 fixture 只发 `GossipBlock`（从不发 `ConsensusQc`）⇒ 无论 DAG 登记多少次，
+    // 都不能推进 head 或产生 finality（ADR-0064：外部 finality 必须来自独立验证的 PrecommitQC）。
+    assert_eq!(head_height(&f2), 0, "仅 block（无 QC）⇒ head 不推进");
     assert_eq!(head_hash(&f2), env.genesis_hash, "head 仍为 genesis");
-    assert_eq!(head_finality(&f2), None, "补登记不产生 finality");
+    assert_eq!(
+        head_finality(&f2),
+        None,
+        "仅 block（无 QC）⇒ 不产生 finality"
+    );
     assert!(
         f2.sync_respond_diagnostics().served == 0,
         "本测试不涉及 responder"
