@@ -1,6 +1,6 @@
-//! YAZIMAO Node — production executable skeleton（**P1-A.2**）。
+//! YAZIMAO Node — long-running production node executable（**P1-A.3**）。
 //!
-//! # 本轮边界（P1-A.2 = seed 装载 + 身份 + 基座 transport + runtime 装配验证）
+//! # 本轮边界（P1-A.3 = 有界长运行驱动循环）
 //! ```text
 //! process start
 //!   → main()
@@ -9,12 +9,19 @@
 //!   → seed 装载（严格 hex64；只读；不回显；hex 读缓冲与临时 seed buffer 均经正式 `zeroize` 清零）
 //!   → 身份装配（network identity；validator 模式：身份分离 + 成员预检 + KeyProvider）
 //!   → 基座 transport（IdleTransport）+ NodeRuntime 装配（既有 `start_with_network`）
-//!   → 装配断言（NodeId / peer-auth / listener / 入站连接数）→ 既有 `shutdown`
-//!   → STOP（事件循环 / 拨号 / 信号属 P1-A.3）
+//!   → 装配断言（NodeId / peer-auth / listener / 入站连接数）
+//!   → 有界运行循环：每轮 [configured peers 建立（幂等）→ 既有 `NodeRuntime::step()` → pacing]
+//!   → 预算耗尽 ⇒ 既有 `shutdown()`（**恰好一次**）→ 摘要行 → exit 0
+//!   → `step()` 失败 ⇒ fail-closed：停止循环 → 仍执行 `shutdown()` → 非 0 退出
 //! ```
 //!
-//! **本 build 仍不是可长期运行的节点**：装配并验证后即有序释放退出（无事件循环、无拨号、
-//! 无信号处理、无日志/遥测）。
+//! **驱动点唯一**：循环只调用既有 `NodeRuntime::step()`（不新增共识 / 网络 / 存储逻辑）。
+//!
+//! # 明确未实现（诚实声明）
+//! - **无 Ctrl-C / SIGTERM 优雅停机**（不引入 signal 依赖；`unsafe_code = forbid`）⇒ 运维终止
+//!   依赖 OS 默认终止；持久状态由既有 crash-consistency 保证（WAL 每事务 fsync / safety journal
+//!   durable / finality durable-before-bridge / commit durable-before-advance）。
+//! - 无 peer discovery / 无自动重连策略 / 无日志与遥测 / 无 `--run-ms`（仅 `--run-steps` 预算）。
 //!
 //! # 诚实声明（help 文案同步）
 //! - `bootstrap / devnet / testnet oriented`；**NOT MAINNET READY**。
@@ -57,7 +64,7 @@ use nova_network::transport::{ConnectionTarget, Transport};
 use nova_node::bootstrap::NodeConfig;
 use nova_node::key_provider::{KeyProvider, KeyProviderConfig, KeyProviderError};
 use nova_node::network_identity::{NetworkSigner, NetworkSigningError};
-use nova_node::runtime::{NodeRuntime, NodeRuntimeError};
+use nova_node::runtime::{NodeRuntime, NodeRuntimeError, RuntimeError};
 use nova_node::signer::{SigningCapability, SigningError};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -69,6 +76,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const IDLE_MS_DEFAULT: u64 = 1;
 /// 有界空闲间隔上限（ms；越界 ⇒ fail-closed）。
 const IDLE_MS_MAX: u64 = 50;
+/// 有界运行步数默认值（`--run-steps`；smoke / test 友好且必有限）。
+const RUN_STEPS_DEFAULT: u64 = 5_000;
 
 /// CLI 契约文本（非日志；不含任何完成度宣称）。
 const HELP: &str = "\
@@ -77,11 +86,13 @@ bootstrap/devnet/testnet oriented executable skeleton
 
 NOT MAINNET READY
 
-P1-A.2 scope: CLI parsing + genesis pre-flight validation + NodeConfig assembly +
-seed-based network/validator identities + runtime assembly verification.
-The bounded event loop, peer dialing, signal handling and graceful shutdown policy
-are NOT implemented in this build (deferred to P1-A.3): this build assembles the
-runtime, verifies it, shuts it down and exits; it does not keep running as a node.
+P1-A.3 scope: CLI parsing + genesis pre-flight validation + NodeConfig assembly +
+seed-based network/validator identities + runtime assembly verification + a bounded
+long-running drive loop over the existing NodeRuntime::step().
+Signal handling (Ctrl-C / SIGTERM) and a graceful-shutdown policy are NOT implemented:
+this build drives the runtime for a bounded number of steps (--run-steps) and then
+performs the existing runtime shutdown and exits; external termination relies on OS
+default termination (durable storage/safety state is crash-consistent).
 
 Networking model (current architecture):
   configured peers only
@@ -109,6 +120,8 @@ Options:
   --safety-dir <path>           validator safety journal directory
   --validator-seed-file <path>  32-byte validator identity seed (hex64)
   --idle-ms <n>                 bounded idle interval in ms (default 1, maximum 50)
+  --run-steps <n>               maximum number of runtime steps to execute in this
+                                process (default 5000; must be > 0)
   --help                        print this help and exit 0
   --version                     print version and exit 0
 ";
@@ -138,6 +151,8 @@ enum CliError {
     InvalidPeerFormat(String),
     /// `--idle-ms` 为 0 或 > 50（或非数字）。
     InvalidIdleMs,
+    /// `--run-steps` 非数字或为 0（必须 > 0）。
+    InvalidRunSteps,
     /// `--validator` 未提供 `--safety-dir`。
     ValidatorRequiresSafetyDir,
     /// `--validator` 未提供 `--validator-seed-file`。
@@ -219,6 +234,15 @@ enum StartupError {
     Identity(IdentityError),
     /// `NodeRuntime` 装配失败（既有 typed 错误透传）。
     Runtime(NodeRuntimeError),
+    /// 运行循环中 `NodeRuntime::step()` 失败（fail-closed）。
+    ///
+    /// 载荷 = 既有 `RuntimeError` 的**变体名**（`&'static str`），仅记录类别：
+    /// - 既有 `RuntimeError` 仅实现 `Debug`（`crates/node/src/runtime.rs`，本轮**冻结不可改**）
+    ///   ⇒ 无法满足 `StartupError` 的 `Clone/PartialEq/Eq` 派生；
+    /// - 其 `Debug` 文本可能包含 session/nonce 类运行期材料 ⇒ 入口层不复制底层载荷文本。
+    ///
+    /// 错误事实仍 fail-closed 传播（非 0 退出，未吞错）。
+    Run(&'static str),
     /// 既有 `NodeRuntime::shutdown` 失败（D-A2-1 ② 资源释放）。
     Shutdown,
     /// CLI 契约输出写失败（stdout）。
@@ -251,6 +275,8 @@ struct Cli {
     validator_seed_file: Option<PathBuf>,
     network_seed_file: PathBuf,
     idle_ms: u64,
+    /// 本进程最多执行的 `NodeRuntime::step()` 次数（`--run-steps`；必 > 0）。
+    run_steps: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +380,7 @@ fn parse_args(args: &[String]) -> Result<Cli, CliError> {
     let mut validator_seed_file: Option<PathBuf> = None;
     let mut network_seed_file: Option<PathBuf> = None;
     let mut idle_ms: Option<u64> = None;
+    let mut run_steps: Option<u64> = None;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -452,6 +479,18 @@ fn parse_args(args: &[String]) -> Result<Cli, CliError> {
                 }
                 idle_ms = Some(v);
             }
+            "--run-steps" => {
+                if run_steps.is_some() {
+                    return Err(CliError::DuplicateArgument("--run-steps"));
+                }
+                let raw = take_value(args, &mut i, "--run-steps")?;
+                let v = raw.parse::<u64>().map_err(|_| CliError::InvalidRunSteps)?;
+                // 0 = 无驱动 / 非有限预算语义 ⇒ 拒绝（必 > 0；有限预算为本轮终止策略）。
+                if v == 0 {
+                    return Err(CliError::InvalidRunSteps);
+                }
+                run_steps = Some(v);
+            }
             other if other.starts_with("--") => {
                 return Err(CliError::UnknownArgument(other.to_string()));
             }
@@ -495,6 +534,7 @@ fn parse_args(args: &[String]) -> Result<Cli, CliError> {
         validator_seed_file,
         network_seed_file,
         idle_ms: idle_ms.unwrap_or(IDLE_MS_DEFAULT),
+        run_steps: run_steps.unwrap_or(RUN_STEPS_DEFAULT),
     })
 }
 
@@ -673,14 +713,15 @@ struct RuntimeReport {
     inbound_connections: usize,
 }
 
-/// **P1-A.2 主体**：seed 装载 → 身份 → 基座 transport → `NodeRuntime` 装配 → 断言 → shutdown。
+/// seed 装载 → 身份 → 基座 transport → `NodeRuntime` 装配 → 装配断言 ⇒ 返回**已装配且未 shutdown**
+/// 的 runtime（P1-A.2 为装配后立即 shutdown；P1-A.3 起 shutdown 归 `main`，**恰好一次**）。
 ///
-/// 边界：**不**进入事件循环（P1-A.3）；**不**拨号（属 P1-A.3）；**不**修改 runtime / provider /
-/// identity 既有实现（全部经公开 trait 在 binary 内实现）。
+/// 边界：**不**驱动循环（归 [`run_node_loop`]）；**不**拨号（归 [`run_node_loop`] 的幂等
+/// `establish_configured_peers`）；**不**修改 runtime / provider / identity 既有实现。
 fn assemble_and_verify_runtime(
     cli: &Cli,
     set: &ValidatorSet,
-) -> Result<RuntimeReport, StartupError> {
+) -> Result<(NodeRuntime, RuntimeReport), StartupError> {
     // 1. 网络身份（必填 seed；只读；派生后立即清零临时 buffer）。
     //    `Zeroizing` 同时覆盖所有 early return（`?`）路径 —— 不留栈残留。
     let mut net_seed =
@@ -758,9 +799,116 @@ fn assemble_and_verify_runtime(
         inbound_connections,
     };
 
-    // 5. D-A2-1 ②：装配验证结束后调用**既有** `shutdown`（仅资源释放；非新关机机制）。
-    runtime.shutdown().map_err(|_| StartupError::Shutdown)?;
-    Ok(report)
+    // 5. 装配完成 ⇒ **不在此处** shutdown（P1-A.3：循环结束后由 `main` 在所有路径上恰调用一次）。
+    Ok((runtime, report))
+}
+
+// ---------------------------------------------------------------------------
+// P1-A.3：有界长运行驱动循环（唯一驱动点 = 既有 `NodeRuntime::step()`）
+// ---------------------------------------------------------------------------
+
+/// 有界运行摘要（仅**非敏感**观测值）；不含 seed / 私钥 / 任何秘密材料。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunSummary {
+    /// 实际执行的 `NodeRuntime::step()` 调用次数（含返回 `Err` 的那一次；`<= run_steps`）。
+    steps: u64,
+    /// 本进程的 step 预算（`--run-steps`）。
+    run_steps: u64,
+    /// canonical head 高度（full-node 形态无 adapter ⇒ 0）。
+    head_height: u64,
+    /// configured peers 中已认证 `Established` 的数量。
+    established_peers: usize,
+    /// configured peers 总数。
+    configured_peers: usize,
+    /// 退出时并存入站连接数。
+    inbound_connections: usize,
+    /// 累计成功注册的入站连接数（单调；确定性观测）。
+    inbound_accepted: u64,
+}
+
+/// 采集当前 runtime 只读观测（不触碰秘密材料）。
+fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
+    let head_height = runtime.block_production().map_or(0, |a| a.head().height);
+    let established_peers = cli
+        .peers
+        .iter()
+        .filter(|t| runtime.network_peer_established(t.peer_id))
+        .count();
+    let inbound_accepted = runtime
+        .network_inbound_diagnostics()
+        .map_or(0, |d| d.accepted);
+    RunSummary {
+        steps,
+        run_steps: cli.run_steps,
+        head_height,
+        established_peers,
+        configured_peers: cli.peers.len(),
+        inbound_connections: runtime.network_inbound_connection_count(),
+        inbound_accepted,
+    }
+}
+
+/// 循环结果：正常耗完预算或 fail-closed 停止（**两者均携带摘要**，便于退出观测）。
+struct RunLoopOutcome {
+    summary: RunSummary,
+    /// `Some` ⇒ 某次 `runtime.step()` 返回 `Err`（fail-closed：不继续下一轮、不吞错）。
+    error: Option<StartupError>,
+}
+
+/// `RuntimeError` → 稳定类别标签（穷尽匹配；新增变体 ⇒ 编译期强制在本层显式处理）。
+fn run_fault_kind(e: &RuntimeError) -> &'static str {
+    match e {
+        RuntimeError::EventLoop(_) => "EventLoop",
+        RuntimeError::Driver(_) => "Driver",
+        RuntimeError::Egress(_) => "Egress",
+        RuntimeError::Proposer(_) => "Proposer",
+        RuntimeError::Validator(_) => "Validator",
+        RuntimeError::NetworkDial(_) => "NetworkDial",
+        RuntimeError::Session(_) => "Session",
+        RuntimeError::NetworkSigning(_) => "NetworkSigning",
+        RuntimeError::PeerAuthMissing => "PeerAuthMissing",
+        RuntimeError::IdentityMismatch { .. } => "IdentityMismatch",
+        RuntimeError::NetworkSecurity(_) => "NetworkSecurity",
+        RuntimeError::DagRegister(_) => "DagRegister",
+        RuntimeError::BlockCommit(_) => "BlockCommit",
+        RuntimeError::BlockCodec(_) => "BlockCodec",
+        RuntimeError::BlockStore(_) => "BlockStore",
+        RuntimeError::BlockDecode(_) => "BlockDecode",
+        RuntimeError::FinalityFact(_) => "FinalityFact",
+    }
+}
+
+/// **P1-A.3 主体**：有界长运行驱动循环（每轮顺序固定）。
+///
+/// 1. 存在 configured peers ⇒ 调用**幂等** `establish_configured_peers()`（per-peer 错误隔离：
+///    单个 peer dial/握手失败只记入其 `PeerStatus`，**不**终止本节点）。
+/// 2. 调用**唯一驱动点** `runtime.step()`；`Err` ⇒ fail-closed 立即停止（`shutdown` 仍由 `main`
+///    在所有路径上调用，未经修改的 runtime 错误原样向上传播）。
+/// 3. 预算：`steps == cli.run_steps` ⇒ 正常结束（**不**多执行一轮，不存在 N+1）；否则
+///    `std::thread::sleep(cli.idle_ms)` pacing（Owner D1 批准的唯一生产 sleep；`1..=50ms`
+///    已由 CLI 拒绝 0 ⇒ **无 busy loop**）。
+fn run_node_loop(runtime: &mut NodeRuntime, cli: &Cli) -> RunLoopOutcome {
+    let mut steps: u64 = 0;
+    let mut error: Option<StartupError> = None;
+    while steps < cli.run_steps {
+        if !cli.peers.is_empty() {
+            // 幂等；不因单个 configured peer 失败而终止节点（错误在 status 中，无状态机副作用）。
+            let _ = runtime.establish_configured_peers();
+        }
+        steps += 1;
+        if let Err(e) = runtime.step() {
+            error = Some(StartupError::Run(run_fault_kind(&e)));
+            break;
+        }
+        if steps >= cli.run_steps {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(cli.idle_ms));
+    }
+    RunLoopOutcome {
+        summary: summarize(runtime, cli, steps),
+        error,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -786,16 +934,38 @@ fn main() -> Result<(), StartupError> {
         }
         Action::Run(cli) => {
             let (_identity, set) = preflight(&cli).map_err(StartupError::Preflight)?;
-            let report = assemble_and_verify_runtime(&cli, &set)?;
+            let (mut runtime, report) = assemble_and_verify_runtime(&cli, &set)?;
+            // 启动行（CLI 契约输出；非日志）—— 进入循环前写出 ⇒ 绑定地址 / 预算立即可观测。
             write_stdout(&format!(
-                "{PROGRAM}: configuration validated + runtime assembled (P1-A.2); \
-                 node_id={} listen={:?} peer_auth={} inbound_connections={}; \
-                 runtime shut down; event loop deferred to P1-A.3\n",
+                "{PROGRAM}: runtime assembled (P1-A.3); node_id={} listen={:?} peer_auth={}; \
+                 entering bounded run loop (run_steps={} idle_ms={})\n",
                 hex32(report.node_id.as_bytes()),
                 report.listen_addr,
                 report.peer_auth_enabled,
-                report.inbound_connections,
-            ))
+                cli.run_steps,
+                cli.idle_ms,
+            ))?;
+            let outcome = run_node_loop(&mut runtime, &cli);
+            let summary = outcome.summary;
+            // 既有 `shutdown`：**所有路径恰好一次**（含 step 失败路径；consuming self）。
+            let shutdown_result = runtime.shutdown().map_err(|_| StartupError::Shutdown);
+            // 退出摘要行（仅非敏感观测值）。
+            write_stdout(&format!(
+                "{PROGRAM}: stopped after {}/{} steps; head_height={} configured_peers={}/{} \
+                 inbound_connections={} inbound_accepted={}; runtime shut down\n",
+                summary.steps,
+                summary.run_steps,
+                summary.head_height,
+                summary.established_peers,
+                summary.configured_peers,
+                summary.inbound_connections,
+                summary.inbound_accepted,
+            ))?;
+            // 优先级：runtime step 错误优先于 shutdown 错误；两者均**不**吞掉。
+            if let Some(e) = outcome.error {
+                return Err(e);
+            }
+            shutdown_result
         }
     }
 }
@@ -808,6 +978,11 @@ fn main() -> Result<(), StartupError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 默认预算必须 > 0（否则默认 CLI 会产生 0 步空转）；编译期常量断言，无运行期开销。
+    const _: () = assert!(RUN_STEPS_DEFAULT > 0);
+    /// 默认空闲间隔必须落在 CLI 允许区间 `1..=50`。
+    const _: () = assert!(IDLE_MS_DEFAULT > 0 && IDLE_MS_DEFAULT <= IDLE_MS_MAX);
 
     fn argv(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -1426,7 +1601,10 @@ mod tests {
                 env.path("missing-val.seed").to_string_lossy().to_string(),
             ],
         );
-        let err = assemble_and_verify_runtime(&cli, &set).expect_err("must fail-closed");
+        // NodeRuntime 未实现 Debug（既有类型，本轮不可改）⇒ 不使用 expect_err。
+        let err = assemble_and_verify_runtime(&cli, &set)
+            .err()
+            .expect("must fail-closed");
         assert!(
             matches!(err, StartupError::Seed(SeedError::Read)),
             "{err:?}"
@@ -1452,7 +1630,9 @@ mod tests {
                 val_path.to_string_lossy().to_string(),
             ],
         );
-        let err = assemble_and_verify_runtime(&cli, &set).expect_err("must fail-closed");
+        let err = assemble_and_verify_runtime(&cli, &set)
+            .err()
+            .expect("must fail-closed");
         assert!(
             matches!(err, StartupError::Seed(SeedError::Malformed)),
             "{err:?}"
@@ -1479,7 +1659,9 @@ mod tests {
                 val_path.to_string_lossy().to_string(),
             ],
         );
-        let err = assemble_and_verify_runtime(&cli, &set).expect_err("must fail-closed");
+        let err = assemble_and_verify_runtime(&cli, &set)
+            .err()
+            .expect("must fail-closed");
         assert!(
             matches!(
                 err,
@@ -1508,7 +1690,9 @@ mod tests {
                 val_path.to_string_lossy().to_string(),
             ],
         );
-        let err = assemble_and_verify_runtime(&cli, &set).expect_err("must fail-closed");
+        let err = assemble_and_verify_runtime(&cli, &set)
+            .err()
+            .expect("must fail-closed");
         assert!(
             matches!(
                 err,
@@ -1576,7 +1760,7 @@ mod tests {
         env.write_seed("net.seed", TEST_SEED_NET);
         let cli = assembly_cli(&env, genesis_hash, &[]);
         let (_identity, set) = preflight(&cli).expect("preflight ok");
-        let report = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+        let (runtime, report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
         assert_eq!(
             report.node_id,
             NodeId::from_verifying_key(&SigningKey::from_seed(TEST_SEED_NET).verifying_key())
@@ -1584,6 +1768,8 @@ mod tests {
         assert!(report.peer_auth_enabled, "peer-auth 已启用");
         assert_eq!(report.listen_addr, None, "未指定 --listen ⇒ 无 listener");
         assert_eq!(report.inbound_connections, 0, "未拨号 ⇒ 无入站连接");
+        // P1-A.3：装配不再内部 shutdown ⇒ 本测试显式释放（资源不泄漏）。
+        runtime.shutdown().expect("shutdown ok");
     }
 
     // T38 — 合法 validator 装配（成员命中；safety dir 自动创建）
@@ -1605,9 +1791,11 @@ mod tests {
             ],
         );
         let (_identity, set) = preflight(&cli).expect("preflight ok");
-        let report = assemble_and_verify_runtime(&cli, &set).expect("validator assembly ok");
+        let (runtime, report) =
+            assemble_and_verify_runtime(&cli, &set).expect("validator assembly ok");
         assert!(report.peer_auth_enabled);
         assert_eq!(report.inbound_connections, 0);
+        runtime.shutdown().expect("shutdown ok");
     }
 
     // T39 — --listen ⇒ runtime 报告真实监听地址
@@ -1623,8 +1811,197 @@ mod tests {
         );
         assert_eq!(cli.listen_addr, Some("127.0.0.1:0".parse().unwrap()));
         let (_identity, set) = preflight(&cli).expect("preflight ok");
-        let report = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+        let (runtime, report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
         let bound = report.listen_addr.expect("runtime 必须报告真实监听地址");
         assert_ne!(bound.port(), 0, "port 0 已解析为实际端口");
+        runtime.shutdown().expect("shutdown ok");
+    }
+
+    // -----------------------------------------------------------------------
+    // P1-A.3：`--run-steps` 解析 + 有界长运行驱动循环
+    // -----------------------------------------------------------------------
+
+    // T40 — --run-steps 缺值 / 后接另一个 flag ⇒ MissingValue（fail-closed）
+    #[test]
+    fn t40_run_steps_missing_value_rejected() {
+        let mut items = valid_base();
+        items.push("--run-steps");
+        assert_eq!(parse(&items), Err(CliError::MissingValue("--run-steps")));
+
+        let mut items = valid_base();
+        items.extend_from_slice(&["--run-steps", "--idle-ms", "1"]);
+        assert_eq!(parse(&items), Err(CliError::MissingValue("--run-steps")));
+    }
+
+    // T41 — --run-steps 非法值（0 / 非数字 / 负数 / 空白 / 溢出）⇒ InvalidRunSteps
+    #[test]
+    fn t41_run_steps_invalid_values_rejected() {
+        for bad in [
+            "0",
+            "abc",
+            "-1",
+            " 1",
+            "1 ",
+            "0x10",
+            "1.5",
+            "99999999999999999999999",
+        ] {
+            let mut items = valid_base();
+            items.extend_from_slice(&["--run-steps", bad]);
+            assert_eq!(
+                parse(&items),
+                Err(CliError::InvalidRunSteps),
+                "value={bad:?} 必须 fail-closed"
+            );
+        }
+    }
+
+    // T42 — --run-steps 合法值接受；缺省 = RUN_STEPS_DEFAULT（有限预算）
+    #[test]
+    fn t42_run_steps_accepted_and_default() {
+        let mut items = valid_base();
+        items.extend_from_slice(&["--run-steps", "7"]);
+        assert_eq!(parse(&items).map(|c| c.run_steps), Ok(7));
+
+        let mut items = valid_base();
+        items.extend_from_slice(&["--run-steps", "1"]);
+        assert_eq!(parse(&items).map(|c| c.run_steps), Ok(1));
+
+        let mut items = valid_base();
+        items.extend_from_slice(&["--run-steps", "18446744073709551615"]);
+        assert_eq!(parse(&items).map(|c| c.run_steps), Ok(u64::MAX));
+
+        assert_eq!(
+            parse(&valid_base()).map(|c| c.run_steps),
+            Ok(RUN_STEPS_DEFAULT)
+        );
+    }
+
+    // T43 — --run-steps 重复 ⇒ DuplicateArgument
+    #[test]
+    fn t43_run_steps_duplicate_rejected() {
+        let mut items = valid_base();
+        items.extend_from_slice(&["--run-steps", "2", "--run-steps", "3"]);
+        assert_eq!(
+            parse(&items),
+            Err(CliError::DuplicateArgument("--run-steps"))
+        );
+    }
+
+    // T44 — 有界循环：恰好执行 run_steps 次 step（无 N+1）+ 摘要仅含非敏感观测
+    #[test]
+    fn t44_loop_runs_exact_step_budget() {
+        let env = TempEnv::new("t44");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &[
+                "--run-steps".to_string(),
+                "3".to_string(),
+                "--idle-ms".to_string(),
+                "1".to_string(),
+            ],
+        );
+        assert_eq!(cli.run_steps, 3);
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let (mut runtime, report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+        assert_eq!(report.inbound_connections, 0);
+
+        let outcome = run_node_loop(&mut runtime, &cli);
+        assert!(outcome.error.is_none(), "full-node 无拨号 ⇒ step 不应失败");
+        let s = outcome.summary;
+        assert_eq!(s.steps, 3, "run_steps=3 ⇒ 恰好 3 次 step（无 N+1）");
+        assert_eq!(s.run_steps, 3);
+        assert_eq!(s.head_height, 0, "full-node 无 canonical adapter");
+        assert_eq!(s.configured_peers, 0);
+        assert_eq!(s.established_peers, 0);
+        assert_eq!(s.inbound_connections, 0);
+        assert_eq!(s.inbound_accepted, 0);
+        runtime.shutdown().expect("shutdown ok");
+    }
+
+    // T45 — 预算边界：run_steps=1 ⇒ 恰好 1 次 step；默认预算亦为有限值
+    #[test]
+    fn t45_loop_budget_boundary_one_step() {
+        let env = TempEnv::new("t45");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &["--run-steps".to_string(), "1".to_string()],
+        );
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let (mut runtime, report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+        assert!(report.peer_auth_enabled);
+        let outcome = run_node_loop(&mut runtime, &cli);
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.summary.steps, 1, "run_steps=1 ⇒ 恰好 1 次");
+        runtime.shutdown().expect("shutdown ok");
+    }
+
+    // T46 — validator 形态亦可在循环中驱动（预算 1；既有 shutdown 正常）
+    #[test]
+    fn t46_loop_validator_mode_budget_one_step() {
+        let env = TempEnv::new("t46");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let val_path = env.write_seed("val.seed", TEST_SEED_VAL);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &[
+                "--validator".to_string(),
+                "--safety-dir".to_string(),
+                env.path("safety").to_string_lossy().to_string(),
+                "--validator-seed-file".to_string(),
+                val_path.to_string_lossy().to_string(),
+                "--run-steps".to_string(),
+                "1".to_string(),
+            ],
+        );
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let (mut runtime, report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+        assert!(report.peer_auth_enabled);
+        let outcome = run_node_loop(&mut runtime, &cli);
+        assert!(outcome.error.is_none(), "validator 单步不应失败");
+        assert_eq!(outcome.summary.steps, 1);
+        assert_eq!(outcome.summary.configured_peers, 0);
+        assert_eq!(outcome.summary.inbound_accepted, 0);
+        runtime.shutdown().expect("shutdown ok");
+    }
+
+    // T47 — pacing 存在且循环终止（无 busy loop / 无无限循环）：上限宽松断言
+    #[test]
+    fn t47_loop_terminates_with_pacing() {
+        let env = TempEnv::new("t47");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &[
+                "--run-steps".to_string(),
+                "2".to_string(),
+                "--idle-ms".to_string(),
+                "50".to_string(),
+            ],
+        );
+        assert_eq!(cli.idle_ms, 50);
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let (mut runtime, report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+        assert_eq!(report.inbound_connections, 0);
+        let started = std::time::Instant::now();
+        let outcome = run_node_loop(&mut runtime, &cli);
+        let elapsed = started.elapsed();
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.summary.steps, 2, "预算耗尽即退出（无额外轮次）");
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "循环必须有界终止（实测 {elapsed:?}）"
+        );
+        runtime.shutdown().expect("shutdown ok");
     }
 }
