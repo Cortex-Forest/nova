@@ -23,6 +23,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use nova_consensus::dag::Dag;
+use nova_consensus::finality::FinalityError;
 use nova_consensus::proposer::select_proposer;
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_crypto::identity::ChainIdentity;
@@ -156,9 +157,49 @@ fn runtime_propose(
 /// （Propose / Finalized / 无 proposal）与 `WrongProposer`（外部坏 proposal 已被 driver
 /// proposer-authority gate 拦截 —— 不驱动）均为无本地 action，忽略。auto-drive 只产生**本地**
 /// vote；远端参与仍走既有 `submit_remote_vote` 路径（本 step 不改变）。
-fn drive_local_consensus(driver: &mut NodeConsensusDriver<DynSigner>) -> Result<(), RuntimeError> {
-    driver.auto_drive().map_err(RuntimeError::Driver)?;
-    Ok(())
+///
+/// # P1-A.5：唯一的**非致命** Driver 失败（「QC 不适用」）
+/// 派生 QC 经 `process_transition_derived` → `verify_qc` 时，若其 `target` **当前不在本节点 DAG**
+/// （冻结检查 ①；`FinalityError::UnknownTarget`），则该 QC 对本节点**尚不适用** —— 这**不是**
+/// 「QC 已验证有效」，也**不是**本节点运行错误：
+/// - 该错误在 lock routing / outbound push **之前**产生 ⇒ **零** canonical 变更（无 lock /
+///   无 outbound / 无 finality 推进 / 无 DAG 修改 / 不改 `ConsensusState`）；`verify_qc` 未被绕过。
+/// - 与冻结 transition ⑥ 内部对该条件的既有容忍同语义（`integration.rs` 用 `is_ok()` 守卫：失败
+///   仅不 `update_finalized_reference`，不报错）。
+/// - 可达性（丢包 / 缺块；**无需恶意输入**）：proposal 的 `block_hash` 尚未进入本地 DAG 时，本地
+///   vote 若恰好完成 precommit quorum，即会派生此类 QC ⇒ 修复前为**本地致命**（validator 退出）。
+///
+/// 计数经 `not_applicable`（saturating；**只**计数 —— 不保留 payload / target hash / 签名 /
+/// 对端身份 / 错误文本）。**其余全部** Driver 失败保持 fail-closed：`VoteVerification` /
+/// `Actor*` / `ActorLock` / `ProposerSelection` / `NoActor` / 其它 `QcVerification(..)`
+/// （`UnknownTarget` 之外的一切 `FinalityError`）⇒ `RuntimeError::Driver`。容错范围**不扩大**。
+fn drive_local_consensus(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    not_applicable: &mut u64,
+) -> Result<(), RuntimeError> {
+    match driver.auto_drive() {
+        Ok(_) => Ok(()),
+        Err(err) if derived_qc_not_applicable(&err) => {
+            *not_applicable = not_applicable.saturating_add(1);
+            Ok(())
+        }
+        Err(other) => Err(RuntimeError::Driver(other)),
+    }
+}
+
+/// P1-A.5 — 「派生 QC 不适用」**唯一**容忍判定（`drive_local_consensus` 的守卫）。
+///
+/// 精确等于 `DriverError::QcVerification(FinalityError::UnknownTarget)`：
+/// `matches!` 只有**单一**模式 ⇒ `Err(_)` / `QcVerification(_)` / 其它 `FinalityError` /
+/// 其它 `DriverError` 变体**一律** false（⇒ 走 `Err(other) => RuntimeError::Driver`，fail-closed）。
+///
+/// 独立成 fn 的唯一目的：使该边界可被**穷举负向测试**（`mod tests`），防止未来被写成通配符而
+/// 悄悄扩大容错范围。
+fn derived_qc_not_applicable(err: &DriverError) -> bool {
+    matches!(
+        err,
+        DriverError::QcVerification(FinalityError::UnknownTarget)
+    )
 }
 
 /// D10-C Step 4 — Finality Advance 后 durable 写 Recovery Fact（**durable-before-bridge**；幂等）。
@@ -615,9 +656,17 @@ pub struct NodeRuntime {
     /// P1-A.4：**入站（peer 提供）** consensus command 被 Driver 拒绝的计数（观测）。
     ///
     /// 只统计 `take_commands() → process_command(..)` 这条**网络来源**路径；本地路径
-    /// （`drive_local_consensus` / proposer / commit bridge / DAG 登记 / egress）仍 fail-closed。
+    /// （`drive_local_consensus` / proposer / commit bridge / DAG 登记 / egress）仍 fail-closed
+    /// —— P1-A.5 的**唯一**本地例外是「派生 QC target ∉ 本节点 DAG」（`UnknownTarget`，
+    /// 语义 = 不适用），由 [`Self::derived_qc_not_applicable`] 单独计数（**不**并入本计数）。
     /// 拒绝 = 该命令**零 canonical 变更**（driver verify-then-transition；无 lock / 无 outbound）。
     inbound_consensus_rejected: u64,
+    /// P1-A.5：**本地/派生**路径上「派生 QC 的 target 当前不在本节点 DAG」的次数（观测）。
+    ///
+    /// 语义 = `DriverError::QcVerification(FinalityError::UnknownTarget)` ⇒ **不适用**（非有效 QC、
+    /// 非运行错误）：零状态变更（无 lock / 无 outbound / 无 canonical / 无 finality / 无 DAG 修改）。
+    /// 仅 `u64` 计数（saturating **不保留** QC payload / target hash / 签名 / 对端身份 / 错误文本）。
+    derived_qc_not_applicable: u64,
     /// D9 Step 7：入站 listener 逻辑 step 计数（每网络 step +1；pending 超时基准；无系统时钟）。
     inbound_tick: u64,
     /// D9 Step 7：入站连接握手 pending（peer 字节键 → 接受时 tick；Established / 失败 / 超时后移除）。
@@ -816,6 +865,7 @@ impl NodeRuntime {
             sync_resolved_responses: 0,
             sync_unknown_responses: 0,
             inbound_consensus_rejected: 0,
+            derived_qc_not_applicable: 0,
             inbound_tick: 0,
             inbound_pending: BTreeMap::new(),
             sync_respond: SyncRespondDiagnostics::default(),
@@ -931,6 +981,14 @@ impl NodeRuntime {
     /// 仅计数（不携带 payload / 签名 / 错误文本）；本地路径错误不以本计数表达。
     pub fn inbound_consensus_rejected(&self) -> u64 {
         self.inbound_consensus_rejected
+    }
+
+    /// P1-A.5：本地/派生路径上「派生 QC 的 target 不在本节点 DAG」（`UnknownTarget`）次数。
+    ///
+    /// 该条件被判定为**不适用**（非有效 QC、非运行错误）⇒ 不终止 runtime、零状态变更；
+    /// 仅计数（不携带 QC payload / target hash / 签名 / 对端身份 / 错误文本）。
+    pub fn derived_qc_not_applicable(&self) -> u64 {
+        self.derived_qc_not_applicable
     }
 
     /// 当前 outbound sync correlator 中 active（未 resolve / 未 expire）request 数
@@ -1543,6 +1601,9 @@ impl NodeRuntime {
         // 错误 —— 否则任何一个 peer 都能用一条非法 vote 或不可应用（target ∉ 本节点 DAG）的 QC
         // 远程终止本节点。拒绝语义本身不变：driver 先验证后转移（verify-then-transition），失败
         // ⇒ 零 canonical 变更 / 无 lock / 无 outbound；被拒命令仅被丢弃，不产生任何状态变更。
+        // （P1-A.5：本地路径仅对**同一**条件「派生 QC target ∉ DAG」做同类容忍 —— 见
+        //  `drive_local_consensus`；`inbound_consensus_rejected` 与 `derived_qc_not_applicable`
+        //  是两个独立计数，不互相混合。）
         for command in commands {
             if process_command(&mut self.driver, command).is_err() {
                 // 不记录错误文本 / payload / 签名（避免运行期材料外泄）；至少一次计数、不 panic。
@@ -1717,7 +1778,9 @@ impl NodeRuntime {
         }
         // D10-A Step 3：本地 consensus 自动推进（每 step 幂等 —— 本地产出的 canonical
         // proposal 自动执行本地 Prevote/Precommit → QC/finality 由既有 transition 产生）。
-        drive_local_consensus(&mut self.driver)?;
+        // P1-A.5：派生 QC 的 target 不在本节点 DAG（`UnknownTarget`）⇒ **不适用**（非错误）：
+        // 计数后继续；其余 Driver 失败仍 fail-closed（见 helper doc）。
+        drive_local_consensus(&mut self.driver, &mut self.derived_qc_not_applicable)?;
         // D10-C Step 4：Finality → durable Recovery Fact（**durable-before-bridge**；幂等）。
         // 观察 frozen transition ⑥ 产出的 finalized_reference + 同一 transition 派生的
         // PrecommitQC（consensus 只读；经不相交字段调用 —— 网络段已持 network_stack 借用）。
@@ -1793,6 +1856,7 @@ impl NodeRuntime {
             sync_resolved_responses: _,
             sync_unknown_responses: _,
             inbound_consensus_rejected: _,
+            derived_qc_not_applicable: _,
             inbound_tick: _,
             inbound_pending: _,
             sync_respond: _,
@@ -1853,5 +1917,53 @@ mod tests {
             crypto_validator_id(&pk),
             "derive == crypto identity::validator_id（值不变）"
         );
+    }
+
+    /// P1-A.5 T2（单元负向穷举）：容忍边界**必须**精确等于 `QcVerification(UnknownTarget)`。
+    ///
+    /// 证明「不能扩大容错范围」：`FinalityError` 全部**其它**变体 + 其它 `DriverError` 变体
+    /// 一律 ⇒ `false` ⇒ `drive_local_consensus` 走 `Err(other) => RuntimeError::Driver` ⇒ fail-closed。
+    /// （防未来退化为 `Err(_) => Ok(())` 或 `QcVerification(_) => Ok(())`。）
+    #[test]
+    fn p1a5_tolerance_is_exactly_qc_unknown_target() {
+        use crate::validator::ValidatorActorError;
+        use nova_consensus::error::ConsensusError;
+
+        // 唯一被容忍的失败（精确变体）。
+        assert!(
+            derived_qc_not_applicable(&DriverError::QcVerification(FinalityError::UnknownTarget)),
+            "QcVerification(UnknownTarget) 是唯一「QC 不适用」（非致命）"
+        );
+
+        // `FinalityError` 其余全部变体 ⇒ 不容忍。
+        let other_finality = [
+            FinalityError::InvalidQcStructure,
+            FinalityError::DuplicateValidator,
+            FinalityError::ValidatorSetMismatch,
+            FinalityError::InsufficientQuorum,
+            FinalityError::Evidence(ConsensusError::InvalidSignature),
+            FinalityError::NotPrecommitQc,
+        ];
+        for e in other_finality {
+            assert!(
+                !derived_qc_not_applicable(&DriverError::QcVerification(e)),
+                "QcVerification({e:?}) 不得被容忍（不得写成 QcVerification(_)）"
+            );
+        }
+
+        // 其它 `DriverError` 变体 ⇒ 不容忍（不得写成 `Err(_) => Ok(())`）。
+        let other_driver = [
+            DriverError::NoActor(0),
+            DriverError::VoteVerification(ConsensusError::InvalidSignature),
+            DriverError::ActorLock(ValidatorActorError::IdentityMismatch),
+            DriverError::Actor(ValidatorActorError::BlockSigning),
+            DriverError::ProposerSelection(ConsensusError::EmptyValidatorSet),
+        ];
+        for e in other_driver {
+            assert!(
+                !derived_qc_not_applicable(&e),
+                "DriverError::{e:?} 不得被容忍（fail-closed 必须保持）"
+            );
+        }
     }
 }
