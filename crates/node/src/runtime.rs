@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 
 use nova_consensus::dag::Dag;
 use nova_consensus::finality::FinalityError;
+use nova_consensus::integration::{ConsensusState, TransitionResult};
 use nova_consensus::proposer::select_proposer;
+use nova_consensus::round::{RoundStep, RoundTimeoutConfig};
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::signature::VerifyingKey;
@@ -200,6 +202,211 @@ fn derived_qc_not_applicable(err: &DriverError) -> bool {
         err,
         DriverError::QcVerification(FinalityError::UnknownTarget)
     )
+}
+
+// ---------------------------------------------------------------------------
+// P1-A.6 — Round Timeout Pacemaker（node-local liveness；ADR-0049 冻结语义）
+// ---------------------------------------------------------------------------
+//
+// 时间基准 = **逻辑 step tick**（每 `NodeRuntime::step()` 恰好 +1）。
+// **无**墙钟（无 `Instant` / `SystemTime`）、无 OS timer、无后台线程、无持久化 —— 与仓内既有
+// `LogicalTick` / `sync_tick` / `inbound_tick` 超时机制同构（确定性、可重放）。
+//
+// 边界（不得越界）：timeout 的**唯一**动作是调用冻结的 `ConsensusNode::round_timeout()`；
+// 它**不**产生 vote / QC / finality / lock / DAG 变更，也**不**广播（非证据、非 certificate）。
+
+/// `RoundTimeoutConfig::timeout_for` 退避循环的迭代上界（见 [`round_timeout_window_ticks`]）。
+const ROUND_TIMEOUT_MAX_BACKOFF_STEPS: u64 = 64;
+
+/// 窗口下界（保证 arming 后至少有一个 step 的宽限期；防退化的 0 窗口立即触发）。
+const ROUND_TIMEOUT_MIN_WINDOW_TICKS: u64 = 1;
+
+/// P1-A.6 — `window(round) = min(initial × backoff^round, max)`（冻结 `RoundTimeoutConfig` 语义）。
+///
+/// 数值以 **逻辑 step tick** 解释（node-local 配置，**非**协议常量 —— ADR-0049 §3.5）。
+/// 溢出安全：`timeout_for` 内部为 `saturating_mul(...).min(max)`；这里额外把 round 夹到
+/// [`ROUND_TIMEOUT_MAX_BACKOFF_STEPS`] 以避免退化配置（如 `backoff_factor == 1` 且
+/// `initial < max`）在极大 round 上退化为 O(round) 循环：`backoff ≥ 2` 时 `initial × 2^64`
+/// 必然 saturate 到 cap ⇒ 结果与真实 round **完全一致**；`backoff == 1` 时窗口与迭代次数无关。
+fn round_timeout_window_ticks(config: &RoundTimeoutConfig, round: u64) -> u64 {
+    config
+        .timeout_for(round.min(ROUND_TIMEOUT_MAX_BACKOFF_STEPS))
+        .max(ROUND_TIMEOUT_MIN_WINDOW_TICKS)
+}
+
+/// P1-A.6 — 当前 `(height, round)` 的本地计时器（**只**含位置 + tick 计数）。
+///
+/// `elapsed_ticks` = 本计时器（重新）arm 之后**已历经的 step 数**（arming 的那一步记 1）。
+/// 语义：`window_ticks` = 该 `(height, round)` 允许的最大 step 数；`elapsed >= window` ⇒ 到期。
+///
+/// 不保留任何 proposal / block hash / QC / 签名 / 对端材料（hash 仅瞬时存在于本 step 的观测快照，
+/// 见 [`RoundObservation`] —— 不进计时器状态、不跨 step 保留）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoundTimer {
+    height: u64,
+    round: u64,
+    elapsed_ticks: u64,
+    window_ticks: u64,
+}
+
+/// P1-A.6 — 计时器推进结果（纯计算；便于穷举单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoundTimerTick {
+    /// 新 `(height, round)` ⇒ 已 ARM（`elapsed = 1`：arming step 计入本 round；**不**继承上一轮 elapsed）。
+    Armed,
+    /// 计时中（尚未到期）。
+    Waiting,
+    /// 本 tick 达到窗口 ⇒ 应触发一次本地 round timeout。
+    Expired,
+    /// 当前 round 内观测到 canonical 进展 ⇒ 窗口重开（`elapsed = 1`：本 step 计入新窗口）。
+    Reset,
+}
+
+/// P1-A.6 — 计时器推进一步（**纯函数**；无墙钟 / 无随机 / 无 I/O —— 同输入同输出）。
+///
+/// - **ARM**：`prev` 为空或 `(height, round)` 变化 ⇒ 新计时器（`elapsed = 1`）；ADR-0049 §3.3
+///   「round transition MUST NOT inherit stale deadline」⇒ 绝不继承上一轮 elapsed。
+/// - **RESET**：本 step 在**当前** `(height, round)` 内观测到 canonical 进展 ⇒ 窗口重开
+///   （`elapsed = 1`；不增窗、不改 round）。只有**真实状态变化**能 reset ⇒ invalid / stale /
+///   duplicate / spam 输入（不改变状态）**不可能** reset（ADR-0049 §3.4 MUST NOT）。
+/// - **EXPIRE**：`elapsed >= window` ⇒ 到期（`window` = 该 round 允许的最大 step 数）。
+fn round_timer_tick(
+    prev: Option<RoundTimer>,
+    height: u64,
+    round: u64,
+    window_ticks: u64,
+    progressed: bool,
+) -> (RoundTimer, RoundTimerTick) {
+    let same_round = prev.is_some_and(|t| t.height == height && t.round == round);
+    if !same_round {
+        return (
+            RoundTimer {
+                height,
+                round,
+                elapsed_ticks: 1,
+                window_ticks,
+            },
+            RoundTimerTick::Armed,
+        );
+    }
+    let mut timer = prev.expect("same_round ⇒ prev 必为 Some");
+    if progressed {
+        timer.elapsed_ticks = 1;
+        timer.window_ticks = window_ticks;
+        return (timer, RoundTimerTick::Reset);
+    }
+    timer.elapsed_ticks = timer.elapsed_ticks.saturating_add(1);
+    let tick = if timer.elapsed_ticks >= timer.window_ticks {
+        RoundTimerTick::Expired
+    } else {
+        RoundTimerTick::Waiting
+    };
+    (timer, tick)
+}
+
+/// P1-A.6 — 本 round 是否**已被 finality 确认**（唯一 DISARM 判据）。
+///
+/// **必须**三项同时成立：`step == Finalized` **且** proposal 存在 **且**
+/// `finality.finalized_reference == proposal.block_hash`。
+///
+/// 单看 `step == Finalized` **不可**作为 disarm 判据：P1-A.5 已实测存在「派生 QC
+/// `UnknownTarget` ⇒ step 到 Finalized 但 finality 未推进」的状态（且该状态下 vote 已进终态守卫
+/// ⇒ 无法自行恢复）；该状态**必须**仍可 timeout，否则该高度永久滞留。
+fn round_finalized_by_finality(state: &ConsensusState) -> bool {
+    state.round.step == RoundStep::Finalized
+        && state
+            .round
+            .proposal
+            .as_ref()
+            .is_some_and(|p| state.finality.finalized_reference == Some(p.block_hash))
+}
+
+/// P1-A.6 — 计时器决策所需的状态观测（**仅**本 step 内瞬时使用；不跨 step 保留）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoundObservation {
+    height: u64,
+    round: u64,
+    step: RoundStep,
+    proposal_hash: Option<[u8; 32]>,
+    finalized_reference: Option<[u8; 32]>,
+}
+
+/// P1-A.6 — 当前 canonical state 的计时器观测快照（只读；不变更任何状态）。
+fn observe_round(node: &ConsensusNode) -> RoundObservation {
+    let state = node.state();
+    RoundObservation {
+        height: state.round.height,
+        round: state.round.round,
+        step: state.round.step,
+        proposal_hash: state.round.proposal.as_ref().map(|p| p.block_hash),
+        finalized_reference: state.finality.finalized_reference,
+    }
+}
+
+/// P1-A.6 — Round Timeout Pacemaker 主体（**free fn**：`step()` 网络段已持 `network_stack`
+/// 可变借用 ⇒ 只能经不相交字段引用调用，与 `drive_local_consensus` / `finality_commit_bridge` 同构）。
+///
+/// # 契约（ADR-0049 冻结语义；本函数只做 node-local liveness）
+/// - 时间基准 = **逻辑 step tick**（每 `step()` +1；无墙钟 / 无线程 / 不持久化）。
+/// - 唯一动作 = 调用冻结的 `ConsensusNode::round_timeout()`；**不**产生 vote / QC / finality /
+///   lock / DAG / canonical 变更，也**不**广播（timeout 非证据、非 certificate、不计入 quorum）。
+/// - 检查点在 `runtime_propose` **之前** ⇒ round change 后新当选 proposer 可在**同一 step**
+///   内走既有提案路径（liveness 在一个 step 内闭合）。
+///
+/// # 决策
+/// 1. DISARM：本 round 已被 finality 确认（[`round_finalized_by_finality`]）⇒ 停止计时并返回。
+/// 2. ARM / RESET / EXPIRE：见 [`round_timer_tick`]（`progressed` = 本 step 在**当前**
+///    `(height, round)` 内观测到 canonical 进展 ⇒ 窗口重开；invalid / stale / duplicate 输入
+///    不改变状态 ⇒ 结构上无法 reset）。
+/// 3. EXPIRE ⇒ `ConsensusNode::round_timeout()`；`Applied` ⇒ 计数 + 立即对新
+///    `(height, round)` 重开窗口；`Rejected`（`RoundOverflow`）/ `Ignored` ⇒ 计数 + 重开窗口
+///    （不 wrap / 不 panic / state 不变 —— 遵循既有 `TransitionResult` 语义）。
+///
+/// `entry` = 本 step 入口的观测快照（用于 `progressed` 判定；仅本 step 内有效）。
+fn drive_round_timeout(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    config: &RoundTimeoutConfig,
+    timer: &mut Option<RoundTimer>,
+    round_timeouts: &mut u64,
+    entry: RoundObservation,
+) {
+    // DISARM：必须**已被 finality 确认**（不是单看 `step == Finalized` —— 见谓词 doc）。
+    if round_finalized_by_finality(driver.consensus().state()) {
+        *timer = None;
+        return;
+    }
+    let observed = observe_round(driver.consensus());
+    let window_ticks = round_timeout_window_ticks(config, observed.round);
+    let (next, tick) = round_timer_tick(
+        *timer,
+        observed.height,
+        observed.round,
+        window_ticks,
+        observed != entry,
+    );
+    *timer = Some(next);
+    if tick != RoundTimerTick::Expired {
+        return;
+    }
+    // EXPIRE ⇒ 冻结的 node-local RoundTimeout（不新增任何共识语义）。
+    match driver.consensus_mut().round_timeout() {
+        TransitionResult::Applied { .. } => {
+            *round_timeouts = round_timeouts.saturating_add(1);
+        }
+        // `u64::MAX` 轮：`checked_successor` ⇒ `None` ⇒ `Rejected{RoundOverflow}`（不 wrap、
+        // state 与 context 不变）。计该次尝试；不 panic、不视为致命错误。
+        TransitionResult::Rejected { .. } | TransitionResult::Ignored { .. } => {
+            *round_timeouts = round_timeouts.saturating_add(1);
+        }
+    }
+    // 立即对新 `(height, round)` 重开窗口（elapsed 不继承；窗口 = 新轮的 `timeout_for`）。
+    let after = observe_round(driver.consensus());
+    *timer = Some(RoundTimer {
+        height: after.height,
+        round: after.round,
+        elapsed_ticks: 1,
+        window_ticks: round_timeout_window_ticks(config, after.round),
+    });
 }
 
 /// D10-C Step 4 — Finality Advance 后 durable 写 Recovery Fact（**durable-before-bridge**；幂等）。
@@ -667,6 +874,15 @@ pub struct NodeRuntime {
     /// 非运行错误）：零状态变更（无 lock / 无 outbound / 无 canonical / 无 finality / 无 DAG 修改）。
     /// 仅 `u64` 计数（saturating **不保留** QC payload / target hash / 签名 / 对端身份 / 错误文本）。
     derived_qc_not_applicable: u64,
+    /// P1-A.6 — round timeout 窗口参数（**逻辑 step tick** 单位；默认 `RoundTimeoutConfig::default()`）。
+    ///
+    /// node-local 配置面：非协议常量（ADR-0049 §3.5）、非 CLI flag、不进 `NodeConfig`、不持久化。
+    round_timeout_config: RoundTimeoutConfig,
+    /// P1-A.6 — 当前 `(height, round)` 的本地计时器（`None` = 尚未 arm / 已被 finality disarm）。
+    /// **只**含位置 + tick 计数（无 payload / 无 hash / 无签名 / 无对端材料）。
+    round_timer: Option<RoundTimer>,
+    /// P1-A.6 — 本地 round timeout 触发次数（saturating；诊断观测，不携带任何共识材料）。
+    round_timeouts: u64,
     /// D9 Step 7：入站 listener 逻辑 step 计数（每网络 step +1；pending 超时基准；无系统时钟）。
     inbound_tick: u64,
     /// D9 Step 7：入站连接握手 pending（peer 字节键 → 接受时 tick；Established / 失败 / 超时后移除）。
@@ -866,6 +1082,9 @@ impl NodeRuntime {
             sync_unknown_responses: 0,
             inbound_consensus_rejected: 0,
             derived_qc_not_applicable: 0,
+            round_timeout_config: RoundTimeoutConfig::default(),
+            round_timer: None,
+            round_timeouts: 0,
             inbound_tick: 0,
             inbound_pending: BTreeMap::new(),
             sync_respond: SyncRespondDiagnostics::default(),
@@ -989,6 +1208,34 @@ impl NodeRuntime {
     /// 仅计数（不携带 QC payload / target hash / 签名 / 对端身份 / 错误文本）。
     pub fn derived_qc_not_applicable(&self) -> u64 {
         self.derived_qc_not_applicable
+    }
+
+    /// P1-A.6：本地 round timeout 已触发（调用冻结 `round_timeout()`）的次数（saturating 观测）。
+    ///
+    /// 计数 = 计时器到期并执行一次本地 RoundTimeout **尝试**（含 `u64::MAX` 轮被冻结
+    /// `checked_successor` 拒绝的尝试）；不携带任何 payload / hash / 签名 / 对端材料。
+    pub fn round_timeouts(&self) -> u64 {
+        self.round_timeouts
+    }
+
+    /// P1-A.6：当前计时器已历 step 数（arming step 记 1；`None` = 尚未 arm / 已被 finality disarm）。
+    pub fn round_timeout_elapsed_ticks(&self) -> Option<u64> {
+        self.round_timer.map(|t| t.elapsed_ticks)
+    }
+
+    /// P1-A.6：当前计时器窗口（tick；`None` = 未 arm）。只读观测（诊断 / 确定测试）。
+    pub fn round_timeout_window_ticks(&self) -> Option<u64> {
+        self.round_timer.map(|t| t.window_ticks)
+    }
+
+    /// P1-A.6 — **测试 / 开发 seam**：设置 round timeout 窗口参数（**tick** 单位）。
+    ///
+    /// - 非生产配置面：无 CLI flag / 不进 `NodeConfig` / 不持久化 / 不改任何共识语义。
+    /// - 调用后丢弃当前计时器，下一 `step()` 按新参数重新 arm（确定测试无需等待 / 无 sleep）。
+    /// - 生产默认 = `RoundTimeoutConfig::default()`（1000 / 60_000 / 2）。
+    pub fn set_round_timeout_config(&mut self, config: RoundTimeoutConfig) {
+        self.round_timeout_config = config;
+        self.round_timer = None;
     }
 
     /// 当前 outbound sync correlator 中 active（未 resolve / 未 expire）request 数
@@ -1564,6 +1811,10 @@ impl NodeRuntime {
             }
             return Ok(());
         };
+        // P1-A.6 — round-timeout 决策的**入口观测快照**：仅用于判定「本 step 是否在当前
+        // `(height, round)` 内观测到 canonical 进展」（⇒ RESET）；仅本 step 内瞬时有效，
+        // **不**进入计时器状态、不跨 step 保留 hash。
+        let round_entry = observe_round(self.driver.consensus());
         // D9 Step 7 — 入站 listener 前半段（1. inbound accept/greet；bounded；nonblocking）。
         // - `begin_step` 重置本 step 入站帧预算（≤ MAX_INBOUND_FRAMES_PER_POLL）。
         // - accept ≤ MAX_ACCEPT_PER_STEP；KEEP-FIRST；connect_peer（connected ≠ authenticated）；
@@ -1742,6 +1993,18 @@ impl NodeRuntime {
             &mut self.missing_ancestor_ledger,
             sync_head,
         )?;
+        // ===== P1-A.6 — Round Timeout Pacemaker（唯一检查点）=====
+        // 顺序固定：sync 编排 → **round-timeout 检查** → `runtime_propose`（本地提案）→
+        // `drive_local_consensus`。放在提案生成**之前**，使 round change 后新当选 proposer 能
+        // **同一 step** 内走既有提案路径（liveness 在一个 step 内闭合）；其余阶段顺序不变。
+        // （free fn + 不相交字段引用：网络段已持 `network_stack` 可变借用。）
+        drive_round_timeout(
+            &mut self.driver,
+            &self.round_timeout_config,
+            &mut self.round_timer,
+            &mut self.round_timeouts,
+            round_entry,
+        );
         // STEP 10-19-6 OPT-1：node-local proposer orchestration —— 仅本节点为当前 proposer 且
         // 阶段 Propose 且本轮未提案时，经 BlockBuilder 产出真实 Block + ProposalRef 并提交；
         // 否则幂等 no-op。不自动投票（vote 仍走既有路径）。
@@ -1857,6 +2120,9 @@ impl NodeRuntime {
             sync_unknown_responses: _,
             inbound_consensus_rejected: _,
             derived_qc_not_applicable: _,
+            round_timeout_config: _,
+            round_timer: _,
+            round_timeouts: _,
             inbound_tick: _,
             inbound_pending: _,
             sync_respond: _,
@@ -1965,5 +2231,152 @@ mod tests {
                 "DriverError::{e:?} 不得被容忍（fail-closed 必须保持）"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // P1-A.6 T1（单元）：纯计时状态机 / 窗口算术 / DISARM 判据
+    // （集成层时序与可观测行为见 `tests/d10_p1_a6_round_timeout_liveness.rs`）
+    // -----------------------------------------------------------------------
+
+    /// 窗口算术 = 冻结 `min(initial × backoff^round, max)`；含 cap / 退化配置 / 极大 round 有界。
+    #[test]
+    fn p1a6_window_follows_backoff_and_cap() {
+        let cfg = RoundTimeoutConfig {
+            initial_timeout: 10,
+            max_timeout: 25,
+            backoff_factor: 2,
+        };
+        assert_eq!(round_timeout_window_ticks(&cfg, 0), 10);
+        assert_eq!(round_timeout_window_ticks(&cfg, 1), 20);
+        assert_eq!(round_timeout_window_ticks(&cfg, 2), 25, "40 ⇒ cap 25");
+        assert_eq!(round_timeout_window_ticks(&cfg, 3), 25, "cap 后恒定");
+        assert_eq!(
+            round_timeout_window_ticks(&cfg, u64::MAX),
+            25,
+            "极大 round 有界（不 O(round)；结果 = cap）"
+        );
+
+        // 生产默认（tick 单位；node config 非协议常量）：1000 / 60_000 / 2。
+        let default_cfg = RoundTimeoutConfig::default();
+        assert_eq!(round_timeout_window_ticks(&default_cfg, 0), 1_000);
+        assert_eq!(round_timeout_window_ticks(&default_cfg, 1), 2_000);
+        assert_eq!(round_timeout_window_ticks(&default_cfg, 6), 60_000);
+        assert_eq!(round_timeout_window_ticks(&default_cfg, u64::MAX), 60_000);
+
+        // 退化配置：0 窗口 ⇒ 下界 1；backoff == 1 ⇒ 不增长（且不退化循环）。
+        let zero = RoundTimeoutConfig {
+            initial_timeout: 0,
+            max_timeout: 60_000,
+            backoff_factor: 2,
+        };
+        assert_eq!(round_timeout_window_ticks(&zero, 0), 1);
+        let flat = RoundTimeoutConfig {
+            initial_timeout: 5,
+            max_timeout: 60_000,
+            backoff_factor: 1,
+        };
+        assert_eq!(round_timeout_window_ticks(&flat, u64::MAX), 5);
+    }
+
+    /// ARM / 未到期 / 恰好到期 / 不继承 elapsed / RESET / 确定性。
+    #[test]
+    fn p1a6_timer_arms_waits_expires_and_resets() {
+        // ARM：新 (height, round) ⇒ elapsed = 1（arming step 计入）；不继承任何历史。
+        let (armed, tick) = round_timer_tick(None, 0, 0, 3, false);
+        assert_eq!(tick, RoundTimerTick::Armed);
+        assert_eq!(armed.elapsed_ticks, 1);
+        assert_eq!((armed.height, armed.round, armed.window_ticks), (0, 0, 3));
+
+        // 未到期 → 恰好到期（window = 3 ⇒ elapsed 1、2 为 Waiting；3 为 Expired）。
+        let (waiting, tick) = round_timer_tick(Some(armed), 0, 0, 3, false);
+        assert_eq!(tick, RoundTimerTick::Waiting);
+        assert_eq!(waiting.elapsed_ticks, 2);
+        let (expired, tick) = round_timer_tick(Some(waiting), 0, 0, 3, false);
+        assert_eq!(tick, RoundTimerTick::Expired, "恰好到达 window ⇒ 到期");
+        assert_eq!(expired.elapsed_ticks, 3);
+
+        // 新 round ⇒ 全新窗口（不继承 elapsed = 3）；窗口按新 round 传入。
+        let (next_round, tick) = round_timer_tick(Some(expired), 0, 1, 6, false);
+        assert_eq!(tick, RoundTimerTick::Armed);
+        assert_eq!(next_round.elapsed_ticks, 1, "round 变更后 elapsed 不继承");
+        assert_eq!(next_round.window_ticks, 6);
+
+        // height 变更 ⇒ 同样 fresh（丢弃旧高度计时）。
+        let (next_height, tick) = round_timer_tick(Some(next_round), 1, 0, 3, false);
+        assert_eq!(tick, RoundTimerTick::Armed);
+        assert_eq!((next_height.height, next_height.round), (1, 0));
+        assert_eq!(next_height.elapsed_ticks, 1);
+
+        // RESET：同 round 内进展 ⇒ 窗口重开（elapsed 回 1；不增窗、不改 round）。
+        let (reset, tick) = round_timer_tick(Some(expired), 0, 0, 3, true);
+        assert_eq!(tick, RoundTimerTick::Reset);
+        assert_eq!(reset.elapsed_ticks, 1);
+        assert_eq!((reset.height, reset.round), (0, 0));
+        // 重开后需再满一个窗口 ⇒ 下一 tick 不得到期。
+        let (_, tick) = round_timer_tick(Some(reset), 0, 0, 3, false);
+        assert_eq!(tick, RoundTimerTick::Waiting);
+
+        // 确定性 / 无墙钟：同一序列重复执行 ⇒ 结果逐项相同。
+        let run = || {
+            let mut seen = Vec::new();
+            let mut current = None;
+            for progressed in [false, false, false, true, false, false, false] {
+                let (timer, tick) = round_timer_tick(current, 2, 7, 3, progressed);
+                seen.push((timer.elapsed_ticks, tick));
+                current = Some(timer);
+            }
+            seen
+        };
+        assert_eq!(run(), run(), "同输入同输出（无外部时钟 / 无随机）");
+    }
+
+    /// DISARM 判据：**必须** `step == Finalized` **且** proposal 存在 **且**
+    /// `finalized_reference == proposal.block_hash`（单看 Finalized 不够）。
+    #[test]
+    fn p1a6_disarm_requires_matching_finality() {
+        use nova_consensus::finality::FinalityState;
+        use nova_consensus::round::{ProposalRef, RoundState, VoteAccumulator};
+
+        let state = |step: RoundStep, proposal: Option<[u8; 32]>, finalized: Option<[u8; 32]>| {
+            ConsensusState {
+                round: RoundState {
+                    height: 3,
+                    round: 1,
+                    proposal: proposal.map(|block_hash| ProposalRef {
+                        block_hash,
+                        proposer: ValidatorId::from_bytes([1u8; 32]),
+                    }),
+                    prevotes: VoteAccumulator::new(),
+                    precommits: VoteAccumulator::new(),
+                    step,
+                },
+                finality: FinalityState {
+                    finalized_reference: finalized,
+                    highest_precommit_qc: None,
+                },
+            }
+        };
+
+        let x = [0x11u8; 32];
+        assert!(
+            round_finalized_by_finality(&state(RoundStep::Finalized, Some(x), Some(x))),
+            "Finalized + proposal + finality 匹配 ⇒ DISARM"
+        );
+        assert!(
+            !round_finalized_by_finality(&state(RoundStep::Precommit, Some(x), Some(x))),
+            "未 Finalized ⇒ 不 disarm"
+        );
+        assert!(
+            !round_finalized_by_finality(&state(RoundStep::Finalized, None, Some(x))),
+            "无 proposal ⇒ 不 disarm"
+        );
+        assert!(
+            !round_finalized_by_finality(&state(RoundStep::Finalized, Some(x), None)),
+            "P1-A.5 场景（Finalized 但无 finality）⇒ **必须**仍可 timeout"
+        );
+        assert!(
+            !round_finalized_by_finality(&state(RoundStep::Finalized, Some(x), Some([0x22u8; 32]))),
+            "finality 与 proposal 不匹配 ⇒ 不 disarm"
+        );
     }
 }
