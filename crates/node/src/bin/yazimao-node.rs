@@ -73,6 +73,7 @@ const PROGRAM: &str = "yazimao-node";
 /// 软件版本（workspace 统一版本）。
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 有界空闲间隔默认值（ms）。
+/// `IDLE_MS_MAX`（`= 50`）上限（`--idle-ms 0` 已被 CLI 拒绝 ⇒ 无 busy loop）。
 const IDLE_MS_DEFAULT: u64 = 1;
 /// 有界空闲间隔上限（ms；越界 ⇒ fail-closed）。
 const IDLE_MS_MAX: u64 = 50;
@@ -986,10 +987,61 @@ fn run_fault_kind(e: &RuntimeError) -> &'static str {
 /// 4. **P1-A.9（P1-3）**：每 `STATUS_INTERVAL_STEPS` 步输出一行 status（stdout；固定 interval；
 ///    无墙钟 / 无随机 / 不影响 step timing）。status 写失败只记录（`status_write_failed`），
 ///    **不**改变 step 语义、**不**跳过 `shutdown`、**不**覆盖 step 错误。
+///
+/// P1-A.13 —— peer warm-up 最大轮数（每轮 = 一次 `establish_configured_peers()` + `idle_ms` pacing）。
+///
+/// 有界性保证：configured peer 永久不可达时**不会**卡死启动 —— 到期（rounds 耗尽）即带
+/// `warmup_exhausted` 继续进入正常有界运行循环；也不会引入新协议/新消息（仅复用既有幂等接口）。
+const WARMUP_MAX_ROUNDS: u64 = 300;
+
 fn run_node_loop(runtime: &mut NodeRuntime, cli: &Cli) -> RunLoopOutcome {
     let mut steps: u64 = 0;
     let mut error: Option<StartupError> = None;
     let mut status_write_failed = false;
+
+    // ===== P1-A.13 — 有界 peer warm-up（先建连/握手，再驱动共识）=====
+    // 动机：若在 configured peer 尚未 Established 时就 `step()`，首轮（height=0/round=0）proposer
+    // 的提案 egress 无接收者 ⇒ **提案丢失**，只能依赖 round-timeout 恢复（默认窗口 1000 逻辑 tick，
+    // 在慢 step 下可达分钟级）⇒ 启动期看似无进展。
+    // 与已通过的 in-process rig（A.10：先建连后共识）在“共识起始条件”上对齐。
+    // **不**修改 pacemaker 默认值、**不**改 runtime / consensus。
+    if !cli.peers.is_empty() {
+        let mut rounds: u64 = 0;
+        loop {
+            let _ = runtime.establish_configured_peers();
+            // P1-A.14 — 网络生命周期**窄口**：只驱动网络（inbound_tick / begin_step /
+            // accept+greet / poll_once / reconcile），**不**进入共识 ⇒ 零 proposal / vote / QC /
+            // finality / commit / head advance / round mutation。
+            // 必要性（P1-A.13 实测证据）：`establish_configured_peers()` 只驱动**本端 dial 侧**，
+            // listener 侧的 accept/greet 仅存在于 `step()` 的网络段 ⇒ 仅靠前者 warm-up 永不完成
+            // （`established_peers=0~1` 耗尽 300 轮）。
+            // 错误处理与上一行同策略（best-effort；warm-up 不 fail-closed）：紧随其后的正常循环
+            // 第一步 `step()` 会**先**执行同一网络生命周期并以既有 fail-closed 语义传播错误
+            // ⇒ 不吞错 / 不改 step 语义 / 不改网络协议。
+            let _ = runtime.poll_network_only();
+            let established = cli
+                .peers
+                .iter()
+                .filter(|t| runtime.network_peer_established(t.peer_id))
+                .count();
+            let done = established == cli.peers.len();
+            if done || rounds >= WARMUP_MAX_ROUNDS {
+                let _ = write_stdout(&format!(
+                    "{PROGRAM}: peer warm-up {}; configured_peers={} established_peers={} \
+                     warmup_rounds={} warmup_max_rounds={}\n",
+                    if done { "completed" } else { "exhausted" },
+                    cli.peers.len(),
+                    established,
+                    rounds,
+                    WARMUP_MAX_ROUNDS,
+                ));
+                break;
+            }
+            rounds += 1;
+            std::thread::sleep(std::time::Duration::from_millis(cli.idle_ms));
+        }
+    }
+
     while steps < cli.run_steps {
         if !cli.peers.is_empty() {
             // 幂等；不因单个 configured peer 失败而终止节点（错误在 status 中，无状态机副作用）。

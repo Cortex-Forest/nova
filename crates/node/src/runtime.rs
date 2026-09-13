@@ -2338,31 +2338,28 @@ impl NodeRuntime {
         })
     }
 
-    /// 一轮运行时驱动（Stage C）：网络 disabled（`start`）⇒ `Ok(())`（不产生网络 identity）；
-    /// 启用网络（`start_with_network`）⇒ EventLoop poll NetworkService → dispatch →
-    /// Handler 产 **owned** `NodeConsensusCommand` → Runtime drain → `process_command` →
-    /// Driver（既有验证门面）→ ConsensusNode / ValidatorActor。
+    /// **P1-A.14** — 网络生命周期 helper（**仅**网络层；**零**共识副作用）。
     ///
-    /// borrow-safe：`poll_once` 临时借 `stack.el` + `stack.ns`（同栈内 disjoint 字段）；
-    /// `take_commands()` 返回 owned commands 后即释放 EventLoop 借用；随后才 `&mut self.driver`。
-    /// 无 `Handler → &mut Driver/Runtime`、无 self-reference（无 Rc/RefCell/Arc/unsafe/async）。
-    pub fn step(&mut self) -> Result<(), RuntimeError> {
+    /// 严格等价于抽取前 `step()` 的既有网络段（顺序与语义**不变**，不复制/不重写网络逻辑）：
+    ///
+    /// 1. `inbound_tick` 递增（既有网络侧计数）。
+    /// 2. `inbound.begin_step()`（重置本 step 入站帧预算 ≤ `MAX_INBOUND_FRAMES_PER_POLL`）。
+    /// 3. `inbound_accept_and_greet(..)`（accept ≤ `MAX_ACCEPT_PER_STEP`；KEEP-FIRST；
+    ///    `connect_peer`（connected ≠ authenticated）；本端 Handshake Init；失败只计数 ⇒ 无 Err）。
+    /// 4. `stack.el.poll_once(&mut stack.ns)`（握手 / 会话 / EOF 处理；错误映射 `EventLoop`）。
+    /// 5. `inbound_reconcile(..)`（EOF 清理 + pending 状态机）。
+    ///
+    /// **不**执行（因此共识状态零变更）：`take_commands()` / `process_inbound_consensus_command`
+    /// / `take_block_inbound` / sync 编排 / `drive_round_timeout` / `runtime_propose` / 提案 egress /
+    /// `drive_local_consensus` / finality 持久化 / QC history / commit bridge / `advance_to_height` /
+    /// egress drain。网络 stack 产生的 command / block-inbound 事件**保留在既有有界队列**中，
+    /// 由随后的正式 `step()` drain（不新增队列、不改容量、不改协议）。
+    ///
+    /// 网络 disabled（`network_stack == None`）⇒ `Ok(())`（与 `step()` 的原早退分支一致）。
+    fn poll_network_lifecycle(&mut self) -> Result<(), RuntimeError> {
         let Some(stack) = &mut self.network_stack else {
-            // 网络 disabled：node-local proposer orchestration（真实 BlockBuilder；显式 timestamp）。
-            let proposal = runtime_propose(
-                &mut self.driver,
-                &self.block_production,
-                self.proposal_timestamp,
-            )?;
-            if let Some(pb) = proposal {
-                self.last_proposal = Some(pb);
-            }
             return Ok(());
         };
-        // P1-A.6 — round-timeout 决策的**入口观测快照**：仅用于判定「本 step 是否在当前
-        // `(height, round)` 内观测到 canonical 进展」（⇒ RESET）；仅本 step 内瞬时有效，
-        // **不**进入计时器状态、不跨 step 保留 hash。
-        let round_entry = observe_round(self.driver.consensus());
         // D9 Step 7 — 入站 listener 前半段（1. inbound accept/greet；bounded；nonblocking）。
         // - `begin_step` 重置本 step 入站帧预算（≤ MAX_INBOUND_FRAMES_PER_POLL）。
         // - accept ≤ MAX_ACCEPT_PER_STEP；KEEP-FIRST；connect_peer（connected ≠ authenticated）；
@@ -2392,6 +2389,56 @@ impl NodeRuntime {
             &mut self.inbound_pending,
             self.inbound_tick,
         );
+        Ok(())
+    }
+
+    /// **P1-A.14** — 网络生命周期**窄口**（启动 warm-up 专用）：仅驱动 1–5 步网络生命周期，
+    /// **不** drain / 不处理任何 consensus command / block inbound / sync / round-timeout /
+    /// proposer / 投票 / QC / finality / commit / head advance / egress。
+    ///
+    /// 用途：与 `establish_configured_peers()` 交替调用，使**双向**（含 listener 侧 accept/greet）
+    /// 的网络生命周期可在**不进入共识**的前提下推进 —— 纯 `establish_configured_peers()` 只驱动
+    /// 本端 dial 侧，无法完成 listener 侧（P1-A.13 实测：`established_peers=0~1` 耗尽 300 轮）。
+    ///
+    /// 安全边界：见 `poll_network_lifecycle()` 文档（proposal / vote / QC / finality / commit /
+    /// head advance / round mutation 全部为 NO）。
+    pub fn poll_network_only(&mut self) -> Result<(), RuntimeError> {
+        self.poll_network_lifecycle()
+    }
+
+    /// 一轮运行时驱动（Stage C）：网络 disabled（`start`）⇒ `Ok(())`（不产生网络 identity）；
+    /// 启用网络（`start_with_network`）⇒ EventLoop poll NetworkService → dispatch →
+    /// Handler 产 **owned** `NodeConsensusCommand` → Runtime drain → `process_command` →
+    /// Driver（既有验证门面）→ ConsensusNode / ValidatorActor。
+    ///
+    /// borrow-safe：`poll_once` 临时借 `stack.el` + `stack.ns`（同栈内 disjoint 字段）；
+    /// `take_commands()` 返回 owned commands 后即释放 EventLoop 借用；随后才 `&mut self.driver`。
+    /// 无 `Handler → &mut Driver/Runtime`、无 self-reference（无 Rc/RefCell/Arc/unsafe/async）。
+    pub fn step(&mut self) -> Result<(), RuntimeError> {
+        if self.network_stack.is_none() {
+            // 网络 disabled：node-local proposer orchestration（真实 BlockBuilder；显式 timestamp）。
+            let proposal = runtime_propose(
+                &mut self.driver,
+                &self.block_production,
+                self.proposal_timestamp,
+            )?;
+            if let Some(pb) = proposal {
+                self.last_proposal = Some(pb);
+            }
+            return Ok(());
+        }
+        // P1-A.6 — round-timeout 决策的**入口观测快照**：仅用于判定「本 step 是否在当前
+        // `(height, round)` 内观测到 canonical 进展」（⇒ RESET）；仅本 step 内瞬时有效，
+        // **不**进入计时器状态、不跨 step 保留 hash。
+        let round_entry = observe_round(self.driver.consensus());
+        // P1-A.14 — 网络生命周期（既有 1–5 步）抽取为 `poll_network_lifecycle()`：
+        // **顺序与语义完全不变**（本调用即原内联代码位置）；窄口 `poll_network_only()` 复用同一
+        // helper（抽取而非复制 ⇒ 不存在第二套网络逻辑）。
+        self.poll_network_lifecycle()?;
+        let Some(stack) = &mut self.network_stack else {
+            // 不可达（上方已判 `None`）；保留「无网络栈 ⇒ 无网络阶段」的既有语义。
+            return Ok(());
+        };
         let commands = stack.el.handler_mut().take_commands();
         // P1-A.4：**入站（peer 提供）consensus command** 的 Driver 拒绝边界。
         //
