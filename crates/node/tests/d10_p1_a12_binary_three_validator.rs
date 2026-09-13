@@ -354,13 +354,29 @@ fn assert_no_consensus_errors(label: &str, out: &str, err: &str) {
 // ===========================================================================
 
 /// 单个 validator 的实时样本（**仅**来自完整 status 行）。
+///
+/// P1-A.19 —— 字段语义**必须**区分（RC-2 = `TEST PREDICATE ARTIFACT` 的根因）：
+/// - `head`：canonical head（commit 结果；只随 finality 授权 + commit 桥推进、不回退）⇒ **活性 progress 主判据**；
+/// - `consensus`：`consensus_height`（本节点当前轮次高度）⇒ 与 `head` 并列的主判据（禁止只判「单节点 head」）；
+/// - `finalized`：`finalized_height` = **durable QC-history tip**（对端 QC **服务能力**指标；
+///   ⚠️ **不等价于 consensus finality**：不参与本地 safety / finality / commit 不变式，追赶 / 快进 /
+///   重负载下可**合法滞后**）⇒ 仅作 sanity bound（≤ head）+ durable 见证（任一节点 ≥ 1）；
+/// - `established`：established peers。
 #[derive(Clone, Copy, Debug)]
 struct StatusSample {
     steps: u64,
     head: u64,
-    /// `finalized_height=none` ⇒ `None`（尚未产生 durable finality）。
+    /// `finalized_height=none` ⇒ `None`（durable QC-history tip **未知**；**不是**「无 finality」）。
     finalized: Option<u64>,
+    consensus: u64,
     established: u64,
+}
+
+impl StatusSample {
+    /// durable sanity：QC-history tip 若存在必须 `≤ head`（tip **领先** head 才是异常）。
+    fn durable_sane(&self) -> bool {
+        self.finalized.is_none_or(|f| f <= self.head)
+    }
 }
 
 /// 单个 validator 的实时采样跟踪（按 `steps` 去重；保留全部样本用于“持续进展”判定）。
@@ -396,6 +412,7 @@ impl LiveTracker {
             steps,
             head,
             finalized: field(&line, "finalized_height="),
+            consensus: field(&line, "consensus_height=").unwrap_or(0),
             established: field(&line, "established_peers=").unwrap_or(0),
         });
     }
@@ -404,23 +421,24 @@ impl LiveTracker {
         self.samples.last().copied()
     }
 
-    /// 至少 2 个完整样本，且 `finalized_height` 至少一次**严格增加**（持续 durable 进展）。
+    /// 至少 2 个完整样本，且 `head` 至少一次**严格增加**（持续进展）。
+    ///
+    /// P1-A.19：原判据用 `finalized_height`（durable QC tip）严格增加 —— 该量在追赶 / 快进 / 重负载下
+    /// **可合法滞后**，会把「无滞后」误判为「无进展」。改用 `head`（只随 finality 授权 + commit 桥推进）
+    /// ⇒ 严格性等价或更强（head 前进**必须**经 quorum precommit QC + commit 桥）。
     fn sustained(&self) -> bool {
-        self.samples.len() >= 2
-            && self
-                .samples
-                .windows(2)
-                .any(|w| w[1].finalized.unwrap_or(0) > w[0].finalized.unwrap_or(0))
+        self.samples.len() >= 2 && self.samples.windows(2).any(|w| w[1].head > w[0].head)
     }
 
     /// §18 审计行：validator / steps / head / finalized / established / samples。
     fn audit(&self) -> String {
         match self.last() {
             Some(s) => format!(
-                "{}: steps={} head={} finalized={:?} established={} samples={}",
+                "{}: steps={} head={} consensus={} finalized_tip={:?} established={} samples={}",
                 self.label,
                 s.steps,
                 s.head,
+                s.consensus,
                 s.finalized,
                 s.established,
                 self.samples.len()
@@ -445,17 +463,27 @@ fn fatal_marker(out: &str, err: &str) -> Option<&'static str> {
         .find(|n| out.contains(n) || err.contains(n))
 }
 
-/// T1/T2 共用验收谓词（全部证据 = **实时完整 status 样本**）：
-/// - 每节点：`finalized == Some(head)`（无滞后 validator）、`head >= 2`、`established >= 1`；
-/// - 每节点：≥2 完整样本且 `finalized` 至少一次严格增加（持续进展）。
+/// T1/T2 共用验收谓词（全部证据 = **实时完整 status 样本**）；P1-A.19 语义修正：
+/// - 每节点：`consensus == head`（与 head 同步）∧ `head >= 2` ∧ `established >= 1` ∧ durable sanity（tip ≤ head）；
+/// - 每节点：≥2 完整样本且 `head` 至少一次严格增加（持续进展）；
+/// - **durable 见证**（不被完全移除）：任一节点 QC-history tip ≥ 1。
+///
+/// ⚠️ 原文案要求每节点 `finalized == Some(head)` —— `finalized_height` 是 **durable QC tip（服务能力）**，
+/// **不是** consensus finality（RC-2 = `TEST PREDICATE ARTIFACT`）。
+/// `consensus == head` 亦**不**单独声明 finality proof：它只表示本节点已把 head 推进到其轮次高度，
+/// 而 head 只能经 quorum precommit QC + commit 桥前进。
 fn formal_predicate(ts: &[LiveTracker]) -> bool {
     !ts.is_empty()
         && ts.iter().all(|t| {
             t.sustained()
                 && t.last().is_some_and(|s| {
-                    s.finalized == Some(s.head) && s.head >= 2 && s.established >= 1
+                    s.consensus == s.head && s.head >= 2 && s.established >= 1 && s.durable_sane()
                 })
         })
+        && ts
+            .iter()
+            .filter_map(|t| t.last())
+            .any(|s| s.finalized.is_some_and(|f| f >= 1))
 }
 
 /// 有界观测：持续采样直到谓词成立或窗口到期（**在 terminate 之前**收集全部验收证据）。
@@ -531,7 +559,8 @@ fn run_formal_acceptance(
     // ---- 断言（P1-A.14 正式口径）----
     assert!(
         accepted,
-        "P1-A.14 正式验收未在 {window:?} 内达成（口径 = 实时 durable finality + 持续进展 + 无致命错误；\
+        "P1-A.14 正式验收未在 {window:?} 内达成（口径 = 实时 head/consensus 进展 + 持续进展 + 无致命错误；\
+         durable QC tip 仅作 sanity(≤ head) 与见证(任一 ≥ 1)，**不**作 consensus finality 判据；\
          **不**要求 6000 步 / exit 0）：{audit:?}"
     );
     assert!(
@@ -541,17 +570,26 @@ fn run_formal_acceptance(
     for t in &trackers {
         let s = t.last().expect("accepted ⇒ 必有完整样本");
         assert!(
-            s.finalized == Some(s.head),
-            "{} 必须 head == finalized（无滞后 validator）：head={} finalized={:?}",
+            s.consensus == s.head,
+            "{} 必须 consensus_height == head（与 head 同步；head 只能经 finality 授权 + commit 桥前进）：\
+             head={} consensus={}",
             t.label,
             s.head,
-            s.finalized
+            s.consensus
         );
         assert!(
-            s.finalized.is_some_and(|f| f >= 2),
-            "{} durable finalized_height 必须 ≥2（实测 {:?}）",
+            s.head >= 2,
+            "{} canonical head 必须 ≥2（实测 {}）",
             t.label,
-            s.finalized
+            s.head
+        );
+        assert!(
+            s.durable_sane(),
+            "{} durable QC-history tip 必须 ≤ head（tip={:?} head={}）；\
+             ⚠️ tip 是服务能力指标，可合法滞后，但不得领先 head",
+            t.label,
+            s.finalized,
+            s.head
         );
         assert!(
             s.established >= 1,
@@ -561,20 +599,32 @@ fn run_formal_acceptance(
         );
         assert!(
             t.sustained(),
-            "{} 必须观测到 ≥2 个完整样本且 finalized 至少一次严格增加；finalized 序列={:?}",
+            "{} 必须观测到 ≥2 个完整样本且 head 至少一次严格增加；head 序列={:?}",
             t.label,
-            t.samples.iter().map(|s| s.finalized).collect::<Vec<_>>()
+            t.samples.iter().map(|s| s.head).collect::<Vec<_>>()
         );
     }
-    // 收敛（**可达口径**）：所有 validator 都 durable-finalized 至少同一高度 2；
-    // 不要求瞬时等值（真实进程步进速率不同）。精确引用一致性由 A.10 in-process rig 断言。
-    let min_finalized = trackers
+    // **durable 见证（P1-A.19 §9）**：至少一个节点仍展示 QC-history 基础服务能力（tip ≥ 1）。
+    assert!(
+        trackers
+            .iter()
+            .filter_map(|t| t.last())
+            .any(|s| s.finalized.is_some_and(|f| f >= 1)),
+        "P1-A.19 durable 见证缺失：所有节点 durable QC-history tip 均 < 1（tip 序列：{:?}）",
+        trackers
+            .iter()
+            .map(|t| t.last().and_then(|s| s.finalized))
+            .collect::<Vec<_>>()
+    );
+    // 收敛（**P1-A.19 口径**）：所有节点 canonical head ≥ 2（head 前进必经 finality 路径）；
+    // 不要求 durable tip 等值 / 瞬时一致 —— 精确引用一致性由 A.10 in-process rig 断言。
+    let min_head = trackers
         .iter()
-        .filter_map(|t| t.last().and_then(|s| s.finalized))
+        .filter_map(|t| t.last().map(|s| s.head))
         .min();
     assert!(
-        min_finalized.is_some_and(|m| m >= 2),
-        "P1-A.14 收敛口径 min(finalized) ≥ 2 未达成：{audit:?}"
+        min_head.is_some_and(|m| m >= 2),
+        "P1-A.14 收敛口径 min(head) ≥ 2 未达成：{audit:?}"
     );
     // 无致命错误（窄匹配；同时覆盖 stdout 与 stderr）。
     for c in children.iter() {
@@ -960,8 +1010,43 @@ fn t3_unreachable_peer_exhausts_warmup_and_exits_bounded() {
 /// 属 P1-A.18 议题）。90s 足以观察到 ≥1 块推进且不拖长串行化后的总墙钟。
 const A17_DOWNTIME_WINDOW: Duration = Duration::from_secs(90);
 
-/// 实时 status 采样的紧凑元组：`(steps, head, finalized, established)`。
-type LiveStats = (u64, u64, Option<u64>, u64);
+/// 实时 status 采样（P1-A.19 起为**具名字段**；取代位置元组 ⇒ 消除 RC-2 类「索引歧义」：
+/// 原来 `s.2` 既被当作 consensus finality 又被当作 durable QC tip）。
+///
+/// 字段语义见 [`StatusSample`]：主判据 = `head` + `consensus`；`finalized`（durable QC tip）仅作
+/// sanity（≤ head）与见证（任一 ≥ 1）。
+#[derive(Clone, Copy, Debug)]
+struct LiveStats {
+    steps: u64,
+    head: u64,
+    finalized: Option<u64>,
+    consensus: u64,
+    established: u64,
+}
+
+impl LiveStats {
+    /// durable sanity：QC-history tip 若存在必须 `≤ head`。
+    fn durable_sane(&self) -> bool {
+        self.finalized.is_none_or(|f| f <= self.head)
+    }
+}
+
+/// P1-A.19 —— **initial-finality（三节点起步）统一判据**（Owner 批准语义）：
+///
+/// `all(节点: head ≥ H ∧ consensus_height ≥ H ∧ durable sanity)` ∧ `any(节点: durable tip ≥ 1)`
+///
+/// - `H` = 调用方沿用**原场景既有阈值**（本文件 = 2；**不降低**）；
+/// - 主判据 = `head` + `consensus` 进度：`head` 只能经 finality 授权 + commit 桥前进 ⇒
+///   proposer 失败 / 共识停滞 / finality 停滞 / 节点死亡 / 分区 / 追赶失败 **仍全部 FAIL**；
+/// - durable QC tip（服务能力）**不再**作 consensus finality 判据，但保留 sanity 与 ≥1 见证。
+fn initial_finality_reached(kids: &[ChildGuard], h: u64) -> bool {
+    kids.iter()
+        .all(|c| live_stats(c).is_some_and(|s| s.head >= h && s.consensus >= h && s.durable_sane()))
+        && kids
+            .iter()
+            .filter_map(live_stats)
+            .any(|s| s.finalized.is_some_and(|f| f >= 1))
+}
 
 /// **P1-A.17 —— 真实进程测试串行化守卫。**
 ///
@@ -977,17 +1062,18 @@ fn real_binary_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// 读取某进程**最新完整** status 行的 `(steps, head, finalized, established)`。
+/// 读取某进程**最新完整** status 行（P1-A.19：具名字段）。
+///
+/// 严格性：`consensus_height=` 缺失 ⇒ `None`（**不猜**：宁可判为「无有效样本」= 停滞，也不放过）。
 fn live_stats(c: &ChildGuard) -> Option<LiveStats> {
     let line = last_status(&c.stdout())?;
-    let steps = field(&line, "steps=")?;
-    let head = field(&line, "head_height=")?;
-    Some((
-        steps,
-        head,
-        field(&line, "finalized_height="),
-        field(&line, "established_peers=").unwrap_or(0),
-    ))
+    Some(LiveStats {
+        steps: field(&line, "steps=")?,
+        head: field(&line, "head_height=")?,
+        finalized: field(&line, "finalized_height="),
+        consensus: field(&line, "consensus_height=")?,
+        established: field(&line, "established_peers=").unwrap_or(0),
+    })
 }
 
 /// P1-A.17 —— **真实进程** restart-behind-tip 场景（3 validators 全互联、真实 TCP）：
@@ -1070,14 +1156,8 @@ fn p1a17_restart_behind_tip_scenario_with(
         "{tag}: 三节点未在 {STARTUP_TIMEOUT:?} 内进入 run loop"
     );
 
-    // ---- 阶段 1：三节点均达 durable finality ≥ 2（真实进程）----
-    let initial = poll_until(
-        || {
-            kids.iter()
-                .all(|c| live_stats(c).and_then(|s| s.2).is_some_and(|f| f >= 2))
-        },
-        EXIT_TIMEOUT,
-    );
+    // ---- 阶段 1：三节点均达 initial-finality（真实进程；P1-A.19 口径：head + consensus 进度）----
+    let initial = poll_until(|| initial_finality_reached(&kids, 2), EXIT_TIMEOUT);
     let initial_audit: Vec<String> = kids
         .iter()
         .map(|c| format!("{}={:?}", c.label, live_stats(c)))
@@ -1092,10 +1172,10 @@ fn p1a17_restart_behind_tip_scenario_with(
     }
     assert!(
         initial,
-        "{tag}: 三节点未达 finalized ≥ 2：{initial_audit:?}"
+        "{tag}: 三节点未达 initial-finality（head ≥ 2 ∧ consensus ≥ 2 ∧ durable sanity ∧ ∃durable 见证）：{initial_audit:?}"
     );
     let c_before = live_stats(&kids[2]).expect("C 有完整 status 样本");
-    let _pre_target = c_before.1.saturating_add(gap);
+    let _pre_target = c_before.head.saturating_add(gap);
 
     // ---- 阶段 2：停 C；A/B（2/3 quorum）继续推进（**有界观测；不要求特定速率**）----
     let c_kill_status = kids[2].terminate();
@@ -1104,9 +1184,9 @@ fn p1a17_restart_behind_tip_scenario_with(
     );
     let progressed = poll_until(
         || {
-            let a = live_stats(&kids[0]).map(|s| s.1).unwrap_or(0);
-            let b = live_stats(&kids[1]).map(|s| s.1).unwrap_or(0);
-            a.min(b) >= c_before.1.saturating_add(gap)
+            let a = live_stats(&kids[0]).map(|s| s.head).unwrap_or(0);
+            let b = live_stats(&kids[1]).map(|s| s.head).unwrap_or(0);
+            a.min(b) >= c_before.head.saturating_add(gap)
         },
         downtime,
     );
@@ -1119,9 +1199,9 @@ fn p1a17_restart_behind_tip_scenario_with(
     // 本测试只要求「A/B 至少推进 1 块」（仍证明 2/3 quorum 可继续），并把目标改为**实测值**。
     let ab_head_min = kids[..2]
         .iter()
-        .filter_map(|c| live_stats(c).map(|s| s.1))
+        .filter_map(|c| live_stats(c).map(|s| s.head))
         .min()
-        .unwrap_or(c_before.1);
+        .unwrap_or(c_before.head);
     if !progressed {
         eprintln!(
             "{tag} NOTE: N-1 窗口内 A/B 未达预设 gap（实测 min_head={ab_head_min}）；\
@@ -1131,14 +1211,14 @@ fn p1a17_restart_behind_tip_scenario_with(
     let target = if emergent_target {
         // Control C：目标 = min(gap, 实测 A/B head) ⇒ 若 A/B 未达 gap 则不制造假失败，
         // 但达标时仍要求 C2 真正追赶到 **≥ gap 块**（无法凑数）。
-        c_before.1.saturating_add(gap).min(ab_head_min)
+        c_before.head.saturating_add(gap).min(ab_head_min)
     } else {
-        c_before.1.saturating_add(gap).max(ab_head_min)
+        c_before.head.saturating_add(gap).max(ab_head_min)
     };
     eprintln!(
         "{tag}: target head={target}（gap 参数={gap}，实测 gap={}，A/B min_head={ab_head_min}，\
          downtime={downtime:?}，emergent={emergent_target}）",
-        target.saturating_sub(c_before.1)
+        target.saturating_sub(c_before.head)
     );
 
     // ---- 阶段 3：以同一 data dir / safety dir / seed / listen 重启 C ----
@@ -1154,7 +1234,7 @@ fn p1a17_restart_behind_tip_scenario_with(
     );
     let mut c2 = ChildGuard::spawn("C2", &c2_args);
     let reconnected = poll_until(
-        || live_stats(&c2).is_some_and(|s| s.3 >= 1),
+        || live_stats(&c2).is_some_and(|s| s.established >= 1),
         STARTUP_TIMEOUT,
     );
     let c2_after_ready = live_stats(&c2);
@@ -1166,13 +1246,15 @@ fn p1a17_restart_behind_tip_scenario_with(
         "{tag}: C 重启后未重新建立任何 Established peer（status={c2_after_ready:?}）"
     );
 
-    // ---- 阶段 4：C 追赶（head 单调 → ≥ target；durable finalized 恢复并**继续前进**）----
-    // 注：`head == finalized` 仅在**稳态**成立（A.14 口径）；重启 / 追赶快进期间 QC-history tip
-    // 允许滞后，因此本测试判据 = head ≥ target ∧ 1 ≤ finalized ≤ head ∧ finalized 前进。
+    // ---- 阶段 4：C 追赶（head/consensus 单调 → ≥ target）----
+    // 注（P1-A.19）：`finalized_height` = durable QC-history tip = **服务能力**指标，**不是** consensus
+    // finality；追赶 / 快进 / 重负载下可**合法滞后**（A.6 实测 B: head 277 / tip 1）。
+    // 因此本测试判据 = `head ≥ target ∧ consensus ≥ target ∧ durable sanity(≤ head)`，
+    // 而 durable 见证由 A/B/C2 **任一节点** tip ≥ 1 提供（§9：不把 QC-history 服务能力完全移除）。
     let caught = poll_until(
         || {
             live_stats(&c2)
-                .is_some_and(|s| s.1 >= target && s.2.is_some_and(|f| f >= 1 && f <= s.1))
+                .is_some_and(|s| s.head >= target && s.consensus >= target && s.durable_sane())
         },
         EXIT_TIMEOUT,
     );
@@ -1236,34 +1318,42 @@ fn p1a17_restart_behind_tip_scenario_with(
          exit statuses（诊断，非 PASS 条件）: {statuses:?}"
     );
 
-    // ---- 断言 ----
+    // ---- 断言（P1-A.19 口径）----
     assert!(
         caught,
-        "{tag}: C 未在窗口内追赶到 head ≥ {target}（且 durable finalized ≥ 1）（final={c2_final:?}）"
+        "{tag}: C 未在窗口内追赶到 head ≥ {target} ∧ consensus ≥ {target}（final={c2_final:?}）"
     );
-    let (_, c2_head, c2_fin, _) = c2_final.expect("C2 有完整样本");
+    let c2_s = c2_final.expect("C2 有完整样本");
     assert!(
-        c2_head >= target,
-        "{tag}: C head 未达目标（head={c2_head} target={target}）"
-    );
-    assert!(
-        c2_head > c_before.1,
-        "{tag}: C head 未单调前进（restart 前 {} → 后 {c2_head}）",
-        c_before.1
+        c2_s.head >= target && c2_s.consensus >= target,
+        "{tag}: C 未达目标（head={} consensus={} steps={} target={target}）",
+        c2_s.head,
+        c2_s.consensus,
+        c2_s.steps
     );
     assert!(
-        c2_fin.is_some_and(|f| f >= 1),
-        "{tag}: C 重启后 finalized 未 ≥ 1（{c2_fin:?}）"
-    );
-    let c2_fin_v = c2_fin.expect("C2 finalized 存在");
-    assert!(
-        c2_fin_v <= c2_head,
-        "{tag}: finalized 不得领先 head（head={c2_head} finalized={c2_fin_v}）"
+        c2_s.head > c_before.head,
+        "{tag}: C head 未单调前进（restart 前 {} → 后 {}）",
+        c_before.head,
+        c2_s.head
     );
     assert!(
-        c2_fin_v > c_before.2.unwrap_or(0),
-        "{tag}: C 重启后 durable finalized 必须继续前进（{} → {c2_fin_v}）",
-        c_before.2.unwrap_or(0)
+        c2_s.durable_sane(),
+        "{tag}: durable QC tip 不得领先 head（head={} tip={:?}）",
+        c2_s.head,
+        c2_s.finalized
+    );
+    // **durable 见证（P1-A.19 §9）**：至少一个节点（A/B/C2）仍展示 QC-history 基础服务能力（tip ≥ 1）。
+    // 不再要求 **C2 自身** durable tip 严格前进：durable QC-history 持久化是**对端服务能力**，
+    // 追赶 / 快进期间可合法滞后（RC-2 = TEST PREDICATE ARTIFACT；production 不变式不受影响）。
+    assert!(
+        [&kids[0], &kids[1], &c2]
+            .into_iter()
+            .any(|c| live_stats(c).is_some_and(|s| s.finalized.is_some_and(|f| f >= 1))),
+        "{tag}: durable 见证缺失（A/B/C2 的 QC-history tip 均 < 1；A={:?} B={:?} C2={:?}）",
+        live_stats(&kids[0]),
+        live_stats(&kids[1]),
+        c2_final
     );
     assert!(c2_alive, "{tag}: 达标时 C 必须仍在运行");
     assert!(
@@ -1274,8 +1364,8 @@ fn p1a17_restart_behind_tip_scenario_with(
         assert!(m.is_none(), "{tag}: {label} 出现 fatal 标记 {m:?}");
     }
     eprintln!(
-        "{tag} PASS: gap={gap} C {} → {c2_head}（finalized={c2_fin:?}），A/B 存活={ab_alive:?}",
-        c_before.1
+        "{tag} PASS: gap={gap} C {} → {}（consensus={}，durable tip={:?}），A/B 存活={ab_alive:?}",
+        c_before.head, c2_s.head, c2_s.consensus, c2_s.finalized
     );
 }
 
@@ -1494,13 +1584,8 @@ fn p1a17_snapshot_rollback_scenario(tag: &str, gap: u64) {
         dump_all_node_forensics(tag, "startup", &[&kids[0], &kids[1], &kids[2]], &roots);
     }
     assert!(ready, "{tag}: 未进入 run loop");
-    let initial = poll_until(
-        || {
-            kids.iter()
-                .all(|c| live_stats(c).and_then(|s| s.2).is_some_and(|f| f >= 2))
-        },
-        EXIT_TIMEOUT,
-    );
+    // P1-A.19：head + consensus 进度为主判据（原 `finalized_height ≥ 2` 用的是 durable QC tip）。
+    let initial = poll_until(|| initial_finality_reached(&kids, 2), EXIT_TIMEOUT);
     if !initial {
         dump_all_node_forensics(
             tag,
@@ -1509,7 +1594,10 @@ fn p1a17_snapshot_rollback_scenario(tag: &str, gap: u64) {
             &roots,
         );
     }
-    assert!(initial, "{tag}: 未达三节点 finalized ≥ 2");
+    assert!(
+        initial,
+        "{tag}: 未达 initial-finality（head ≥ 2 ∧ consensus ≥ 2 ∧ durable sanity ∧ ∃durable 见证）"
+    );
 
     // ---- 冷备份：kill C ⇒（C 已停，故为崩溃一致快照）复制其 chain/safety 目录 ⇒ 立即重启 C ----
     let _ = kids[2].terminate();
@@ -1518,7 +1606,7 @@ fn p1a17_snapshot_rollback_scenario(tag: &str, gap: u64) {
     let c_snap = live_stats(&kids[2]).expect("C 快照状态");
     kids[2] = ChildGuard::spawn("C", &args(2));
     let c_ready = poll_until(
-        || live_stats(&kids[2]).is_some_and(|s| s.3 >= 1),
+        || live_stats(&kids[2]).is_some_and(|s| s.established >= 1),
         STARTUP_TIMEOUT,
     );
     if !c_ready {
@@ -1534,11 +1622,11 @@ fn p1a17_snapshot_rollback_scenario(tag: &str, gap: u64) {
     // ---- 3/3 全活（全速）下前进 gap 块 ----
     // 判据用 **head**（commit 结果；只随 finality 推进、不回退）而非 `finalized_height`
     // （= durable QC-history tip，追赶/重负载下可滞后——P1-A.17 实测 B 曾出现 head 373 / tip 27）。
-    let target = c_snap.1.saturating_add(gap);
+    let target = c_snap.head.saturating_add(gap);
     let advanced = poll_until(
         || {
-            let a = live_stats(&kids[0]).map(|s| s.1).unwrap_or(0);
-            let b = live_stats(&kids[1]).map(|s| s.1).unwrap_or(0);
+            let a = live_stats(&kids[0]).map(|s| s.head).unwrap_or(0);
+            let b = live_stats(&kids[1]).map(|s| s.head).unwrap_or(0);
             a.min(b) >= target
         },
         EXIT_TIMEOUT,
@@ -1563,7 +1651,7 @@ fn p1a17_snapshot_rollback_scenario(tag: &str, gap: u64) {
     copy_dir_recursive(&safety_snap, &safety_live);
     let mut c2 = ChildGuard::spawn("C2", &args(2));
     let reconnected = poll_until(
-        || live_stats(&c2).is_some_and(|s| s.3 >= 1),
+        || live_stats(&c2).is_some_and(|s| s.established >= 1),
         STARTUP_TIMEOUT,
     );
     if !reconnected {
@@ -1579,13 +1667,13 @@ fn p1a17_snapshot_rollback_scenario(tag: &str, gap: u64) {
         "{tag}: 回滚后的 C 未重连（status={:?}）",
         live_stats(&c2)
     );
-    let c_before_target = c_snap.1;
+    let c_before_target = c_snap.head;
 
-    // ---- 验收：C 追赶至 ≥ target；finalized 恢复；head 单调 ----
+    // ---- 验收：C 追赶至 ≥ target（head ∧ consensus）；durable tip 仅 sanity ----
     let caught = poll_until(
         || {
             live_stats(&c2)
-                .is_some_and(|s| s.1 >= target && s.2.is_some_and(|f| f >= 1 && f <= s.1))
+                .is_some_and(|s| s.head >= target && s.consensus >= target && s.durable_sane())
         },
         EXIT_TIMEOUT,
     );
@@ -1634,18 +1722,35 @@ fn p1a17_snapshot_rollback_scenario(tag: &str, gap: u64) {
 
     assert!(
         caught,
-        "{tag}: C 未在窗口内追赶 head ≥ {target}（final={c2_final:?}）"
+        "{tag}: C 未在窗口内追赶 head ≥ {target} ∧ consensus ≥ {target}（final={c2_final:?}）"
     );
-    let (_, c2_head, c2_fin, _) = c2_final.expect("C2 有完整样本");
-    assert!(c2_head >= target, "{tag}: head={c2_head} < target={target}");
+    let c2_s = c2_final.expect("C2 有完整样本");
     assert!(
-        c2_head > c_before_target,
-        "{tag}: head 未单调前进（{c_before_target} → {c2_head}）"
+        c2_s.head >= target && c2_s.consensus >= target,
+        "{tag}: head={} consensus={} < target={target}",
+        c2_s.head,
+        c2_s.consensus
     );
-    let f = c2_fin.expect("C2 finalized 存在");
     assert!(
-        f >= 1 && f <= c2_head,
-        "{tag}: finalized 越界（head={c2_head} fin={f}）"
+        c2_s.head > c_before_target,
+        "{tag}: head 未单调前进（{c_before_target} → {}）",
+        c2_s.head
+    );
+    assert!(
+        c2_s.durable_sane(),
+        "{tag}: durable QC tip 越界（head={} tip={:?}）",
+        c2_s.head,
+        c2_s.finalized
+    );
+    // **durable 见证（P1-A.19 §9）**：至少一个节点仍展示 QC-history 基础服务能力（tip ≥ 1）。
+    assert!(
+        [&kids[0], &kids[1], &c2]
+            .into_iter()
+            .any(|c| live_stats(c).is_some_and(|s| s.finalized.is_some_and(|f| f >= 1))),
+        "{tag}: durable 见证缺失（A/B/C2 的 QC-history tip 均 < 1；A={:?} B={:?} C2={:?}）",
+        live_stats(&kids[0]),
+        live_stats(&kids[1]),
+        c2_final
     );
     assert!(c2_alive, "{tag}: 达标时 C 必须仍存活");
     assert!(
@@ -1655,7 +1760,10 @@ fn p1a17_snapshot_rollback_scenario(tag: &str, gap: u64) {
     for (label, m) in &markers {
         assert!(m.is_none(), "{tag}: {label} 出现 fatal 标记 {m:?}");
     }
-    eprintln!("{tag} PASS: gap={gap} C {c_before_target} → {c2_head}（finalized={f}）");
+    eprintln!(
+        "{tag} PASS: gap={gap} C {c_before_target} → {}（durable tip={:?}，consensus={}）",
+        c2_s.head, c2_s.finalized, c2_s.consensus
+    );
 }
 
 /// **P1-A.17 T3（正式）**：确定性 gap = 20（旧 64 窗口内，但此前**从未**被真实进程验证）。
@@ -1740,13 +1848,7 @@ fn p1a18_t8_round_ge1_history_sync_after_restart() {
         ),
         "{tag}: 未进入 run loop"
     );
-    let ready = poll_until(
-        || {
-            kids.iter()
-                .all(|c| live_stats(c).and_then(|s| s.2).is_some_and(|f| f >= 2))
-        },
-        EXIT_TIMEOUT,
-    );
+    let ready = poll_until(|| initial_finality_reached(&kids, 2), EXIT_TIMEOUT);
     if !ready {
         dump_all_node_forensics(
             tag,
@@ -1755,7 +1857,10 @@ fn p1a18_t8_round_ge1_history_sync_after_restart() {
             &chain_roots(&env),
         );
     }
-    assert!(ready, "{tag}: 未达三节点 finalized ≥ 2");
+    assert!(
+        ready,
+        "{tag}: 未达 initial-finality（head ≥ 2 ∧ consensus ≥ 2 ∧ durable sanity ∧ ∃durable 见证）"
+    );
 
     // ---- 选定「**未来**高度的 round-0 proposer」并停掉它 ----
     //
@@ -1766,7 +1871,7 @@ fn p1a18_t8_round_ge1_history_sync_after_restart() {
     // 注意：必须取**跨节点最新** head（单节点 status 可能滞后），且必须选**未来**高度。
     let h = kids
         .iter()
-        .filter_map(|c| live_stats(c).map(|s| s.1))
+        .filter_map(|c| live_stats(c).map(|s| s.head))
         .max()
         .unwrap_or(0);
     let (h_k, i0) = (h + 1..=h + 64)
@@ -1791,7 +1896,7 @@ fn p1a18_t8_round_ge1_history_sync_after_restart() {
         || {
             survivors
                 .iter()
-                .all(|i| live_stats(&kids[*i]).map(|s| s.1).unwrap_or(0) >= h_k)
+                .all(|i| live_stats(&kids[*i]).is_some_and(|s| s.head >= h_k && s.consensus >= h_k))
         },
         EXIT_TIMEOUT,
     );
@@ -1847,13 +1952,13 @@ fn p1a18_t8_round_ge1_history_sync_after_restart() {
     // ---- 重启被停节点（同目录 / 同 seed）⇒ 必须追赶（历史含 round ≥ 1 的块）----
     let target = survivors
         .iter()
-        .map(|i| live_stats(&kids[*i]).map(|s| s.1).unwrap_or(0))
+        .map(|i| live_stats(&kids[*i]).map(|s| s.head).unwrap_or(0))
         .min()
         .unwrap_or(h_k)
         .max(h_k);
     let mut revived = ChildGuard::spawn(["A", "B", "C"][i0], &args(i0));
     let reconnected = poll_until(
-        || live_stats(&revived).is_some_and(|s| s.3 >= 1),
+        || live_stats(&revived).is_some_and(|s| s.established >= 1),
         STARTUP_TIMEOUT,
     );
     if !reconnected {
@@ -1871,7 +1976,10 @@ fn p1a18_t8_round_ge1_history_sync_after_restart() {
     );
 
     let caught = poll_until(
-        || live_stats(&revived).is_some_and(|s| s.1 >= target),
+        || {
+            live_stats(&revived)
+                .is_some_and(|s| s.head >= target && s.consensus >= target && s.durable_sane())
+        },
         EXIT_TIMEOUT,
     );
     let revived_alive = revived.is_running();
@@ -1921,13 +2029,28 @@ fn p1a18_t8_round_ge1_history_sync_after_restart() {
 
     assert!(
         caught,
-        "{tag}: 重启节点未追赶 head ≥ {target}（final={revived_final:?}）"
+        "{tag}: 重启节点未追赶 head ≥ {target} ∧ consensus ≥ {target}（final={revived_final:?}）"
     );
-    let (_, rh, rf, _) = revived_final.expect("revived 有完整样本");
-    assert!(rh >= target, "{tag}: head={rh} < target={target}");
+    let rs = revived_final.expect("revived 有完整样本");
     assert!(
-        rf.is_some_and(|f| f >= 1),
-        "{tag}: 重启后 finalized 未恢复（{rf:?}）"
+        rs.head >= target && rs.consensus >= target,
+        "{tag}: head={} consensus={} steps={} < target={target}",
+        rs.head,
+        rs.consensus,
+        rs.steps
+    );
+    assert!(
+        rs.durable_sane(),
+        "{tag}: durable QC tip 越界（head={} tip={:?}）",
+        rs.head,
+        rs.finalized
+    );
+    // **durable 见证（P1-A.19 §9）**：至少一个节点仍展示 QC-history 基础服务能力（tip ≥ 1）。
+    assert!(
+        kids.iter()
+            .chain(std::iter::once(&revived))
+            .any(|c| live_stats(c).is_some_and(|s| s.finalized.is_some_and(|f| f >= 1))),
+        "{tag}: durable 见证缺失（所有节点 QC-history tip 均 < 1）"
     );
     assert!(revived_alive, "{tag}: 达标时重启节点必须仍存活");
     assert!(
@@ -1939,8 +2062,9 @@ fn p1a18_t8_round_ge1_history_sync_after_restart() {
     }
     eprintln!(
         "{tag} PASS: **height {h_k}** 在其 round-0 proposer（下标 {i0}）全程离线的情况下由存活 2/3 跨过\
-         ⇒ 该高度**只在 round ≥ 1 产出**；重启节点经 sync（QC-bound round 解析）追赶至 head {rh}（finalized={rf:?}），\
-         跨节点最新 head（停机时）={h}"
+         ⇒ 该高度**只在 round ≥ 1 产出**；重启节点经 sync（QC-bound round 解析）追赶至 head {}（durable tip={:?}），\
+         跨节点最新 head（停机时）={h}",
+        rs.head, rs.finalized
     );
 }
 
