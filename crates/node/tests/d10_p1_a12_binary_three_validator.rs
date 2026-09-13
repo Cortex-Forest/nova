@@ -42,6 +42,11 @@ const IDLE_MS: &str = "1";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// 正式**观测窗口**（P1-A.14：实时验收窗口；**不**再要求进程在窗口内退出）。
 const EXIT_TIMEOUT: Duration = Duration::from_secs(240);
+/// **回滚（snapshot rollback）后 C2 追赶 gap=70 的验收窗口**（P1-A.17/A12 harness fix 取证）：
+/// 实测追赶速率 ≈4.3s/块 ⇒ gap 68 块理论最低 ≈292s、历史 p95 ≈329s ⇒ 默认 240s 在边界产生
+/// 间歇假失败（C2 始终 alive / 持续前进 / 无 fatal）。仅放宽**恢复过程**的验收时间，
+/// **不**放宽任何断言（target / head / consensus / durable sanity / established 全部保持）。
+const A17_CATCHUP_WINDOW: Duration = Duration::from_secs(420);
 
 /// 确定性身份（validator ≠ network；三节点互不相同）。
 const VAL_SEED: [[u8; 32]; 3] = [[0x31; 32], [0x32; 32], [0x33; 32]];
@@ -1089,7 +1094,7 @@ fn live_stats(c: &ChildGuard) -> Option<LiveStats> {
 /// head 单调 / 最终 head ≥ 目标 / 1 ≤ finalized ≤ head 且 finalized 前进 / 无 fatal（InvalidSignature · QcVerification · panic · `Error: Run(` ·
 /// ValidatorNotInValidatorSet · IdentityMismatch · CorruptedState）/ 达标时进程存活。
 fn p1a17_restart_behind_tip_scenario(tag: &str, gap: u64) {
-    p1a17_restart_behind_tip_scenario_with(tag, gap, A17_DOWNTIME_WINDOW, false);
+    p1a17_restart_behind_tip_scenario_with(tag, gap, A17_DOWNTIME_WINDOW, false, RUN_STEPS);
 }
 
 /// **P1-A.17-SYNC-STABILITY Control C（诊断）**：与 [`p1a17_restart_behind_tip_scenario`] 同流程，
@@ -1103,6 +1108,7 @@ fn p1a17_restart_behind_tip_scenario_with(
     gap: u64,
     downtime: Duration,
     emergent_target: bool,
+    run_steps: &str,
 ) {
     let _serial = real_binary_guard();
     let env = TempDir::new(tag);
@@ -1135,7 +1141,7 @@ fn p1a17_restart_behind_tip_scenario_with(
                     &ports,
                     &genesis_path,
                     &hash_hex,
-                    RUN_STEPS,
+                    run_steps,
                 ),
             )
         })
@@ -1230,7 +1236,7 @@ fn p1a17_restart_behind_tip_scenario_with(
         &ports,
         &genesis_path,
         &hash_hex,
-        RUN_STEPS,
+        run_steps,
     );
     let mut c2 = ChildGuard::spawn("C2", &c2_args);
     let reconnected = poll_until(
@@ -1387,10 +1393,23 @@ fn p1a17_restart_behind_tip_after_downtime() {
 /// `downtime` 内真正推进 ≥ 70 块，本用例即验证「**同目录 restart 追赶 ≥ 70（> 旧窗口 64）**」。
 /// 不做任何目录复制 ⇒ **不**依赖冷备份 harness。
 const A17_SCS_SCDIR_DOWNTIME: Duration = Duration::from_secs(420);
+/// **Control C step-budget（A12 harness fix）**：大 downtime（420s）内 N-1 停滞期 step 空转很快
+/// （round timeout 以逻辑 step 计 + idle_ms=1）⇒ 默认 `RUN_STEPS=6000` 会在 C 重启前耗尽
+/// （A/B 正常 exit 0）⇒ C2 无 peer 可连（established=0）。本诊断**单列**更大生命周期预算：
+/// - **仅**该用例生效（其余用例继续用 `RUN_STEPS`）；
+/// - **不**改生产 run_steps 默认值 / idle_ms / peer lifecycle / ChildGuard；
+/// - **不**放宽 established / rejoin / catch-up / target 任何断言；downtime 与窗口均不变。
+const A17_SCS_SCDIR_RUN_STEPS: &str = "60000";
 
 #[test]
 fn p1a17_same_dir_restart_large_gap_diagnostic() {
-    p1a17_restart_behind_tip_scenario_with("a17_scs_scdir", 70, A17_SCS_SCDIR_DOWNTIME, true);
+    p1a17_restart_behind_tip_scenario_with(
+        "a17_scs_scdir",
+        70,
+        A17_SCS_SCDIR_DOWNTIME,
+        true,
+        A17_SCS_SCDIR_RUN_STEPS,
+    );
 }
 
 /// 递归复制目录（测试专用；「冷备份 / 回滚到旧状态」场景，用于**确定性**制造 gap）。
@@ -1675,7 +1694,7 @@ fn p1a17_snapshot_rollback_scenario(tag: &str, gap: u64) {
             live_stats(&c2)
                 .is_some_and(|s| s.head >= target && s.consensus >= target && s.durable_sane())
         },
-        EXIT_TIMEOUT,
+        A17_CATCHUP_WINDOW,
     );
 
     let c2_alive = c2.is_running();
@@ -1876,10 +1895,18 @@ fn p1a18_t8_round_ge1_history_sync_after_restart() {
         .unwrap_or(0);
     let (h_k, i0) = (h + 1..=h + 64)
         .find_map(|hh| {
-            let p = select_proposer(CHAIN_ID, hh.saturating_sub(1), 0, &genesis_hash, &set).ok()?;
-            (0..3).find(|i| id_of_index(*i) == p).map(|i| (hh, i))
+            // fixture 前提**内联在搜索谓词**：同时要求「round-0 proposer 可定位」∧「round-0 ≠ round-1」
+            // （3 等权验证者下二者相同概率 ≈1/3 ⇒ 只按前一条件选取会以 ≈1/3 概率在下方防御断言处中止）。
+            let p0 =
+                select_proposer(CHAIN_ID, hh.saturating_sub(1), 0, &genesis_hash, &set).ok()?;
+            let p1 =
+                select_proposer(CHAIN_ID, hh.saturating_sub(1), 1, &genesis_hash, &set).ok()?;
+            if p0 == p1 {
+                return None;
+            }
+            (0..3).find(|i| id_of_index(*i) == p0).map(|i| (hh, i))
         })
-        .expect("未来 64 个高度内必存在可定位的 round-0 proposer");
+        .expect("未来 64 个高度内必存在可定位的 round-0 proposer（且 round-0 ≠ round-1）");
     let p0 = select_proposer(CHAIN_ID, h_k - 1, 0, &genesis_hash, &set).expect("proposer");
     let p1 = select_proposer(CHAIN_ID, h_k - 1, 1, &genesis_hash, &set).expect("proposer");
     assert_eq!(id_of_index(i0), p0, "victim 必须是 H_k 的 round-0 proposer");
