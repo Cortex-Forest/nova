@@ -245,6 +245,82 @@ pub fn dispatch_gossip_block_round_aware<B: StorageBackend + Clone>(
     validate_block_inbound(wire, &ctx)
 }
 
+/// **P1-A.18 RC-1（Stage 2）** —— 从**绑定** QC 证据切片解析轮次（sync / catch-up 路径）。
+///
+/// 绑定规则与 Stage 1 **同一语义**：仅统计 `target == block_hash` 的条目。
+/// - 0 个绑定条目 ⇒ `Ok(None)`（调用方**回退 round 0**：与 Stage 2 之前逐字一致，不猜轮）；
+/// - 1 个（或多个但全为同一轮）⇒ `Ok(Some(r))`；
+/// - **两个不同轮都绑定同一 block hash** ⇒ `Err(())`（调用方必须**拒绝**；不得静默择一）。
+///
+/// 有界性：扫描上界 = 调用方切片长度（= 既有 `PENDING_EXTERNAL_QC_CAP`，**有界**）；
+/// 本函数**只做等值匹配**——不做「逐轮试签名」，不遍历 validator，不做 membership-only 接受。
+pub fn resolve_proposer_round_from_evidences(
+    block_hash: [u8; 32],
+    evidences: &[ProposerRoundEvidence],
+) -> Result<Option<u64>, ()> {
+    let mut bound: Option<u64> = None;
+    for (round, target) in evidences {
+        if *target != block_hash {
+            continue;
+        }
+        match bound {
+            None => bound = Some(*round),
+            Some(prev) if prev == *round => {}
+            Some(_) => return Err(()),
+        }
+    }
+    Ok(bound)
+}
+
+/// **P1-A.18 RC-1（Stage 2）** —— sync 批次的**证据绑定 round-aware** 期望 proposer 解析 + 验证。
+///
+/// 与 [`dispatch_sync_block_response_with_validator_set_and_dag`] 的唯一差异：期望 proposer 的**父高
+/// 轮次**可由 `qc_evidences` 中**严格绑定**（`target == 本块 canonical hash`）的 QC 证据给出。
+/// `qc_history` 的键不变式（`height == qc.context.height + 1`）保证该 QC 正是**该块**的 QC；本函数
+/// 仍以 **hash 严格相等**作为唯一绑定判据（多余条件一律不用该轮）。
+///
+/// 安全边界（与 Stage 1 完全一致）：候选轮**至多 2 个**（`{0, bound_round}`，去重后仍只注入**单个**
+/// `expected_proposer_vk`）；**不**遍历轮 / **不**遍历 validator / **不**做 membership-only 接受；
+/// 无绑定证据 ⇒ **回退 round 0**（既有行为）；两个绑定条目轮不同 ⇒ **拒绝**
+/// （`InvalidProposerSignature`）。`block_inbound` seam 与其单钥验签**逐字不变**；
+/// `qc_evidences = &[]` ⇒ 与既有 round-0 入口**逐字等价**（T1 以断言固化）。
+pub fn dispatch_sync_block_response_round_aware<B: StorageBackend + Clone>(
+    adapter: &NodeBlockAdapter<B, NoAccountsKeyResolver>,
+    max_block_bytes: usize,
+    payload: &[u8],
+    set: &ValidatorSet,
+    dag: Option<&nova_consensus::dag::Dag>,
+    qc_evidences: &[ProposerRoundEvidence],
+) -> Vec<Result<InboundBlockVerdict, InboundBlockError>> {
+    let response = match SyncBlockResponse::decode(payload) {
+        Ok(r) => r,
+        Err(_) => return vec![Err(InboundBlockError::Malformed)],
+    };
+    response
+        .blocks
+        .iter()
+        .map(|block_payload| {
+            let round = match wire_block_hash(&block_payload.0) {
+                Some(h) => match resolve_proposer_round_from_evidences(h, qc_evidences) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => 0,
+                    // 冲突（同一 block hash 两个不同绑定轮）⇒ 拒绝：不静默择一、不放宽验证。
+                    Err(()) => return Err(InboundBlockError::InvalidProposerSignature),
+                },
+                // 结构损坏：证据不可用（不猜轮）；validator 自身以 Malformed 拒绝。
+                None => 0,
+            };
+            let expected_vk = match resolve_expected_proposer_vk_at_round(adapter, set, round) {
+                Ok(vk) => vk,
+                Err(e) => return Err(e),
+            };
+            let ctx =
+                inbound_context_with_proposer(adapter, max_block_bytes, Some(&expected_vk), dag);
+            validate_block_inbound(&block_payload.0, &ctx)
+        })
+        .collect()
+}
+
 /// dispatch 一条 `SyncBlockResponse` payload（codec：count + len-prefixed block wires）。
 ///
 /// 解码失败（结构损坏）⇒ `vec![Err(Malformed)]`；每块经**同一** validator seam 逐条验证。

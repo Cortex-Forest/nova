@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nova_consensus::proposer::select_proposer;
+use nova_consensus::validator::ValidatorSet;
 use nova_crypto::address::{
     ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
@@ -1668,6 +1670,278 @@ fn p1a17_snapshot_rollback_medium_gap() {
 #[test]
 fn p1a17_snapshot_rollback_beyond_old_window() {
     p1a17_snapshot_rollback_scenario("a17_snap70", 70);
+}
+
+/// **P1-A.18 RC-1 Stage 2（T8）** —— 真实多进程：历史含 **round ≥ 1** 块的重启追赶。
+///
+/// 确定性构造（不依赖运气）：
+/// 1. A/B/C 起步，等 durable finality ≥ 2；
+/// 2. 读当前 head `h`，计算 **height h+1 的 round-0 proposer** `P0 = select(chain, h, 0, genesis, set)`
+///    并**停掉该 proposer 对应的进程**（其余 2/3 仍满足 quorum）；
+/// 3. P0 离线 ⇒ height h+1 **不可能在 round 0 产出**（`build_proposal` 要求
+///    `select(rs.height, rs.round) == local_id` ⇒ round 0 只有 P0 能提案）⇒ 存活两节点 round timeout
+///    ⇒ **round 1** ⇒ P_1 提案（Stage 1 round-aware gossip 验证）⇒ votes/QC/finality ⇒ head 前进；
+/// 4. 重启被停节点（同目录 / 同 seed）⇒ 它必须经 **sync** 取回该 **round ≥ 1** 历史块，
+///    依赖 Stage 2 的 **QC-bound round 解析**（`qc.target == block_hash`）才能完成 proposer 验签
+///    ⇒ 登记 DAG ⇒ finality ⇒ head 追赶。
+///
+/// PASS 判据 = 「P0 离线期间存活 2/3 仍推进 head」∧「重启节点追赶到 ≥ 存活节点 head」；
+/// 二者合并只有在 **round ≥ 1 可产出且可同步** 时成立。
+#[test]
+fn p1a18_t8_round_ge1_history_sync_after_restart() {
+    let _serial = real_binary_guard();
+    let tag = "a18_t8";
+    let env = TempDir::new(tag);
+    let genesis = test_genesis(&VAL_SEED);
+    let genesis_hash = compute_genesis_hash(&genesis).expect("hash");
+    let hash_hex = hex32(&genesis_hash);
+    let genesis_path = env.write(
+        "genesis.bin",
+        &canonical_genesis_bytes(&genesis).expect("canonical"),
+    );
+    for (i, s) in NET_SEED.iter().enumerate() {
+        env.write_seed(&format!("f2-3-net-{i}.seed"), *s);
+    }
+    for (i, s) in VAL_SEED.iter().enumerate() {
+        env.write_seed(&format!("f2-3-val-{i}.seed"), *s);
+    }
+    let net_ids: Vec<NodeId> = NET_SEED.iter().map(|s| net_node_id(*s)).collect();
+    let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let set = ValidatorSet::from_genesis(&genesis);
+    let id_of_index = |i: usize| {
+        derive_validator_id(
+            &SigningKey::from_seed(VAL_SEED[i])
+                .verifying_key()
+                .to_bytes(),
+        )
+    };
+    let args = |i: usize| {
+        f2_node_args(
+            &env,
+            3,
+            i,
+            &net_ids,
+            &ports,
+            &genesis_path,
+            &hash_hex,
+            RUN_STEPS,
+        )
+    };
+
+    let mut kids: Vec<ChildGuard> = (0..3)
+        .map(|i| ChildGuard::spawn(["A", "B", "C"][i], &args(i)))
+        .collect();
+    assert!(
+        poll_until(
+            || kids
+                .iter()
+                .all(|c| c.stdout().contains("entering bounded run loop")),
+            STARTUP_TIMEOUT
+        ),
+        "{tag}: 未进入 run loop"
+    );
+    let ready = poll_until(
+        || {
+            kids.iter()
+                .all(|c| live_stats(c).and_then(|s| s.2).is_some_and(|f| f >= 2))
+        },
+        EXIT_TIMEOUT,
+    );
+    if !ready {
+        dump_all_node_forensics(
+            tag,
+            "initial-finality",
+            &[&kids[0], &kids[1], &kids[2]],
+            &chain_roots(&env),
+        );
+    }
+    assert!(ready, "{tag}: 未达三节点 finalized ≥ 2");
+
+    // ---- 选定「**未来**高度的 round-0 proposer」并停掉它 ----
+    //
+    // 确定性构造（不依赖运气 / 不依赖 status 采样）：`build_proposal` 要求
+    // `select(rs.height, rs.round) == local_id` ⇒ **round 0 只有该高度的 round-0 proposer 能提案**。
+    // 故只要其进程离线，该高度**只能在 round ≥ 1 产出** —— 这就是「历史含 round ≥ 1 块」的构造性证明。
+    //
+    // 注意：必须取**跨节点最新** head（单节点 status 可能滞后），且必须选**未来**高度。
+    let h = kids
+        .iter()
+        .filter_map(|c| live_stats(c).map(|s| s.1))
+        .max()
+        .unwrap_or(0);
+    let (h_k, i0) = (h + 1..=h + 64)
+        .find_map(|hh| {
+            let p = select_proposer(CHAIN_ID, hh.saturating_sub(1), 0, &genesis_hash, &set).ok()?;
+            (0..3).find(|i| id_of_index(*i) == p).map(|i| (hh, i))
+        })
+        .expect("未来 64 个高度内必存在可定位的 round-0 proposer");
+    let p0 = select_proposer(CHAIN_ID, h_k - 1, 0, &genesis_hash, &set).expect("proposer");
+    let p1 = select_proposer(CHAIN_ID, h_k - 1, 1, &genesis_hash, &set).expect("proposer");
+    assert_eq!(id_of_index(i0), p0, "victim 必须是 H_k 的 round-0 proposer");
+    assert_ne!(p0, p1, "round-0 与 round-1 当选者必须不同");
+    eprintln!(
+        "{tag} 构造：跨节点最新 head={h} ⇒ 选取 **height {h_k}**（其 round-0 proposer = 节点下标 {i0}，将停掉；\
+         round-1 proposer = {p1:?}）⇒ 该高度**只能在 round ≥ 1 产出**"
+    );
+    let killed_status = kids[i0].terminate();
+    let survivors: Vec<usize> = (0..3).filter(|i| *i != i0).collect();
+
+    // ---- 存活 2/3：必须跨过 H_k ⇒ **必然经 round timeout → round ≥ 1** 产出该高度 ----
+    let advanced = poll_until(
+        || {
+            survivors
+                .iter()
+                .all(|i| live_stats(&kids[*i]).map(|s| s.1).unwrap_or(0) >= h_k)
+        },
+        EXIT_TIMEOUT,
+    );
+    // 取证：存活节点 status 轨迹（含 `round=`）⇒ 「round ≥ 1」的可观测痕迹。
+    // 采样可能错过短窗口，故**仅记录**（逻辑构造已保证 height h+1 只能在 round ≥ 1 产出）。
+    let mut round_trace: Vec<String> = Vec::new();
+    let mut saw_round_ge1 = false;
+    for i in &survivors {
+        for l in kids[*i]
+            .stdout()
+            .lines()
+            .filter(|l| l.contains("status steps="))
+        {
+            let (Some(steps), Some(head), Some(round)) = (
+                field(l, "steps="),
+                field(l, "head_height="),
+                field(l, "round="),
+            ) else {
+                continue;
+            };
+            if round >= 1 {
+                saw_round_ge1 = true;
+                round_trace.push(format!(
+                    "{}: steps={steps} head={head} round={round}",
+                    kids[*i].label
+                ));
+            }
+        }
+    }
+    let ab_after: Vec<String> = kids
+        .iter()
+        .map(|c| format!("{}={:?}", c.label, live_stats(c)))
+        .collect();
+    eprintln!(
+        "{tag} 存活节点 after: {ab_after:?}；killed_status={killed_status:?}；\
+         观察到 round ≥ 1 的 status 样本={saw_round_ge1}；round≥1 轨迹（前 8 条）={:?}",
+        round_trace.iter().take(8).collect::<Vec<_>>()
+    );
+    if !advanced {
+        dump_all_node_forensics(
+            tag,
+            "p0-offline-advance",
+            &[&kids[0], &kids[1], &kids[2]],
+            &chain_roots(&env),
+        );
+    }
+    assert!(
+        advanced,
+        "{tag}: H_k={h_k} 的 round-0 proposer（下标 {i0}）离线后，存活 2/3 未在窗口内跨过 H_k（{ab_after:?}）\
+         ⇒ 无法证明 round ≥ 1 产出"
+    );
+
+    // ---- 重启被停节点（同目录 / 同 seed）⇒ 必须追赶（历史含 round ≥ 1 的块）----
+    let target = survivors
+        .iter()
+        .map(|i| live_stats(&kids[*i]).map(|s| s.1).unwrap_or(0))
+        .min()
+        .unwrap_or(h_k)
+        .max(h_k);
+    let mut revived = ChildGuard::spawn(["A", "B", "C"][i0], &args(i0));
+    let reconnected = poll_until(
+        || live_stats(&revived).is_some_and(|s| s.3 >= 1),
+        STARTUP_TIMEOUT,
+    );
+    if !reconnected {
+        dump_all_node_forensics(
+            tag,
+            "revived-reconnect",
+            &[&kids[0], &kids[1], &kids[2], &revived],
+            &chain_roots(&env),
+        );
+    }
+    assert!(
+        reconnected,
+        "{tag}: 重启节点未重连（status={:?}）",
+        live_stats(&revived)
+    );
+
+    let caught = poll_until(
+        || live_stats(&revived).is_some_and(|s| s.1 >= target),
+        EXIT_TIMEOUT,
+    );
+    let revived_alive = revived.is_running();
+    let revived_final = live_stats(&revived);
+    let markers: Vec<(String, Option<&str>)> = vec![
+        (
+            "A".to_string(),
+            fatal_marker(&kids[0].stdout(), &kids[0].stderr()),
+        ),
+        (
+            "B".to_string(),
+            fatal_marker(&kids[1].stdout(), &kids[1].stderr()),
+        ),
+        (
+            "C".to_string(),
+            fatal_marker(&kids[2].stdout(), &kids[2].stderr()),
+        ),
+        (
+            "REVIVED".to_string(),
+            fatal_marker(&revived.stdout(), &revived.stderr()),
+        ),
+    ];
+    let revived_corrupt = [
+        "ValidatorNotInValidatorSet",
+        "IdentityMismatch",
+        "CorruptedState",
+    ]
+    .into_iter()
+    .find(|m| revived.stdout().contains(m) || revived.stderr().contains(m));
+    let statuses = [
+        kids[0].terminate(),
+        kids[1].terminate(),
+        kids[2].terminate(),
+        revived.terminate(),
+    ];
+
+    eprintln!(
+        "=== {tag} T8 DIAGNOSTICS ===\n\
+         跨节点最新 head（停机时）: {h}\n\
+         **round ≥ 1 高度**: H_k = {h_k}（其 round-0 proposer = 下标 {i0}，整个产出窗口离线）\n\
+         存活节点 after: {ab_after:?}\n\
+         revived final: {revived_final:?} alive={revived_alive}（target head ≥ {target}）\n\
+         fatal markers: {markers:?}\n\
+         revived identity/corruption: {revived_corrupt:?}\n\
+         exit statuses（诊断）: {statuses:?}"
+    );
+
+    assert!(
+        caught,
+        "{tag}: 重启节点未追赶 head ≥ {target}（final={revived_final:?}）"
+    );
+    let (_, rh, rf, _) = revived_final.expect("revived 有完整样本");
+    assert!(rh >= target, "{tag}: head={rh} < target={target}");
+    assert!(
+        rf.is_some_and(|f| f >= 1),
+        "{tag}: 重启后 finalized 未恢复（{rf:?}）"
+    );
+    assert!(revived_alive, "{tag}: 达标时重启节点必须仍存活");
+    assert!(
+        revived_corrupt.is_none(),
+        "{tag}: 出现身份/损坏标记 {revived_corrupt:?}"
+    );
+    for (label, m) in &markers {
+        assert!(m.is_none(), "{tag}: {label} 出现 fatal 标记 {m:?}");
+    }
+    eprintln!(
+        "{tag} PASS: **height {h_k}** 在其 round-0 proposer（下标 {i0}）全程离线的情况下由存活 2/3 跨过\
+         ⇒ 该高度**只在 round ≥ 1 产出**；重启节点经 sync（QC-bound round 解析）追赶至 head {rh}（finalized={rf:?}），\
+         跨节点最新 head（停机时）={h}"
+    );
 }
 
 /// F2 实验 B：**交错启动** 3 个真实 validator（先 A 单独跑到 ≥100 steps，再依次启 B/C）。

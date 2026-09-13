@@ -47,7 +47,7 @@ use nova_storage::persistent::PersistentBackend;
 use crate::assembly::{AdoptionOutcome, ConsensusNode};
 use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter, NodeBlockApplicationError};
 use crate::block_dispatch::{
-    dispatch_gossip_block_round_aware, dispatch_sync_block_response_with_validator_set_and_dag,
+    dispatch_gossip_block_round_aware, dispatch_sync_block_response_round_aware,
     resolve_proposer_round_evidence,
 };
 use crate::block_inbound::{InboundBlockError, InboundBlockVerdict};
@@ -2659,12 +2659,22 @@ impl NodeRuntime {
                     vec![Some(wire)],
                 ),
                 (Some(adapter), BlockInboundMessage::SyncBlockResponse(payload)) => {
-                    let outcomes = dispatch_sync_block_response_with_validator_set_and_dag(
+                    // P1-A.18 RC-1（Stage 2）：**绑定** QC 证据（**有界**；复用既有
+                    // `pending_external_qc`，不新增任何长期状态）。仅当 `qc.target ==` 入站块
+                    // hash 时该 QC 的 `context.round` 才会被采用（绑定校验在 dispatcher 内完成）；
+                    // 无证据 ⇒ 回退 round 0；同一块 hash 出现两个不同轮 ⇒ 拒绝（不放宽验证）。
+                    let qc_evidences: Vec<(u64, [u8; 32])> = self
+                        .pending_external_qc
+                        .iter()
+                        .map(|p| (p.qc.context.round, p.qc.target))
+                        .collect();
+                    let outcomes = dispatch_sync_block_response_round_aware(
                         adapter,
                         self.max_block_bytes,
                         &payload,
                         &validator_set,
                         Some(self.driver.consensus().dag()),
+                        &qc_evidences,
                     );
                     // D10-C Step 8：逐块 wire（与 outcomes **同序**；结构损坏 ⇒ 单条 None，
                     // 对应 `Err(Malformed)` —— 不登记 / 不落盘）。
