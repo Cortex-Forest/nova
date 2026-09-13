@@ -47,8 +47,8 @@ use nova_storage::persistent::PersistentBackend;
 use crate::assembly::{AdoptionOutcome, ConsensusNode};
 use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter, NodeBlockApplicationError};
 use crate::block_dispatch::{
-    dispatch_gossip_block_with_validator_set_and_dag,
-    dispatch_sync_block_response_with_validator_set_and_dag,
+    dispatch_gossip_block_round_aware, dispatch_sync_block_response_with_validator_set_and_dag,
+    resolve_proposer_round_evidence,
 };
 use crate::block_inbound::{InboundBlockError, InboundBlockVerdict};
 use crate::bootstrap::{self, ConnectionTargetError, NodeConfig, NodeStartupError};
@@ -163,6 +163,31 @@ const INBOUND_PENDING_TIMEOUT_STEPS: u64 = 1000;
 fn blockstore_stage(stage: &str, e: StorageError) -> RuntimeError {
     eprintln!("BlockStore stage={stage} err={e:?}");
     RuntimeError::BlockStore(e)
+}
+
+/// P1-A.18 RC-1 —— **proposal-bound** 轮证据（仅「父高轮 + 已接受 proposal」时给出）。
+///
+/// 语义：`(state.round.round, proposal.block_hash)`；`head_height` 必须等于 `round.height`
+/// （`build_proposal` 的高度同步 gate ⇒ 产块轮高 = 父高 = head）。绑定键校验（块 hash 严格相等）
+/// 由 `block_dispatch::resolve_proposer_round_evidence` 完成 —— 本函数**不**猜测、不筛选。
+fn proposal_round_evidence(state: &ConsensusState, head_height: u64) -> Option<(u64, [u8; 32])> {
+    if state.round.height != head_height {
+        return None;
+    }
+    state
+        .round
+        .proposal
+        .as_ref()
+        .map(|p| (state.round.round, p.block_hash))
+}
+
+/// P1-A.18 RC-1 —— **QC-bound** 轮证据（本地 `last_precommit_qc()` ⇒ `(round, target)`）。
+///
+/// 绑定键 = `qc.target`；仅当其与待验证 / 待登记 / 待提交块 hash **严格相等**时才被使用（见
+/// `block_dispatch::resolve_proposer_round_evidence`）。不新造规则 / 不引入新状态 / 无 wall clock。
+fn last_precommit_round_evidence(node: &ConsensusNode) -> Option<(u64, [u8; 32])> {
+    node.last_precommit_qc()
+        .map(|qc| (qc.context.round, qc.target))
 }
 
 /// Node-local proposer step（STEP 10-19-6 OPT-1）：本节点为当前 proposer 时经真实 BlockBuilder
@@ -781,12 +806,23 @@ fn finality_commit_bridge(
             return Ok(());
         };
         // proposer（V0.1 parent-height 语义；与 D9 / rebuild / restore 同源 —— 不新造规则）。
+        //
+        // P1-A.18 RC-1：轮次只取**绑定证据** —— `last_precommit_qc()` 且其 `target == X`
+        // （本 Gate 已强制 `block_hash(block) == X`）⇒ `qc.context.round`；无绑定证据 ⇒ 回退
+        // 既有 round 0（不猜）。否则 round≥1 产出的块会在 Gate 5 被按 round-0 期望验签而失败
+        // ⇒ 该高度永久停滞（RC-1）。
         let chain_id = driver.consensus().chain_id();
         let genesis_hash = driver.consensus().genesis_hash();
+        let round = resolve_proposer_round_evidence(
+            x,
+            None,
+            last_precommit_round_evidence(driver.consensus()),
+        )
+        .unwrap_or(0);
         let Some(p) = select_proposer(
             chain_id,
             b.header.height.saturating_sub(1),
-            0,
+            round,
             &genesis_hash,
             set,
         )
@@ -840,10 +876,20 @@ fn register_remote_canonical_block(
     let block_hash = nova_runtime::block_hash(&block).map_err(RuntimeError::BlockCodec)?;
     let chain_id = driver.consensus().chain_id();
     let genesis_hash = driver.consensus().genesis_hash();
+    // P1-A.18 RC-1：登记 proposer 必须与**绑定证据**给出的轮一致（proposal-bound 优先，其次
+    // QC-bound；两者冲突 ⇒ 保守 no-op：**不登记**，且**不**以 Err 让节点 fail-closed 退出）。
+    // 无证据 ⇒ 回退既有 round 0（与 P1-A.18 之前行为一致）。
+    let Ok(round) = resolve_proposer_round_evidence(
+        block_hash,
+        proposal_round_evidence(driver.consensus().state(), adapter.head().height),
+        last_precommit_round_evidence(driver.consensus()),
+    ) else {
+        return Ok(());
+    };
     let proposer = select_proposer(
         chain_id,
         height.saturating_sub(1),
-        0,
+        round,
         &genesis_hash,
         driver.consensus().validator_set(),
     )
@@ -2595,7 +2641,7 @@ impl NodeRuntime {
             let (source, outcomes, wires) = match (&self.block_production, msg) {
                 (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => (
                     BlockInboundSource::Gossip,
-                    vec![dispatch_gossip_block_with_validator_set_and_dag(
+                    vec![dispatch_gossip_block_round_aware(
                         adapter,
                         self.max_block_bytes,
                         &wire,
@@ -2603,6 +2649,12 @@ impl NodeRuntime {
                         // D9 Step 8A（G1）：注入本地 DAG ⇒ 已落盘但不在 DAG 的块不短路为
                         // AlreadyKnown，走完 ⑥/⑦ 全验证 ⇒ 可幂等补登记（不 commit / 不推 head）。
                         Some(self.driver.consensus().dag()),
+                        // P1-A.18 RC-1：**绑定证据**（无证据 ⇒ 回退 round 0；两个来源冲突 ⇒ 拒绝）。
+                        proposal_round_evidence(
+                            self.driver.consensus().state(),
+                            adapter.head().height,
+                        ),
+                        last_precommit_round_evidence(self.driver.consensus()),
                     )],
                     vec![Some(wire)],
                 ),

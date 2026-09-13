@@ -36,7 +36,10 @@ use nova_storage::persistent::PersistentBackend;
 use nova_storage::store::StateStore;
 
 use nova_node::block_adapter::{ChainHead, NoAccountsKeyResolver, NodeBlockAdapter};
-use nova_node::block_dispatch::{dispatch_gossip_block, dispatch_gossip_block_with_validator_set};
+use nova_node::block_dispatch::{
+    dispatch_gossip_block, dispatch_gossip_block_round_aware,
+    dispatch_gossip_block_with_validator_set, resolve_proposer_round_evidence,
+};
 use nova_node::block_inbound::{InboundBlockError, InboundBlockVerdict, UnverifiableItem};
 
 const CHAIN_ID: u64 = 1001;
@@ -296,6 +299,312 @@ fn d9_t3_corrupted_proposer_signature_rejected() {
         "bad signature under correct identity must be rejected"
     );
     assert_head_unchanged(&adapter, &head_before);
+}
+
+// ---------------------------------------------------------------------------
+// P1-A.18 RC-1（Stage 1）—— **证据绑定 round-aware** 期望 proposer
+// ---------------------------------------------------------------------------
+
+/// `select_proposer(head, r) != select_proposer(head, 0)` 的首个 `r > 0`
+/// （确定性且**有界**扫描；不引入无限遍历）。
+fn first_round_with_different_proposer(set: &ValidatorSet, head_height: u64) -> u64 {
+    let p0 = select_proposer(CHAIN_ID, head_height, 0, &GENESIS_HASH, set).unwrap();
+    for r in 1..=16u64 {
+        if select_proposer(CHAIN_ID, head_height, r, &GENESIS_HASH, set).unwrap() != p0 {
+            return r;
+        }
+    }
+    panic!("no round <= 16 differs from round 0 (unexpected for a 3-validator set)");
+}
+
+/// `select_proposer(head, r) != exclude` 的首个 `r > 0`（用于「错误轮证据」负例）。
+fn first_round_with_proposer_other_than(
+    set: &ValidatorSet,
+    head_height: u64,
+    exclude: ValidatorId,
+) -> u64 {
+    for r in 1..=16u64 {
+        if select_proposer(CHAIN_ID, head_height, r, &GENESIS_HASH, set).unwrap() != exclude {
+            return r;
+        }
+    }
+    panic!("no round <= 16 selects a proposer other than the excluded id");
+}
+
+/// 按 `ValidatorId` 找 fixture key（找不到 ⇒ 测试失败，不静默 fallback）。
+fn key_for<'a>(target: ValidatorId, kps: &[&'a KeyPair]) -> &'a KeyPair {
+    kps.iter()
+        .copied()
+        .find(|kp| id_of(kp) == target)
+        .expect("proposer must be one of the fixture members")
+}
+
+/// **证据解析契约（纯函数）**：只有**绑定**（hash 严格相等）的证据生效；冲突 ⇒ `Err`。
+#[test]
+fn p1a18_evidence_resolver_contract() {
+    let h = [0x11u8; 32];
+    let other = [0x22u8; 32];
+    assert_eq!(resolve_proposer_round_evidence(h, None, None), Ok(0));
+    assert_eq!(
+        resolve_proposer_round_evidence(h, Some((3, h)), None),
+        Ok(3)
+    );
+    assert_eq!(
+        resolve_proposer_round_evidence(h, None, Some((4, h))),
+        Ok(4)
+    );
+    assert_eq!(
+        resolve_proposer_round_evidence(h, Some((3, h)), Some((3, h))),
+        Ok(3),
+        "same round from both sources is not a conflict"
+    );
+    assert_eq!(
+        resolve_proposer_round_evidence(h, Some((3, h)), Some((4, h))),
+        Err(()),
+        "conflicting bound rounds must be rejected (no silent pick)"
+    );
+    assert_eq!(
+        resolve_proposer_round_evidence(h, Some((3, other)), Some((4, h))),
+        Ok(4),
+        "evidence bound to another hash is unusable"
+    );
+    assert_eq!(
+        resolve_proposer_round_evidence(h, Some((3, other)), None),
+        Ok(0),
+        "hash mismatch => fall back to round 0"
+    );
+}
+
+/// **T1（回归）**：无证据 ⇒ round-aware 入口与既有 round-0 入口**逐字等价**。
+#[test]
+fn p1a18_t1_no_evidence_is_identical_to_round0_entry() {
+    let kp = KeyPair::generate().unwrap();
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![vin(&kp, 100)]));
+    let block = canonical_next_block(&kp);
+    let w = wire(&block);
+    let hash = nova_runtime::block_hash(&block).unwrap();
+    let expected = Ok(InboundBlockVerdict::CanonicalNextCandidate {
+        block_hash: hash,
+        height: 1,
+    });
+    assert_eq!(
+        dispatch_gossip_block_with_validator_set(&adapter, MAX_BLOCK_BYTES, &w, &set),
+        expected
+    );
+    assert_eq!(
+        dispatch_gossip_block_round_aware(&adapter, MAX_BLOCK_BYTES, &w, &set, None, None, None),
+        expected
+    );
+}
+
+/// **T2（RC-1 回归）**：`round r > 0` 的当选 proposer 产块 —— 无绑定证据 ⇒ 拒（修复前行为）；
+/// 有**绑定** proposal 证据 ⇒ **接受**，并可用该 proposer key 走既有 apply 路径推进 head。
+#[test]
+fn p1a18_t2_round_gt0_proposer_accepted_with_bound_evidence() {
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let kp_c = KeyPair::generate().unwrap();
+    let kps: [&KeyPair; 3] = [&kp_a, &kp_b, &kp_c];
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![
+        vin(&kp_a, 100),
+        vin(&kp_b, 100),
+        vin(&kp_c, 100),
+    ]));
+
+    let r = first_round_with_different_proposer(&set, 0);
+    let p_0 = select_proposer(CHAIN_ID, 0, 0, &GENESIS_HASH, &set).unwrap();
+    let p_r = select_proposer(CHAIN_ID, 0, r, &GENESIS_HASH, &set).unwrap();
+    assert_ne!(p_r, p_0, "round {} proposer must differ from round 0", r);
+    let signer = key_for(p_r, &kps);
+
+    let block = canonical_next_block(signer);
+    let w = wire(&block);
+    let hash = nova_runtime::block_hash(&block).unwrap();
+    let head_before = adapter.head().clone();
+
+    assert_eq!(
+        dispatch_gossip_block_round_aware(&adapter, MAX_BLOCK_BYTES, &w, &set, None, None, None),
+        Err(InboundBlockError::InvalidProposerSignature),
+        "without bound evidence a round-{} block is rejected (pre-fix behavior)",
+        r
+    );
+    assert_eq!(
+        dispatch_gossip_block_round_aware(
+            &adapter,
+            MAX_BLOCK_BYTES,
+            &w,
+            &set,
+            None,
+            Some((r, hash)),
+            None
+        ),
+        Ok(InboundBlockVerdict::CanonicalNextCandidate {
+            block_hash: hash,
+            height: 1,
+        }),
+        "bound round-{} proposer must be accepted",
+        r
+    );
+    assert_eq!(adapter.head(), &head_before, "dispatch is read-only");
+
+    let mut adapter = adapter;
+    let new_head = adapter.apply_block(&w, signer.verifying_key()).unwrap();
+    assert_eq!(new_head.block_hash, hash);
+    assert_eq!(adapter.head().height, 1, "head advances by one");
+}
+
+/// **T5（负例）**：证据轮次的当选 proposer **不是**签名者 ⇒ 拒绝
+/// （不得因为「签名者 ∈ ValidatorSet」而接受）。
+#[test]
+fn p1a18_t5_wrong_round_evidence_rejected() {
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let kp_c = KeyPair::generate().unwrap();
+    let kps: [&KeyPair; 3] = [&kp_a, &kp_b, &kp_c];
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![
+        vin(&kp_a, 100),
+        vin(&kp_b, 100),
+        vin(&kp_c, 100),
+    ]));
+
+    let r = first_round_with_different_proposer(&set, 0);
+    let p_r = select_proposer(CHAIN_ID, 0, r, &GENESIS_HASH, &set).unwrap();
+    let signer = key_for(p_r, &kps);
+    let r_wrong = first_round_with_proposer_other_than(&set, 0, p_r);
+    assert_ne!(
+        r_wrong, r,
+        "the wrong-round evidence must differ from the real round"
+    );
+
+    let block = canonical_next_block(signer);
+    let w = wire(&block);
+    let hash = nova_runtime::block_hash(&block).unwrap();
+    let head_before = adapter.head().clone();
+
+    assert_eq!(
+        resolve_proposer_round_evidence(hash, Some((r_wrong, hash)), None),
+        Ok(r_wrong),
+        "the evidence itself is bound (but names the wrong round)"
+    );
+    assert_eq!(
+        dispatch_gossip_block_round_aware(
+            &adapter,
+            MAX_BLOCK_BYTES,
+            &w,
+            &set,
+            None,
+            Some((r_wrong, hash)),
+            None
+        ),
+        Err(InboundBlockError::InvalidProposerSignature),
+        "evidence round {} selects a proposer other than the signer => reject",
+        r_wrong
+    );
+    assert_head_unchanged(&adapter, &head_before);
+}
+
+/// **T6（负例）**：QC 证据绑定到**另一个 block hash** ⇒ 其轮**不得**被采用
+/// （防止 `Block H + QC for X ⇒ derive proposer for X ⇒ accept H`）。
+#[test]
+fn p1a18_t6_qc_target_mismatch_never_supplies_round() {
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let kp_c = KeyPair::generate().unwrap();
+    let kps: [&KeyPair; 3] = [&kp_a, &kp_b, &kp_c];
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![
+        vin(&kp_a, 100),
+        vin(&kp_b, 100),
+        vin(&kp_c, 100),
+    ]));
+
+    let r = first_round_with_different_proposer(&set, 0);
+    let p_r = select_proposer(CHAIN_ID, 0, r, &GENESIS_HASH, &set).unwrap();
+    let signer = key_for(p_r, &kps);
+    let block = canonical_next_block(signer);
+    let w = wire(&block);
+    let hash = nova_runtime::block_hash(&block).unwrap();
+    let other_hash = [0xEEu8; 32];
+    assert_ne!(other_hash, hash);
+
+    assert_eq!(
+        dispatch_gossip_block_round_aware(
+            &adapter,
+            MAX_BLOCK_BYTES,
+            &w,
+            &set,
+            None,
+            None,
+            Some((r, other_hash))
+        ),
+        Err(InboundBlockError::InvalidProposerSignature),
+        "QC bound to another target must not supply its round"
+    );
+    assert_eq!(
+        dispatch_gossip_block_round_aware(
+            &adapter,
+            MAX_BLOCK_BYTES,
+            &w,
+            &set,
+            None,
+            Some((r, hash)),
+            Some((r, other_hash))
+        ),
+        Ok(InboundBlockVerdict::CanonicalNextCandidate {
+            block_hash: hash,
+            height: 1,
+        }),
+        "the hash-bound proposal evidence is what enables acceptance"
+    );
+}
+
+/// **T6b（负例）**：两个来源都绑定该块 hash 但轮不同 ⇒ 拒绝（不静默择一）。
+#[test]
+fn p1a18_t6b_conflicting_bound_evidence_rejected() {
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let kp_c = KeyPair::generate().unwrap();
+    let kps: [&KeyPair; 3] = [&kp_a, &kp_b, &kp_c];
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![
+        vin(&kp_a, 100),
+        vin(&kp_b, 100),
+        vin(&kp_c, 100),
+    ]));
+
+    let r = first_round_with_different_proposer(&set, 0);
+    let p_r = select_proposer(CHAIN_ID, 0, r, &GENESIS_HASH, &set).unwrap();
+    let signer = key_for(p_r, &kps);
+    let r2 = if r == 1 { 2 } else { 1 };
+    assert_ne!(r2, r);
+
+    let block = canonical_next_block(signer);
+    let w = wire(&block);
+    let hash = nova_runtime::block_hash(&block).unwrap();
+
+    assert_eq!(
+        dispatch_gossip_block_round_aware(
+            &adapter,
+            MAX_BLOCK_BYTES,
+            &w,
+            &set,
+            None,
+            Some((r, hash)),
+            Some((r2, hash))
+        ),
+        Err(InboundBlockError::InvalidProposerSignature),
+        "conflicting bound rounds ({} vs {}) must be rejected",
+        r,
+        r2
+    );
 }
 
 // ---------------------------------------------------------------------------
