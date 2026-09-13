@@ -79,6 +79,23 @@ const IDLE_MS_MAX: u64 = 50;
 /// 有界运行步数默认值（`--run-steps`；smoke / test 友好且必有限）。
 const RUN_STEPS_DEFAULT: u64 = 5_000;
 
+/// P1-A.9（P1-3）—— periodic status 的固定 **step interval**（逻辑条件：`steps % 100 == 0`）。
+///
+/// 选择理由：
+/// - **不使用墙钟**（无 `Instant` / `SystemTime` / sleep 耦合）⇒ 完全确定性、可单测、不改变
+///   step timing / 不引入时间依赖；
+/// - 小整数（100）：默认预算 `RUN_STEPS_DEFAULT = 5_000` ⇒ 最多约 50 行 status（**无日志洪水**），
+///   且默认 1ms pacing 下约每 0.1s 一行 ⇒ "可观测但不过量"；
+/// - 输出路径复用既有 `write_stdout`（stdout only）⇒ **零新依赖** / 无日志框架 / 无 metrics crate。
+const STATUS_INTERVAL_STEPS: u64 = 100;
+
+/// P1-A.9（P1-3）—— 是否在本 step 输出 status（确定性；固定 interval）。
+///
+/// `steps` 从 1 起 ⇒ 首个 status 在 `STATUS_INTERVAL_STEPS`（**不**在 step 0 / 不每 step）。
+fn should_emit_status(steps: u64) -> bool {
+    steps > 0 && steps.is_multiple_of(STATUS_INTERVAL_STEPS)
+}
+
 /// CLI 契约文本（非日志；不含任何完成度宣称）。
 const HELP: &str = "\
 YAZIMAO node
@@ -824,9 +841,24 @@ struct RunSummary {
     inbound_connections: usize,
     /// 累计成功注册的入站连接数（单调；确定性观测）。
     inbound_accepted: u64,
+    /// P1-A.9（P1-3）—— 已 finalize 高度（= durable per-height PrecommitQC 最高高度；
+    /// `None` = 尚未产生/持久化任何 finality）。**既有只读 accessor**，不扩张 runtime API。
+    finalized_height: Option<u64>,
+    /// P1-A.9（P1-3）—— 共识当前高度（`consensus.round.height`）。
+    consensus_height: u64,
+    /// P1-A.9（P1-3）—— 共识当前轮次（`consensus.round.round`）。
+    round: u64,
+    /// P1-A.9（P1-3）—— 有界 sync pending intent 数。
+    sync_pending: usize,
+    /// P1-A.9（P1-3）—— 本进程是否 validator 形态（proposal/vote/finality 推进）。
+    validator_enabled: bool,
+    /// P1-A.9（P1-3）—— A.8 dial 尝试总数（saturating；恒定观测）。
+    peer_dial_attempts_total: u64,
+    /// P1-A.9（P1-3）—— A.8 dial 失败总数（saturating；恒定观测）。
+    peer_dial_failures_total: u64,
 }
 
-/// 采集当前 runtime 只读观测（不触碰秘密材料）。
+/// 采样当前 runtime 只读观测（不触碰秘密材料；全部用**既有** public accessor）。
 fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
     let head_height = runtime.block_production().map_or(0, |a| a.head().height);
     let established_peers = cli
@@ -837,6 +869,8 @@ fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
     let inbound_accepted = runtime
         .network_inbound_diagnostics()
         .map_or(0, |d| d.accepted);
+    let consensus_height = runtime.driver().consensus().state().round.height;
+    let round = runtime.driver().consensus().state().round.round;
     RunSummary {
         steps,
         run_steps: cli.run_steps,
@@ -845,7 +879,66 @@ fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
         configured_peers: cli.peers.len(),
         inbound_connections: runtime.network_inbound_connection_count(),
         inbound_accepted,
+        finalized_height: runtime.qc_history_tip_height(),
+        consensus_height,
+        round,
+        sync_pending: runtime.sync_pending_requests(),
+        validator_enabled: runtime.validator_enabled(),
+        peer_dial_attempts_total: runtime.peer_dial_attempts_total(),
+        peer_dial_failures_total: runtime.peer_dial_failures_total(),
     }
+}
+
+/// P1-A.9（P1-3）—— 单行 periodic status（确定性；仅非敏感观测值）。
+///
+/// 字段顺序固定、无时间戳、无随机值、不读取外部服务。
+fn status_line(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> String {
+    let s = summarize(runtime, cli, steps);
+    let finalized = s
+        .finalized_height
+        .map_or_else(|| "none".to_string(), |h| h.to_string());
+    format!(
+        "{PROGRAM}: status steps={} head_height={} finalized_height={} consensus_height={} \
+         round={} configured_peers={} established_peers={} inbound_connections={} \
+         sync_pending={} validator_enabled={}\n",
+        s.steps,
+        s.head_height,
+        finalized,
+        s.consensus_height,
+        s.round,
+        s.configured_peers,
+        s.established_peers,
+        s.inbound_connections,
+        s.sync_pending,
+        s.validator_enabled,
+    )
+}
+
+/// P1-A.9（P1-3）—— 退出摘要行（保留 P1-A.3 既有契约字段，另增 P1-A.9 观测字段）。
+fn summary_line(s: &RunSummary) -> String {
+    let finalized = s
+        .finalized_height
+        .map_or_else(|| "none".to_string(), |h| h.to_string());
+    format!(
+        "{PROGRAM}: stopped after {}/{} steps; head_height={} finalized_height={} \
+         consensus_height={} round={} configured_peers={}/{} inbound_connections={} \
+         inbound_accepted={} sync_pending={} peer_dial_attempts={} peer_dial_failures={} \
+         validator_enabled={}; runtime shut down\n",
+        s.steps,
+        s.run_steps,
+        s.head_height,
+        finalized,
+        s.consensus_height,
+        s.round,
+        s.established_peers,
+        s.configured_peers,
+        s.inbound_connections,
+        s.inbound_accepted,
+        s.sync_pending,
+        s.peer_dial_attempts_total,
+        s.peer_dial_failures_total,
+        s.validator_enabled,
+    )
 }
 
 /// 循环结果：正常耗完预算或 fail-closed 停止（**两者均携带摘要**，便于退出观测）。
@@ -853,6 +946,9 @@ struct RunLoopOutcome {
     summary: RunSummary,
     /// `Some` ⇒ 某次 `runtime.step()` 返回 `Err`（fail-closed：不继续下一轮、不吞错）。
     error: Option<StartupError>,
+    /// P1-A.9（P1-3）—— periodic status 写失败（best-effort 观测）。
+    /// **不**改变 step 语义 / **不**跳过 `shutdown` / **不**覆盖 step 错误（优先级最低）。
+    status_write_failed: bool,
 }
 
 /// `RuntimeError` → 稳定类别标签（穷尽匹配；新增变体 ⇒ 编译期强制在本层显式处理）。
@@ -887,9 +983,13 @@ fn run_fault_kind(e: &RuntimeError) -> &'static str {
 /// 3. 预算：`steps == cli.run_steps` ⇒ 正常结束（**不**多执行一轮，不存在 N+1）；否则
 ///    `std::thread::sleep(cli.idle_ms)` pacing（Owner D1 批准的唯一生产 sleep；`1..=50ms`
 ///    已由 CLI 拒绝 0 ⇒ **无 busy loop**）。
+/// 4. **P1-A.9（P1-3）**：每 `STATUS_INTERVAL_STEPS` 步输出一行 status（stdout；固定 interval；
+///    无墙钟 / 无随机 / 不影响 step timing）。status 写失败只记录（`status_write_failed`），
+///    **不**改变 step 语义、**不**跳过 `shutdown`、**不**覆盖 step 错误。
 fn run_node_loop(runtime: &mut NodeRuntime, cli: &Cli) -> RunLoopOutcome {
     let mut steps: u64 = 0;
     let mut error: Option<StartupError> = None;
+    let mut status_write_failed = false;
     while steps < cli.run_steps {
         if !cli.peers.is_empty() {
             // 幂等；不因单个 configured peer 失败而终止节点（错误在 status 中，无状态机副作用）。
@@ -900,6 +1000,10 @@ fn run_node_loop(runtime: &mut NodeRuntime, cli: &Cli) -> RunLoopOutcome {
             error = Some(StartupError::Run(run_fault_kind(&e)));
             break;
         }
+        // P1-A.9（P1-3）：固定 interval 观测行（best-effort；写失败不中断 / 不吞错）。
+        if should_emit_status(steps) && write_stdout(&status_line(runtime, cli, steps)).is_err() {
+            status_write_failed = true;
+        }
         if steps >= cli.run_steps {
             break;
         }
@@ -908,6 +1012,7 @@ fn run_node_loop(runtime: &mut NodeRuntime, cli: &Cli) -> RunLoopOutcome {
     RunLoopOutcome {
         summary: summarize(runtime, cli, steps),
         error,
+        status_write_failed,
     }
 }
 
@@ -949,21 +1054,14 @@ fn main() -> Result<(), StartupError> {
             let summary = outcome.summary;
             // 既有 `shutdown`：**所有路径恰好一次**（含 step 失败路径；consuming self）。
             let shutdown_result = runtime.shutdown().map_err(|_| StartupError::Shutdown);
-            // 退出摘要行（仅非敏感观测值）。
-            write_stdout(&format!(
-                "{PROGRAM}: stopped after {}/{} steps; head_height={} configured_peers={}/{} \
-                 inbound_connections={} inbound_accepted={}; runtime shut down\n",
-                summary.steps,
-                summary.run_steps,
-                summary.head_height,
-                summary.established_peers,
-                summary.configured_peers,
-                summary.inbound_connections,
-                summary.inbound_accepted,
-            ))?;
-            // 优先级：runtime step 错误优先于 shutdown 错误；两者均**不**吞掉。
+            // 退出摘要行（仅非敏感观测值；P1-A.9 扩充字段，保留 P1-A.3 既有契约字段）。
+            write_stdout(&summary_line(&summary))?;
+            // 优先级：runtime step 错误 > periodic status 写失败 > shutdown 错误；均**不**吞掉。
             if let Some(e) = outcome.error {
                 return Err(e);
+            }
+            if outcome.status_write_failed {
+                return Err(StartupError::OutputWrite);
             }
             shutdown_result
         }
@@ -2002,6 +2100,107 @@ mod tests {
             elapsed < std::time::Duration::from_secs(30),
             "循环必须有界终止（实测 {elapsed:?}）"
         );
+        runtime.shutdown().expect("shutdown ok");
+    }
+
+    // T48（P1-A.9 / P1-3）— status 固定 interval：非每 step、非零、默认预算下无日志洪水
+    #[test]
+    fn t48_status_interval_is_fixed_and_not_per_step() {
+        assert!(!should_emit_status(0), "step 0 不是有效 step");
+        for s in 1..STATUS_INTERVAL_STEPS {
+            assert!(!should_emit_status(s), "step {s} 不得输出 status");
+        }
+        assert!(should_emit_status(STATUS_INTERVAL_STEPS));
+        assert!(should_emit_status(STATUS_INTERVAL_STEPS * 2));
+        assert!(!should_emit_status(STATUS_INTERVAL_STEPS * 2 + 1));
+        // 编译期事实（不得每 step 输出；默认预算下 status 行数有界）。
+        const { assert!(STATUS_INTERVAL_STEPS > 1) };
+        const { assert!(RUN_STEPS_DEFAULT / STATUS_INTERVAL_STEPS <= 64) };
+    }
+
+    // T49（P1-A.9 / P1-3）— status 行确定性 + 必需字段（不绑定完整字符串）
+    #[test]
+    fn t49_status_line_is_deterministic_and_has_required_fields() {
+        let env = TempEnv::new("t49");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &["--run-steps".to_string(), "1".to_string()],
+        );
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let (runtime, _report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+
+        let a = status_line(&runtime, &cli, STATUS_INTERVAL_STEPS);
+        let b = status_line(&runtime, &cli, STATUS_INTERVAL_STEPS);
+        assert_eq!(a, b, "status 行必须确定性（无墙钟 / 无随机）");
+        assert!(a.starts_with("yazimao-node: status "), "status 前缀: {a}");
+        assert!(a.ends_with('\n'), "status 行必须以换行结束");
+        for key in [
+            "steps=",
+            "head_height=",
+            "finalized_height=",
+            "consensus_height=",
+            "round=",
+            "configured_peers=",
+            "established_peers=",
+            "inbound_connections=",
+            "sync_pending=",
+            "validator_enabled=",
+        ] {
+            assert!(a.contains(key), "status 行缺少字段 {key}: {a}");
+        }
+        assert!(
+            a.contains(&format!("steps={STATUS_INTERVAL_STEPS}")),
+            "status 必须报告当前 steps: {a}"
+        );
+        runtime.shutdown().expect("shutdown ok");
+    }
+
+    // T50（P1-A.9 / P1-3）— 退出摘要：保留 P1-A.3 契约字段 + 新增 A.8/P1-A.9 观测字段
+    #[test]
+    fn t50_summary_line_keeps_contract_and_adds_observation_fields() {
+        let env = TempEnv::new("t50");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &["--run-steps".to_string(), "2".to_string()],
+        );
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let (mut runtime, _report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+        let outcome = run_node_loop(&mut runtime, &cli);
+        assert!(outcome.error.is_none());
+        assert!(
+            !outcome.status_write_failed,
+            "stdout 可用时 status 写不得失败（2 steps < interval ⇒ 无 status）"
+        );
+        let line = summary_line(&outcome.summary);
+        // P1-A.3 既有契约字段（集成测试依赖同名子串）。
+        for key in [
+            "stopped after ",
+            "head_height=",
+            "configured_peers=",
+            "inbound_connections=",
+            "inbound_accepted=",
+            "runtime shut down",
+        ] {
+            assert!(line.contains(key), "摘要缺少契约字段 {key}: {line}");
+        }
+        // P1-A.9 新增观测字段。
+        for key in [
+            "finalized_height=",
+            "consensus_height=",
+            "round=",
+            "sync_pending=",
+            "peer_dial_attempts=",
+            "peer_dial_failures=",
+            "validator_enabled=",
+        ] {
+            assert!(line.contains(key), "摘要缺少新增字段 {key}: {line}");
+        }
         runtime.shutdown().expect("shutdown ok");
     }
 }

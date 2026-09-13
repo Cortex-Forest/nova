@@ -1987,6 +1987,21 @@ impl NodeRuntime {
                 .as_ref()
                 .map(|s| s.ns.is_connected(t.peer_id))
                 .unwrap_or(false);
+            // P1-A.9（P1-2）—— 与 NetworkService **实际会话状态**对账：
+            // 连接与会话都消失（TCP/session EOF、对端重启、链路抖动）⇒ 清本 peer 的 per-peer
+            // Init 标记，使**下一次 dial 能重新发送** Handshake Init。否则 stale 标记会永久阻止
+            // 重握手（dial 成功但 Init 永不重发 ⇒ 单向失联，仅在进程重启后才自愈）。
+            //
+            // 安全边界（均为必须）：
+            // - 仅在 **既未 `connected` 也未 `established`** 时清 ⇒ 有效 session 不受影响；
+            // - `connected && !established`（握手进行中）**不**清 ⇒ 不重发 Init / 不消耗 frozen
+            //   per-peer handshake rate limit；
+            // - 不改 network crate / 不新增握手消息 / 不改 wire protocol / 不绕过认证；
+            // - 与 A.8 `peer_lifecycle` 退避是**独立维度**（此处不碰 `failure_count` /
+            //   `next_allowed_attempt_tick`）。
+            if !connected && !established {
+                self.handshake_init_sent_for.remove(&t.peer_id);
+            }
             // 已认证 / 已连接：**不 dial**（不在退避门控范围；由既有 prepare 内部跳过 dial）。
             if established || connected {
                 match self.establish_prepare(t.peer_id, t.address) {
