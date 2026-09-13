@@ -533,3 +533,264 @@ fn hex(hash: [u8; 32]) -> String {
     }
     s
 }
+
+// ---------------------------------------------------------------------------
+// P1-A.20-C Phase 2 — Node 生产写入/读取迁移（verified multi-encoding / proposer-aware ⑥a）
+//
+// 迁移面（生产路径）：⑥a durable-first 写 `BlockStore::put` → `put_verified`（身份 =
+// `(block_hash, proposer)`）；读 `get` → `get_content`（内容型读）；legacy 记录保留。
+// 本组测试在**集成层**固定该调用形态与 storage 契约：zero-persist / 多 proposer 共存 /
+// 无 proposer fallback / legacy 兼容（不被删除 / 改写）。
+// ---------------------------------------------------------------------------
+
+/// proposer 索引标签（32B）：生产用 `ValidatorId::as_bytes()`；本 rig 无 `ValidatorSet` ⇒
+/// 用**同一 key 的压缩公钥**作标签（storage 只把它当**索引**，真伪由 `expected_vk` 验签决定）。
+fn proposer_label(kp: &KeyPair) -> [u8; 32] {
+    kp.verifying_key().to_bytes()
+}
+
+/// T1 + T2 — verified durable-first encoding（round 0 与 round ≥ 1 同款写入路径）：
+/// 经 ⑥a 落盘后该块的 encoding **按 `(hash, proposer)` 可取用**且**签名可验证**；
+/// 内容型读（`get_content`，生产读取路径）同样可得。
+#[test]
+fn p1a20c_t1_t2_verified_encoding_round0_and_round1() {
+    let (chain, kp) = setup();
+    let mut adapter = create_adapter(&chain);
+    let label = proposer_label(&kp);
+    let vk = kp.verifying_key();
+
+    // height 1（round 0 语义下产出）：apply_block_with_proposer ⇒ ⑥a put_verified
+    let (a, wa) = next_empty_block(&adapter, &kp);
+    let ha = nova_runtime::block_hash(&a).unwrap();
+    adapter
+        .apply_block_with_proposer(&wa, vk, &label, 3)
+        .unwrap();
+    assert_eq!(adapter.head().height, 1);
+    assert_eq!(adapter.head().block_hash, ha);
+
+    let bs = BlockStore::open(&chain.blocks_dir).unwrap();
+    assert_eq!(
+        bs.get_for_proposer(&ha, &label).unwrap(),
+        Some(a.clone()),
+        "T1：verified encoding 落盘（(hash, proposer) 身份）"
+    );
+    assert_eq!(
+        bs.get_for_proposer_verified(&ha, &label, vk, CHAIN_ID)
+            .unwrap(),
+        Some(a.clone()),
+        "T1：encoding 签名可验证"
+    );
+
+    // height 2（round ≥ 1 同款写入路径）：continue commit，encoding 同款可取用
+    let (b, wb) = next_empty_block(&adapter, &kp);
+    let hb = nova_runtime::block_hash(&b).unwrap();
+    adapter
+        .apply_block_with_proposer(&wb, vk, &label, 3)
+        .unwrap();
+    assert_eq!(adapter.head().height, 2);
+    assert_eq!(adapter.head().block_hash, hb);
+    assert_eq!(
+        bs.get_for_proposer(&hb, &label).unwrap(),
+        Some(b.clone()),
+        "T2：round ≥ 1 同款 encoding"
+    );
+    assert_eq!(
+        bs.get_content(&hb).unwrap(),
+        Some(b),
+        "读迁移：get_content（内容型读，生产路径）可用"
+    );
+}
+
+/// T3 + T4 — 同 `block_hash` / 不同 proposer 的两份 encoding **共存**（生产 `put_verified`
+/// 调用形态）：不 KEEP-FIRST、不覆盖、内容一致（`proposer_signature` ∉ `block_hash`，
+/// ADR-0042）；已存在的 `(hash, proposer)` 重复写 ⇒ 幂等 `AlreadyPresent`，不新增记录。
+#[test]
+fn p1a20c_t3_t4_same_hash_two_proposers_coexist() {
+    let chain = TestChain::new();
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let mut adapter = create_adapter(&chain);
+
+    let (block_a, wire_a) = next_empty_block(&adapter, &kp_a);
+    let mut block_b = block_a.clone();
+    block_b.proposer_signature = block_signature(&block_a.header, kp_b.signing_key());
+    let h = nova_runtime::block_hash(&block_a).unwrap();
+    assert_eq!(
+        nova_runtime::block_hash(&block_b).unwrap(),
+        h,
+        "proposer_signature ∉ block_hash（ADR-0042）"
+    );
+    assert_ne!(block_a.proposer_signature, block_b.proposer_signature);
+
+    let label_a = proposer_label(&kp_a);
+    let label_b = proposer_label(&kp_b);
+    let bs = BlockStore::open(&chain.blocks_dir).unwrap();
+    assert!(matches!(
+        bs.put_verified(&block_a, &label_a, kp_a.verifying_key(), CHAIN_ID, 3)
+            .unwrap(),
+        nova_storage::block_store::PutOutcome::Inserted
+    ));
+    assert!(
+        matches!(
+            bs.put_verified(&block_b, &label_b, kp_b.verifying_key(), CHAIN_ID, 3)
+                .unwrap(),
+            nova_storage::block_store::PutOutcome::Inserted
+        ),
+        "T3/T4：第二份 proposer encoding 不因同 hash 被拒（旧 put ⇒ CorruptedState fail-closed）"
+    );
+
+    let mut labels = bs.list_proposers(&h).unwrap();
+    labels.sort_unstable();
+    assert_eq!(
+        labels.len(),
+        2,
+        "两份 encoding 共存（无 KEEP-FIRST / 无覆盖）"
+    );
+    assert_eq!(
+        bs.get_for_proposer(&h, &label_a)
+            .unwrap()
+            .unwrap()
+            .proposer_signature,
+        block_a.proposer_signature
+    );
+    assert_eq!(
+        bs.get_for_proposer(&h, &label_b)
+            .unwrap()
+            .unwrap()
+            .proposer_signature,
+        block_b.proposer_signature
+    );
+    assert_eq!(
+        bs.get_content(&h).unwrap().unwrap().header,
+        block_a.header,
+        "内容一致（同一 canonical header/body）"
+    );
+
+    // 经 ⑥a 生产路径重复写入已有 (hash, proposer) ⇒ 幂等（不新增 / 不覆盖）
+    adapter
+        .apply_block_with_proposer(&wire_a, kp_a.verifying_key(), &label_a, 3)
+        .unwrap();
+    assert_eq!(adapter.head().block_hash, h);
+    assert_eq!(
+        bs.list_proposers(&h).unwrap().len(),
+        2,
+        "⑥a 幂等：已存在 ⇒ 不新增 / 不覆盖"
+    );
+}
+
+/// T5 — 错误 proposer 签名：adapter ② fail-closed（不 commit / **零持久化**）；
+/// 直接调用 storage 也必须 zero-persist（验证先于任何 FS 写入）。
+#[test]
+fn p1a20c_t5_wrong_proposer_rejected_zero_persist() {
+    let (chain, kp) = setup();
+    let mut adapter = create_adapter(&chain);
+    let other = KeyPair::generate().unwrap();
+    let (block, wire) = next_empty_block(&adapter, &kp);
+    let h = nova_runtime::block_hash(&block).unwrap();
+
+    let err = adapter
+        .apply_block_with_proposer(&wire, other.verifying_key(), &proposer_label(&other), 3)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            nova_node::block_adapter::NodeBlockApplicationError::Pipeline(_)
+        ),
+        "非签名者 key ⇒ Pipeline（实际 {err:?}）"
+    );
+    assert_eq!(adapter.head().height, 0, "未 commit");
+
+    let bs = BlockStore::open(&chain.blocks_dir).unwrap();
+    assert!(
+        bs.list_proposers(&h).unwrap().is_empty(),
+        "adapter 路径零持久化"
+    );
+    assert!(!bs.contains(&h).unwrap());
+
+    assert!(
+        matches!(
+            bs.put_verified(
+                &block,
+                &proposer_label(&other),
+                other.verifying_key(),
+                CHAIN_ID,
+                3
+            ),
+            Err(nova_storage::error::StorageError::CorruptedState)
+        ),
+        "storage 层同样拒绝（签名 ≠ 声明 proposer）"
+    );
+    assert!(
+        bs.list_proposers(&h).unwrap().is_empty(),
+        "storage 路径亦零持久化"
+    );
+}
+
+/// T11 — legacy 记录**不被删除 / 不被改写**：legacy 单记录（`block_<hash>.blk`）与
+/// verified 目录 encoding 共存；migrate 之后 legacy 字节与可读性完全不变。
+#[test]
+fn p1a20c_t11_legacy_record_preserved() {
+    let (chain, kp) = setup();
+    let mut adapter = create_adapter(&chain);
+    let vk = kp.verifying_key();
+    let label = proposer_label(&kp);
+
+    let (a, wa) = next_empty_block(&adapter, &kp);
+    let ha = nova_runtime::block_hash(&a).unwrap();
+    adapter.apply_block(&wa, vk).unwrap(); // legacy 路径（遗留 API；测试可达）
+    let legacy_path = chain.blocks_dir.join(format!("block_{}.blk", hex(ha)));
+    assert!(legacy_path.exists(), "legacy 记录存在");
+    let before = std::fs::read(&legacy_path).unwrap();
+
+    let (b, wb) = next_empty_block(&adapter, &kp);
+    let hb = nova_runtime::block_hash(&b).unwrap();
+    adapter
+        .apply_block_with_proposer(&wb, vk, &label, 3)
+        .unwrap(); // verified 路径
+
+    assert_eq!(
+        std::fs::read(&legacy_path).unwrap(),
+        before,
+        "T11：legacy 字节不变（不删 / 不改写 / 不自动迁移）"
+    );
+    let bs = BlockStore::open(&chain.blocks_dir).unwrap();
+    assert_eq!(bs.get(&ha).unwrap(), Some(a), "T11：legacy 仍可读");
+    assert!(bs.contains(&hb).unwrap(), "新块走 encoding 路径");
+    assert_eq!(bs.get_content(&hb).unwrap(), Some(b));
+}
+
+/// T12 — **无 proposer fallback**：请求不存在的 proposer encoding ⇒ `None`
+/// （绝不返回其它 proposer 的 encoding）；内容型读不受影响。
+#[test]
+fn p1a20c_t12_no_proposer_fallback() {
+    let (chain, kp) = setup();
+    let mut adapter = create_adapter(&chain);
+    let vk = kp.verifying_key();
+    let label = proposer_label(&kp);
+    let other = KeyPair::generate().unwrap();
+    let other_label = proposer_label(&other);
+
+    let (a, wa) = next_empty_block(&adapter, &kp);
+    adapter
+        .apply_block_with_proposer(&wa, vk, &label, 3)
+        .unwrap();
+    let ha = nova_runtime::block_hash(&a).unwrap();
+    let bs = BlockStore::open(&chain.blocks_dir).unwrap();
+
+    assert_eq!(
+        bs.get_for_proposer(&ha, &other_label).unwrap(),
+        None,
+        "T12：不得返回其它 proposer 的 encoding"
+    );
+    assert_eq!(
+        bs.get_for_proposer_verified(&ha, &other_label, other.verifying_key(), CHAIN_ID)
+            .unwrap(),
+        None,
+        "T12：verified 读同样不 fallback"
+    );
+    assert_eq!(
+        bs.get_content(&ha).unwrap(),
+        Some(a),
+        "内容型读与 proposer 身份无关"
+    );
+}

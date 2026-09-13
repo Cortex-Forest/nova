@@ -31,9 +31,12 @@ use nova_crypto::identity::{
     AccountInit, ChainIdentity, GenesisError, GenesisV1, decode_genesis_bytes,
     validate_genesis_with_expected,
 };
+use nova_crypto::signature::VerifyingKey;
 use nova_network::node_id::NodeId;
 use nova_network::transport::ConnectionTarget;
-use nova_runtime::{AccountChange, BlockPipelineError, KeyResolver};
+use nova_runtime::{
+    AccountChange, Block, BlockPipelineError, KeyResolver, validate_block_signature,
+};
 use nova_storage::block_store::BlockStore;
 use nova_storage::error::StorageError;
 use nova_storage::head::HeadRecord;
@@ -46,6 +49,7 @@ use crate::block_adapter::{
     ChainHead, NoAccountsKeyResolver, NodeBlockAdapter, NodeBlockApplicationError,
 };
 use crate::key_provider::KeyProviderConfig;
+use crate::qc_history::QcHistory;
 
 /// 节点启动配置（F-3 最小；Node-local，非协议）。
 #[derive(Debug, Clone)]
@@ -290,10 +294,64 @@ fn genesis_changes(accounts: &[AccountInit]) -> Vec<AccountChange> {
 
 /// D10-C Step 2 — restart 后 Consensus DAG 重建（canonical ancestry；consensus-not-persisted seam）。
 ///
+/// **P1-A.20-C Phase 2** —— 历史块的 proposer 解析（**不再硬编码 round 0**）。
+///
+/// 顺序（均为**既有** authority / 既有验证；无新授权 / 无 round-0 回退 / 无伪造）：
+/// 1. **QC 优先（target-specific）**：`qc_history.get(height)` 且 `qc.target == block_hash` ⇒
+///    `round = qc.context.round` ⇒ `select_proposer(chain_id, height-1, round, genesis_hash, set)`
+///    ⇒ **再用该 proposer 的 key 验签该块**（QC 与块必须相互印证）；
+/// 2. QC 不可得（缺失 / target 不匹配 / 推导后验签失败）⇒ **不猜 round**：改为在**既有
+///    ValidatorSet** 内按**签名**枚举（membership-bounded ≤ |set|）：唯一命中者即该块实际
+///    签名 proposer（密码学绑定，强于轮次推导）；
+/// 3. 无命中或**多命中**（重复 key / 装配不一致）⇒ **fail-closed**
+///    （canonical 块无法唯一归属任一成员 ⟹ 状态不一致；`Storage(CorruptedState)`）。
+fn resolve_historical_proposer(
+    qc_history: Option<&QcHistory>,
+    chain_id: u64,
+    genesis_hash: &[u8; 32],
+    set: &ValidatorSet,
+    hash: &[u8; 32],
+    block: &Block,
+) -> Result<ValidatorId, NodeStartupError> {
+    let height = block.header.height;
+    if let Some(history) = qc_history
+        && let Ok(Some(qc)) = history.get(height)
+        && qc.target == *hash
+        && let Ok(p) = select_proposer(
+            chain_id,
+            height.saturating_sub(1),
+            qc.context.round,
+            genesis_hash,
+            set,
+        )
+        && let Some(info) = set.info(&p)
+        && let Ok(vk) = VerifyingKey::from_bytes(&info.consensus_public_key)
+        && validate_block_signature(block, &vk, chain_id).is_ok()
+    {
+        return Ok(p);
+    }
+    // QC 不可得 ⇒ 不猜 round：按签名在既有集合内枚举（≤ |set|；deterministic 排序）。
+    let mut found: Option<ValidatorId> = None;
+    for info in set.validators() {
+        let Ok(vk) = VerifyingKey::from_bytes(&info.consensus_public_key) else {
+            continue;
+        };
+        if validate_block_signature(block, &vk, chain_id).is_ok() {
+            if found.is_some() {
+                // 多命中（重复 key / 装配不一致）⇒ fail-closed（不猜）。
+                return Err(NodeStartupError::Storage(StorageError::CorruptedState));
+            }
+            found = Some(info.validator_id);
+        }
+    }
+    found.ok_or(NodeStartupError::Storage(StorageError::CorruptedState))
+}
+
 /// 从 canonical head 沿 committed BlockStore 的 parent 链回溯至 genesis，重建 frozen `Dag`：
 /// genesis 根（height 0；无 block 文件）+ 每个 canonical committed 块的 [`BlockReference`]
-/// （真实 `header.height` + 单 parent 边 + `proposer` 由 `select_proposer(chain_id, height-1, 0,
-/// genesis_hash, set)` 推导 —— 父高轮，与 vote / QC 轮高语义及 block_adapter V0.1 一致）。
+/// （真实 `header.height` + 单 parent 边 + `proposer` 由**历史 QC 的 `context.round`** 推导，
+/// 见 [`resolve_historical_proposer`]：**不再硬编码 round 0**；QC 不可得时按**签名**在既有
+/// ValidatorSet 内枚举（密码学绑定），仍不可得 ⇒ fail-closed）。
 /// reference 按自底向上（genesis → … → head）顺序加入 ⇒ 复用 frozen `Dag::add_block` 校验
 /// （parent 已存在 / `parent.height < height`），**不改共识层**。
 ///
@@ -308,6 +366,7 @@ fn genesis_changes(accounts: &[AccountInit]) -> Vec<AccountChange> {
 pub fn rebuild_consensus_dag(
     adapter: &NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>,
     set: &ValidatorSet,
+    qc_history: Option<&QcHistory>,
 ) -> Result<Dag, NodeStartupError> {
     let genesis_hash = adapter.genesis_hash();
     let chain_id = adapter.chain_id();
@@ -339,7 +398,10 @@ pub fn rebuild_consensus_dag(
     let mut visited: HashSet<[u8; 32]> = HashSet::from([head.block_hash]);
     let mut cur = head.block_hash;
     loop {
-        let block = match block_store.get(&cur).map_err(NodeStartupError::Storage)? {
+        let block = match block_store
+            .get_content(&cur)
+            .map_err(NodeStartupError::Storage)?
+        {
             Some(b) => b,
             None => return Err(NodeStartupError::DagRebuildMissingAncestor(cur)),
         };
@@ -359,19 +421,17 @@ pub fn rebuild_consensus_dag(
     //    `Dag::add_block` 的 parent 存在 + `parent.height < height` 校验通过
     //    （高度不合法 ⇒ 拒 ⇒ fail closed）。
     for &hash in ancestry.iter().rev() {
-        let block = match block_store.get(&hash).map_err(NodeStartupError::Storage)? {
+        let block = match block_store
+            .get_content(&hash)
+            .map_err(NodeStartupError::Storage)?
+        {
             Some(b) => b,
             None => return Err(NodeStartupError::DagRebuildMissingAncestor(hash)),
         };
-        // proposer 推导：该块是 round = header.height - 1 的 canonical-next（V0.1 父高轮语义）。
-        let proposer = select_proposer(
-            chain_id,
-            block.header.height.saturating_sub(1),
-            0,
-            &genesis_hash,
-            set,
-        )
-        .map_err(NodeStartupError::DagRebuild)?;
+        // proposer 推导（P1-A.20-C Phase 2）：按**历史 QC 的 context.round** 推导；
+        // QC 不可得 ⇒ **不猜 round**，改为按签名在既有 ValidatorSet 内枚举（见 helper）。
+        let proposer =
+            resolve_historical_proposer(qc_history, chain_id, &genesis_hash, set, &hash, &block)?;
         dag.add_block(BlockReference {
             block_hash: hash,
             height: block.header.height,
@@ -559,7 +619,8 @@ pub fn read_finality_fact(path: &Path) -> Result<Option<(u64, [u8; 32])>, NodeSt
 /// 1. identity（network_id / chain_id / genesis_hash）；2. QC 为 Precommit 且
 ///    `reference == qc.target`；3. `qc.context.height + 1 == height`（canonical-next parent-round）；
 /// 4. `reference` 已在 committed DAG ⇒ fact 已满足（**幂等 / stale ignore** —— 不注入、不回退）；
-/// 5. `BlockStore.get(reference)` 存在且 `block.header.height == height`；
+/// 5. `BlockStore.get_content(reference)` 存在且 `block.header.height == height`
+///    （**P1-A.20-C Phase 2**：内容型读 —— legacy 或任一 encoding 同内容）；
 /// 6. canonical head 关系：未 commit 时要求 X 是 head 的严格 child（`parent == head.block_hash ∧
 ///    height == head.height + 1`），否则 ⇒ `FinalityFactHeadConflict`（同高异 hash / unrelated /
 ///    高度异常；**绝不选择 / 绝不猜测**）；
@@ -613,7 +674,7 @@ pub fn restore_finality_fact(
         .block_store()
         .ok_or(NodeStartupError::FinalityFactCorrupt)?;
     let block = match block_store
-        .get(&fact.reference)
+        .get_content(&fact.reference)
         .map_err(NodeStartupError::Storage)?
     {
         Some(b) => b,
@@ -663,4 +724,288 @@ pub fn restore_finality_fact(
     verify_qc(&fact.qc, set, &genesis_hash, &dag).map_err(NodeStartupError::FinalityFactQc)?;
 
     Ok((dag, Some(fact.reference)))
+}
+
+// ---------------------------------------------------------------------------
+// P1-A.20-C Phase 2 — T9（历史 round ≥ 1 的 proposer 解析）
+//
+// 目标（Owner Phase 2 mandate §15-T9）：restart 后重建历史块的 proposer 时，**必须**使用
+// 历史 QC 的 `context.round`（`select_proposer(chain, height-1, round, genesis_hash, set)`），
+// **不得**硬编码 round 0；QC 不可得 / 不适用 ⇒ 按**签名**在既有 ValidatorSet 内枚举；
+// 集合外签名 ⇒ **fail-closed**。
+//
+// 可观测性说明：frozen `Dag` 不暴露 `BlockReference.proposer` 读取器（`crates/consensus`
+// 本阶段禁止改动）⇒ 端到端「DAG 内的 proposer」不可从外部断言；本测试固定在**最近可观测
+// 接缝** `resolve_historical_proposer`（`rebuild_consensus_dag` 每个 canonical 块调用的
+// 解析器）。QC 键语义（ADR-0064 / `qc_history`）：键 `h` 存的是**该块**的 QC
+// （`context.height == h-1` ∧ `target == block_hash(block@h)`）。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nova_consensus::finality::QcContext;
+    use nova_crypto::address::{
+        ADDRESS_VERSION, AddressType, YazimaoAddress, YazimaoAddressPayload,
+    };
+    use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
+    use nova_crypto::identity::{
+        AccountInit, EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit,
+        compute_genesis_hash,
+    };
+    use nova_crypto::key::KeyPair;
+    use nova_crypto::signature::sign_message_hash;
+    use nova_runtime::{
+        BLOCK_VERSION, BlockBody, BlockHeader, block_hash, compute_transaction_root,
+        encode_block_header,
+    };
+
+    const T9_CHAIN_ID: u64 = 1001;
+    const T9_STAKE: u128 = 200_000;
+
+    /// 独立临时目录（每次调用唯一；测试内自清理）。
+    fn t9_dir(tag: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d =
+            std::env::temp_dir().join(format!("nova_p1a20c_t9_{tag}_{}_{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn t9_addr(i: u8) -> YazimaoAddress {
+        YazimaoAddress::from_payload(YazimaoAddressPayload {
+            address_version: ADDRESS_VERSION,
+            address_type: AddressType::UserAccount,
+            network_id: NetworkId::Mainnet,
+            key_hash: [0x11u8.wrapping_add(i); 32],
+        })
+    }
+
+    fn t9_genesis(pks: &[[u8; 32]]) -> GenesisV1 {
+        let accounts: Vec<AccountInit> = (0..pks.len())
+            .map(|i| AccountInit {
+                address: t9_addr(i as u8),
+                liquid_balance: 1_000_000,
+            })
+            .collect();
+        let mut vs: Vec<ValidatorInit> = pks
+            .iter()
+            .zip(accounts.iter())
+            .map(|(pk, a)| ValidatorInit {
+                account_address: a.address,
+                consensus_public_key: *pk,
+                bonded_stake: T9_STAKE,
+                commission_bps: 0,
+            })
+            .collect();
+        vs.sort_by_key(|v| ValidatorId::from_consensus_public_key(&v.consensus_public_key));
+        let total_supply: u128 = accounts.iter().map(|a| a.liquid_balance).sum();
+        GenesisV1 {
+            network_id: NetworkId::Mainnet,
+            chain_id: T9_CHAIN_ID,
+            genesis_timestamp: 1,
+            initial_validator_set: vs,
+            initial_accounts: accounts,
+            protocol_parameters: ProtocolParamsV1 {
+                max_tx_bytes: 64 * 1024,
+                max_block_bytes: 8 * 1024 * 1024,
+                max_gas_per_block: 1_000_000,
+                max_contract_code_bytes: 1024,
+                max_contract_storage_bytes: 1024,
+                epoch_length_blocks: 1_000,
+                snapshot_interval_blocks: 10_000,
+            },
+            economics_parameters: EconomicsParamsV1 {
+                total_supply,
+                min_validator_stake: 100,
+                unbonding_period_seconds: 1_000,
+                fee_burn_bps: 0,
+            },
+        }
+    }
+
+    /// 合成某高度的块（parent = genesis；仅用于 proposer 解析 —— 不执行状态）。
+    fn t9_block(genesis_hash: [u8; 32], height: u64, kp: &KeyPair) -> Block {
+        let body = BlockBody { txs: Vec::new() };
+        let header = BlockHeader {
+            version: BLOCK_VERSION,
+            chain_id: T9_CHAIN_ID,
+            height,
+            parent_hash: genesis_hash,
+            finality_reference: None,
+            transaction_root: compute_transaction_root(&body),
+            state_root: [0u8; 32],
+            validator_set_hash: genesis_hash,
+            timestamp: 0,
+        };
+        let payload = encode_block_header(&header);
+        let signed =
+            build_signed_bytes(AlgorithmId::Ed25519, DomainId::Block, T9_CHAIN_ID, &payload)
+                .unwrap();
+        let msg = hash_signing_message(&signed);
+        Block {
+            header,
+            body,
+            proposer_signature: sign_message_hash(kp.signing_key(), &msg).to_bytes(),
+        }
+    }
+
+    /// 合成「某块的 QC」：键 `block_height`、`context.height = block_height - 1`（ADR-0064）。
+    fn t9_qc(
+        block_height: u64,
+        round: u64,
+        target: [u8; 32],
+        genesis_hash: [u8; 32],
+    ) -> QuorumCertificate {
+        QuorumCertificate {
+            context: QcContext {
+                chain_id: T9_CHAIN_ID,
+                height: block_height - 1,
+                round,
+                vote_type: VoteType::Precommit,
+            },
+            target,
+            validator_set_id: genesis_hash,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// 确定性选取「round 0 ≠ round 1 当选者」的候选高度（T9 可区分性的**唯一**前提）。
+    ///
+    /// 随机 key 下固定高度可能恰好相同（3-validator 每高度 `p0 == p1` 概率 ≈ 1/3）⇒
+    /// 在多个高度 × 多组密钥上确定性搜索（64 × 8 组密钥下失败概率可忽略）。
+    fn t9_case() -> (
+        Vec<KeyPair>,
+        [u8; 32],
+        ValidatorSet,
+        u64,
+        ValidatorId,
+        ValidatorId,
+    ) {
+        for _ in 0..8 {
+            let kps: Vec<KeyPair> = (0..3).map(|_| KeyPair::generate().unwrap()).collect();
+            let pks: Vec<[u8; 32]> = kps.iter().map(|k| k.verifying_key().to_bytes()).collect();
+            let genesis = t9_genesis(&pks);
+            let genesis_hash = compute_genesis_hash(&genesis).unwrap();
+            let set = ValidatorSet::from_genesis(&genesis);
+            for height in 1..=64u64 {
+                let Ok(p0) = select_proposer(T9_CHAIN_ID, height - 1, 0, &genesis_hash, &set)
+                else {
+                    continue;
+                };
+                let Ok(p1) = select_proposer(T9_CHAIN_ID, height - 1, 1, &genesis_hash, &set)
+                else {
+                    continue;
+                };
+                if p0 != p1 {
+                    return (kps, genesis_hash, set, height, p0, p1);
+                }
+            }
+        }
+        panic!("未找到 round 0 ≠ round 1 的候选高度（3-validator 下概率可忽略）");
+    }
+
+    /// T9 — 历史 QC 的 `context.round` 决定历史块 proposer（**不得** round-0 硬编码）；
+    /// QC 缺失 / target 不符 / QC 推导后验签失败 ⇒ 签名枚举回退；集合外签名 ⇒ fail-closed。
+    #[test]
+    fn p1a20c_t9_historical_qc_round_resolves_proposer() {
+        let (kps, genesis_hash, set, h, p0, p1) = t9_case();
+
+        let kp_of = |id: &ValidatorId| -> &KeyPair {
+            let info = set.info(id).unwrap();
+            kps.iter()
+                .find(|k| k.verifying_key().to_bytes() == info.consensus_public_key)
+                .expect("成员 key 可得")
+        };
+
+        // 场景 A：块由 **round 1 当选者**签名 + 历史 QC（round 1，target = 该块）
+        //         ⇒ 解析结果必须是 round 1 的 proposer（round-0 硬编码 ⇒ p0 ⇒ FAIL）。
+        let block_a = t9_block(genesis_hash, h, kp_of(&p1));
+        let hash_a = block_hash(&block_a).unwrap();
+        let da = t9_dir("qc_round1");
+        let mut history_a = QcHistory::open(&da, NetworkId::Mainnet, T9_CHAIN_ID, genesis_hash);
+        history_a
+            .put(h, &t9_qc(h, 1, hash_a, genesis_hash))
+            .expect("QC 写入（键 = 块高度）");
+        assert_eq!(
+            resolve_historical_proposer(
+                Some(&history_a),
+                T9_CHAIN_ID,
+                &genesis_hash,
+                &set,
+                &hash_a,
+                &block_a
+            )
+            .unwrap(),
+            p1,
+            "T9：历史 QC round=1 ⇒ select_proposer(h-1, 1)（非 round 0）"
+        );
+        // 场景 B：同一块、无 QC ⇒ 签名枚举回退（密码学绑定 ⇒ 同一结果；不猜 round）。
+        assert_eq!(
+            resolve_historical_proposer(None, T9_CHAIN_ID, &genesis_hash, &set, &hash_a, &block_a)
+                .unwrap(),
+            p1,
+            "T9：QC 不可得 ⇒ 签名枚举回退（不硬编码 round）"
+        );
+        let _ = std::fs::remove_dir_all(&da);
+
+        // 场景 C：QC 存在但 **target 不是该块** ⇒ QC 不适用 ⇒ 回退签名枚举（不被误导）。
+        let dc = t9_dir("qc_other_target");
+        let mut history_c = QcHistory::open(&dc, NetworkId::Mainnet, T9_CHAIN_ID, genesis_hash);
+        history_c
+            .put(h, &t9_qc(h, 1, [0xABu8; 32], genesis_hash))
+            .unwrap();
+        assert_eq!(
+            resolve_historical_proposer(
+                Some(&history_c),
+                T9_CHAIN_ID,
+                &genesis_hash,
+                &set,
+                &hash_a,
+                &block_a
+            )
+            .unwrap(),
+            p1,
+            "T9：QC target 不符 ⇒ 回退签名枚举（不得按 QC 猜 proposer）"
+        );
+        let _ = std::fs::remove_dir_all(&dc);
+
+        // 场景 D：QC 声称 round 1（⇒ p1），但块**实际由 p0 签名** ⇒ QC 推导的 key 验签失败
+        //         ⇒ 回退签名枚举 ⇒ p0（**绝不**盲信 QC / 绝不伪造 proposer）。
+        let block_d = t9_block(genesis_hash, h, kp_of(&p0));
+        let hash_d = block_hash(&block_d).unwrap();
+        let dd = t9_dir("qc_mismatch_signer");
+        let mut history_d = QcHistory::open(&dd, NetworkId::Mainnet, T9_CHAIN_ID, genesis_hash);
+        history_d
+            .put(h, &t9_qc(h, 1, hash_d, genesis_hash))
+            .unwrap();
+        let resolved_d = resolve_historical_proposer(
+            Some(&history_d),
+            T9_CHAIN_ID,
+            &genesis_hash,
+            &set,
+            &hash_d,
+            &block_d,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved_d, p0,
+            "T9：QC 与块签名不一致 ⇒ 以签名者为准（不盲信 QC）"
+        );
+        assert_ne!(resolved_d, p1, "T9：不得返回 QC 推导的 p1");
+        let _ = std::fs::remove_dir_all(&dd);
+
+        // 场景 E：块签名者 **不在 ValidatorSet** ⇒ fail-closed（无法唯一归属 ⇒ CorruptedState）。
+        let outsider = KeyPair::generate().unwrap();
+        let block_e = t9_block(genesis_hash, h, &outsider);
+        let hash_e = block_hash(&block_e).unwrap();
+        let err =
+            resolve_historical_proposer(None, T9_CHAIN_ID, &genesis_hash, &set, &hash_e, &block_e)
+                .unwrap_err();
+        assert!(
+            matches!(err, NodeStartupError::Storage(StorageError::CorruptedState)),
+            "T9：集合外 proposer ⇒ fail-closed（实际 {err:?}）"
+        );
+    }
 }

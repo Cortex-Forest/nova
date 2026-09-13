@@ -239,7 +239,9 @@ pub fn lookup_block<B: StorageBackend + Clone>(
         return SyncLookup::NoBlockStore;
     };
     if let Some(hash) = request.block_hash {
-        return match block_store.get(&hash) {
+        // P1-A.20-C Phase 2：内容型读取 ⇒ `get_content`（legacy 或任一 encoding；内容逐字节相同）。
+        // ⚠️ round-aware encoding 选择（QC → round → proposer）属 Phase 3；本轮不引入。
+        return match block_store.get_content(&hash) {
             Ok(Some(block)) if block.header.height == request.height => {
                 SyncLookup::Found(Box::new(block))
             }
@@ -259,7 +261,8 @@ pub fn lookup_block<B: StorageBackend + Clone>(
     let mut height = head.height;
     let mut steps = 0u64;
     loop {
-        let block = match block_store.get(&hash) {
+        // P1-A.20-C Phase 2：内容型读取 ⇒ `get_content`（沿 parent_hash 回走只需内容）。
+        let block = match block_store.get_content(&hash) {
             Ok(Some(b)) => b,
             _ => return SyncLookup::Missing,
         };

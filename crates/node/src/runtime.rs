@@ -221,12 +221,26 @@ fn runtime_propose(
             .map_err(RuntimeError::Validator)?;
     }
     // D10-C Step 4：本地 produced block 尽早 durable 进 BlockStore（只写 block；不推进 head /
-    // state / 不提前 commit；同 hash 同 bytes 幂等）—— 使「finality 后 commit 前 crash」时，
-    // restart 可经 BlockStore.get(X) 取回完整 block 由 bridge 完成 commit。
+    // state / 不提前 commit）—— 使「finality 后 commit 前 crash」时，
+    // restart 可经 BlockStore 取回完整 block 由 bridge 完成 commit。
+    //
+    // P1-A.20-C Phase 2：改用 **verified multi-encoding** 写入（`put_verified`：hash 重算 +
+    // 签名复验先于落盘）。proposer/vk/chain_id 均来自**既有** authority（本地 validator
+    // identity + ValidatorSet）；storage **不**猜 proposer / 不落未验证 bytes。
     if let Some(adapter) = block_production.as_ref()
         && let Some(bs) = adapter.block_store()
     {
-        bs.put(&pb.block)
+        let set = driver.consensus().validator_set();
+        let Some(info) = set.info(&local_id) else {
+            // 本地 id 不在集合（装配不一致）⇒ 保守 no-op（不落盘 / 不提交提案；不猜 / 不伪造）。
+            return Ok(Some(pb));
+        };
+        let Ok(vk) = VerifyingKey::from_bytes(&info.consensus_public_key) else {
+            return Ok(Some(pb));
+        };
+        let chain_id = driver.consensus().chain_id();
+        let max_encodings = set.len();
+        bs.put_verified(&pb.block, local_id.as_bytes(), &vk, chain_id, max_encodings)
             .map_err(|e| blockstore_stage("local_proposal_put", e))?;
     }
     // 提交共识（ProposalRef 64B；只记 hash，不含 Block）。
@@ -581,9 +595,10 @@ fn adopt_pending_external_finality(
             }
         }
         // 2. durable block（未落盘 ⇒ 保留等待；不猜 / 不按高度取块）。
+        //    P1-A.20-C Phase 2：内容型读取 ⇒ `get_content`（legacy 或任一 encoding；内容逐字节相同）。
         let block = adapter
             .block_store()
-            .and_then(|bs| bs.get(&entry.qc.target).ok().flatten());
+            .and_then(|bs| bs.get_content(&entry.qc.target).ok().flatten());
         let Some(block) = block else {
             kept.push_back(entry);
             continue;
@@ -790,8 +805,9 @@ fn finality_commit_bridge(
         return Ok(());
     }
     // Gate 3：解析 finalized 块 —— D10-C Step 4：优先本地 `last_proposal`（strict hash == X）；
-    //    restart 恢复路径（`last_proposal` 已丢失）⇒ 从 `BlockStore.get(X)` 解析（get 已 strict
-    //    decode + hash 重算 == X）。两者皆失败 ⇒ NO COMMIT（绝不按 height / proposer 猜块）。
+    //    restart 恢复路径（`last_proposal` 已丢失）⇒ 从 `BlockStore.get_content(X)` 解析
+    //    （P1-A.20-C Phase 2 内容型读：legacy 或任一 encoding 同内容；已 strict decode +
+    //    hash 重算 == X）。两者皆失败 ⇒ NO COMMIT（绝不按 height / proposer 猜块）。
     let (block, proposer) = if let Some(pb) = last_proposal.filter(|pb| pb.block_hash == x) {
         (pb.block.clone(), pb.proposal_ref.proposer)
     } else {
@@ -800,7 +816,7 @@ fn finality_commit_bridge(
             return Ok(());
         };
         let Some(b) = bs
-            .get(&x)
+            .get_content(&x)
             .map_err(|e| blockstore_stage(&format!("finality_commit_get hash={x:02x?}"), e))?
         else {
             return Ok(());
@@ -841,8 +857,12 @@ fn finality_commit_bridge(
     };
     // Gate 5：encode + 冻结 apply_block（durable commit；错误 fail-closed）。
     let wire = nova_runtime::encode_block(&block).map_err(RuntimeError::BlockCodec)?;
+    // P1-A.20-C Phase 2：⑥a 走 **verified multi-encoding**（`put_verified`）——
+    // `proposer` / `vk` 均来自上文的**既有**解析（绑定证据 + ValidatorSet）；
+    // ⚠️ round 解析语义**未变**（`last_precommit_qc` 绑定 / 回退 round 0 保留给 Phase 3 迁移）。
+    let max_encodings = set.len();
     adapter
-        .apply_block(&wire, &vk)
+        .apply_block_with_proposer(&wire, &vk, proposer.as_bytes(), max_encodings)
         .map_err(RuntimeError::BlockCommit)?;
     Ok(())
 }
@@ -895,8 +915,21 @@ fn register_remote_canonical_block(
     )
     .map_err(RuntimeError::DagRegister)?;
     // durable-first：与本地 proposal 路径同语义（幂等；不推进 head / state）。
+    //
+    // P1-A.20-C Phase 2：改用 **verified multi-encoding** 写入 —— `proposer` 来自上文
+    // **绑定证据**解析结果，`expected_vk` 来自**既有** ValidatorSet；storage 复验签名后才落盘
+    // （zero-persist）。⚠️ `proposer` 仍然仅写入 storage 的**索引标签**，不写 round。
+    let set = driver.consensus().validator_set();
+    let Some(info) = set.info(&proposer) else {
+        // proposer 不在集合（装配不一致）⇒ 保守 no-op（不落盘 / 不登记；不猜 / 不伪造）。
+        return Ok(());
+    };
+    let Ok(vk) = VerifyingKey::from_bytes(&info.consensus_public_key) else {
+        return Ok(());
+    };
+    let max_encodings = set.len();
     if let Some(bs) = adapter.block_store() {
-        bs.put(&block)
+        bs.put_verified(&block, proposer.as_bytes(), &vk, chain_id, max_encodings)
             .map_err(|e| blockstore_stage(&format!("remote_canonical_put height={height}"), e))?;
     }
     driver
@@ -1369,6 +1402,27 @@ impl NodeRuntime {
         // 10. ConsensusNode（canonical state owner）——随后装配进 NodeConsensusDriver。
         //     validator：初始共识高度 = canonical head height（ChainHead 单一高度源）；full-node = 0。
         let set = ValidatorSet::from_genesis(&genesis);
+
+        // P1-A.7 / P1-A.20-C Phase 2：per-height PrecommitQC history（ADR-0064）。
+        // - 仅在有 canonical adapter（能验证 / 提交）时装配 —— full-node 不产生无主 artifact。
+        // - tip 由本地 finality fact 高度**播种**（单文件读取；**不扫描** `qc_history/`）。
+        // - **Phase 2 顺序调整**：在 DAG 重建**之前**构造 —— 重建需要按高度读取历史 QC 的
+        //   `context.round` 以解析历史（round ≥ 1）块的 proposer（见 `rebuild_consensus_dag`）。
+        let mut qc_history = block_production.as_ref().map(|_| {
+            QcHistory::open(
+                &config.storage_dir,
+                identity.network_id,
+                identity.chain_id,
+                identity.genesis_hash,
+            )
+        });
+        if let Some(history) = qc_history.as_mut()
+            && let Ok(Some((height, _))) = bootstrap::read_finality_fact(
+                &config.storage_dir.join(bootstrap::FINALITY_FACT_FILE),
+            )
+        {
+            history.note_tip(height);
+        }
         // D10-C Step 2 — DAG Restart Rebuild：validator（bootstrap 装配 canonical BlockStore）在
         //    restart 后沿 canonical head → parent 链重建 Consensus DAG ancestry（consensus DAG 不
         //    persisted 的补偿 seam），使 safety lock / ancestry 判定在重启后可安全继续；重建只读
@@ -1379,7 +1433,7 @@ impl NodeRuntime {
         //    （fail-closed；见 bootstrap::restore_finality_fact）。
         let (dag, restored_finality) = match block_production.as_ref() {
             Some(adapter) => {
-                let dag = bootstrap::rebuild_consensus_dag(adapter, &set)
+                let dag = bootstrap::rebuild_consensus_dag(adapter, &set, qc_history.as_ref())
                     .map_err(NodeRuntimeError::Startup)?;
                 let fact_path = config.storage_dir.join(bootstrap::FINALITY_FACT_FILE);
                 bootstrap::restore_finality_fact(
@@ -1471,25 +1525,6 @@ impl NodeRuntime {
 
         // 协议参数（block inbound size 上限；来自 genesis；只读）。
         let max_block_bytes = genesis.protocol_parameters.max_block_bytes as usize;
-
-        // P1-A.7：per-height PrecommitQC history（ADR-0064）。
-        // - 仅在有 canonical adapter（能验证 / 提交）时装配 —— full-node 不产生无主 artifact。
-        // - tip 由本地 finality fact 高度**播种**（单文件读取；**不扫描** `qc_history/`）。
-        let mut qc_history = block_production.as_ref().map(|_| {
-            QcHistory::open(
-                &config.storage_dir,
-                identity.network_id,
-                identity.chain_id,
-                identity.genesis_hash,
-            )
-        });
-        if let Some(history) = qc_history.as_mut()
-            && let Ok(Some((height, _))) = bootstrap::read_finality_fact(
-                &config.storage_dir.join(bootstrap::FINALITY_FACT_FILE),
-            )
-        {
-            history.note_tip(height);
-        }
 
         Ok(Self {
             chain_identity: identity,

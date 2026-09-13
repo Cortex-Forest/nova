@@ -452,7 +452,7 @@ fn d10_c2_t4_missing_ancestor_fail_closed() {
     let adapter2 = nova_node::bootstrap::start(NoAccountsKeyResolver, &config).unwrap();
     assert_eq!(adapter2.head().height, 2, "head 块存在，恢复通过");
     let set = ValidatorSet::from_genesis(&genesis);
-    let err = nova_node::bootstrap::rebuild_consensus_dag(&adapter2, &set).unwrap_err();
+    let err = nova_node::bootstrap::rebuild_consensus_dag(&adapter2, &set, None).unwrap_err();
     assert!(
         matches!(err, NodeStartupError::DagRebuildMissingAncestor(h) if h == a_hash),
         "缺 A ⇒ fail closed（实际: {err:?}）"
@@ -490,7 +490,7 @@ fn d10_c2_t5_corrupt_ancestor_fail_closed() {
 
     let adapter2 = nova_node::bootstrap::start(NoAccountsKeyResolver, &config).unwrap();
     let set = ValidatorSet::from_genesis(&genesis);
-    let err = nova_node::bootstrap::rebuild_consensus_dag(&adapter2, &set).unwrap_err();
+    let err = nova_node::bootstrap::rebuild_consensus_dag(&adapter2, &set, None).unwrap_err();
     assert!(
         matches!(err, NodeStartupError::Storage(StorageError::CorruptedState)),
         "损坏祖先 ⇒ Storage(CorruptedState)（实际: {err:?}）"
@@ -518,8 +518,8 @@ fn d10_c2_t6_rebuild_idempotent() {
         .unwrap()
         .block_hash;
 
-    let d1 = nova_node::bootstrap::rebuild_consensus_dag(&adapter, &set).unwrap();
-    let d2 = nova_node::bootstrap::rebuild_consensus_dag(&adapter, &set).unwrap();
+    let d1 = nova_node::bootstrap::rebuild_consensus_dag(&adapter, &set, None).unwrap();
+    let d2 = nova_node::bootstrap::rebuild_consensus_dag(&adapter, &set, None).unwrap();
     assert_eq!(d1.len(), 2);
     assert_eq!(d2.len(), d1.len(), "幂等：两次重建成员数一致");
     for h in [genesis_hash, a_hash] {
@@ -534,7 +534,7 @@ fn d10_c2_t6_rebuild_idempotent() {
     let config2 = e2.config();
     let adapter_fresh = nova_node::bootstrap::start(NoAccountsKeyResolver, &config2).unwrap();
     assert_eq!(adapter_fresh.head().height, 0);
-    let df = nova_node::bootstrap::rebuild_consensus_dag(&adapter_fresh, &set).unwrap();
+    let df = nova_node::bootstrap::rebuild_consensus_dag(&adapter_fresh, &set, None).unwrap();
     assert!(
         df.is_empty(),
         "无 committed 块 ⇒ 空 DAG（兼容 fresh-start）"

@@ -207,10 +207,44 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
     /// 应用一个完整 block wire（冻结顺序 ①~⑥；ADR-0046 §12）。
     ///
     /// 返回更新后的 [`ChainHead`]（仅 ⑥ commit 成功后才更新 head）。
+    ///
+    /// **legacy / compatibility**：⑥a 走 legacy `BlockStore::put`（单记录语义）。
+    /// **生产 durable-first 路径请用** [`Self::apply_block_with_proposer`]（verified multi-encoding）。
     pub fn apply_block(
         &mut self,
         wire: &[u8],
         proposer_vk: &VerifyingKey,
+    ) -> Result<ChainHead, NodeBlockApplicationError> {
+        self.apply_block_inner(wire, proposer_vk, None)
+    }
+
+    /// **P1-A.20-C Phase 2** —— proposer-aware（verified）durable commit。
+    ///
+    /// 与 [`Self::apply_block`] **同语义**（①~⑥ 顺序 / 错误类型 / head 仅 ⑥ 成功后推进），
+    /// 唯一差异：⑥a 用 `BlockStore::put_verified(block, proposer, proposer_vk, chain_id, max_encodings)`
+    /// 取代 legacy `put` ⇒ durable-first 支持「同 hash 多 proposer encoding」，并且
+    /// **zero-persist**（storage 落盘前重算 hash + 复验签名）。
+    ///
+    /// # 调用方契约
+    /// `proposer`（32B id）与 `proposer_vk` 必须来自**既有** authority
+    /// （`ValidatorSet.info(proposer).consensus_public_key`）——本方法**不**推导 / **不**猜 proposer；
+    /// `max_encodings` 由调用方给定（node 层 = `ValidatorSet.validators().len()`；storage 会 clamp）。
+    pub fn apply_block_with_proposer(
+        &mut self,
+        wire: &[u8],
+        proposer_vk: &VerifyingKey,
+        proposer: &[u8; 32],
+        max_encodings: usize,
+    ) -> Result<ChainHead, NodeBlockApplicationError> {
+        self.apply_block_inner(wire, proposer_vk, Some((proposer, max_encodings)))
+    }
+
+    /// ①~⑥ 共用管线（`encoding = Some` ⇒ ⑥a 走 `put_verified`；`None` ⇒ legacy `put`）。
+    fn apply_block_inner(
+        &mut self,
+        wire: &[u8],
+        proposer_vk: &VerifyingKey,
+        encoding: Option<(&[u8; 32], usize)>,
     ) -> Result<ChainHead, NodeBlockApplicationError> {
         // ① decode
         let block = decode_block(wire)?;
@@ -253,9 +287,22 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
         validate_height_parent(&block, &parent)?;
         // ⑥a block durable first（crash-consistent：canonical block 先落盘；state+head 批在后）。
         //    - 后续 state commit 失败 ⇒ orphan block 允许存在（R-1），但 head 不推进（BC 保证）。
+        //    - P1-A.20-C Phase 2：`encoding = Some(..)` ⇒ **verified multi-encoding**
+        //      （`put_verified`：hash 重算 + 签名复验先于落盘；`CapReached` 属非致命 Ok）。
         if let Some(bs) = &self.block_store {
-            bs.put(&block)
-                .map_err(|e| NodeBlockApplicationError::Pipeline(BlockPipelineError::Storage(e)))?;
+            match encoding {
+                Some((proposer, max_encodings)) => {
+                    bs.put_verified(&block, proposer, proposer_vk, self.chain_id, max_encodings)
+                        .map_err(|e| {
+                            NodeBlockApplicationError::Pipeline(BlockPipelineError::Storage(e))
+                        })?;
+                }
+                None => {
+                    bs.put(&block).map_err(|e| {
+                        NodeBlockApplicationError::Pipeline(BlockPipelineError::Storage(e))
+                    })?;
+                }
+            }
         }
         // ⑥b 提交前：构造 HeadRecord 并入队（head 与 state 同批共持久化；ADR-0048 OD-7 PRIMARY）。
         // head.state_root = header.state_root（④ 已验证 == 计算 root == commit root，ADR-0030 C-3）。
@@ -292,10 +339,14 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
     /// 或未启用 block storage ⇒ `Ok`（跳过）。
     ///
     /// 校验链（任何 mismatch ⇒ [`StorageError::CorruptedState`] fail-closed，不自动跳过）：
-    /// - block 存在（`BlockStore.get` 已 strict decode + `block_hash` 重算 == head.block_hash）；
+    /// - block 存在（`BlockStore.get_content` 已 strict decode + `block_hash` 重算 == head.block_hash）；
     /// - `block.header.height == head.height`；
     /// - `block.header.state_root == head.state_root`（BC-2）；
     /// - `block.header.parent_hash == head.parent_hash`（BC 一致性）。
+    ///
+    /// **P1-A.20-C Phase 2**：读取迁移为**内容型读** `get_content`（legacy 单记录 或 任一
+    /// `(hash, proposer)` encoding 逐字节同内容 —— Phase 2 起生产写入不再产生 legacy 记录，
+    /// 若仍用 legacy-only `get` 则重启时 head 块不可见 ⇒ 假 `CorruptedState` fail-closed）。
     pub fn verify_committed_head_block(&self) -> Result<(), NodeBlockApplicationError> {
         let head = &self.head;
         if head.height == 0 {
@@ -305,7 +356,7 @@ impl<B: StorageBackend + Clone, R: KeyResolver> NodeBlockAdapter<B, R> {
             return Ok(()); // 未启用 block storage：无 block 可校验（遗留路径）
         };
         let block = bs
-            .get(&head.block_hash)
+            .get_content(&head.block_hash)
             .map_err(|e| NodeBlockApplicationError::Pipeline(BlockPipelineError::Storage(e)))?
             .ok_or(NodeBlockApplicationError::Pipeline(
                 BlockPipelineError::Storage(StorageError::CorruptedState),
