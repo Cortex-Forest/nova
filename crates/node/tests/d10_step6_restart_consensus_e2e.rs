@@ -369,7 +369,7 @@ fn d10_c6_t4_cross_block_after_restart_commits() {
     // B 真实 parent == A（durable block header）。
     let bs =
         nova_storage::block_store::BlockStore::open(&config.storage_dir.join("blocks")).unwrap();
-    let b = bs.get(&b_hash).unwrap().expect("B block durable");
+    let b = bs.get_content(&b_hash).unwrap().expect("B block durable");
     assert_eq!(b.header.height, 2);
     assert_eq!(b.header.parent_hash, a_hash, "B.parent == A");
     // DAG：A → B 真实边 + 全传递 ancestry。

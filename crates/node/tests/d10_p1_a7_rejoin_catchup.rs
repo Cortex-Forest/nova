@@ -253,8 +253,10 @@ fn head_finality(rt: &NodeRuntime) -> Option<[u8; 32]> {
 }
 
 fn store_get(rt: &NodeRuntime, hash: &[u8; 32]) -> Option<Block> {
-    rt.block_production()
-        .and_then(|a| a.block_store().and_then(|bs| bs.get(hash).ok().flatten()))
+    rt.block_production().and_then(|a| {
+        a.block_store()
+            .and_then(|bs| bs.get_content(hash).ok().flatten())
+    })
 }
 
 /// 用 genesis 两验证者 seed 对给定 `(context_height, round, target)` 构造**真实签名**的

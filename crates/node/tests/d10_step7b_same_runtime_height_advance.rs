@@ -164,7 +164,7 @@ fn head_hash(runtime: &NodeRuntime) -> [u8; 32] {
 /// durable block header（BlockStore；证明 commit 是真实持久化，不是内存伪造）。
 fn durable_header(config: &NodeConfig, hash: &[u8; 32]) -> BlockHeader {
     let bs = BlockStore::open(&config.storage_dir.join("blocks")).unwrap();
-    bs.get(hash)
+    bs.get_content(hash)
         .expect("BlockStore 可读")
         .expect("block durable")
         .header

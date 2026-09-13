@@ -557,7 +557,10 @@ fn d10_c8_t3_follower_finalizes_and_commits_remote_block() {
     );
     // durable commit（apply_block ⑥：height/parent 由 head 派生校验）。
     let bs = BlockStore::open(&config.storage_dir.join("blocks")).unwrap();
-    let committed = bs.get(&a_hash).unwrap().expect("committed block durable");
+    let committed = bs
+        .get_content(&a_hash)
+        .unwrap()
+        .expect("committed block durable");
     assert_eq!(committed.header.height, 1);
     assert_eq!(committed.header.parent_hash, genesis_hash);
     // Step 7-B：commit 后 consensus 进入下一高度轮（follower 同样适用）。

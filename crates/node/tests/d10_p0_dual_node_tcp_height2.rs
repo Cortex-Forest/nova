@@ -426,8 +426,8 @@ fn d10_p0_dual_node_tcp_height2_closure() {
     // H1 durable（两侧 BlockStore）+ DAG 登记（B 侧为远端登记）。
     let a_bs = BlockStore::open(&a_config.storage_dir.join("blocks")).unwrap();
     let b_bs = BlockStore::open(&b_config.storage_dir.join("blocks")).unwrap();
-    let h1_a = a_bs.get(&h1_hash).unwrap().expect("A durable H1");
-    let h1_b = b_bs.get(&h1_hash).unwrap().expect("B durable H1");
+    let h1_a = a_bs.get_content(&h1_hash).unwrap().expect("A durable H1");
+    let h1_b = b_bs.get_content(&h1_hash).unwrap().expect("B durable H1");
     assert_eq!(h1_a.header.height, 1);
     assert_eq!(
         h1_a.header.parent_hash, genesis_hash,
@@ -510,8 +510,8 @@ fn d10_p0_dual_node_tcp_height2_closure() {
     assert_eq!(a_h2_hash, b_h2_hash, "A/B canonical H2 hash 必须一致");
     assert_ne!(a_h2_hash, h1_hash, "H2 != H1");
 
-    let a_h2 = a_bs.get(&a_h2_hash).unwrap().expect("A durable H2");
-    let b_h2 = b_bs.get(&b_h2_hash).unwrap().expect("B durable H2");
+    let a_h2 = a_bs.get_content(&a_h2_hash).unwrap().expect("A durable H2");
+    let b_h2 = b_bs.get_content(&b_h2_hash).unwrap().expect("B durable H2");
     assert_eq!(a_h2.header.height, 2, "A canonical H2 height == 2");
     assert_eq!(b_h2.header.height, 2, "B canonical H2 height == 2");
     assert_eq!(a_h2.header.parent_hash, h1_hash, "A H2.parent == H1.hash");

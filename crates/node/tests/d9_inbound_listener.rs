@@ -432,7 +432,7 @@ fn d9_in2_proposal_and_block_reach_inbound_peer() {
         adapter
             .block_store()
             .expect("A BlockStore")
-            .get(&block_hash)
+            .get_content(&block_hash)
             .expect("BlockStore get")
             .expect("A 本地 produced block 已 durable")
     };
