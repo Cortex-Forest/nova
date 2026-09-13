@@ -103,6 +103,12 @@ const SYNC_DISPATCH_MAX_PER_STEP: usize = 8;
 /// 被 `expire_at` 释放；无 retry / 无 backoff；correlator capacity 即有界）。
 const SYNC_DEADLINE_HORIZON: u64 = 64;
 
+/// P1-A.17 —— catch-up 驱动：每步最多补记的「head+1 追赶 intent」条数（bounded = 1/步）。
+///
+/// 仅当**无 in-flight 同步请求**时补记 ⇒ 自然退化为「单次串行追赶」：每步至多 1 个请求，
+/// 无 retry storm / 无重复请求风暴 / 无新状态。
+const SYNC_CATCHUP_INTENTS_PER_STEP: usize = 1;
+
 /// P1-A.7 — 入站 QC 的**有界** pending 缓冲上限（ADR-0064）。
 ///
 /// 当入站 QC 的 `target` 当前不在本节点 DAG（既有 `UnknownTarget` = **不适用**）时，把该 QC
@@ -145,6 +151,20 @@ const NETWORK_PROTOCOL_VERSION: u8 = 1;
 /// 无系统时钟依赖，确定性）。
 const INBOUND_PENDING_TIMEOUT_STEPS: u64 = 1000;
 
+/// P1-A.17-SYNC-STABILITY —— `RuntimeError::BlockStore` **来源标注**（取证专用观测）。
+///
+/// **语义完全不变**：返回的错误变体 / payload / 控制流与 `RuntimeError::BlockStore(e)` 逐字相同；
+/// 仅在返回前向 **stderr** 追加一行 stage 标签（node 无日志/遥测依赖；stderr 由真实进程测试捕获）。
+///
+/// 目的：区分三个映射点（`local_proposal_put` / `finality_commit_get` / `remote_canonical_put`）
+/// 与底层 `StorageError` 变体（`BackendFailure`（IO）/ `CorruptedState`（记录校验或 hash 不一致）/
+/// `SerializationFailure`（编码））—— 这是「catch-up 中途 `Error: Run("BlockStore")`」定性的唯一
+/// 可观测手段：bin 层 `run_fault_kind` 只输出类别名（不携底层细节）。
+fn blockstore_stage(stage: &str, e: StorageError) -> RuntimeError {
+    eprintln!("BlockStore stage={stage} err={e:?}");
+    RuntimeError::BlockStore(e)
+}
+
 /// Node-local proposer step（STEP 10-19-6 OPT-1）：本节点为当前 proposer 时经真实 BlockBuilder
 /// 产出 Block + ProposalRef → submit ProposalRef。
 ///
@@ -181,7 +201,8 @@ fn runtime_propose(
     if let Some(adapter) = block_production.as_ref()
         && let Some(bs) = adapter.block_store()
     {
-        bs.put(&pb.block).map_err(RuntimeError::BlockStore)?;
+        bs.put(&pb.block)
+            .map_err(|e| blockstore_stage("local_proposal_put", e))?;
     }
     // 提交共识（ProposalRef 64B；只记 hash，不含 Block）。
     let _ = driver.submit_proposal(pb.proposal_ref.clone());
@@ -753,7 +774,10 @@ fn finality_commit_bridge(
         let Some(bs) = adapter.block_store() else {
             return Ok(());
         };
-        let Some(b) = bs.get(&x).map_err(RuntimeError::BlockStore)? else {
+        let Some(b) = bs
+            .get(&x)
+            .map_err(|e| blockstore_stage(&format!("finality_commit_get hash={x:02x?}"), e))?
+        else {
             return Ok(());
         };
         // proposer（V0.1 parent-height 语义；与 D9 / rebuild / restore 同源 —— 不新造规则）。
@@ -826,7 +850,8 @@ fn register_remote_canonical_block(
     .map_err(RuntimeError::DagRegister)?;
     // durable-first：与本地 proposal 路径同语义（幂等；不推进 head / state）。
     if let Some(bs) = adapter.block_store() {
-        bs.put(&block).map_err(RuntimeError::BlockStore)?;
+        bs.put(&block)
+            .map_err(|e| blockstore_stage(&format!("remote_canonical_put height={height}"), e))?;
     }
     driver
         .consensus_mut()
@@ -2184,8 +2209,10 @@ impl NodeRuntime {
         ledger: &mut MissingAncestorIntentLedger,
         head_height: Option<u64>,
     ) -> Result<(), RuntimeError> {
-        // 0. D8-3-1-E：每 step 推进 deterministic tick + expire 到期 active request
-        //    （release-only：无 retry / 无 backoff / 无重新选 peer；correlator capacity 即有界）。
+        // 0. D8-3-1-E：每 step 推进 deterministic tick + expire 到期 active request。
+        //    P1-A.17：仍为 **release-only**（不开启 correlator 自动 retry seam）—— 释放后的槽位由
+        //    调用侧的 catch-up 驱动（`record_catchup_intent`）在下一步以**新 request_id + 轮换 peer**
+        //    重新发起 ⇒ 有界重发（无 retry storm / 无重复 register 语义冲突）。
         *tick = tick.saturating_add(1);
         let _expired = correlator.expire_at(*tick);
         // 1. candidate = Established peers（SI-6：只向 Established 发送）。
@@ -2199,6 +2226,14 @@ impl NodeRuntime {
             return Ok(());
         }
         let policy = PeerSelectionPolicy::default();
+        // P1-A.17 —— deterministic peer rotation（无新状态 / 无假 health / 无随机 / 无墙钟）：
+        // `select_peer` 内部对输入再排序（NodeId canonical bytes 字典序）⇒ 仅轮转输入无效；
+        // 因此显式构造同一稳定序，并按逻辑 tick 轮转**被排除的前缀**（attempted）⇒ 同一
+        // `head+1` target 的多次重发在多个 Established peer 间轮换（单 peer 网络退化为原行为）。
+        let mut stable: Vec<PeerCandidate> = candidates.clone();
+        stable.sort_by(|a, b| a.peer_id.as_bytes().cmp(b.peer_id.as_bytes()));
+        let rotate = (*tick as usize) % stable.len().max(1);
+        let attempted: Vec<NodeId> = stable.iter().take(rotate).map(|c| c.peer_id).collect();
         // 2. 有界消费 ledger intents（take_all ≤ cap；本 step 上限 SYNC_SCHEDULE_MAX_PER_STEP）。
         let intents = ledger.take_all();
         let mut scheduled = 0usize;
@@ -2212,9 +2247,9 @@ impl NodeRuntime {
             {
                 continue;
             }
-            let peer = match select_peer(&policy, &candidates, &[]) {
+            let peer = match select_peer(&policy, &candidates, &attempted) {
                 Ok(p) => p,
-                Err(_) => continue, // 无可用候选（candidates 非空时不发生）
+                Err(_) => continue, // 无可用候选（candidates 非空时不会发生）
             };
             let request_id = random_request_id().map_err(RuntimeError::NetworkSecurity)?;
             let r = scheduler.schedule_from_missing_ancestor(request_id, peer, &intent);
@@ -2404,6 +2439,56 @@ impl NodeRuntime {
     /// head advance / round mutation 全部为 NO）。
     pub fn poll_network_only(&mut self) -> Result<(), RuntimeError> {
         self.poll_network_lifecycle()
+    }
+
+    /// P1-A.17 —— **catch-up 驱动**（node-layer；无新协议 / 无新状态 / 不伪造 hash）。
+    ///
+    /// # 问题（P1-A.16 判定）
+    /// 追赶 intent 只由**新到的** QC / block verdict 事件产生（`MissingAncestorIntentLedger`），
+    /// 而远端每产生**一个新高度**才带来 1 条 intent ⇒ 落后节点每步最多补 1 块，且补块速率被
+    /// 锚定为「远端产块速率」⇒ **gap 永不收敛**（即使窗口足够大）。
+    ///
+    /// # 本函数做什么
+    /// 用**既有**可观测证据自持地补记 intent：
+    /// - 证据 = `pending_external_qc` 中**保留**的 future external QC（其 `target` 尚未进本地 DAG
+    ///   ⇒ 其高度严格高于本地 head）——这正是「远端存在更高链」的**既有**证据（复用 ADR-0064 的
+    ///   pending 缓冲，**不新增** Status 解析 / 不改 wire / 不加状态）；
+    /// - 仅在 **无 in-flight**（correlator active + eligible 均为空）时补记 ⇒ 每步 ≤
+    ///   [`SYNC_CATCHUP_INTENTS_PER_STEP`]，天然 bounded；上一请求一旦 resolve/expire，下一步即补发
+    ///   ⇒ 这就是**有界重发**（新 `request_id` + 轮换 peer），无需开启 correlator 的自动 retry seam；
+    /// - `observed_height` = 该 QC 的真实高度（真实证据）；dedup key = 其 `target`
+    ///   （**不伪造** `head+1` 的 hash）；target 仍按既有 ADR-0062 规则（`local_head + 1` / `hash = None`）；
+    /// - 追平后：pending 中的 future QC 被采纳路径消费 / 清空 ⇒ 证据消失 ⇒ **驱动自动停止**（无空转）。
+    fn record_catchup_intent(
+        ledger: &mut MissingAncestorIntentLedger,
+        pending: &VecDeque<PendingExternalQc>,
+        correlator: &SyncRequestCorrelator,
+        head_height: Option<u64>,
+        budget: usize,
+    ) -> usize {
+        if budget == 0 {
+            return 0;
+        }
+        let Some(head) = head_height else {
+            return 0;
+        };
+        if !correlator.is_empty() || correlator.eligible_len() > 0 {
+            return 0;
+        }
+        let Some(entry) = pending
+            .iter()
+            .find(|p| p.qc.context.height.saturating_add(1) > head)
+        else {
+            return 0;
+        };
+        ledger.record(MissingAncestorIntent {
+            observed_height: entry.qc.context.height.saturating_add(1),
+            observed_block_hash: entry.qc.target,
+            local_head_height: head,
+            source: BlockInboundSource::SyncResponse,
+            count: 1,
+        });
+        1
     }
 
     /// 一轮运行时驱动（Stage C）：网络 disabled（`start`）⇒ `Ok(())`（不产生网络 identity）；
@@ -2606,6 +2691,16 @@ impl NodeRuntime {
         // NetworkService.enqueue_outbound（Established-only）。有界；不 dial / 不 retry / 不
         // timeout 策略（D8-2 边界）；Response→persist/commit 不属本步。
         let sync_head = self.block_production.as_ref().map(|a| a.head().height);
+        // P1-A.17 —— catch-up 驱动（见 free fn doc）：以**保留的 future external QC** 为证据，
+        // 在无 in-flight 请求时自持地补记一条 `head+1` intent ⇒ 落后节点以每步 ≤1 块的速率
+        // **自主收敛**（不再被“远端产块速率”锚定）；追平后证据消失、驱动自停。
+        let _ = Self::record_catchup_intent(
+            &mut self.missing_ancestor_ledger,
+            &self.pending_external_qc,
+            &self.sync_correlator,
+            sync_head,
+            SYNC_CATCHUP_INTENTS_PER_STEP,
+        );
         Self::sync_orchestrate(
             &mut stack.ns,
             stack.signer.as_ref(),

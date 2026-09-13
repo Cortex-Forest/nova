@@ -43,7 +43,19 @@ pub const MAX_SYNC_BLOCKS_PER_RESPONSE: usize = 1;
 /// 无 hash 请求的 parent 回走上限（防无限 ancestor traversal）。
 ///
 /// 超过 ⇒ `WalkExceeded`（不响应）；walk = 0 时只允许命中 head 自身。
-pub const MAX_SYNC_WALK: u64 = 64;
+///
+/// **P1-A.17（同步可靠性）**：`64 → 512`。
+/// - 语义：可服务窗口 = responder canonical head 往回 `MAX_SYNC_WALK` 个高度；
+///   requester 的 target 恒为 `本地 head + 1`（ADR-0062）⇒ **本常量即单次可追赶的最大 gap**。
+/// - 旧值 64 在实测吞吐（P1-A.14 T2：约 1.2 区块/秒）下等价于「停机超过约 55 秒即永久失联」，
+///   且 requester 侧无重发途径 ⇒ 对 Testnet 运维不可接受。
+/// - 新值 512 ⇒ 覆盖 100+ gap 且留 ~5× 余量；按实测吞吐约等于十余分钟停机容忍度。
+/// - **CPU/IO 上界（DoS 评估）**：每次请求最多 `MAX_SYNC_WALK` 次 `BlockStore::get`
+///   （内存 KV + 严格解码/哈希校验，无磁盘随机读）；每步最多
+///   [`MAX_SYNC_RESPONSES_PER_STEP`]（= 4）条 serve ⇒ 最坏约 2048 次查表/步，
+///   且请求入口已是 Established-only + 有界队列（[`MAX_PENDING_SYNC_REQUESTS`]）。
+/// - 超过窗口的请求在 `lookup_block` 中 **O(1) 早退**（`WalkExceeded`）——不付出窗口长度代价。
+pub const MAX_SYNC_WALK: u64 = 512;
 
 /// 每 step 最多 serve 的请求数（bounded work；其余留在 wiring 队列，下一 step 继续）。
 pub const MAX_SYNC_RESPONSES_PER_STEP: usize = 4;
@@ -238,6 +250,10 @@ pub fn lookup_block<B: StorageBackend + Clone>(
     if request.height == 0 || request.height > head.height {
         // 高度 0 = genesis（无 block 实体）；高于 head = 尚未 canonical（不猜 / 不回其它块）。
         return SyncLookup::Missing;
+    }
+    // P1-A.17：窗口外 ⇒ O(1) 早退（与逐步回走到达同一结论，但不付出窗口长度代价）。
+    if head.height.saturating_sub(request.height) > MAX_SYNC_WALK {
+        return SyncLookup::WalkExceeded;
     }
     let mut hash = head.block_hash;
     let mut height = head.height;

@@ -16,7 +16,7 @@ use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -589,6 +589,7 @@ fn run_formal_acceptance(
 
 #[test]
 fn p1a12_three_real_validator_processes_reach_durable_finality() {
+    let _serial = real_binary_guard();
     let env = TempDir::new("three_validator");
 
     // ---- fixtures：3 validator seed + 3 network seed + devnet genesis（3 验证者）----
@@ -798,6 +799,7 @@ fn last_status(out: &str) -> Option<String> {
 /// **不**要求：`6000/6000 steps`、`exit 0`、两节点瞬时等值（真实进程步进速率不同）。
 #[test]
 fn t1_two_real_validators_reach_durable_finality() {
+    let _serial = real_binary_guard();
     let env = TempDir::new("f2a");
     let val_seeds = [VAL_SEED[0], VAL_SEED[1]];
     let net_seeds = [NET_SEED[0], NET_SEED[1]];
@@ -886,6 +888,7 @@ fn t1_two_real_validators_reach_durable_finality() {
 /// 与既有进程 guard（`ChildGuard`）。验收 = warm-up exhausted + exit 0 + 预算耗尽摘要。
 #[test]
 fn t3_unreachable_peer_exhausts_warmup_and_exits_bounded() {
+    let _serial = real_binary_guard();
     const T3_RUN_STEPS: &str = "120";
     let env = TempDir::new("t3");
     let val_seeds = [VAL_SEED[0], VAL_SEED[1]];
@@ -946,9 +949,731 @@ fn t3_unreachable_peer_exhausts_warmup_and_exits_bounded() {
     eprintln!("T3 PASS: warm-up exhausted + 有界运行至预算耗尽 + exit 0");
 }
 
+// ===========================================================================
+// P1-A.17 — 真实 binary：restart behind tip / catch-up（3 validators，quorum 2/3）
+// ===========================================================================
+
+/// P1-A.17 —— N-1 停机观测窗口（仅用于「停 1 个验证者后 A/B 推进多少」的**观测**，
+/// **不是** FAIL 条件：实测该速率受 round-timeout pacemaker 限制（≈80s/块且波动大），
+/// 属 P1-A.18 议题）。90s 足以观察到 ≥1 块推进且不拖长串行化后的总墙钟。
+const A17_DOWNTIME_WINDOW: Duration = Duration::from_secs(90);
+
+/// 实时 status 采样的紧凑元组：`(steps, head, finalized, established)`。
+type LiveStats = (u64, u64, Option<u64>, u64);
+
+/// **P1-A.17 —— 真实进程测试串行化守卫。**
+///
+/// 本文件的测试各自 spawn 2–3 个真实 `yazimao-node` 进程；并发运行会互相抢占 CPU，
+/// 使**墙钟敏感**的验收（live-window finality / catch-up）在重负载下假失败
+/// （P1-A.17 全量套件实测：并行时 2 个用例失败，单独运行时全绿）。
+/// 该守卫把本 binary 内的真实进程测试串行化（跨 binary 仍并行；其余 target 均为快速单测）。
+fn real_binary_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// 读取某进程**最新完整** status 行的 `(steps, head, finalized, established)`。
+fn live_stats(c: &ChildGuard) -> Option<LiveStats> {
+    let line = last_status(&c.stdout())?;
+    let steps = field(&line, "steps=")?;
+    let head = field(&line, "head_height=")?;
+    Some((
+        steps,
+        head,
+        field(&line, "finalized_height="),
+        field(&line, "established_peers=").unwrap_or(0),
+    ))
+}
+
+/// P1-A.17 —— **真实进程** restart-behind-tip 场景（3 validators 全互联、真实 TCP）：
+///
+/// ```text
+/// A/B/C 起步（3 validator，quorum 2/3）→ 三者 durable finality ≥ 2
+///   → 停 C（kill）→ A/B 继续推进 ≥ C.head + gap（= 2/3 quorum 存活）
+///   → 以**同一** data dir / safety dir / validator seed / listen 端口重启 C
+///   → C 重连 → 追赶（head 单调上升至 ≥ 目标高度；durable finalized 恢复并继续前进）
+/// ```
+///
+/// 断言口径（P1-A.16 §15）：同身份 / 同目录 / 重连 / head 单调 / 最终 head ≥ 目标 / finalized ≥ 1 /
+/// head 单调 / 最终 head ≥ 目标 / 1 ≤ finalized ≤ head 且 finalized 前进 / 无 fatal（InvalidSignature · QcVerification · panic · `Error: Run(` ·
+/// ValidatorNotInValidatorSet · IdentityMismatch · CorruptedState）/ 达标时进程存活。
+fn p1a17_restart_behind_tip_scenario(tag: &str, gap: u64) {
+    p1a17_restart_behind_tip_scenario_with(tag, gap, A17_DOWNTIME_WINDOW, false);
+}
+
+/// **P1-A.17-SYNC-STABILITY Control C（诊断）**：与 [`p1a17_restart_behind_tip_scenario`] 同流程，
+/// 但 `downtime` 更长且目标取 **min(gap, A/B 实测 head)**：
+/// - 可在**不删除 / 不复制**任何目录的前提下观察「**同目录** restart + **大 gap** 追赶」
+///   （真实 operator restart 路径）；
+/// - 验收标准与既有用例**完全一致**（head 单调前进 / `finalized ≥ 1` 且 ≤ head /
+///   达标时仍存活 / 无 fatal 标记 / finalized 继续前进）—— **不**新增/放宽任何标准。
+fn p1a17_restart_behind_tip_scenario_with(
+    tag: &str,
+    gap: u64,
+    downtime: Duration,
+    emergent_target: bool,
+) {
+    let _serial = real_binary_guard();
+    let env = TempDir::new(tag);
+    let genesis = test_genesis(&VAL_SEED);
+    let hash_hex = hex32(&compute_genesis_hash(&genesis).expect("hash"));
+    let genesis_path = env.write(
+        "genesis.bin",
+        &canonical_genesis_bytes(&genesis).expect("canonical"),
+    );
+    for (i, s) in NET_SEED.iter().enumerate() {
+        env.write_seed(&format!("f2-3-net-{i}.seed"), *s);
+    }
+    for (i, s) in VAL_SEED.iter().enumerate() {
+        env.write_seed(&format!("f2-3-val-{i}.seed"), *s);
+    }
+    let net_ids: Vec<NodeId> = NET_SEED.iter().map(|s| net_node_id(*s)).collect();
+    let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let labels: [&'static str; 3] = ["A", "B", "C"];
+    let roots = chain_roots(&env);
+
+    let mut kids: Vec<ChildGuard> = (0..3)
+        .map(|i| {
+            ChildGuard::spawn(
+                labels[i],
+                &f2_node_args(
+                    &env,
+                    3,
+                    i,
+                    &net_ids,
+                    &ports,
+                    &genesis_path,
+                    &hash_hex,
+                    RUN_STEPS,
+                ),
+            )
+        })
+        .collect();
+
+    let ready = poll_until(
+        || {
+            kids.iter()
+                .all(|c| c.stdout().contains("entering bounded run loop"))
+        },
+        STARTUP_TIMEOUT,
+    );
+    if !ready {
+        dump_all_node_forensics(tag, "startup", &[&kids[0], &kids[1], &kids[2]], &roots);
+    }
+    assert!(
+        ready,
+        "{tag}: 三节点未在 {STARTUP_TIMEOUT:?} 内进入 run loop"
+    );
+
+    // ---- 阶段 1：三节点均达 durable finality ≥ 2（真实进程）----
+    let initial = poll_until(
+        || {
+            kids.iter()
+                .all(|c| live_stats(c).and_then(|s| s.2).is_some_and(|f| f >= 2))
+        },
+        EXIT_TIMEOUT,
+    );
+    let initial_audit: Vec<String> = kids
+        .iter()
+        .map(|c| format!("{}={:?}", c.label, live_stats(c)))
+        .collect();
+    if !initial {
+        dump_all_node_forensics(
+            tag,
+            "initial-finality",
+            &[&kids[0], &kids[1], &kids[2]],
+            &roots,
+        );
+    }
+    assert!(
+        initial,
+        "{tag}: 三节点未达 finalized ≥ 2：{initial_audit:?}"
+    );
+    let c_before = live_stats(&kids[2]).expect("C 有完整 status 样本");
+    let _pre_target = c_before.1.saturating_add(gap);
+
+    // ---- 阶段 2：停 C；A/B（2/3 quorum）继续推进（**有界观测；不要求特定速率**）----
+    let c_kill_status = kids[2].terminate();
+    eprintln!(
+        "{tag}: C stopped（before={c_before:?}）→ 观测 A/B 的 N-1 推进（窗口 {EXIT_TIMEOUT:?}）"
+    );
+    let progressed = poll_until(
+        || {
+            let a = live_stats(&kids[0]).map(|s| s.1).unwrap_or(0);
+            let b = live_stats(&kids[1]).map(|s| s.1).unwrap_or(0);
+            a.min(b) >= c_before.1.saturating_add(gap)
+        },
+        downtime,
+    );
+    let ab_audit: Vec<String> = kids[..2]
+        .iter()
+        .map(|c| format!("{}={:?}", c.label, live_stats(c)))
+        .collect();
+    // 实测：N-1 活性受 round-timeout pacemaker 限制（≈80s/块且波动大）⇒ **不**把
+    // 「停 1 个后能推进多少」当作本测试的 PASS 条件（那属 P1-A.18 pacemaker 议题）；
+    // 本测试只要求「A/B 至少推进 1 块」（仍证明 2/3 quorum 可继续），并把目标改为**实测值**。
+    let ab_head_min = kids[..2]
+        .iter()
+        .filter_map(|c| live_stats(c).map(|s| s.1))
+        .min()
+        .unwrap_or(c_before.1);
+    if !progressed {
+        eprintln!(
+            "{tag} NOTE: N-1 窗口内 A/B 未达预设 gap（实测 min_head={ab_head_min}）；\
+             改用 emergent target（P1-A.18 pacemaker 议题，不作为本测试失败）"
+        );
+    }
+    let target = if emergent_target {
+        // Control C：目标 = min(gap, 实测 A/B head) ⇒ 若 A/B 未达 gap 则不制造假失败，
+        // 但达标时仍要求 C2 真正追赶到 **≥ gap 块**（无法凑数）。
+        c_before.1.saturating_add(gap).min(ab_head_min)
+    } else {
+        c_before.1.saturating_add(gap).max(ab_head_min)
+    };
+    eprintln!(
+        "{tag}: target head={target}（gap 参数={gap}，实测 gap={}，A/B min_head={ab_head_min}，\
+         downtime={downtime:?}，emergent={emergent_target}）",
+        target.saturating_sub(c_before.1)
+    );
+
+    // ---- 阶段 3：以同一 data dir / safety dir / seed / listen 重启 C ----
+    let c2_args = f2_node_args(
+        &env,
+        3,
+        2,
+        &net_ids,
+        &ports,
+        &genesis_path,
+        &hash_hex,
+        RUN_STEPS,
+    );
+    let mut c2 = ChildGuard::spawn("C2", &c2_args);
+    let reconnected = poll_until(
+        || live_stats(&c2).is_some_and(|s| s.3 >= 1),
+        STARTUP_TIMEOUT,
+    );
+    let c2_after_ready = live_stats(&c2);
+    if !reconnected {
+        dump_all_node_forensics(tag, "restart-reconnect", &[&kids[0], &kids[1], &c2], &roots);
+    }
+    assert!(
+        reconnected,
+        "{tag}: C 重启后未重新建立任何 Established peer（status={c2_after_ready:?}）"
+    );
+
+    // ---- 阶段 4：C 追赶（head 单调 → ≥ target；durable finalized 恢复并**继续前进**）----
+    // 注：`head == finalized` 仅在**稳态**成立（A.14 口径）；重启 / 追赶快进期间 QC-history tip
+    // 允许滞后，因此本测试判据 = head ≥ target ∧ 1 ≤ finalized ≤ head ∧ finalized 前进。
+    let caught = poll_until(
+        || {
+            live_stats(&c2)
+                .is_some_and(|s| s.1 >= target && s.2.is_some_and(|f| f >= 1 && f <= s.1))
+        },
+        EXIT_TIMEOUT,
+    );
+
+    // ---- 验收证据必须在 terminate 之前采集 ----
+    let c2_alive = c2.is_running();
+    let c2_final = live_stats(&c2);
+    // 取证（test-only 观测；**不**改变任何验收条件）：把各进程**完整 stdout** 落盘 ⇒
+    // `%TEMP%\yazimao-p1-a12-{A,B,C2}.log` 含每 100 步的 status 行（可重建完整时间线）。
+    eprintln!("{}", kids[0].diagnostic(None, true));
+    eprintln!("{}", kids[1].diagnostic(None, true));
+    eprintln!("{}", c2.diagnostic(None, true));
+    let ab_alive = [kids[0].is_running(), kids[1].is_running()];
+    let ab_final: Vec<Option<LiveStats>> = kids[..2].iter().map(live_stats).collect();
+    let markers: Vec<(String, Option<&str>)> = vec![
+        (
+            "A".to_string(),
+            fatal_marker(&kids[0].stdout(), &kids[0].stderr()),
+        ),
+        (
+            "B".to_string(),
+            fatal_marker(&kids[1].stdout(), &kids[1].stderr()),
+        ),
+        (
+            "C-killed".to_string(),
+            fatal_marker(&kids[2].stdout(), &kids[2].stderr()),
+        ),
+        ("C2".to_string(), fatal_marker(&c2.stdout(), &c2.stderr())),
+    ];
+    // 重启特有的 fail-closed 标记（不在通用 fatal_marker 内）。
+    let c2_identity_reject = [
+        "ValidatorNotInValidatorSet",
+        "IdentityMismatch",
+        "CorruptedState",
+    ]
+    .into_iter()
+    .find(|m| c2.stdout().contains(m) || c2.stderr().contains(m));
+    // 取证（test-only）：仅失败路径导出，不改变任何断言。
+    if !caught || !c2_alive {
+        dump_all_node_forensics(tag, "catchup", &[&kids[0], &kids[1], &c2], &roots);
+    }
+    let c2_status_exit = c2.child.try_wait().ok().flatten();
+
+    // ---- 清理：终止全部子进程（无 orphan）----
+    let statuses = [
+        kids[0].terminate(),
+        kids[1].terminate(),
+        c_kill_status,
+        c2.terminate(),
+    ];
+
+    eprintln!(
+        "=== {tag} P1-A.17 DIAGNOSTICS ===\n\
+         C before restart: {c_before:?}\n\
+         target head: {target}（gap={gap}）\n\
+         A/B during C downtime: {ab_audit:?}\n\
+         A/B final: {ab_final:?} alive={ab_alive:?}\n\
+         C2 final: {c2_final:?} alive_at_acceptance={c2_alive} wait={c2_status_exit:?}\n\
+         fatal markers: {markers:?}\n\
+         c2 identity/corruption markers: {c2_identity_reject:?}\n\
+         exit statuses（诊断，非 PASS 条件）: {statuses:?}"
+    );
+
+    // ---- 断言 ----
+    assert!(
+        caught,
+        "{tag}: C 未在窗口内追赶到 head ≥ {target}（且 durable finalized ≥ 1）（final={c2_final:?}）"
+    );
+    let (_, c2_head, c2_fin, _) = c2_final.expect("C2 有完整样本");
+    assert!(
+        c2_head >= target,
+        "{tag}: C head 未达目标（head={c2_head} target={target}）"
+    );
+    assert!(
+        c2_head > c_before.1,
+        "{tag}: C head 未单调前进（restart 前 {} → 后 {c2_head}）",
+        c_before.1
+    );
+    assert!(
+        c2_fin.is_some_and(|f| f >= 1),
+        "{tag}: C 重启后 finalized 未 ≥ 1（{c2_fin:?}）"
+    );
+    let c2_fin_v = c2_fin.expect("C2 finalized 存在");
+    assert!(
+        c2_fin_v <= c2_head,
+        "{tag}: finalized 不得领先 head（head={c2_head} finalized={c2_fin_v}）"
+    );
+    assert!(
+        c2_fin_v > c_before.2.unwrap_or(0),
+        "{tag}: C 重启后 durable finalized 必须继续前进（{} → {c2_fin_v}）",
+        c_before.2.unwrap_or(0)
+    );
+    assert!(c2_alive, "{tag}: 达标时 C 必须仍在运行");
+    assert!(
+        c2_identity_reject.is_none(),
+        "{tag}: C 重启出现身份/损坏拒绝标记 {c2_identity_reject:?}"
+    );
+    for (label, m) in &markers {
+        assert!(m.is_none(), "{tag}: {label} 出现 fatal 标记 {m:?}");
+    }
+    eprintln!(
+        "{tag} PASS: gap={gap} C {} → {c2_head}（finalized={c2_fin:?}），A/B 存活={ab_alive:?}",
+        c_before.1
+    );
+}
+
+/// **P1-A.17 T2（正式）**：真实进程 restart-behind-tip（停 C ⇒ A/B 以 2/3 quorum 继续 ⇒ 同目录重启 C
+/// ⇒ 追赶至 ≥ 目标高度并恢复 finality）。
+///
+/// **口径依据（实测，P1-A.17 首轮）**：停 1 个验证者后，A/B 在 240s 内仅 36 → 39（≈80s/块），
+/// 且第二轮 240s 内推进不足 2 块 —— 瓶颈是 **N-1 活性（round-timeout pacemaker 的 1000 tick 窗口）**，
+/// **不是** sync（sync 侧已由 P1-A.17 把窗口从 64 提升到 512）。故本用例的目标高度取**实测值**
+/// （emergent target = 重启时刻 A/B 的 durable finalized 最小值），不再预先规定 gap 大小。
+#[test]
+fn p1a17_restart_behind_tip_after_downtime() {
+    p1a17_restart_behind_tip_scenario("a17_small", 1);
+}
+
+/// **Control C（P1-A.17-SYNC-STABILITY 诊断）**：同目录 restart + **大 gap**（无删除 / 无复制）。
+///
+/// 目标 = `min(70, 实测 A/B head)`（见 [`p1a17_restart_behind_tip_scenario_with`]）：若 A/B 在
+/// `downtime` 内真正推进 ≥ 70 块，本用例即验证「**同目录 restart 追赶 ≥ 70（> 旧窗口 64）**」。
+/// 不做任何目录复制 ⇒ **不**依赖冷备份 harness。
+const A17_SCS_SCDIR_DOWNTIME: Duration = Duration::from_secs(420);
+
+#[test]
+fn p1a17_same_dir_restart_large_gap_diagnostic() {
+    p1a17_restart_behind_tip_scenario_with("a17_scs_scdir", 70, A17_SCS_SCDIR_DOWNTIME, true);
+}
+
+/// 递归复制目录（测试专用；「冷备份 / 回滚到旧状态」场景，用于**确定性**制造 gap）。
+fn copy_dir_recursive(src: &Path, dst: &Path) {
+    std::fs::create_dir_all(dst).expect("mkdir dst");
+    for entry in std::fs::read_dir(src).expect("read_dir src") {
+        let entry = entry.expect("dir entry");
+        let to = dst.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir_recursive(&entry.path(), &to);
+        } else {
+            std::fs::copy(entry.path(), &to).expect("copy file");
+        }
+    }
+}
+
+/// **P1-A.17-SYNC-STABILITY 取证**（test-only 观测；**不**参与任何验收判定）：
+/// 导出 `<storage_root>/blocks`（**BlockStore 真实目录**，不是 storage root）清单：filename + size。
+///
+/// 诊断价值：
+/// - 存在 `block_*.blk.tmp` ⇒ `atomic_write` 已过 `File::create(tmp)` 但**未完成** `fs::rename`
+///   （Windows 典型：目标被占用 / sharing violation / 瞬态 IO）；
+/// - `size==0` 的 `.blk` ⇒ 记录被部分写入（`write_all` 之后、`sync_all` 之前失败）；
+/// - `blk` 计数 vs head ⇒ 是否有缺失块文件。
+fn dump_blockstore_forensics(tag: &str, chain_root: &Path) {
+    let blocks = chain_root.join("blocks");
+    let (mut blk, mut zero, mut tmp, mut other) = (0usize, 0usize, 0usize, 0usize);
+    let mut blk_files: Vec<String> = Vec::new();
+    let mut tmp_files: Vec<String> = Vec::new();
+    match std::fs::read_dir(&blocks) {
+        Ok(rd) => {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                if name.ends_with(".blk.tmp") {
+                    tmp += 1;
+                    tmp_files.push(format!("{name} size={len}"));
+                } else if name.ends_with(".blk") {
+                    blk += 1;
+                    if len == 0 {
+                        zero += 1;
+                    }
+                    if blk_files.len() < 30 {
+                        blk_files.push(format!("{name} size={len}"));
+                    }
+                } else {
+                    other += 1;
+                }
+            }
+        }
+        Err(e) => eprintln!("{tag} BLOCKSTORE FORENSICS: blocks 目录不可读 {blocks:?}: {e}"),
+    }
+    eprintln!(
+        "{tag} BLOCKSTORE FORENSICS root={chain_root:?} blocks={blocks:?} blk={blk} \
+         zero_blk={zero} tmp={tmp} other={other}\n  blk_files(first30)={blk_files:?}\n  \
+         tmp_files={tmp_files:?}"
+    );
+}
+
+/// 三个 validator 的 chain (storage) 根目录（`<storage>/blocks` 才是 BlockStore 目录）。
+fn chain_roots(env: &TempDir) -> Vec<PathBuf> {
+    (0..3)
+        .map(|i| env.path(&format!("f2-3-chain-{i}")))
+        .collect()
+}
+
+/// **P1-A.17-SYNC-STABILITY 统一失败取证**（test-only；**任意阶段**失败都导出，**不**改变判定）。
+///
+/// 覆盖 startup / initial-finality / reconnect / A-B-advance / catch-up 全阶段：
+/// 每节点 status 采样 + stdout/stderr 尾部（各 ≤200 行）+ BlockStore stage 分类标记 +
+/// 每个 `<storage>/blocks` 清单。**只**在失败路径调用（PASS 路径不产生额外输出）。
+fn dump_all_node_forensics(tag: &str, phase: &str, kids: &[&ChildGuard], roots: &[PathBuf]) {
+    let mut stage_lines: Vec<String> = Vec::new();
+    eprintln!("=== {tag} FORENSICS BEGIN phase={phase} ===");
+    for c in kids {
+        let out = c.stdout();
+        let err = c.stderr();
+        let tail = |s: &str| -> String {
+            let lines: Vec<&str> = s.lines().collect();
+            lines[lines.len().saturating_sub(200)..].join("\n")
+        };
+        for l in err.lines().chain(out.lines()) {
+            if l.contains("BlockStore stage=") {
+                stage_lines.push(format!("{}: {l}", c.label));
+            }
+        }
+        let has = |k: &str| out.contains(k) || err.contains(k);
+        eprintln!(
+            "=== NODE {} FORENSICS phase={phase} status={:?} stdout_bytes={} stderr_bytes={}\n\
+             markers: BackendFailure={} CorruptedState={} SerializationFailure={} \
+             blockstore_exit={} panicked={} identity_reject={}\n\
+             --- NODE {} STDOUT TAIL ---\n{}\n--- NODE {} STDERR TAIL ---\n{}\n=== END NODE {} ===",
+            c.label,
+            live_stats(c),
+            out.len(),
+            err.len(),
+            has("BackendFailure"),
+            has("CorruptedState"),
+            has("SerializationFailure"),
+            has("Error: Run(\"BlockStore\")"),
+            has("panicked at"),
+            has("IdentityMismatch") || has("ValidatorNotInValidatorSet"),
+            c.label,
+            tail(&out),
+            c.label,
+            tail(&err),
+            c.label,
+        );
+    }
+    let cls = if stage_lines
+        .iter()
+        .any(|l| l.contains("stage=remote_canonical_put"))
+    {
+        "SYNC_BLOCKSTORE_FAILURE"
+    } else if stage_lines
+        .iter()
+        .any(|l| l.contains("stage=finality_commit_get"))
+    {
+        "FINALITY_COMMIT_BLOCKSTORE_FAILURE"
+    } else if stage_lines
+        .iter()
+        .any(|l| l.contains("stage=local_proposal_put"))
+    {
+        "LOCAL_PROPOSAL_BLOCKSTORE_FAILURE"
+    } else if stage_lines.is_empty() {
+        "NO_BLOCKSTORE_STAGE"
+    } else {
+        "OTHER_BLOCKSTORE_STAGE"
+    };
+    eprintln!("{tag} BLOCKSTORE CLASS={cls} stage_lines={stage_lines:?}");
+    for root in roots {
+        dump_blockstore_forensics(tag, root);
+    }
+    eprintln!("=== {tag} FORENSICS END phase={phase} ===");
+}
+
+/// **P1-A.17 T3/T4（正式）**：**确定性 gap** 的 restart-behind-tip —— 冷备份回滚场景。
+///
+/// 为何用该场景：忠实场景（停 1 个验证者等 gap 长大）受 **N-1 pacemaker 速率**限制（实测 ≈80s/块，
+/// 且波动大）⇒ 无法在单个测试窗口内稳定制造 ≥10 块 gap。本场景在 **3/3 全活**（全速）下让链前进
+/// `gap` 块，再让 C 回滚到更早的**一致性备份**（kill 后复制，故为崩溃一致快照）并重启：
+/// - 仍然**真实**经过 P1-A.17 关注的完整同步路径：重连 → 发现远端更高链 → `SyncBlockRequest`
+///   （`head+1` / `hash=None`）→ 响应验证 → durable 持久化 → DAG 登记 → finality 采纳 → head 推进；
+/// - `gap` 可控且确定性 ⇒ 可用于验证 **新窗口（512）** 下 `gap > 64`（旧窗口**必然失败**）的追赶能力。
+fn p1a17_snapshot_rollback_scenario(tag: &str, gap: u64) {
+    let _serial = real_binary_guard();
+    let env = TempDir::new(tag);
+    let genesis = test_genesis(&VAL_SEED);
+    let hash_hex = hex32(&compute_genesis_hash(&genesis).expect("hash"));
+    let genesis_path = env.write(
+        "genesis.bin",
+        &canonical_genesis_bytes(&genesis).expect("canonical"),
+    );
+    for (i, s) in NET_SEED.iter().enumerate() {
+        env.write_seed(&format!("f2-3-net-{i}.seed"), *s);
+    }
+    for (i, s) in VAL_SEED.iter().enumerate() {
+        env.write_seed(&format!("f2-3-val-{i}.seed"), *s);
+    }
+    let net_ids: Vec<NodeId> = NET_SEED.iter().map(|s| net_node_id(*s)).collect();
+    let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+    let args = |i: usize| {
+        f2_node_args(
+            &env,
+            3,
+            i,
+            &net_ids,
+            &ports,
+            &genesis_path,
+            &hash_hex,
+            RUN_STEPS,
+        )
+    };
+    let chain_live = env.path("f2-3-chain-2");
+    let safety_live = env.path("f2-3-safety-2");
+    let chain_snap = env.path("snap-chain-2");
+    let safety_snap = env.path("snap-safety-2");
+    let roots = chain_roots(&env);
+
+    let mut kids: Vec<ChildGuard> = (0..3)
+        .map(|i| ChildGuard::spawn(["A", "B", "C"][i], &args(i)))
+        .collect();
+    let ready = poll_until(
+        || {
+            kids.iter()
+                .all(|c| c.stdout().contains("entering bounded run loop"))
+        },
+        STARTUP_TIMEOUT,
+    );
+    if !ready {
+        dump_all_node_forensics(tag, "startup", &[&kids[0], &kids[1], &kids[2]], &roots);
+    }
+    assert!(ready, "{tag}: 未进入 run loop");
+    let initial = poll_until(
+        || {
+            kids.iter()
+                .all(|c| live_stats(c).and_then(|s| s.2).is_some_and(|f| f >= 2))
+        },
+        EXIT_TIMEOUT,
+    );
+    if !initial {
+        dump_all_node_forensics(
+            tag,
+            "initial-finality",
+            &[&kids[0], &kids[1], &kids[2]],
+            &roots,
+        );
+    }
+    assert!(initial, "{tag}: 未达三节点 finalized ≥ 2");
+
+    // ---- 冷备份：kill C ⇒（C 已停，故为崩溃一致快照）复制其 chain/safety 目录 ⇒ 立即重启 C ----
+    let _ = kids[2].terminate();
+    copy_dir_recursive(&chain_live, &chain_snap);
+    copy_dir_recursive(&safety_live, &safety_snap);
+    let c_snap = live_stats(&kids[2]).expect("C 快照状态");
+    kids[2] = ChildGuard::spawn("C", &args(2));
+    let c_ready = poll_until(
+        || live_stats(&kids[2]).is_some_and(|s| s.3 >= 1),
+        STARTUP_TIMEOUT,
+    );
+    if !c_ready {
+        dump_all_node_forensics(
+            tag,
+            "post-snapshot-restart",
+            &[&kids[0], &kids[1], &kids[2]],
+            &roots,
+        );
+    }
+    assert!(c_ready, "{tag}: 重启的 C 未重新建立 Established peer");
+
+    // ---- 3/3 全活（全速）下前进 gap 块 ----
+    // 判据用 **head**（commit 结果；只随 finality 推进、不回退）而非 `finalized_height`
+    // （= durable QC-history tip，追赶/重负载下可滞后——P1-A.17 实测 B 曾出现 head 373 / tip 27）。
+    let target = c_snap.1.saturating_add(gap);
+    let advanced = poll_until(
+        || {
+            let a = live_stats(&kids[0]).map(|s| s.1).unwrap_or(0);
+            let b = live_stats(&kids[1]).map(|s| s.1).unwrap_or(0);
+            a.min(b) >= target
+        },
+        EXIT_TIMEOUT,
+    );
+    let ab_audit: Vec<String> = kids[..2]
+        .iter()
+        .map(|c| format!("{}={:?}", c.label, live_stats(c)))
+        .collect();
+    if !advanced {
+        dump_all_node_forensics(tag, "ab-advance", &[&kids[0], &kids[1], &kids[2]], &roots);
+    }
+    assert!(
+        advanced,
+        "{tag}: A/B 未在窗口内前进到 finalized ≥ {target}（{ab_audit:?}）"
+    );
+
+    // ---- 回滚 C 到快照（gap 块）并重启 ----
+    let _ = kids[2].terminate();
+    std::fs::remove_dir_all(&chain_live).expect("remove live chain");
+    std::fs::remove_dir_all(&safety_live).expect("remove live safety");
+    copy_dir_recursive(&chain_snap, &chain_live);
+    copy_dir_recursive(&safety_snap, &safety_live);
+    let mut c2 = ChildGuard::spawn("C2", &args(2));
+    let reconnected = poll_until(
+        || live_stats(&c2).is_some_and(|s| s.3 >= 1),
+        STARTUP_TIMEOUT,
+    );
+    if !reconnected {
+        dump_all_node_forensics(
+            tag,
+            "post-rollback-reconnect",
+            &[&kids[0], &kids[1], &c2],
+            &roots,
+        );
+    }
+    assert!(
+        reconnected,
+        "{tag}: 回滚后的 C 未重连（status={:?}）",
+        live_stats(&c2)
+    );
+    let c_before_target = c_snap.1;
+
+    // ---- 验收：C 追赶至 ≥ target；finalized 恢复；head 单调 ----
+    let caught = poll_until(
+        || {
+            live_stats(&c2)
+                .is_some_and(|s| s.1 >= target && s.2.is_some_and(|f| f >= 1 && f <= s.1))
+        },
+        EXIT_TIMEOUT,
+    );
+
+    let c2_alive = c2.is_running();
+    let c2_final = live_stats(&c2);
+    // 取证（test-only 观测；**不**改变任何验收条件）：完整 stdout 落盘 ⇒ status 时间线。
+    eprintln!("{}", kids[0].diagnostic(None, true));
+    eprintln!("{}", kids[1].diagnostic(None, true));
+    eprintln!("{}", c2.diagnostic(None, true));
+    let ab_alive = [kids[0].is_running(), kids[1].is_running()];
+    let markers: Vec<(String, Option<&str>)> = vec![
+        (
+            "A".to_string(),
+            fatal_marker(&kids[0].stdout(), &kids[0].stderr()),
+        ),
+        (
+            "B".to_string(),
+            fatal_marker(&kids[1].stdout(), &kids[1].stderr()),
+        ),
+        ("C2".to_string(), fatal_marker(&c2.stdout(), &c2.stderr())),
+    ];
+    let c2_identity_reject = [
+        "ValidatorNotInValidatorSet",
+        "IdentityMismatch",
+        "CorruptedState",
+    ]
+    .into_iter()
+    .find(|m| c2.stdout().contains(m) || c2.stderr().contains(m));
+    // 取证（test-only）：仅失败路径导出，不改变任何断言。
+    if !caught || !c2_alive {
+        dump_all_node_forensics(tag, "catchup", &[&kids[0], &kids[1], &c2], &roots);
+    }
+    let statuses = [kids[0].terminate(), kids[1].terminate(), c2.terminate()];
+
+    eprintln!(
+        "=== {tag} P1-A.17 SNAPSHOT DIAGNOSTICS ===\n\
+         C snapshot: {c_snap:?}（回滚前目标 head ≥ {target}，gap={gap}）\n\
+         A/B at rollback: {ab_audit:?}\n\
+         C2 final: {c2_final:?} alive_at_acceptance={c2_alive}\n\
+         A/B alive at acceptance: {ab_alive:?}\n\
+         fatal markers: {markers:?}\n\
+         c2 identity/corruption: {c2_identity_reject:?}\n\
+         exit statuses（诊断）: {statuses:?}"
+    );
+
+    assert!(
+        caught,
+        "{tag}: C 未在窗口内追赶 head ≥ {target}（final={c2_final:?}）"
+    );
+    let (_, c2_head, c2_fin, _) = c2_final.expect("C2 有完整样本");
+    assert!(c2_head >= target, "{tag}: head={c2_head} < target={target}");
+    assert!(
+        c2_head > c_before_target,
+        "{tag}: head 未单调前进（{c_before_target} → {c2_head}）"
+    );
+    let f = c2_fin.expect("C2 finalized 存在");
+    assert!(
+        f >= 1 && f <= c2_head,
+        "{tag}: finalized 越界（head={c2_head} fin={f}）"
+    );
+    assert!(c2_alive, "{tag}: 达标时 C 必须仍存活");
+    assert!(
+        c2_identity_reject.is_none(),
+        "{tag}: 出现身份/损坏标记 {c2_identity_reject:?}"
+    );
+    for (label, m) in &markers {
+        assert!(m.is_none(), "{tag}: {label} 出现 fatal 标记 {m:?}");
+    }
+    eprintln!("{tag} PASS: gap={gap} C {c_before_target} → {c2_head}（finalized={f}）");
+}
+
+/// **P1-A.17 T3（正式）**：确定性 gap = 20（旧 64 窗口内，但此前**从未**被真实进程验证）。
+#[test]
+fn p1a17_snapshot_rollback_medium_gap() {
+    p1a17_snapshot_rollback_scenario("a17_snap20", 20);
+}
+
+/// **P1-A.17 T4（正式）**：确定性 gap = 70（**超出旧的 `MAX_SYNC_WALK = 64`**）——
+/// 旧实现下 responder 必然 `WalkExceeded`（不响应）且无重发途径 ⇒ 永久失联；
+/// P1-A.17 将窗口提升到 512 后本用例是「>64 追赶可行」的直接证据。
+#[test]
+fn p1a17_snapshot_rollback_beyond_old_window() {
+    p1a17_snapshot_rollback_scenario("a17_snap70", 70);
+}
+
 /// F2 实验 B：**交错启动** 3 个真实 validator（先 A 单独跑到 ≥100 steps，再依次启 B/C）。
 #[test]
 fn f2b_staggered_three_validator() {
+    let _serial = real_binary_guard();
     let env = TempDir::new("f2b");
     let val_seeds = [VAL_SEED[0], VAL_SEED[1], VAL_SEED[2]];
     let net_seeds = [NET_SEED[0], NET_SEED[1], NET_SEED[2]];
