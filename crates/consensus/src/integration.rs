@@ -218,8 +218,22 @@ impl QcRegistry {
     }
 }
 
-/// target → 按 validator_id 升序的已验证 (vote, signature)。
-type TargetEvidence = BTreeMap<ValidatorId, (ValidatorVote, [u8; 64])>;
+/// `VoteType` → 类型字节（与既有 `vote_ledger::VoteKey::ordinal` 约定一致：Prevote=0x01 / Precommit=0x02）。
+///
+/// `VoteType` **刻意不实现 `Ord`** ⇒ evidence 键用类型字节而非 `VoteType` 本体
+///（P1-A.11：同一 target 下 Prevote 与 Precommit 的 evidence 必须互不覆盖）。
+fn vote_type_byte(vote_type: VoteType) -> u8 {
+    match vote_type {
+        VoteType::Prevote => 0x01,
+        VoteType::Precommit => 0x02,
+    }
+}
+
+/// target → 按 **(vote_type 字节, validator_id) 升序**的已验证 (vote, signature)。
+///
+/// 迭代序天然 = 先 vote_type、再 validator_id ⇒ 过滤单一 vote_type 后即为 **ValidatorId 升序**
+///（满足 `verify_qc` 对 evidence 升序的要求）。
+type TargetEvidence = BTreeMap<(u8, ValidatorId), (ValidatorVote, [u8; 64])>;
 type EvidenceByTarget = HashMap<[u8; 32], TargetEvidence>;
 
 /// 当前 (height, round) 已验证票（ephemeral，MF-11）——仅用于 QC construction。
@@ -246,7 +260,10 @@ impl RoundEvidence {
         self.by_target
             .entry(vote.target_block_hash)
             .or_default()
-            .insert(vote.validator_id, (vote.clone(), *signature));
+            .insert(
+                (vote_type_byte(vote.vote_type), vote.validator_id),
+                (vote.clone(), *signature),
+            );
     }
 
     /// round 推进时 reset（timeout 路径）；绑定新 (height, round)。
@@ -266,10 +283,16 @@ impl RoundEvidence {
         height: u64,
         round: u64,
     ) -> Option<QuorumCertificate> {
-        let entries = self.by_target.get(&target)?;
-        let evidence: Vec<QcEvidence> = entries
+        // P1-A.11：**只**取与请求 `vote_type` 同构的 evidence（不得混入另一类型签名）。
+        // 复合键迭代 = （类型字节, ValidatorId）升序 ⇒ 过滤单一类型后即 ValidatorId 升序，
+        // 满足 `verify_qc` 的 evidence 升序契约（不得依赖整张 map 的自然顺序）。
+        let want = vote_type_byte(vote_type);
+        let evidence: Vec<QcEvidence> = self
+            .by_target
+            .get(&target)?
             .iter()
-            .map(|(vid, (v, sig))| QcEvidence {
+            .filter(|((ty, _), _)| *ty == want)
+            .map(|((_, vid), (v, sig))| QcEvidence {
                 validator_id: *vid,
                 source_block_hash: v.source_block_hash,
                 timestamp: v.timestamp,
@@ -1668,6 +1691,141 @@ mod tests {
             Some(expected),
             "transition 只组装冻结结构（MF-8）"
         );
+    }
+
+    // ---- P1-A.11：QC evidence vote-type isolation（同一 target 下 Prevote/Precommit 不得互相覆盖）----
+
+    fn vote_parts(ev: ConsensusEvent) -> (ValidatorVote, [u8; 64]) {
+        match ev {
+            ConsensusEvent::Vote { vote, signature } => (vote, signature),
+            other => panic!("expected Vote event, got {other:?}"),
+        }
+    }
+
+    /// 含 `target` 的最小 DAG（供 `verify_qc` ① 检查）。
+    fn dag_with(target: [u8; 32]) -> Dag {
+        let mut dag = Dag::new();
+        dag.add_block(BlockReference {
+            block_hash: target,
+            height: 1,
+            parents: vec![],
+            proposer: ValidatorId::from_bytes([0xAA; 32]),
+        })
+        .unwrap();
+        dag
+    }
+
+    /// TEST A/B/C/D/E：混合记录顺序下 evidence 必须按 vote_type 隔离；2-of-3 两类 QC 均可验证。
+    #[test]
+    fn p1a11_evidence_is_vote_type_isolated() {
+        let ctx = test_ctx(3, 100); // total 300 ⇒ quorum = 200（2-of-3）
+        assert_eq!(ctx.set.quorum(), 200);
+        let mut ev = RoundEvidence::new(0, 0);
+        let (pv_a, sig_pv_a) = vote_parts(vote_event(&ctx, 0, VoteType::Prevote, 100));
+        let (pv_b, sig_pv_b) = vote_parts(vote_event(&ctx, 1, VoteType::Prevote, 100));
+        let (pc_a, sig_pc_a) = vote_parts(vote_event(&ctx, 0, VoteType::Precommit, 100));
+        let (pc_b, sig_pc_b) = vote_parts(vote_event(&ctx, 1, VoteType::Precommit, 100));
+        // 顺序：Prevote A/B → Precommit A/B（修复前：A/B 的 Prevote 会被 Precommit 覆盖）
+        ev.record(&pv_a, &sig_pv_a);
+        ev.record(&pv_b, &sig_pv_b);
+        ev.record(&pc_a, &sig_pc_a);
+        ev.record(&pc_b, &sig_pc_b);
+
+        let dag = dag_with(TARGET);
+        let pv_qc = ev
+            .assemble_qc(CHAIN_ID, &GENESIS_HASH, TARGET, VoteType::Prevote, 0, 0)
+            .expect("prevote qc");
+        assert_eq!(pv_qc.context.vote_type, VoteType::Prevote);
+        assert_eq!(pv_qc.evidence.len(), 2, "Prevote evidence = A/B（2-of-3）");
+        let pv_sigs: Vec<[u8; 64]> = pv_qc.evidence.iter().map(|e| e.signature).collect();
+        assert!(pv_sigs.contains(&sig_pv_a) && pv_sigs.contains(&sig_pv_b));
+        assert!(
+            !pv_sigs.contains(&sig_pc_a) && !pv_sigs.contains(&sig_pc_b),
+            "Prevote QC 不得包含 Precommit 签名"
+        );
+        assert!(
+            pv_qc
+                .evidence
+                .windows(2)
+                .all(|w| w[0].validator_id < w[1].validator_id),
+            "evidence 必须 ValidatorId 升序"
+        );
+        assert!(
+            verify_qc(&pv_qc, &ctx.set, &GENESIS_HASH, &dag).is_ok(),
+            "Prevote QC 必须通过 verify_qc"
+        );
+
+        let pc_qc = ev
+            .assemble_qc(CHAIN_ID, &GENESIS_HASH, TARGET, VoteType::Precommit, 0, 0)
+            .expect("precommit qc");
+        assert_eq!(pc_qc.context.vote_type, VoteType::Precommit);
+        assert_eq!(
+            pc_qc.evidence.len(),
+            2,
+            "Precommit evidence = A/B（2-of-3）"
+        );
+        let pc_sigs: Vec<[u8; 64]> = pc_qc.evidence.iter().map(|e| e.signature).collect();
+        assert!(pc_sigs.contains(&sig_pc_a) && pc_sigs.contains(&sig_pc_b));
+        assert!(
+            !pc_sigs.contains(&sig_pv_a) && !pc_sigs.contains(&sig_pv_b),
+            "Precommit QC 不得包含 Prevote 签名"
+        );
+        assert!(
+            verify_qc(&pc_qc, &ctx.set, &GENESIS_HASH, &dag).is_ok(),
+            "Precommit QC 必须通过 verify_qc"
+        );
+    }
+
+    /// TEST B（反向顺序）+ E（同键幂等）+ F（不同 target 不污染）。
+    #[test]
+    fn p1a11_reverse_order_idempotent_and_target_isolated() {
+        let ctx = test_ctx(3, 100);
+        let mut ev = RoundEvidence::new(0, 0);
+        let (pv_a, sig_pv_a) = vote_parts(vote_event(&ctx, 0, VoteType::Prevote, 100));
+        let (pc_a, sig_pc_a) = vote_parts(vote_event(&ctx, 0, VoteType::Precommit, 100));
+        // 反向：先 Precommit 再 Prevote ⇒ 两者必须共存（修复前 Prevote 会覆盖 Precommit）
+        ev.record(&pc_a, &sig_pc_a);
+        ev.record(&pv_a, &sig_pv_a);
+        let pc = ev
+            .assemble_qc(CHAIN_ID, &GENESIS_HASH, TARGET, VoteType::Precommit, 0, 0)
+            .expect("precommit qc");
+        assert_eq!(pc.evidence.len(), 1);
+        assert_eq!(
+            pc.evidence[0].signature, sig_pc_a,
+            "必须保留 Precommit 签名"
+        );
+        let pv = ev
+            .assemble_qc(CHAIN_ID, &GENESIS_HASH, TARGET, VoteType::Prevote, 0, 0)
+            .expect("prevote qc");
+        assert_eq!(pv.evidence.len(), 1);
+        assert_eq!(pv.evidence[0].signature, sig_pv_a, "必须保留 Prevote 签名");
+
+        // E：同 validator/同 type/同 target 重复 record ⇒ 仍 1 条（幂等覆盖，条目数不增长）。
+        let (pv_a2, sig_pv_a2) = vote_parts(vote_event(&ctx, 0, VoteType::Prevote, 100));
+        ev.record(&pv_a2, &sig_pv_a2);
+        let pv2 = ev
+            .assemble_qc(CHAIN_ID, &GENESIS_HASH, TARGET, VoteType::Prevote, 0, 0)
+            .expect("prevote qc");
+        assert_eq!(pv2.evidence.len(), 1, "同键幂等：不得产生重复 evidence");
+        assert_eq!(pv2.evidence[0].signature, sig_pv_a2, "同键覆盖为最新记录");
+
+        // F：不同 target 不得互相污染（另一 target 的票不进入本 target evidence）。
+        let other = [0x77u8; 32];
+        let mut other_vote = pv_a.clone();
+        other_vote.target_block_hash = other;
+        ev.record(&other_vote, &sig_pv_a);
+        let pv3 = ev
+            .assemble_qc(CHAIN_ID, &GENESIS_HASH, TARGET, VoteType::Prevote, 0, 0)
+            .expect("prevote qc");
+        assert_eq!(
+            pv3.evidence.len(),
+            1,
+            "另一 target 的票不得进入 TARGET evidence"
+        );
+        let other_qc = ev
+            .assemble_qc(CHAIN_ID, &GENESIS_HASH, other, VoteType::Prevote, 0, 0)
+            .expect("other qc");
+        assert_eq!(other_qc.evidence.len(), 1, "target 桶相互隔离");
     }
 
     // ---- T20：QC Identity Completeness（encode_qc 全字段 injective）----
