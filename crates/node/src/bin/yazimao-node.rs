@@ -138,8 +138,8 @@ Options:
   --safety-dir <path>           validator safety journal directory
   --validator-seed-file <path>  32-byte validator identity seed (hex64)
   --idle-ms <n>                 bounded idle interval in ms (default 1, maximum 50)
-  --run-steps <n>               maximum number of runtime steps to execute in this
-                                process (default 5000; must be > 0)
+  --run-steps <n>               run for n steps and exit (default 5000)
+  --run-steps 0                 run continuously without a step limit
   --help                        print this help and exit 0
   --version                     print version and exit 0
 ";
@@ -503,10 +503,8 @@ fn parse_args(args: &[String]) -> Result<Cli, CliError> {
                 }
                 let raw = take_value(args, &mut i, "--run-steps")?;
                 let v = raw.parse::<u64>().map_err(|_| CliError::InvalidRunSteps)?;
-                // 0 = 无驱动 / 非有限预算语义 ⇒ 拒绝（必 > 0；有限预算为本轮终止策略）。
-                if v == 0 {
-                    return Err(CliError::InvalidRunSteps);
-                }
+                // B1（Testnet）—— `0` = **continuous / unlimited**（不因 step 预算自然退出）；
+                // `N > 0` = 有限预算（既有语义**完全不变**；全部测试继续依赖有限值）。
                 run_steps = Some(v);
             }
             other if other.starts_with("--") => {
@@ -926,7 +924,11 @@ fn summary_line(s: &RunSummary) -> String {
          inbound_accepted={} sync_pending={} peer_dial_attempts={} peer_dial_failures={} \
          validator_enabled={}; runtime shut down\n",
         s.steps,
-        s.run_steps,
+        if s.run_steps == 0 {
+            "unlimited".to_string()
+        } else {
+            s.run_steps.to_string()
+        },
         s.head_height,
         finalized,
         s.consensus_height,
@@ -981,9 +983,10 @@ fn run_fault_kind(e: &RuntimeError) -> &'static str {
 ///    单个 peer dial/握手失败只记入其 `PeerStatus`，**不**终止本节点）。
 /// 2. 调用**唯一驱动点** `runtime.step()`；`Err` ⇒ fail-closed 立即停止（`shutdown` 仍由 `main`
 ///    在所有路径上调用，未经修改的 runtime 错误原样向上传播）。
-/// 3. 预算：`steps == cli.run_steps` ⇒ 正常结束（**不**多执行一轮，不存在 N+1）；否则
-///    `std::thread::sleep(cli.idle_ms)` pacing（Owner D1 批准的唯一生产 sleep；`1..=50ms`
-///    已由 CLI 拒绝 0 ⇒ **无 busy loop**）。
+/// 3. 预算：`run_steps > 0` 时 `steps == cli.run_steps` ⇒ 正常结束（**不**多执行一轮，不存在
+///    N+1）；`run_steps == 0` ⇒ **continuous**（无 step 上限；仅 `runtime.step()` 返回 `Err`
+///    时 fail-closed 停止）。两种模式均 `std::thread::sleep(cli.idle_ms)` pacing
+///    （Owner D1 批准的唯一生产 sleep；`1..=50ms` 已由 CLI 拒绝 0 ⇒ **无 busy loop**）。
 /// 4. **P1-A.9（P1-3）**：每 `STATUS_INTERVAL_STEPS` 步输出一行 status（stdout；固定 interval；
 ///    无墙钟 / 无随机 / 不影响 step timing）。status 写失败只记录（`status_write_failed`），
 ///    **不**改变 step 语义、**不**跳过 `shutdown`、**不**覆盖 step 错误。
@@ -1042,7 +1045,8 @@ fn run_node_loop(runtime: &mut NodeRuntime, cli: &Cli) -> RunLoopOutcome {
         }
     }
 
-    while steps < cli.run_steps {
+    // B1（Testnet）—— `run_steps == 0` = continuous（无 step 上限）；`> 0` = 既有有限预算。
+    while cli.run_steps == 0 || steps < cli.run_steps {
         if !cli.peers.is_empty() {
             // 幂等；不因单个 configured peer 失败而终止节点（错误在 status 中，无状态机副作用）。
             let _ = runtime.establish_configured_peers();
@@ -1056,7 +1060,8 @@ fn run_node_loop(runtime: &mut NodeRuntime, cli: &Cli) -> RunLoopOutcome {
         if should_emit_status(steps) && write_stdout(&status_line(runtime, cli, steps)).is_err() {
             status_write_failed = true;
         }
-        if steps >= cli.run_steps {
+        // B1：仅**有限预算**在 steps 达到 N 时退出；`0`（continuous）不因预算退出。
+        if cli.run_steps != 0 && steps >= cli.run_steps {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(cli.idle_ms));
@@ -1093,13 +1098,24 @@ fn main() -> Result<(), StartupError> {
             let (_identity, set) = preflight(&cli).map_err(StartupError::Preflight)?;
             let (mut runtime, report) = assemble_and_verify_runtime(&cli, &set)?;
             // 启动行（CLI 契约输出；非日志）—— 进入循环前写出 ⇒ 绑定地址 / 预算立即可观测。
+            // B1：有限预算 ⇒ 既有无改动契约行 `entering bounded run loop`（既有测试依赖该字符串）；
+            // continuous（run_steps=0）⇒ `entering continuous run loop`。
             write_stdout(&format!(
                 "{PROGRAM}: runtime assembled (P1-A.3); node_id={} listen={:?} peer_auth={}; \
-                 entering bounded run loop (run_steps={} idle_ms={})\n",
+                 entering {} run loop (run_steps={} idle_ms={})\n",
                 hex32(report.node_id.as_bytes()),
                 report.listen_addr,
                 report.peer_auth_enabled,
-                cli.run_steps,
+                if cli.run_steps == 0 {
+                    "continuous"
+                } else {
+                    "bounded"
+                },
+                if cli.run_steps == 0 {
+                    "unlimited".to_string()
+                } else {
+                    cli.run_steps.to_string()
+                },
                 cli.idle_ms,
             ))?;
             let outcome = run_node_loop(&mut runtime, &cli);
@@ -1983,11 +1999,11 @@ mod tests {
         assert_eq!(parse(&items), Err(CliError::MissingValue("--run-steps")));
     }
 
-    // T41 — --run-steps 非法值（0 / 非数字 / 负数 / 空白 / 溢出）⇒ InvalidRunSteps
+    // T41 — --run-steps 非法值（非数字 / 负数 / 空白 / 溢出）⇒ InvalidRunSteps
+    //      （**B1 语义变更**：`0` 现在合法 = continuous / unlimited ⇒ 不再属于非法值）
     #[test]
     fn t41_run_steps_invalid_values_rejected() {
         for bad in [
-            "0",
             "abc",
             "-1",
             " 1",
@@ -2006,7 +2022,7 @@ mod tests {
         }
     }
 
-    // T42 — --run-steps 合法值接受；缺省 = RUN_STEPS_DEFAULT（有限预算）
+    // T42 — --run-steps 合法值接受（含 B1 的 `0` = continuous）；缺省 = RUN_STEPS_DEFAULT（有限预算）
     #[test]
     fn t42_run_steps_accepted_and_default() {
         let mut items = valid_base();
@@ -2020,6 +2036,15 @@ mod tests {
         let mut items = valid_base();
         items.extend_from_slice(&["--run-steps", "18446744073709551615"]);
         assert_eq!(parse(&items).map(|c| c.run_steps), Ok(u64::MAX));
+
+        // B1（Testnet）—— `0` = **continuous / unlimited**（不再被拒绝）；CLI 必须接受并原样传入。
+        let mut items = valid_base();
+        items.extend_from_slice(&["--run-steps", "0"]);
+        assert_eq!(
+            parse(&items).map(|c| c.run_steps),
+            Ok(0),
+            "run_steps=0 ⇒ continuous / unlimited"
+        );
 
         assert_eq!(
             parse(&valid_base()).map(|c| c.run_steps),
