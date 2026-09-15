@@ -81,6 +81,7 @@ fn inbound_context_with_proposer<'a, B: StorageBackend + Clone>(
 /// - 块本身**不携带** proposer 自证；期望 proposer 完全由本地 ValidatorSet 独立推导。
 /// - 空集合 / 成员缺失 / 成员 consensus key 无法构成 Ed25519 点 ⇒ `Err(UnsupportedValidation(
 ///   ProposerSignature))`（缺失 proposer identity = 验证失败；不放行、不跳过）。
+///
 /// P1-A.18 RC-1 —— **绑定轮证据**：`(round, bound_block_hash)`。
 ///
 /// 绑定键 = `bound_block_hash`：**仅当**它与待验证块的 canonical hash **严格相等**时，`round`
@@ -98,6 +99,9 @@ pub type ProposerRoundEvidence = (u64, [u8; 32]);
 /// - `Ok(0)` = 无可用证据 ⇒ 调用方**回退既有 round 0 行为**（不猜、不放宽）；
 /// - `Ok(r)` = 恰有一个绑定来源 ⇒ 用 `r`（r 可为 0）；
 /// - `Err(())` = **两个绑定来源给出不同轮** ⇒ 调用方必须**拒绝**（不得静默择一、不得遍历其它轮）。
+// `Err(())` 是**协议语义**（“绑定证据矛盾”单一信号），不是错误信息载体；
+// 调用方按契约 `Err(()) => 拒绝该块` 处理，本提交不改变该契约 / 不改公开签名。
+#[allow(clippy::result_unit_err)]
 pub fn resolve_proposer_round_evidence(
     block_hash: [u8; 32],
     proposal: Option<ProposerRoundEvidence>,
@@ -254,6 +258,8 @@ pub fn dispatch_gossip_block_round_aware<B: StorageBackend + Clone>(
 ///
 /// 有界性：扫描上界 = 调用方切片长度（= 既有 `PENDING_EXTERNAL_QC_CAP`，**有界**）；
 /// 本函数**只做等值匹配**——不做「逐轮试签名」，不遍历 validator，不做 membership-only 接受。
+// `Err(())` 与 Stage 1 同一协议语义（“绑定证据矛盾”单一信号）；契约不变。
+#[allow(clippy::result_unit_err)]
 pub fn resolve_proposer_round_from_evidences(
     block_hash: [u8; 32],
     evidences: &[ProposerRoundEvidence],

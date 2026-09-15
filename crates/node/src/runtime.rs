@@ -850,7 +850,8 @@ fn finality_commit_bridge(
         let chain_id = driver.consensus().chain_id();
         let genesis_hash = driver.consensus().genesis_hash();
         // 两个来源都必须**严格绑定 X**（`target == X`）；未绑定 ⇒ 视为“无证据”（不得当证据用）。
-        let local_evidence = last_precommit_round_evidence(driver.consensus()).filter(|(_, t)| *t == x);
+        let local_evidence =
+            last_precommit_round_evidence(driver.consensus()).filter(|(_, t)| *t == x);
         let history_evidence = qc_history
             .and_then(|h| h.get(b.header.height).ok().flatten())
             .filter(|qc| qc.target == x)
@@ -2401,7 +2402,7 @@ impl NodeRuntime {
         // - 频率：每 `SYNC_PROBE_INTERVAL` 个逻辑 tick 至多 1 次 —— 复用既有 `*tick`。
         // - peer：复用既有 `select_peer` + 既有 tick 轮转（`attempted`）⇒ one peer per probe，不广播。
         // - request_id：复用既有 `random_request_id()`（CSPRNG；无新计数器 / 无持久状态）。
-        if *tick % SYNC_PROBE_INTERVAL == 0
+        if tick.is_multiple_of(SYNC_PROBE_INTERVAL)
             && scheduler.is_empty()
             && correlator.is_empty()
             && correlator.eligible_len() == 0
@@ -2833,7 +2834,8 @@ impl NodeRuntime {
                         // - gossip 分支：切片为空 ⇒ `Ok(None)` ⇒ 逐字保持既有本地证据链
                         //   （proposal → last_precommit → round 0）；
                         // - `Err(冲突轮)` ⇒ **保守拒绝该块**（不落盘 / 不登记；**不得**回退 round 0）。
-                        match resolve_proposer_round_from_evidences(*block_hash, &sync_qc_evidences) {
+                        match resolve_proposer_round_from_evidences(*block_hash, &sync_qc_evidences)
+                        {
                             Ok(resolved_round) => {
                                 register_remote_canonical_block(
                                     &mut self.driver,
