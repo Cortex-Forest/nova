@@ -48,7 +48,7 @@ use crate::assembly::{AdoptionOutcome, ConsensusNode};
 use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter, NodeBlockApplicationError};
 use crate::block_dispatch::{
     dispatch_gossip_block_round_aware, dispatch_sync_block_response_round_aware,
-    resolve_proposer_round_evidence,
+    resolve_proposer_round_evidence, resolve_proposer_round_from_evidences,
 };
 use crate::block_inbound::{InboundBlockError, InboundBlockVerdict};
 use crate::bootstrap::{self, ConnectionTargetError, NodeConfig, NodeStartupError};
@@ -67,11 +67,12 @@ use crate::proposer::{ProposalBuild, ProposerError, build_proposal};
 use crate::qc_history::{QcHistory, QcHistoryError};
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
-use crate::sync_correlator::{LogicalTick, SyncRequestCorrelator};
+use crate::sync_correlator::{LogicalTick, SyncRequestCorrelator, SyncRequestTarget};
 use crate::sync_dispatch::{NetworkSyncDispatcher, dispatch_batch};
 use crate::sync_responder::{SyncRespondDiagnostics, serve_requests as serve_sync_requests};
 use crate::sync_scheduler::{
-    PeerCandidate, PeerSelectionPolicy, ScheduleResult, SyncRequestScheduler, select_peer,
+    PeerCandidate, PeerSelectionPolicy, ScheduleResult, SyncRequestIntent, SyncRequestScheduler,
+    select_peer,
 };
 use crate::validator::{ValidatorActor, ValidatorActorError};
 use crate::wiring::{
@@ -102,6 +103,15 @@ const SYNC_DISPATCH_MAX_PER_STEP: usize = 8;
 /// register 用 deadline horizon（D8-3-1：expire release-only —— 悬挂 request 在该 step 数后
 /// 被 `expire_at` 释放；无 retry / 无 backoff；correlator capacity 即有界）。
 const SYNC_DEADLINE_HORIZON: u64 = 64;
+
+/// B2-C2 —— Trigger #3（低频 proactive catch-up probe）间隔（逻辑 tick；Owner 已批准 Option C′）。
+///
+/// 与 `SYNC_DEADLINE_HORIZON`（=64）**对齐**：一个无响应 request（对端 behind ⇒ responder
+/// `Missing` ⇒ 静默不响应）或未 resolve 的 request 最迟在 64 tick 被 `expire_at` 释放；
+/// probe 间隔 ≥ deadline horizon ⇒ **同一高度不会在前一个 request 尚未自然释放前被反复探测**
+/// （无 tight loop / 无 retry storm）。复用既有 step-driven `sync_tick` ⇒ **零新增状态**
+/// （无 `last_probe_tick` / `last_probe_height` / `last_probe_peer` / backoff / 持久化）。
+const SYNC_PROBE_INTERVAL: u64 = 64;
 
 /// P1-A.17 —— catch-up 驱动：每步最多补记的「head+1 追赶 intent」条数（bounded = 1/步）。
 ///
@@ -781,8 +791,11 @@ fn persist_finality_fact_if_needed(
 /// 2. `X != adapter.head().block_hash`（幂等锚：已 commit ⇒ no-op —— stale / duplicate 安全）；
 /// 3. X 解析为完整块且 `block_hash(block) == X`（**严格 match**；V0.1 seam = 本地 `last_proposal`；
 ///    不 match ⇒ NO COMMIT，绝不 fallback 任意块）；
-/// 4. proposer 解析 = 本地登记 proposer（`proposal_ref.proposer` → `ValidatorSet.info` →
-///    `VerifyingKey`；复用 D9 expected-proposer 同款推导）；
+/// 4. proposer 解析 = **hash 绑定**轮次证据（`target == X`）→ `select_proposer` →
+///    `ValidatorSet.info` → `VerifyingKey`；**B2-D1**：证据来源 = 本地 `last_precommit_qc`
+///    与既有 per-height `qc_history`（key = 块高 H ⇒ `qc.target == block_hash(H) == X`）
+///    无绑定证据 / 两源冲突 ⇒ **defer（no-op）**（不猜轮 / 不以 round 0 兜底 / 不致命退出）；
+///    绑定 QC 的 round 本身为 0 ⇒ 合法使用 0；
 /// 5. `adapter.apply_block(wire, vk)`（复用冻结 ①~⑥ durable commit：height/parent 线性防护、
 ///    block durable-first、state+head 同 WAL 批、head 仅 ⑥ 成功推进）。
 ///
@@ -792,6 +805,7 @@ fn finality_commit_bridge(
     driver: &mut NodeConsensusDriver<DynSigner>,
     adapter: Option<&mut NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>>,
     last_proposal: Option<&ProposalBuild>,
+    qc_history: Option<&QcHistory>,
 ) -> Result<(), RuntimeError> {
     let Some(adapter) = adapter else {
         return Ok(()); // full-node / 无 canonical adapter ⇒ 无 commit
@@ -823,18 +837,34 @@ fn finality_commit_bridge(
         };
         // proposer（V0.1 parent-height 语义；与 D9 / rebuild / restore 同源 —— 不新造规则）。
         //
-        // P1-A.18 RC-1：轮次只取**绑定证据** —— `last_precommit_qc()` 且其 `target == X`
-        // （本 Gate 已强制 `block_hash(block) == X`）⇒ `qc.context.round`；无绑定证据 ⇒ 回退
-        // 既有 round 0（不猜）。否则 round≥1 产出的块会在 Gate 5 被按 round-0 期望验签而失败
-        // ⇒ 该高度永久停滞（RC-1）。
+        // P1-A.18 RC-1 + **B2-D1**：轮次只取 **hash 绑定**证据（`target == X`），两个来源：
+        // - 来源 A = 本地 `last_precommit_qc`（**单一槽位**，会被更新 QC 覆盖 ⇒ 可能已不绑定 X）；
+        // - 来源 B = 既有 per-height `qc_history`（key = 块高 H ⇒ `qc.target == block_hash(H) == X`；
+        //   store 层已双向强制 `height == qc.context.height + 1` / `reference == qc.target` /
+        //   `vote_type == Precommit`（**复用 API，不重造存储校验**）；本 step 已在 commit 之前写入
+        //   与 `finalized_reference` 绑定的 QC（含外部采纳 QC）⇒ 重启后仍可用）。
+        // `resolve_proposer_round_evidence` 统一处理：恰一个绑定 ⇒ 用其 round（**可为 0，合法**）；
+        // 都未绑定 ⇒ `Ok(None)`；都绑定但轮不同 ⇒ `Err(())`。
+        // Owner 裁决：`Ok(None)` / `Err(())` 一律 **defer（no-op）** —— 不猜 round、
+        // **绝不以 round 0 兜底**、不致命退出（节点不因缺证据而终止；下一 tick 若证据到位可再试）。
         let chain_id = driver.consensus().chain_id();
         let genesis_hash = driver.consensus().genesis_hash();
-        let round = resolve_proposer_round_evidence(
-            x,
-            None,
-            last_precommit_round_evidence(driver.consensus()),
-        )
-        .unwrap_or(0);
+        // 两个来源都必须**严格绑定 X**（`target == X`）；未绑定 ⇒ 视为“无证据”（不得当证据用）。
+        let local_evidence = last_precommit_round_evidence(driver.consensus()).filter(|(_, t)| *t == x);
+        let history_evidence = qc_history
+            .and_then(|h| h.get(b.header.height).ok().flatten())
+            .filter(|qc| qc.target == x)
+            .map(|qc| (qc.context.round, qc.target));
+        // Owner 裁决：**无绑定证据 ⇒ defer**（不猜 round / **不以 round 0 兜底**）。
+        // 注意：绑定 QC 的 `round == 0` 是**合法**证据 ⇒ 走下方正常路径使用 0（二者严格区分）。
+        if local_evidence.is_none() && history_evidence.is_none() {
+            return Ok(());
+        }
+        // `resolve_proposer_round_evidence` 统一处理：恰一个绑定 ⇒ 其 round（可为 0）；
+        // 两源都绑定但轮不同 ⇒ `Err(())` ⇒ **defer**（不静默择一 / 不降级 round 0 / 不致命）。
+        let Ok(round) = resolve_proposer_round_evidence(x, local_evidence, history_evidence) else {
+            return Ok(());
+        };
         let Some(p) = select_proposer(
             chain_id,
             b.header.height.saturating_sub(1),
@@ -885,6 +915,7 @@ fn register_remote_canonical_block(
     driver: &mut NodeConsensusDriver<DynSigner>,
     adapter: &NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>,
     wire: &[u8],
+    resolved_round: Option<u64>,
 ) -> Result<(), RuntimeError> {
     let block = nova_runtime::decode_block(wire).map_err(RuntimeError::BlockDecode)?;
     let height = block.header.height;
@@ -896,13 +927,23 @@ fn register_remote_canonical_block(
     let block_hash = nova_runtime::block_hash(&block).map_err(RuntimeError::BlockCodec)?;
     let chain_id = driver.consensus().chain_id();
     let genesis_hash = driver.consensus().genesis_hash();
-    // P1-A.18 RC-1：登记 proposer 必须与**绑定证据**给出的轮一致（proposal-bound 优先，其次
-    // QC-bound；两者冲突 ⇒ 保守 no-op：**不登记**，且**不**以 Err 让节点 fail-closed 退出）。
-    // 无证据 ⇒ 回退既有 round 0（与 P1-A.18 之前行为一致）。
+    // P1-A.18 RC-1 + A3（register ↔ validate parity）：登记 proposer 必须与**绑定证据**给出的轮一致。
+    //
+    // `resolved_round` = **sync validation 已据以验签通过**的那一轮（调用方以**同一**有界 QC 证据切片
+    // + **同一** canonical hash 解析所得，见 `step()` 的 `SyncBlockResponse` 分支）；gossip / 本地路径为
+    // `None`。它作为**QC 侧绑定证据** `(r, block_hash)` 参与**同一个** `resolve_proposer_round_evidence`：
+    // - `Some(r)` ⇒ 与本地 proposal 证据同权参与；二者冲突 ⇒ `Err` ⇒ 保守 no-op（**不登记**，且**不**以
+    //   `Err` 让节点 fail-closed 退出）；二者均无绑定 ⇒ 仍回退既有 round 0；
+    // - `None` ⇒ 逐字保持既有本地证据链（proposal → last_precommit → round 0）——gossip 行为零变化。
+    //
+    // ⚠️ 高度语义不变（仍为父高轮 `height - 1`）；`select_proposer` / `BlockStore::put_verified` 语义不变。
+    let qc_evidence = resolved_round
+        .map(|r| (r, block_hash))
+        .or_else(|| last_precommit_round_evidence(driver.consensus()));
     let Ok(round) = resolve_proposer_round_evidence(
         block_hash,
         proposal_round_evidence(driver.consensus().state(), adapter.head().height),
-        last_precommit_round_evidence(driver.consensus()),
+        qc_evidence,
     ) else {
         return Ok(());
     };
@@ -2339,6 +2380,45 @@ impl NodeRuntime {
             }
             // Duplicate / Full：bounded 丢弃（不自动重试；同一 intent 只消费一次 —— T10）。
         }
+        // B2-C2 —— Trigger #3：低频 proactive catch-up probe（Owner 已批准 Option C′）。
+        //
+        // 动机（trigger starvation，B2-C2 PRECHECK 实测）：节点已连接 Established peer 但对端**停产**
+        // ⇒ 既无 `FutureMissingAncestor` 也无更高外部 QC 证据 ⇒ 既有 Trigger#1/#2 永不触发 ⇒ 落后
+        // 节点可永久停在旧高度（head 停滞数万 step、`sync_pending` 恒 0）。
+        //
+        // 本 probe **只触发既有 pipeline**：scheduler → `dispatch_batch`（correlator.register =
+        // register-before-send）→ `NetworkSyncDispatcher` → 既有响应验证 / 登记 / finality commit。
+        // **不**构造 `MissingAncestorIntent`（不伪造 `observed_block_hash`、**不写 ledger**）、
+        // **不**新建发送 / 验证 / commit 路径、**不**改动 wire / consensus / storage / 既有 limits。
+        //
+        // 安全边界：
+        // - target = `{ height: local_head + 1, block_hash: None }`（ADR-0062 height-anchored：
+        //   `None` 诚实表达“target hash 未知”）—— **绝不**使用 head hash / 前块 hash / 零值 /
+        //   哨兵 / 猜测 hash；真实 hash 由既有响应验证链决定。
+        // - dedup gate（§7 硬要求）：`correlator` active 与 eligible **均空**（request_id 去重
+        //   **≠** target-height 去重，故**不**依赖 request_id）；并额外要求 `scheduler` 队列为空
+        //   —— 确保本 step 已由真实证据排入的请求不会与同高度 probe 重复（只加强，不弱化）。
+        // - 频率：每 `SYNC_PROBE_INTERVAL` 个逻辑 tick 至多 1 次 —— 复用既有 `*tick`。
+        // - peer：复用既有 `select_peer` + 既有 tick 轮转（`attempted`）⇒ one peer per probe，不广播。
+        // - request_id：复用既有 `random_request_id()`（CSPRNG；无新计数器 / 无持久状态）。
+        if *tick % SYNC_PROBE_INTERVAL == 0
+            && scheduler.is_empty()
+            && correlator.is_empty()
+            && correlator.eligible_len() == 0
+            && let Some(hh) = head_height
+            && let Ok(peer) = select_peer(&policy, &candidates, &attempted)
+        {
+            let request_id = random_request_id().map_err(RuntimeError::NetworkSecurity)?;
+            // Duplicate / Full 在此不可达（gate 已保证队列空 + request_id 全新）；仍 bounded 丢弃。
+            let _ = scheduler.schedule(SyncRequestIntent {
+                request_id,
+                peer,
+                target: SyncRequestTarget {
+                    height: hh.saturating_add(1),
+                    block_hash: None,
+                },
+            });
+        }
         if scheduler.is_empty() {
             return Ok(());
         }
@@ -2673,6 +2753,10 @@ impl NodeRuntime {
                 }
                 other => other,
             };
+            // P1-A.18 / A3（register ↔ validate parity）：本 step sync 入站的**同一**有界 QC 证据切片，
+            // 同时供 validation 与 registration 使用（gossip 分支保持空切片 ⇒ 既有本地证据链不变）。
+            // 仅值传递、不新增任何长期状态；生命周期 = 本 step 本次迭代。
+            let mut sync_qc_evidences: Vec<(u64, [u8; 32])> = Vec::new();
             let (source, outcomes, wires) = match (&self.block_production, msg) {
                 (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => (
                     BlockInboundSource::Gossip,
@@ -2711,6 +2795,8 @@ impl NodeRuntime {
                         Some(self.driver.consensus().dag()),
                         &qc_evidences,
                     );
+                    // A3：把**同一**切片交给后续登记阶段（仅值移动；不复制 / 不重算）。
+                    sync_qc_evidences = qc_evidences;
                     // D10-C Step 8：逐块 wire（与 outcomes **同序**；结构损坏 ⇒ 单条 None，
                     // 对应 `Err(Malformed)` —— 不登记 / 不落盘）。
                     let wires = match SyncBlockResponse::decode(&payload) {
@@ -2737,11 +2823,30 @@ impl NodeRuntime {
                     // D10-C Step 8：远端**已验证** canonical-next block ⇒ durable store + 共识 DAG 登记
                     //（node orchestration；不 commit / 不推进 head / 不授予 finality —— 仅使其可被
                     // frozen `verify_qc` 与 commit bridge 消费）。Gossip 与 SyncResponse 统一。
-                    if matches!(verdict, InboundBlockVerdict::CanonicalNextCandidate { .. })
+                    if let InboundBlockVerdict::CanonicalNextCandidate { block_hash, .. } = verdict
                         && let Some(Some(wire)) = wires.get(idx)
                         && let Some(adapter) = self.block_production.as_ref()
                     {
-                        register_remote_canonical_block(&mut self.driver, adapter, wire)?;
+                        // P1-A.18 / A3：registration 必须与 validation 使用**同一**已解析 round。
+                        // - sync 分支：用**同一** `sync_qc_evidences` + 同一 canonical hash（verdict 携带，
+                        //   与 validation 逐字同一值）再次解析 ⇒ 同一 round；
+                        // - gossip 分支：切片为空 ⇒ `Ok(None)` ⇒ 逐字保持既有本地证据链
+                        //   （proposal → last_precommit → round 0）；
+                        // - `Err(冲突轮)` ⇒ **保守拒绝该块**（不落盘 / 不登记；**不得**回退 round 0）。
+                        match resolve_proposer_round_from_evidences(*block_hash, &sync_qc_evidences) {
+                            Ok(resolved_round) => {
+                                register_remote_canonical_block(
+                                    &mut self.driver,
+                                    adapter,
+                                    wire,
+                                    resolved_round,
+                                )?;
+                            }
+                            Err(()) => {
+                                self.block_inbound_skipped =
+                                    self.block_inbound_skipped.saturating_add(1);
+                            }
+                        }
                     }
                 }
                 self.block_inbound_outcomes.push_back(outcome);
@@ -2886,10 +2991,12 @@ impl NodeRuntime {
         }
         // D10-B：Finality → Commit Bridge（每 tick 至多 commit 一个共识-finalized 本地块；
         // 复用 NodeBlockAdapter::apply_block 的冻结 durable commit —— 不重新实现 storage）。
+        // B2-D1：同时传入既有 per-height `qc_history`（hash 绑定 QC ⇒ correct round evidence）。
         finality_commit_bridge(
             &mut self.driver,
             self.block_production.as_mut(),
             self.last_proposal.as_ref(),
+            self.qc_history.as_ref(),
         )?;
         // D10-C Step 7-B：commit 成功后，以 **durable canonical head** 推进 consensus 到下一高度轮
         //（`finality → commit → head durable → advance`；绝不 advance-before-commit）。

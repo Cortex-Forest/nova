@@ -1262,7 +1262,7 @@ fn p1a17_restart_behind_tip_scenario_with(
             live_stats(&c2)
                 .is_some_and(|s| s.head >= target && s.consensus >= target && s.durable_sane())
         },
-        EXIT_TIMEOUT,
+        A17_CATCHUP_WINDOW,
     );
 
     // ---- 验收证据必须在 terminate 之前采集 ----
