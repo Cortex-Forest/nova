@@ -226,7 +226,7 @@ fn pick_non_proposer_victim(nodes: &[Node], needed: u64) -> usize {
     (0..nodes.len())
         .find(|i| {
             let id = validator_id_of_seed(FIVE_VAL[*i]);
-            !owners.iter().any(|p| *p == id)
+            !owners.contains(&id)
         })
         .unwrap_or_else(|| {
             panic!(
