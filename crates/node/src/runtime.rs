@@ -819,9 +819,11 @@ fn finality_commit_bridge(
         return Ok(());
     }
     // Gate 3：解析 finalized 块 —— D10-C Step 4：优先本地 `last_proposal`（strict hash == X）；
-    //    restart 恢复路径（`last_proposal` 已丢失）⇒ 从 `BlockStore.get_content(X)` 解析
-    //    （P1-A.20-C Phase 2 内容型读：legacy 或任一 encoding 同内容；已 strict decode +
-    //    hash 重算 == X）。两者皆失败 ⇒ NO COMMIT（绝不按 height / proposer 猜块）。
+    //    restart 恢复路径（`last_proposal` 已丢失）⇒ **proposer-aware** 从
+    //    `BlockStore.get_for_proposer_verified(X, P, vk_P, chain_id)` 解析
+    //    （P1-A.17 F-1 **Candidate A 修复**：不再使用 proposer-blind `get_content`；
+    //    encoding identity = `(block_hash, proposer)` ⇒ P 的 encoding 唯一；已 strict decode +
+    //    hash 重算 == X + 以 P 的 key 验签）。两者皆失败 ⇒ NO COMMIT（绝不按 height / proposer 猜块）。
     let (block, proposer) = if let Some(pb) = last_proposal.filter(|pb| pb.block_hash == x) {
         (pb.block.clone(), pb.proposal_ref.proposer)
     } else {
@@ -829,12 +831,12 @@ fn finality_commit_bridge(
         let Some(bs) = adapter.block_store() else {
             return Ok(());
         };
-        let Some(b) = bs
-            .get_content(&x)
-            .map_err(|e| blockstore_stage(&format!("finality_commit_get hash={x:02x?}"), e))?
-        else {
-            return Ok(());
-        };
+        // P1-A.17 F-1 **Candidate A 修复（Option A）**：待提交块的 canonical-next 高度
+        // **不再**由 proposer-blind 内容读取得出 —— finality commit 只处理 head 的**严格 child**
+        // （`height == head.height + 1` ∧ `parent == head.block_hash`）；该不变式由既有 gate 强制
+        // （`adopt_verified_external_finality` 前置契约 / `restore_finality_fact` check 6 /
+        // `apply_block_inner` 门⑤）⇒ 轮次证据与期望 proposer 均在检索**之前**确定。
+        let next_height = adapter.head().height.saturating_add(1);
         // proposer（V0.1 parent-height 语义；与 D9 / rebuild / restore 同源 —— 不新造规则）。
         //
         // P1-A.18 RC-1 + **B2-D1**：轮次只取 **hash 绑定**证据（`target == X`），两个来源：
@@ -853,7 +855,7 @@ fn finality_commit_bridge(
         let local_evidence =
             last_precommit_round_evidence(driver.consensus()).filter(|(_, t)| *t == x);
         let history_evidence = qc_history
-            .and_then(|h| h.get(b.header.height).ok().flatten())
+            .and_then(|h| h.get(next_height).ok().flatten())
             .filter(|qc| qc.target == x)
             .map(|qc| (qc.context.round, qc.target));
         // Owner 裁决：**无绑定证据 ⇒ defer**（不猜 round / **不以 round 0 兜底**）。
@@ -868,12 +870,31 @@ fn finality_commit_bridge(
         };
         let Some(p) = select_proposer(
             chain_id,
-            b.header.height.saturating_sub(1),
+            next_height.saturating_sub(1),
             round,
             &genesis_hash,
             set,
         )
         .ok() else {
+            return Ok(());
+        };
+        // 期望 proposer P 的验证 key（与下方 Gate 4 同源：`ValidatorSet.info` ⇒ `VerifyingKey`）——
+        // 仅本分支需要它来**定向**检索 P 的 encoding；Gate 4 语义未变。
+        let Some(p_info) = set.info(&p) else {
+            return Ok(());
+        };
+        let Ok(p_vk) = VerifyingKey::from_bytes(&p_info.consensus_public_key) else {
+            return Ok(());
+        };
+        // **proposer-aware 检索**（Option A；写侧不变式：`put_verified` 要求「写入 `(hash, P)` 的
+        // 字节必须由 P 签名且验证先于落盘」⇒ 读侧必须按 P 定向，否则读写两侧不自洽）：
+        // - P encoding **不存在** ⇒ `Ok(None)` ⇒ **defer**（既有语义；不猜、**绝不回退**它人 encoding）；
+        // - P encoding 存在但记录损坏 / hash 不符 / 文件名 proposer 与实际签名者不符 / 签名不符 /
+        //   chain_id 不符 ⇒ `Err(StorageError::CorruptedState)` ⇒ **fail-closed（fatal，不吞错）**。
+        let Some(b) = bs
+            .get_for_proposer_verified(&x, p.as_bytes(), &p_vk, chain_id)
+            .map_err(|e| blockstore_stage(&format!("finality_commit_get hash={x:02x?}"), e))?
+        else {
             return Ok(());
         };
         (b, p)
@@ -892,9 +913,87 @@ fn finality_commit_bridge(
     // `proposer` / `vk` 均来自上文的**既有**解析（绑定证据 + ValidatorSet）；
     // ⚠️ round 解析语义**未变**（`last_precommit_qc` 绑定 / 回退 round 0 保留给 Phase 3 迁移）。
     let max_encodings = set.len();
-    adapter
-        .apply_block_with_proposer(&wire, &vk, proposer.as_bytes(), max_encodings)
-        .map_err(RuntimeError::BlockCommit)?;
+    let applied = adapter.apply_block_with_proposer(&wire, &vk, proposer.as_bytes(), max_encodings);
+    // P1-A.17 F-1 **最小观测**（Owner 授权；`runtime.rs` 唯一新增）——Gate 5 失败时把
+    // R（QC 绑定轮）/ R'（实际签名者对应轮）/ 期望 proposer / 实际签名者落到 **stderr**
+    // （与本文件既有 `blockstore_stage` 同款先例）。**仅观测**：
+    // - **不**改控制流（下方仍以**逐字相同**的 `map_err(RuntimeError::BlockCommit)` 传播）；
+    // - **不**改错误值 / 退出码 / 状态 / 存储 / 轮次 / proposer / QC / finality / sync；
+    // - **无** round 0 兜底、无 retry、无 fallback、无忽略错误；
+    // - 仅失败路径执行（成功路径零额外开销）。
+    if let Err(e) = &applied
+        && let Ok(x_diag) = nova_runtime::block_hash(&block)
+    {
+        let diag_chain_id = driver.consensus().chain_id();
+        let diag_genesis = driver.consensus().genesis_hash();
+        let st_round = &driver.consensus().state().round;
+        let r_local = last_precommit_round_evidence(driver.consensus())
+            .filter(|(_, t)| *t == x_diag)
+            .map(|(r, _)| r);
+        let r_hist = qc_history
+            .and_then(|h| h.get(block.header.height).ok().flatten())
+            .filter(|qc| qc.target == x_diag)
+            .map(|qc| qc.context.round);
+        let r_used = resolve_proposer_round_evidence(
+            x_diag,
+            r_local.map(|r| (r, x_diag)),
+            r_hist.map(|r| (r, x_diag)),
+        )
+        .ok();
+        // 实际签名者识别（**只读**：以集合内每个成员 key 复验同一 wire；不写状态、不改 block）。
+        let mut actual_id = None;
+        let mut actual_keys: Vec<[u8; 32]> = Vec::new();
+        for v in set.validators() {
+            if let Some(info) = set.info(&v.validator_id)
+                && let Ok(cand) = VerifyingKey::from_bytes(&info.consensus_public_key)
+                && nova_runtime::validate_block_signature(&block, &cand, diag_chain_id).is_ok()
+            {
+                actual_id = Some(v.validator_id);
+                actual_keys.push(v.validator_id.as_bytes().to_owned());
+            }
+        }
+        // 与「实际签名者」自洽的候选 round（= R' 的直接证据；上界有界，不猜、不写状态）。
+        let mut r_matches: Vec<u64> = Vec::new();
+        for r in 0..=st_round.round.saturating_add(8) {
+            if let Ok(pp) = select_proposer(
+                diag_chain_id,
+                block.header.height.saturating_sub(1),
+                r,
+                &diag_genesis,
+                set,
+            ) && Some(pp) == actual_id
+            {
+                r_matches.push(r);
+            }
+        }
+        eprintln!(
+            "F1DIAG stage=gate5_apply_fail block_height={} block_hash={:02x?} parent_hash={:02x?}",
+            block.header.height, x_diag, block.header.parent_hash
+        );
+        eprintln!(
+            "F1DIAG head_height={} state_round=(h{},r{}) state_proposal={:02x?} from_local_proposal={}",
+            adapter.head().height,
+            st_round.height,
+            st_round.round,
+            st_round.proposal.as_ref().map(|p| p.block_hash),
+            last_proposal.is_some_and(|pb| pb.block_hash == x_diag)
+        );
+        eprintln!(
+            "F1DIAG qc_round_local={:?} qc_round_history={:?} round_used_R={:?} \
+             rounds_matching_actual_signer={:?}",
+            r_local, r_hist, r_used, r_matches
+        );
+        eprintln!(
+            "F1DIAG expected_proposer={:02x?} actual_signer={:02x?}",
+            proposer.as_bytes(),
+            actual_keys
+        );
+        eprintln!(
+            "F1DIAG chain_id={} validator_set_id={:02x?} err={}",
+            diag_chain_id, diag_genesis, e
+        );
+    }
+    applied.map_err(RuntimeError::BlockCommit)?;
     Ok(())
 }
 
