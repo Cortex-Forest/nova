@@ -49,3 +49,28 @@ jobs:
 
       - name: Build
         run: cargo build --workspace
+
+  # ===========================================================================
+  # Long tests（独立 job）—— 真实二进制 / 多进程 / 多验证者 / 重连场景。
+  # 设计约束（Owner 批准）：
+  #   - 主 `ci` job 的 `cargo test --workspace` **保持不变**：不删除测试、不降低断言。
+  #   - 长测试**单独运行**：显式列出进程级目标 + 独立超时预算 + 独立可见的 check 结果。
+  # 说明：这些目标通过 `CARGO_BIN_EXE_yazimao-node` 启动**真实进程**（loopback TCP），
+  #       单目标耗时量级 460–880 s；`--test-threads=1` 避免多进程争抢端口/CPU 造成假失败。
+  # ===========================================================================
+  long-tests:
+    name: long tests (binary / multi-process)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable, from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Long tests (real binary / multi-process)
+        run: cargo test -p nova-node --test d10_p1_a12_binary_three_validator --test d10_p1_a21_binary_five_validator --test d10_p1_a3_dual_process --test d10_p1_a9_reconnect -- --test-threads=1
