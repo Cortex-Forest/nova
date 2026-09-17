@@ -15,6 +15,7 @@ members = [
     "crates/consensus",
     "crates/crypto",
     "crates/execution",
+    "crates/genesis-builder",
     "crates/network",
     "crates/node",
     "crates/rpc",

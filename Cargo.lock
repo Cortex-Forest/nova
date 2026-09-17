@@ -561,6 +561,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nova-genesis-builder"
+version = "0.1.0"
+dependencies = [
+ "nova-crypto",
+ "serde_json",
+]
+
+[[package]]
 name = "nova-network"
 version = "0.1.0"
 dependencies = [

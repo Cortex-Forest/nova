@@ -1,0 +1,18 @@
+[package]
+name = "nova-genesis-builder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "YAZIMAO production Genesis builder: strict genesis.json -> canonical genesis.bin + genesis_hash + summary (read-only verification)"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Owner 批准的唯一依赖集合：
+# - nova-crypto：canonical 编码 / hash / decode / validate（唯一来源，禁止重写）
+# - serde_json ：JSON 解析（不引入 serde derive；未知/敏感字段由本 crate 显式拒绝）
+# 禁止：nova-node / nova-consensus / nova-network / nova-test-vectors
+nova-crypto = { path = "../crypto" }
+serde_json.workspace = true
