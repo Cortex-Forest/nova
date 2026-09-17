@@ -200,6 +200,41 @@ fn last_precommit_round_evidence(node: &ConsensusNode) -> Option<(u64, [u8; 32])
         .map(|qc| (qc.context.round, qc.target))
 }
 
+/// D10 Recovery C（Phase 1 / D-1）—— **三源**轮次证据统一处理（**复用**冻结
+/// [`block_dispatch::resolve_proposer_round_evidence`]，不新造轮次规则、不引入新状态）。
+///
+/// 契约（与双源版本逐条一致）：
+/// - 三源**均未**绑定 X ⇒ `Ok(None)` ⇒ 调用方 **defer**（**不以 round 0 兜底**）；
+/// - 恰一源绑定 ⇒ 用其 round（**可为 0，合法**）；
+/// - 多源绑定且轮不一致 ⇒ `Err(())` ⇒ 调用方 **defer**（不静默择一 / 不降级）。
+///
+/// 调用方已各自 `.filter(target == x)`（未绑定 ⇒ `None`）；本函数先把「本地 + 历史」交给既有
+/// helper 做同一冲突判定，再与「恢复 fact QC」求交。
+#[allow(clippy::result_unit_err)]
+fn resolve_proposer_round_evidence_with_recovery(
+    x: [u8; 32],
+    local: Option<(u64, [u8; 32])>,
+    history: Option<(u64, [u8; 32])>,
+    restored: Option<(u64, [u8; 32])>,
+) -> Result<Option<u64>, ()> {
+    let a = resolve_proposer_round_evidence(x, local, history)?;
+    let b = resolve_proposer_round_evidence(x, restored, None)?;
+    let a_bound = local.is_some() || history.is_some();
+    let b_bound = restored.is_some();
+    match (a_bound, b_bound) {
+        (false, false) => Ok(None),
+        (true, false) => Ok(Some(a)),
+        (false, true) => Ok(Some(b)),
+        (true, true) => {
+            if a == b {
+                Ok(Some(a))
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
 /// Node-local proposer step（STEP 10-19-6 OPT-1）：本节点为当前 proposer 时经真实 BlockBuilder
 /// 产出 Block + ProposalRef → submit ProposalRef。
 ///
@@ -214,6 +249,9 @@ fn runtime_propose(
     block_production: &Option<NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>>,
     timestamp: u64,
 ) -> Result<Option<ProposalBuild>, RuntimeError> {
+    // G4（Owner 决策）—— **无 recovery hard guard**：恢复窗口内也照常出块。
+    // 恒不 freeze 活性；finality 冲突保护仍由 frozen `check_finality_applicability`
+    // （Conflict ⇒ 零状态变更）与既有 lock 语义承担。
     let Some(adapter) = block_production.as_ref() else {
         return Ok(None);
     };
@@ -285,6 +323,8 @@ fn drive_local_consensus(
     driver: &mut NodeConsensusDriver<DynSigner>,
     not_applicable: &mut u64,
 ) -> Result<(), RuntimeError> {
+    // G4（Owner 决策）—— **无 recovery vote guard**：`auto_drive()` 恒正常执行
+    // （不跳过 vote / 不跳过本地 QC 派生）—— 避免以“等待 bridge 成功”为条件的活性冻结。
     match driver.auto_drive() {
         Ok(_) => Ok(()),
         Err(err) if derived_qc_not_applicable(&err) => {
@@ -806,6 +846,7 @@ fn finality_commit_bridge(
     adapter: Option<&mut NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>>,
     last_proposal: Option<&ProposalBuild>,
     qc_history: Option<&QcHistory>,
+    restored_qc: Option<&QuorumCertificate>,
 ) -> Result<(), RuntimeError> {
     let Some(adapter) = adapter else {
         return Ok(()); // full-node / 无 canonical adapter ⇒ 无 commit
@@ -858,14 +899,25 @@ fn finality_commit_bridge(
             .and_then(|h| h.get(next_height).ok().flatten())
             .filter(|qc| qc.target == x)
             .map(|qc| (qc.context.round, qc.target));
+        // 来源 C（D10 Recovery C / D-1）：启动时从 finality fact 恢复、已过 Check 1–7 + `verify_qc`
+        // 的 PrecommitQC。同样**必须严格绑定 X**（未绑定 ⇒ 视为无证据）。与其它两源同权参与
+        // “恰一绑定 / 冲突 ⇒ defer” 判定（见 `resolve_proposer_round_evidence_with_recovery`）。
+        let restored_evidence = restored_qc
+            .filter(|qc| qc.target == x)
+            .map(|qc| (qc.context.round, qc.target));
         // Owner 裁决：**无绑定证据 ⇒ defer**（不猜 round / **不以 round 0 兜底**）。
         // 注意：绑定 QC 的 `round == 0` 是**合法**证据 ⇒ 走下方正常路径使用 0（二者严格区分）。
-        if local_evidence.is_none() && history_evidence.is_none() {
+        if local_evidence.is_none() && history_evidence.is_none() && restored_evidence.is_none() {
             return Ok(());
         }
-        // `resolve_proposer_round_evidence` 统一处理：恰一个绑定 ⇒ 其 round（可为 0）；
-        // 两源都绑定但轮不同 ⇒ `Err(())` ⇒ **defer**（不静默择一 / 不降级 round 0 / 不致命）。
-        let Ok(round) = resolve_proposer_round_evidence(x, local_evidence, history_evidence) else {
+        // 三源统一处理：恰一个绑定 ⇒ 其 round（可为 0）；多源绑定但轮不同 ⇒ `Err(())` ⇒ **defer**
+        // （不静默择一 / 不降级 round 0 / 不致命）。无绑定已在上方 return。
+        let Ok(Some(round)) = resolve_proposer_round_evidence_with_recovery(
+            x,
+            local_evidence,
+            history_evidence,
+            restored_evidence,
+        ) else {
             return Ok(());
         };
         let Some(p) = select_proposer(
@@ -1458,6 +1510,10 @@ pub struct NodeRuntime {
     qc_history_written: u64,
     /// P1-A.7 — QC history 写入**失败**次数（观测；不 halting consensus，下一 step 重试）。
     qc_history_write_failed: u64,
+    /// D10 Recovery C — 启动时恢复、**尚未 commit** 的 finality（D-1 证据源；`None` = 无恢复）。
+    /// G4 决策：**仅作 bridge 证据 + 只读观测**，**不** gate 任何 proposal / vote 行为；
+    /// `head == reference` 后清空（状态清理）。**不**参与任何共识规则。
+    restored_finality: Option<bootstrap::RestoredFinality>,
     /// P1-A.7 — 入站 QC 「target ∉ DAG」而被**有界**暂存的次数（观测；含 tip hint 驱动）。
     inbound_qc_deferred: u64,
     /// P1-A.7 — 成功采纳外部 finality 的次数（仅 `Adopted`；观测）。
@@ -1599,8 +1655,10 @@ impl NodeRuntime {
             dag,
         );
         // 恢复注入（仅当 fact 全验证通过；单调 —— 不回退 / 不覆盖既有 finality）。
-        if let Some(x) = restored_finality {
-            consensus.restore_finalized_reference(x);
+        // D10 Recovery C：恢复结果本身（含已验证 QC）保留在 runtime ⇒ bridge 证据源
+        // （G4 决策：**不** gate proposal / vote；仅证据 + 只读观测）。
+        if let Some(restored) = restored_finality.as_ref() {
+            consensus.restore_finalized_reference(restored.reference);
         }
 
         // 5–11. validator mode：KeyProvider → id → SafetyStore → recover → ValidatorActor
@@ -1701,6 +1759,7 @@ impl NodeRuntime {
             qc_history_persisted: None,
             qc_history_written: 0,
             qc_history_write_failed: 0,
+            restored_finality,
             inbound_qc_deferred: 0,
             external_finality_adopted: 0,
             external_finality_rejected: 0,
@@ -1772,6 +1831,21 @@ impl NodeRuntime {
     /// 最近一次本地出块产物（本地保留；不持久化 / 不推进 head）。
     pub fn last_proposal(&self) -> Option<&ProposalBuild> {
         self.last_proposal.as_ref()
+    }
+
+    /// D10 Recovery C — 是否处于恢复窗口（**只读观测**；G4 后不再 gate 任何行为）。
+    ///
+    /// 定义：启动恢复了一个**尚未 commit** 的 finality（`restored_finality.is_some()`）且
+    /// canonical head 仍未到达该 reference。`head == reference` 后清除（`step` 内状态清理）。
+    /// 只读；不做 I/O；不改变任何共识 / 存储状态；**不**禁止 proposal / vote。
+    pub fn recovering_finality(&self) -> bool {
+        let Some(restored) = self.restored_finality.as_ref() else {
+            return false;
+        };
+        match self.block_production.as_ref() {
+            Some(adapter) => adapter.head().block_hash != restored.reference,
+            None => false,
+        }
     }
 
     /// 取走 block inbound dispatch 观测（STEP 10-19-10-A；FIFO；bounded）。
@@ -3098,6 +3172,7 @@ impl NodeRuntime {
             self.block_production.as_mut(),
             self.last_proposal.as_ref(),
             self.qc_history.as_ref(),
+            self.restored_finality.as_ref().map(|r| &r.qc),
         )?;
         // D10-C Step 7-B：commit 成功后，以 **durable canonical head** 推进 consensus 到下一高度轮
         //（`finality → commit → head durable → advance`；绝不 advance-before-commit）。
@@ -3111,6 +3186,17 @@ impl NodeRuntime {
             && head_height > self.driver.consensus().state().round.height
         {
             self.driver.consensus_mut().advance_to_height(head_height);
+        }
+        // D10 Recovery C — 恢复状态清理（**非 gate**）：bridge commit 后 canonical head 已到达
+        // 恢复的 finalized reference ⇒ 清空 `restored_finality`（不再充当 bridge 证据）。
+        // G4 决策：此清理**不**影响 proposal / vote（hard guard 已撤销）；未到达则保留（下 step 可再试）。
+        if let Some(reference) = self.restored_finality.as_ref().map(|r| r.reference)
+            && self
+                .block_production
+                .as_ref()
+                .is_some_and(|a| a.head().block_hash == reference)
+        {
+            self.restored_finality = None;
         }
         // STEP 10-18I-N-IMPL：production egress —— drain Driver semantic outbound →
         // NetworkSigner 编码签名 → NetworkService.broadcast（established-only/queue 由 NS 负责）
@@ -3169,6 +3255,7 @@ impl NodeRuntime {
             qc_history_persisted: _,
             qc_history_written: _,
             qc_history_write_failed: _,
+            restored_finality: _,
             inbound_qc_deferred: _,
             external_finality_adopted: _,
             external_finality_rejected: _,

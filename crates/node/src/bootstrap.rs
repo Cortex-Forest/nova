@@ -613,6 +613,22 @@ pub fn read_finality_fact(path: &Path) -> Result<Option<(u64, [u8; 32])>, NodeSt
     Ok(Some((fact.height, fact.reference)))
 }
 
+/// D10 Recovery C（Phase 1 / D-1）— **已通过恢复校验**的 finality 材料。
+///
+/// 语义：由 [`restore_finality_fact`] 在 Check 1–7 与 `verify_qc` **全部通过之后**构造 ⇒
+/// `qc` 就是原 fact 中的 PrecommitQC（**不重新实现 / 不绕过 / 不放宽任何校验**），
+/// `reference == qc.target`、`height == qc.context.height + 1`。
+/// 用途：restart 恢复窗口内作为 finality commit bridge 的**第三证据源**（不改共识规则）。
+#[derive(Debug, Clone)]
+pub struct RestoredFinality {
+    /// 已恢复（尚未 commit）的 finalized block hash（= `qc.target`）。
+    pub reference: [u8; 32],
+    /// 该块高度（= `qc.context.height + 1`）。
+    pub height: u64,
+    /// 原 fact 中的 PrecommitQC（已通过 Check 1–7 与 `verify_qc`）。
+    pub qc: QuorumCertificate,
+}
+
 /// D10-C Step 4 — restart 时 Finality Recovery Fact 恢复（校验全通过才返回待注入 reference）。
 ///
 /// 校验链（任一步失败 ⇒ `Err`，fail-closed）：
@@ -627,7 +643,9 @@ pub fn read_finality_fact(path: &Path) -> Result<Option<(u64, [u8; 32])>, NodeSt
 /// 7. 加 genesis 根（若 rebuild 空 DAG 且 head == genesis）→ `Dag::add_block(X)`（真实 parent /
 ///    height / `select_proposer` 推导 proposer）→ `verify_qc(qc, set, genesis, dag_with_X)`。
 ///
-/// 返回 `(dag, Option<X>)`：`Some(X)` = 恢复注入目标（未 commit 且 QC/block/DAG 全通过）。
+/// 返回 `(dag, Option<RestoredFinality>)`：`Some(..)` = 恢复注入目标（未 commit 且 QC/block/DAG
+/// 全通过）并**携带同一 fact 中已验证的 PrecommitQC**（D10 Recovery C / D-1 证据源；
+/// 不新增信任来源、不新增校验、不放宽 Check 1–7）。
 pub fn restore_finality_fact(
     path: &Path,
     adapter: &NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>,
@@ -636,7 +654,7 @@ pub fn restore_finality_fact(
     chain_id: u64,
     genesis_hash: [u8; 32],
     mut dag: Dag,
-) -> Result<(Dag, Option<[u8; 32]>), NodeStartupError> {
+) -> Result<(Dag, Option<RestoredFinality>), NodeStartupError> {
     // 无 fact ⇒ 正常启动（无恢复）。
     if !path.exists() {
         return Ok((dag, None));
@@ -723,7 +741,15 @@ pub fn restore_finality_fact(
     // QC 验证（`verify_qc` 要求 target ∈ DAG —— X 已加入）。
     verify_qc(&fact.qc, set, &genesis_hash, &dag).map_err(NodeStartupError::FinalityFactQc)?;
 
-    Ok((dag, Some(fact.reference)))
+    // D10 Recovery C（D-1）：QC 已在**此处**通过全部校验 ⇒ 随结果返回（不引入新信任来源）。
+    Ok((
+        dag,
+        Some(RestoredFinality {
+            reference: fact.reference,
+            height: fact.height,
+            qc: fact.qc,
+        }),
+    ))
 }
 
 // ---------------------------------------------------------------------------

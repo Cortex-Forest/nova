@@ -305,11 +305,22 @@ fn crash_state(config: &NodeConfig, kp: &KeyPair, qc_valid: bool) -> [u8; 32] {
         kp,
     );
     let a_hash = block_hash(&a_block).unwrap();
+    // D10 Recovery C（Phase 4）—— 与**生产写侧**一致：`put_verified`（hash 重算 + 以 proposer 的
+    // vk 复验签名，均先于落盘）建立 `(block_hash, proposer)` encoding。否则 bridge 的
+    // `get_for_proposer_verified(X, P, vk_P, chain_id)` 会因 legacy 单记录布局而定向落空 ⇒ defer。
+    // **块 / proposer / vk / chain_id 均与原先一致**（仅替换写入原语；集合仅 1 名验证者 ⇒ cap=1）。
+    let proposer = ValidatorId::from_consensus_public_key(&kp.verifying_key().to_bytes());
     adapter
         .block_store()
         .unwrap()
-        .put(&a_block)
-        .expect("本地 proposal durable 进 BlockStore");
+        .put_verified(
+            &a_block,
+            proposer.as_bytes(),
+            kp.verifying_key(),
+            CHAIN_ID,
+            1,
+        )
+        .expect("本地 proposal durable 进 BlockStore（verified encoding）");
     let qc = precommit_qc_single(genesis_hash, kp, a_hash, 0, 0, qc_valid);
     persist_finality_fact(
         &fact_path_from(config),
