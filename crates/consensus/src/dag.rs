@@ -163,16 +163,32 @@ impl Dag {
         order
     }
 
-    /// 从 `from` 出发沿 parents 收集可达闭包（含 from；DFS，确定性）。
+    /// 从 `from` 出发沿 parents 收集可达闭包（含 from；**显式栈迭代 DFS**，确定性）。
+    ///
+    /// **D11-1（F1，stack-safety）**：原实现以 ``collect_reachable(&p, acc)`` **自递归**下降，
+    /// 在长 canonical 链（恢复态 ~2.6k 深度）上耗尽主线程栈 —— P3 转储确认
+    /// `STATUS_STACK_OVERFLOW (0xC00000FD)` @ `dag.rs:175`（V2 2,584 帧 / V7 2,581 帧，≈368 B/帧）。
+    /// 此处改为显式 `Vec` 栈，**语义逐项不变**：
+    /// - 可达集合 / visited 行为：每个 hash 仅首次插入时入栈（原递归的 `!acc.insert ⇒ return` 等价）；
+    /// - 缺失节点（`from` 或 parent 不在 `blocks`）：仍登记进 `acc` 且不展开（与原实现一致）；
+    /// - parent 遍历与 genesis 根 / DAG 分叉：逐一展开，成环由 `acc` 防御；
+    /// - **不引入深度上限**（超长链照常完成）；遍历顺序不影响结果
+    ///   （`acc` 为集合，最终顺序由 [`Dag::causal_order`] 的 Kahn 排序决定）。
     fn collect_reachable(&self, from: &[u8; 32], acc: &mut HashSet<[u8; 32]>) {
         if !acc.insert(*from) {
             return;
         }
-        if let Some(r) = self.blocks.get(from) {
+        let mut stack: Vec<[u8; 32]> = vec![*from];
+        while let Some(cur) = stack.pop() {
+            let Some(r) = self.blocks.get(&cur) else {
+                continue;
+            };
             let mut sorted_parents = r.parents.clone();
             sorted_parents.sort_unstable();
             for p in sorted_parents {
-                self.collect_reachable(&p, acc);
+                if acc.insert(p) {
+                    stack.push(p);
+                }
             }
         }
     }
@@ -291,6 +307,59 @@ mod tests {
     fn causal_order_unknown_returns_empty() {
         let dag = Dag::new();
         assert_eq!(dag.causal_order(&[0x77; 32]), Vec::<[u8; 32]>::new());
+    }
+
+    /// **D11-1（F1）栈安全回归**：单父链深度 **12,000**（≫ P3 转储确认的生产故障深度 2,584）。
+    ///
+    /// 走**真实路径** `Dag::causal_order`（→ `collect_reachable`），不测孤立 helper：
+    /// - 修复前：该链在测试线程栈（2 MiB，≈368 B/帧 ⇒ ~5.4k 帧）处溢出，进程 abort；
+    /// - 修复后：显式栈完成，且拓扑序语义不变（可达闭包完整、parent 先于 child、tip 最后）。
+    /// 不放大线程栈、不使用任何特殊运行期配置、不加深度上限。
+    #[test]
+    fn causal_order_deep_chain_12000_is_stack_safe() {
+        const DEPTH: u64 = 12_000;
+        let mut dag = Dag::new();
+        let mut prev = [0u8; 32];
+        dag.add_block(BlockReference {
+            block_hash: prev,
+            height: 0,
+            parents: Vec::new(),
+            proposer: vid(0x01),
+        })
+        .unwrap();
+        let mut hashes: Vec<[u8; 32]> = Vec::with_capacity(DEPTH as usize + 1);
+        hashes.push(prev);
+        for h in 1..=DEPTH {
+            let mut hash = [0u8; 32];
+            hash[0..8].copy_from_slice(&h.to_be_bytes());
+            hash[8] = 0xD1;
+            dag.add_block(BlockReference {
+                block_hash: hash,
+                height: h,
+                parents: vec![prev],
+                proposer: vid(0x02),
+            })
+            .unwrap();
+            hashes.push(hash);
+            prev = hash;
+        }
+        assert!(
+            DEPTH >= 10_000,
+            "回归深度必须 ≥ 10,000（覆盖 2,584 生产故障点）"
+        );
+        assert_eq!(dag.len(), DEPTH as usize + 1);
+
+        let order = dag.causal_order(&prev);
+        assert_eq!(order.len(), hashes.len(), "可达闭包 = 整条链");
+        assert_eq!(order[0], hashes[0], "genesis 根最先");
+        assert_eq!(order[order.len() - 1], prev, "tip 最后");
+        let mut pos: HashMap<[u8; 32], usize> = HashMap::with_capacity(hashes.len());
+        for (i, h) in order.iter().enumerate() {
+            pos.insert(*h, i);
+        }
+        for w in hashes.windows(2) {
+            assert!(pos[&w[0]] < pos[&w[1]], "parent 必须先于 child");
+        }
     }
 
     // ---- is_ancestor（ADR-0053 L-4/L-8 canonical primitive）----
