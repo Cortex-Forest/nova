@@ -125,8 +125,10 @@ struct QcIdentity {
 
 /// Per-height PrecommitQC history（node-local）。
 ///
-/// - `tip`：**内存**最高已写入高度（供 tip hint；**不扫描目录**）。启动时可由调用方经
-///   [`Self::note_tip`] 用本地 finality fact 的高度**播种**；缺失 ⇒ 本 step 不发 hint。
+/// - `tip`：**内存**「本地可提供的 QC history 覆盖高度」（供 tip hint；**不扫描目录**）。
+///   **D11-25 D5**：外部上界（例如本地 finality fact 的高度）只能作为**上界**，必须经
+///   [`Self::seed_tip_from_store`] 向下**有界**探测实际存在的 artifact 后才采纳；
+///   未命中 ⇒ tip 保持 `None`（本 step 不发 hint）。
 #[derive(Debug)]
 pub struct QcHistory {
     dir: PathBuf,
@@ -188,6 +190,28 @@ impl QcHistory {
     /// 某高度是否已有 artifact（只做 `exists()`；不读内容）。
     pub fn contains(&self, height: u64) -> bool {
         self.path_for(height).exists()
+    }
+
+    /// **D11-25 D5** — 以**实际存在的 artifact** 为界**有界**播种 tip（不扫描目录）。
+    ///
+    /// 语义：tip 是「本地可提供的 QC history 覆盖高度」的**服务提示**（sync hint），
+    /// **不是** consensus safety primitive ⇒ **不得**仅凭外部传入的上界（例如 finality fact 的
+    /// 高度）直接宣称该高度存在 QC history。
+    ///
+    /// 实现：从 `upper` 向下探测，最多 `retained` 个高度（且不低于 1）：命中第一个存在的
+    /// artifact ⇒ [`Self::note_tip`] 该高度并返回；全部未命中 ⇒ tip 保持原值（不猜测 / 不降级）。
+    /// `contains` 仅做 `exists()` ⇒ 无内容读取 / 无目录遍历 / 无全历史扫描。
+    pub fn seed_tip_from_store(&mut self, upper: u64) {
+        let mut h = upper;
+        let mut probed = 0u64;
+        while h >= 1 && probed < self.retained {
+            if self.contains(h) {
+                self.note_tip(h);
+                return;
+            }
+            h -= 1;
+            probed += 1;
+        }
     }
 
     /// 写入某高度的 PrecommitQC（幂等；同高度不同 QC ⇒ `Err(Conflict)`，**永不覆盖**）。
@@ -517,6 +541,45 @@ mod tests {
 
     fn open(dir: &Path, genesis_hash: [u8; 32]) -> QcHistory {
         QcHistory::open(dir, NetworkId::Mainnet, CHAIN_ID, genesis_hash)
+    }
+
+    /// **D11-25 D5**：tip 播种只能采纳**实际存在**的 artifact 高度（不得凭外部上界虚报）。
+    #[test]
+    fn seed_tip_from_store_never_overclaims() {
+        let (g, _, _) = genesis2();
+        let gh = compute_genesis_hash(&g).expect("hash");
+        let dir = tmp_dir("seed");
+        // 空 store：任何上界 ⇒ tip 保持 None（不猜测）。
+        let mut empty = open(&dir, gh);
+        empty.seed_tip_from_store(9);
+        assert_eq!(empty.tip_height(), None, "无 artifact ⇒ 不播种");
+        // 写入高度 1..=3。
+        let mut store = open(&dir, gh);
+        for h in 1..=3u64 {
+            let qc = signed_qc(gh, h - 1, 0, [h as u8; 32]);
+            store.put(h, &qc).expect("put");
+        }
+        // 新实例（模拟 restart）：上界高于实际覆盖 ⇒ 采纳**实际**最高（3），而非上界（7）。
+        let mut reopened = open(&dir, gh);
+        reopened.seed_tip_from_store(7);
+        assert_eq!(
+            reopened.tip_height(),
+            Some(3),
+            "tip = 实际最高 artifact（不是外部上界）"
+        );
+        // 上界低于实际覆盖且该高度存在 ⇒ 采纳该上界。
+        let mut bounded = open(&dir, gh);
+        bounded.seed_tip_from_store(2);
+        assert_eq!(bounded.tip_height(), Some(2));
+        // 上界远高于覆盖（超出 retention 窗口）⇒ 有界探测未命中 ⇒ 不虚报。
+        let mut far = open(&dir, gh);
+        far.seed_tip_from_store(u64::MAX);
+        assert_eq!(
+            far.tip_height(),
+            None,
+            "超出 retention 窗口 ⇒ 不虚报 coverage"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

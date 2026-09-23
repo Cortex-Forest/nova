@@ -599,18 +599,48 @@ fn d10_c6_t10_finality_crash_same_key_recovery_commit() {
     )
     .unwrap();
 
-    // REAL RESTART（同 seed）：RecoveryFact 恢复注入 X → bridge 从 BlockStore commit X。
+    // REAL RESTART（同 seed）— **D11-23 U4-C 语义**：
+    // ahead-of-head（fact X@1、head = genesis）⇒ **不注入** `finalized_reference`（`R = None`）
+    // + 启动**成功**（不中止）；X / fact 证据保留；bridge 不再以该 fact 为授权完成 commit。
     let mut r = build_test_runtime(&config, TEST_VALIDATOR_SEED);
     assert_eq!(
         r.consensus().state().finality.finalized_reference,
-        Some(a_hash),
-        "RecoveryFact 恢复注入 X"
+        None,
+        "U4-C：ahead fact **不**注入 finalized_reference"
     );
-    step_until_head_height(&mut r, 1);
     assert_eq!(
-        r.block_production().unwrap().head().block_hash,
-        a_hash,
-        "bridge 完成 commit X"
+        r.block_production().unwrap().head().height,
+        0,
+        "U4-C：head 不因 fact 的 reference 被推进（bridge Gate 1 要求 R = Some）"
+    );
+    assert!(
+        r.block_production()
+            .unwrap()
+            .block_store()
+            .unwrap()
+            .contains(&a_hash)
+            .unwrap(),
+        "U4-C：X 的 durable encoding 保留（R = None ≠ 删除 evidence）"
+    );
+    assert!(
+        config.storage_dir.join(FINALITY_FACT_FILE).exists(),
+        "U4-C：durable FinalityFact 文件保留"
+    );
+    // Rule 7：U4-C 只改变 restart restoration —— 运行期由既有共识路径重新建立 finality
+    // （`None ⇒ Advance`，frozen 语义）；此处在单验证者 rig 中步进验证事件循环继续运行。
+    // D11-25：fact 高于节点当前 finality ⇒ writer **非致命跳过**（D3）；同高度证据冲突仍
+    // fail-closed（D4）⇒ 本 rig 保留「一次 Err 即跳出」的容错（不与任何安全断言冲突）。
+    let mut steps_ok = 0u64;
+    for _ in 0..20 {
+        if r.step().is_err() {
+            break;
+        }
+        steps_ok += 1;
+    }
+    assert!(steps_ok > 0, "U4-C：启动后事件循环必须继续运行");
+    assert!(
+        r.consensus().state().finality.finalized_reference.is_some(),
+        "U4-C 不永久禁用 finality：本地 finality 可经既有 transition ⑥ 重新建立"
     );
     r.shutdown().unwrap();
 }

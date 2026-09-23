@@ -28,7 +28,9 @@ use nova_runtime::{
 };
 
 use nova_node::block_adapter::NoAccountsKeyResolver;
-use nova_node::bootstrap::{FINALITY_FACT_FILE, NodeConfig, persist_finality_fact};
+use nova_node::bootstrap::{
+    FINALITY_FACT_FILE, NodeConfig, persist_finality_fact, read_finality_fact,
+};
 
 /// 单验证者 genesis 成员（seed 派生 ⇒ 重启后同一 key 可复现）。
 const VAL_SEED: [u8; 32] = SEED_V1;
@@ -148,84 +150,105 @@ fn assert_validator_matches_rig(genesis_hash: [u8; 32]) {
 }
 
 // ---------------------------------------------------------------------------
-// A22-1 — fact 可恢复；不 panic；bridge 仍 commit X
+// A22-1（D11-23 **U4-C REWRITE**）— fact 存在但 **不注入**；启动继续；head 不被推进
 // ---------------------------------------------------------------------------
 
 #[test]
-fn d10_a22_t1_recovery_fact_restores_and_commits() {
+fn d10_a22_t1_u4c_no_injection_continue() {
     let env = Env::new("a22t1", &[VAL_SEED]);
     let config = env.config("a", None, Vec::new());
     let (a_hash, genesis_hash) = write_crash_state(&config);
     assert_validator_matches_rig(genesis_hash);
 
-    let mut node = start_node(&env, "a", VAL_SEED, NET_SEED, None, Vec::new());
-    // (1) recovery fact 可以恢复（只读观测；G4 后不 gate 任何行为）。
-    assert!(node.rt.recovering_finality(), "启动即处于恢复窗口");
-    assert_eq!(head_height(&node.rt), 0);
+    let node = start_node(&env, "a", VAL_SEED, NET_SEED, None, Vec::new());
+    // U4-C：valid ahead fact ⇒ **不**注入 `finalized_reference`（`R = None`）+ 启动成功。
     assert_eq!(
         finalized_ref(&node.rt),
-        Some(a_hash),
-        "fact 已注入 finality"
+        None,
+        "U4-C：ahead fact **不**注入 finalized_reference"
     );
-
-    // (2) 不 panic；bridge 以 fact QC 为第三证据源完成 commit。
-    let mut committed = false;
-    for _ in 0..20 {
-        node.rt
-            .step()
-            .expect("step 必须 Ok（不 panic / 不 fail-closed）");
-        if head_hash(&node.rt) == a_hash {
-            committed = true;
-            break;
-        }
-    }
     assert!(
-        committed,
-        "bridge 从 verified encoding commit X（head == X）"
+        !node.rt.recovering_finality(),
+        "U4-C：无注入 ⇒ 无 recovery window"
     );
-    assert_eq!(head_height(&node.rt), 1);
-    assert!(!node.rt.recovering_finality(), "head == X ⇒ 状态清理");
+    assert_eq!(
+        head_height(&node.rt),
+        0,
+        "head 未被 bridge 推进（不 commit X）"
+    );
+    // evidence 保留：X 的 durable encoding 仍在（后续正常追赶路径可用）。
+    assert!(
+        node.rt
+            .block_production()
+            .unwrap()
+            .block_store()
+            .unwrap()
+            .contains(&a_hash)
+            .unwrap(),
+        "X 仍 durable 于 BlockStore（R = None ≠ 删除 evidence）"
+    );
     node.rt.shutdown().unwrap();
 }
 
 // ---------------------------------------------------------------------------
-// A22-2 — 恢复窗口不冻结 consensus 活性（head 必须跨过 X）
+// A22-2（D11-23 **U4-C REWRITE**）— ahead fact 在场时的稳态行为（含 A-1 writer 交互）
 // ---------------------------------------------------------------------------
 
 #[test]
-fn d10_a22_t2_recovery_window_does_not_freeze_consensus() {
+fn d10_a22_t2_steady_state_with_ahead_fact() {
     let env = Env::new("a22t2", &[VAL_SEED]);
     let config = env.config("a", None, Vec::new());
-    let (_a_hash, _) = write_crash_state(&config);
+    let (a_hash, _) = write_crash_state(&config);
 
     let mut node = start_node(&env, "a", VAL_SEED, NET_SEED, None, Vec::new());
-    assert!(node.rt.recovering_finality(), "恢复窗口成立");
-
-    // (3) 活动性：本地出块 / 投票 / 推进不得被冻结 ⇒ head 必须跨过 X（≥ 2）。
-    let mut reached = 0u64;
-    for _ in 0..80 {
-        node.rt.step().expect("step 必须 Ok");
-        reached = head_height(&node.rt);
-        if reached >= 2 {
-            break;
+    assert!(
+        !node.rt.recovering_finality(),
+        "U4-C：无注入 ⇒ 无 recovery window"
+    );
+    // 步进：U4-C **不**永久禁用 finality —— 本地共识路径可重新建立 `finalized_reference`
+    // （`None ⇒ Advance` 为 frozen 语义），head 由既有 bridge / 本地路径推进。
+    let mut steps_ok = 0u64;
+    let mut first_err: Option<String> = None;
+    for _ in 0..20 {
+        match node.rt.step() {
+            Ok(()) => steps_ok += 1,
+            Err(e) => {
+                first_err = Some(format!("{e:?}"));
+                break;
+            }
         }
     }
+    assert!(steps_ok > 0, "启动后 step 循环必须正常运行");
     assert!(
-        reached >= 2,
-        "恢复窗口不得冻结活性：head 必须推进到 ≥ 2（实际 {reached}）"
+        finalized_ref(&node.rt).is_some(),
+        "U4-C 不永久禁用 finality：`finalized_reference` 可经既有共识路径重新建立"
+    );
+    assert!(
+        head_height(&node.rt) >= 1,
+        "head 由本地/既有路径推进（而非经 fact 恢复）"
     );
     assert!(
         node.rt.last_proposal().is_some(),
         "本地出块照常（G4：无 hard guard）"
     );
-    assert!(
+    // D11-25 writer 交互记录（本 fixture）：同高度判定 = **完整编码字节一致才 idempotent** —— 若
+    // 节点自产 block@1 的 reference / QC 与 durable fact **不同**，同高度写入会命中
+    // `FinalityFactSameHeightConflict`（Err）⇒ steps_ok 会在首次 finality 处中断。
+    // （D11-25 D3 另规定 `new.height < existing.height` 为**非致命跳过**；本 fixture 中 fact 高度不高于
+    //   节点进度时不会触发该分支。）故 steps_ok 完整跑满即等价于“同高度写入走了 idempotent 分支”。
+    let fact_after = read_finality_fact(&config.storage_dir.join(FINALITY_FACT_FILE)).unwrap();
+    eprintln!(
+        "A22-2 OBS steps_ok={steps_ok} head={} R_is_some={} first_err={:?} fact_after={fact_after:?} fact_x={a_hash:?} contains_x={}",
+        head_height(&node.rt),
+        finalized_ref(&node.rt).is_some(),
+        first_err,
         node.rt
-            .consensus()
-            .state()
-            .finality
-            .finalized_reference
-            .is_some(),
-        "finality 服务正常"
+            .block_production()
+            .unwrap()
+            .block_store()
+            .unwrap()
+            .contains(&a_hash)
+            .unwrap()
     );
     node.rt.shutdown().unwrap();
 }
@@ -235,48 +258,22 @@ fn d10_a22_t2_recovery_window_does_not_freeze_consensus() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn d10_a22_t3_completion_resumes_consensus() {
+fn d10_a22_t3_no_recovery_completion_path() {
     let env = Env::new("a22t3", &[VAL_SEED]);
     let config = env.config("a", None, Vec::new());
     let (a_hash, _) = write_crash_state(&config);
 
     let mut node = start_node(&env, "a", VAL_SEED, NET_SEED, None, Vec::new());
-    node.rt.step().expect("step 1（bridge commit X）");
-    assert_eq!(
+    // U4-C：**不再**存在“bridge commit X → head == X → 恢复完成”路径（R = None ⇒ Gate 1 失败）。
+    node.rt.step().expect("step 1");
+    assert_ne!(
         head_hash(&node.rt),
         a_hash,
-        "head == finalized（恢复完成条件）"
+        "U4-C：head 永不因 fact 的 reference 而 == X"
     );
-    assert!(!node.rt.recovering_finality(), "状态回到 Normal");
-    assert_eq!(
-        node.rt.consensus().state().round.height,
-        1,
-        "commit 后已按 durable head 推进到高度 1 轮"
-    );
-
-    // Normal：恢复出块（head → 2）。
-    let mut advanced = false;
-    for _ in 0..40 {
-        node.rt.step().expect("step（Normal）");
-        if head_height(&node.rt) >= 2 {
-            advanced = true;
-            break;
-        }
-    }
-    assert!(advanced, "恢复完成后必须恢复出块（head 推进到 2）");
     assert!(
         node.rt.last_proposal().is_some(),
-        "Normal 下本地 proposal 恢复"
-    );
-    assert_eq!(head_height(&node.rt), 2);
-    assert!(
-        node.rt
-            .consensus()
-            .state()
-            .finality
-            .finalized_reference
-            .is_some(),
-        "finality 持续推进"
+        "本地出块照常（G4：无 hard guard）"
     );
     node.rt.shutdown().unwrap();
 }

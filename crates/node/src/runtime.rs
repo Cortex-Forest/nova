@@ -786,8 +786,11 @@ fn process_inbound_consensus_command(
 /// - 观察 frozen transition ⑥ 产出的 `finalized_reference = Some(X)`（consensus 只读；不制造
 ///   finality / QC）；QC 取同一 transition 派生的 PrecommitQC（`qc.target == X` 才写 —— 否则
 ///   保守跳过，绝不写 reference-only fact）。
-/// - 幂等：`X` 已持久化 ⇒ no-op（避免每 tick 重写同一 fact）。
+/// - 幂等：`X` 已持久化（完整字节一致）⇒ no-op（避免每 tick 重写同一 fact）。
 /// - `height` = canonical-next 块高（`qc.context.height + 1`；与 restore 校验一致）。
+/// - **D11-25（Model B）**：runtime `R` 前进到**低于**已有 durable evidence 的高度 ⇒
+///   `persist_finality_fact` **不写**并返回 `Ok`（非致命跳过，保留更高证据）⇒ 本调用
+///   **不得**因此产生 fatal Err / 进程退出；只有**同高度证据冲突**才 fail-closed。
 /// - 写失败 ⇒ `Err`（fail-closed；bridge 不执行 —— 不进入「finality 未 durable 却 commit」）。
 /// - free fn：step 网络段持有 `network_stack` 可变借用时，经不相交字段引用调用（不整 &mut self）。
 fn persist_finality_fact_if_needed(
@@ -1448,7 +1451,11 @@ pub struct NodeRuntime {
     last_proposal: Option<ProposalBuild>,
     /// D10-C Step 4 — Finality Recovery Fact 文件路径（chain storage 目录；durable-before-bridge）。
     finality_fact_path: PathBuf,
-    /// D10-C Step 4 — 已 durable 持久化的 finality reference（幂等：避免每 tick 重写同一 fact）。
+    /// D10-C Step 4 / **D11-25** — 已**处理**的 finality reference（幂等：避免每 tick 重写同一 fact）。
+    ///
+    /// D11-25（Model B）语义：`persist_finality_fact` 在「既有 durable evidence 更高」时**不写**
+    /// 并返回 `Ok`（非致命跳过）⇒ 本标记含义 = 「该 reference 已被评估/处理」，
+    /// **不**等价于「该 reference 已在 fact 文件中」。
     finality_fact_persisted: Option<[u8; 32]>,
     /// 协议最大块字节（来自 genesis `protocol_parameters`；block inbound validation 上限；
     /// 不修改协议参数 —— 只读供 `block_dispatch` context 使用）。
@@ -1602,7 +1609,11 @@ impl NodeRuntime {
 
         // P1-A.7 / P1-A.20-C Phase 2：per-height PrecommitQC history（ADR-0064）。
         // - 仅在有 canonical adapter（能验证 / 提交）时装配 —— full-node 不产生无主 artifact。
-        // - tip 由本地 finality fact 高度**播种**（单文件读取；**不扫描** `qc_history/`）。
+        // - **D11-25 D5**：tip 必须 ≤ 实际可用 coverage ⇒ fact 高度仅作**上界**，由
+        //   `seed_tip_from_store` 向下**有界**探测现有 artifact（不扫描目录 / 不遍历历史）；
+        //   未命中 ⇒ tip 保持 `None`（不发 hint）；fact 缺失 / 不可读 ⇒ 同样不播种。
+        //   （tip 属 sync/service hint，**不是** consensus safety primitive；本改动不引入任何新
+        //     的 durable 语义对象，也不改变既有术语集合。）
         // - **Phase 2 顺序调整**：在 DAG 重建**之前**构造 —— 重建需要按高度读取历史 QC 的
         //   `context.round` 以解析历史（round ≥ 1）块的 proposer（见 `rebuild_consensus_dag`）。
         let mut qc_history = block_production.as_ref().map(|_| {
@@ -1618,7 +1629,7 @@ impl NodeRuntime {
                 &config.storage_dir.join(bootstrap::FINALITY_FACT_FILE),
             )
         {
-            history.note_tip(height);
+            history.seed_tip_from_store(height);
         }
         // D10-C Step 2 — DAG Restart Rebuild：validator（bootstrap 装配 canonical BlockStore）在
         //    restart 后沿 canonical head → parent 链重建 Consensus DAG ancestry（consensus DAG 不
@@ -3141,6 +3152,7 @@ impl NodeRuntime {
         // D10-C Step 4：Finality → durable Recovery Fact（**durable-before-bridge**；幂等）。
         // 观察 frozen transition ⑥ 产出的 finalized_reference + 同一 transition 派生的
         // PrecommitQC（consensus 只读；经不相交字段调用 —— 网络段已持 network_stack 借用）。
+        // D11-25（Model B）：R 低于既有 durable evidence ⇒ 不写 + 非致命继续（保留更高证据）。
         persist_finality_fact_if_needed(
             &self.driver,
             &self.chain_identity,

@@ -186,7 +186,7 @@ effective catch-up distance
 3. take block inbound
 4. register_remote_canonical_block
 5. adopt_pending_external_finality          （≤ 2 / step）
-6. persist finality fact
+6. persist finality fact（低于既有 durable evidence ⇒ no-op，非致命）
 7. persist QC history
 8. existing finality commit bridge
 9. advance_to_height
@@ -243,9 +243,20 @@ S10 所有 reject 必须 fail closed
 |---|---|---|
 | A | QC persisted → crash → restart | QC history **remains serviceable** |
 | B | `broadcast → persist` | **禁止**；正确顺序为 `persist → then broadcast`（由 step ordering 保证） |
-| C | 重复写（same height + same reference） | **idempotent** |
-| D | 冲突（same height + different reference） | **reject / never overwrite** |
-| E | finality fact 已 durable、commit 尚未完成 | 重启依靠**既有**恢复机制（`restore_finality_fact` + DAG rebuild + WAL）恢复一致状态 |
+| C | 重复写（same height + **identical complete evidence**） | **idempotent**（完整编码字节一致才幂等，no-op） |
+| D | 冲突（same height + **different reference**） | **reject / never overwrite** |
+| D2 | 冲突（same height + same reference + **different evidence**） | **reject / never overwrite**（finality evidence 是**证据对象**，不只 reference 一个字段） |
+| E | finality fact 已 durable、commit 尚未完成 | 重启：读/校验 durable fact → 按 durable ChainHead 重建 DAG → **不**盲目注入 runtime `finalized_reference`；`FinalityFact` 可高于 `ChainHead` 与 runtime `finalized_reference`；更高的 durable evidence **保留**，不因 runtime `R` 落后而降级/覆盖；runtime finality 由既有 consensus 路径**独立重建** |
+
+**D11-25 clarification（FinalityFact 语义）**：
+
+- `FinalityFact` = **durable finality evidence snapshot**；**不是** `finalized_reference` 的 runtime
+  mirror，也不与之构成等式约束。
+- 两者生命周期不同：`finalized_reference` 是 runtime consensus object（volatile；按 frozen DAG
+  ancestry 单调）；finality evidence 是 durable 对象（**永不降级**）。
+- 因此 `Fact > ChainHead` 与 `Fact > runtime R` 均为**合法状态**（durable-before-bridge 的 crash
+  window）；runtime `R` 前进到低于已有 evidence 的高度 ⇒ **不写 / 不覆盖 / 不删除 / 不报错**
+  （非致命继续）；仅**同高度证据冲突**（Case D / D2）才 fail-closed。
 
 补充：QC history 写入失败**不** halting consensus（它是**对端服务能力**，不参与本地 safety /
 finality / commit 不变式）；失败按观测计数并在下一 step 重试（本地 fail-closed 语义由存储 API

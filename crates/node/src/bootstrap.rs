@@ -162,6 +162,18 @@ pub enum NodeStartupError {
     FinalityFactMissingBlock,
     /// Finality Recovery Fact：与 canonical head 关系冲突（同高异 hash / unrelated / 高度异常）。
     FinalityFactHeadConflict,
+    /// Finality Recovery Fact **写入侧**：同高度但**证据内容不同** ⇒ 拒绝覆盖（fail-closed）。
+    ///
+    /// D11-25（Owner 冻结，D4）：finality evidence 是**证据对象**（不只是 block reference 一个
+    /// 字段）⇒ 同高度**仅**允许**完整编码字节一致**（idempotent no-op）。两种形态均拒绝：
+    ///   · 同高度 + 不同 reference；
+    ///   · 同高度 + 同 reference + 不同 QC / evidence / 其它编码字节。
+    /// 属 **IMPLEMENTATION SAFETY INVARIANT**（**非**协议规则 / **非**共识规则；保护对象 =
+    /// durable evidence，**不是** `finalized_reference`，**不是** canonical head）。
+    ///
+    /// 注意（D11-25 D3）：`new.height < existing.height`（runtime `R` 落到已有 evidence 之下）
+    /// **不是**错误 —— 见 [`persist_finality_fact`]：不写 + 非致命继续。
+    FinalityFactSameHeightConflict,
 }
 
 /// 完整节点启动：first-start bootstrap 或 restart recovery，返回已构造的适配器。
@@ -446,8 +458,8 @@ pub fn rebuild_consensus_dag(
 // =========================================================================
 // D10-C Step 4 — Finality Recovery Fact（node-local；最小 + fail-closed）
 //
-// 目标：`Finality(X) 已达成 → commit 前 crash → restart` 时，从 durable fact 恢复
-// `X was finalized`，使既有 D10-B bridge 能继续 commit X —— 不持久化完整 ConsensusState、
+// 目标：`Finality(X) 已达成 → commit 前 crash → restart` 时，durable fact 保留 `X was finalized`
+// 这一**已验证证据**（供审计 / 服务 / runtime 独立重建），不持久化完整 ConsensusState、
 // 不改 frozen consensus/crypto/core/storage/network、不伪造 finality。
 //
 // 格式（deterministic，node-only；无第二套协议 wire）：
@@ -457,8 +469,24 @@ pub fn rebuild_consensus_dag(
 //
 // 语义：`finalized_reference == qc.target` 且 `qc.context.height + 1 == height`
 // （V0.1 canonical-next：块在 round.height 的 canonical-next ⇒ 块高 = QC 轮高 + 1）。
-// 读取侧任何损坏 / identity 失配 / QC 失败 / block 缺失 / 高度 / head 关系冲突 ⇒ `Err`
+// 读取侧任何损坏 / identity 失配 / QC 失败 / block 缺失 / 高度不符 ⇒ `Err`
 // （fail-closed；绝不当「无 fact」、绝不 ignore、绝不自动覆写损坏文件）。
+//
+// D11-23 U4-C（Owner 冻结）—— **ahead-of-head 不等于 invalid**：
+//   · `verify_qc` 先于 head/canonical 关系判定（IPC-1）⇒ invalid QC **不会**被 ahead 规则静默忽略；
+//   · verified valid 且 reference 严格高于 ChainHead 且可证明为 canonical descendant ⇒
+//     **不注入** `finalized_reference`（`R = None`）+ **继续启动**（不中止）；
+//   · 关系**不可证明**（含同高异 hash / unrelated parent）⇒ 保持既有 `FinalityFactHeadConflict`。
+//   ⇒ U4-C 只改变「是否把 fact 的 reference 装载进 runtime」，不改变任何有效性判定。
+//
+// D11-25（Owner 冻结）—— **FinalityFact = durable finality evidence（Model B）**：
+//   · fact **不是** `finalized_reference` 的 runtime mirror；二者生命周期不同：
+//     `finalized_reference` 是 runtime consensus object（volatile；按 frozen DAG ancestry 单调），
+//     fact 是 durable finality evidence（**永不降级**）；
+//   · 因此 `Fact > R` 与 `Fact > ChainHead` 均为**合法状态**（durable-before-bridge 的既有 crash
+//     window），**不**代表 corruption / downgrade / startup failure；
+//   · 写入侧语义（见 [`persist_finality_fact`]）：runtime `R` 前进到**低于**已有 fact 高度 ⇒
+//     **不写、不覆盖、不删除、不报错**（非致命继续）；仅**同高度证据冲突**才 fail-closed。
 // =========================================================================
 
 /// Finality Recovery Fact 文件名（chain storage 目录下；与 canonical block 文件分离）。
@@ -580,11 +608,20 @@ fn parse_fact(bytes: &[u8]) -> Result<ParsedFact, NodeStartupError> {
     })
 }
 
-/// D10-C Step 4 — 持久化 Finality Recovery Fact（原子写；durable-before-bridge）。
+/// D10-C Step 4 / **D11-25** — 持久化 Finality Recovery Fact（原子写；durable-before-bridge）。
 ///
 /// - 调用方契约：`reference == qc.target` 且 `qc` 为已验证 PrecommitQC（本函数防御检查
 ///   `reference == qc.target`）；`height` = finalized block 高度（= `qc.context.height + 1`）。
-/// - 幂等由调用方避免重复写（同 reference 重写同内容亦无害）。
+/// - **语义（D11-25 D1 = Model B）**：fact = **durable finality evidence snapshot**，
+///   **不是** runtime `finalized_reference` 的 mirror；`Fact > R` / `Fact > ChainHead` 为合法状态。
+/// - **写入状态机（D11-25 D3/D4）**：
+///     ① 无既有 fact ⇒ 写入；
+///     ② 完整编码字节一致 ⇒ idempotent no-op（不重复原子写）；
+///     ③ `new.height > existing.height` ⇒ 写入（证据前进）；
+///     ④ `new.height < existing.height` ⇒ **不写 / 不覆盖 / 不删除 / 不报错**（非致命继续；
+///        保留更高 durable evidence —— runtime `R` 落后**不是**错误）；
+///     ⑤ `new.height == existing.height` 且证据内容不同（不同 reference，或同 reference 但
+///        QC / evidence 字节不同）⇒ `FinalityFactSameHeightConflict`（fail-closed，不覆盖）。
 /// - 失败 ⇒ `Err`（fail-closed；不影响 canonical commit —— commit 由 bridge 后续执行）。
 pub fn persist_finality_fact(
     path: &Path,
@@ -599,6 +636,37 @@ pub fn persist_finality_fact(
         fs::create_dir_all(parent).map_err(|_| NodeStartupError::StorageIo)?;
     }
     let bytes = encode_fact(network_id, chain_id, genesis_hash, height, reference, qc)?;
+    // D11-23 A-1 + **D11-25（Owner 冻结）**：durable evidence 单调保护（Model B）。
+    //
+    // 属 **IMPLEMENTATION SAFETY INVARIANT**（非协议 / 非共识规则）；保护对象 = durable evidence
+    // （`finality_fact.bin`），**不是** `finalized_reference`，**不是** canonical head。
+    //   · 无既有 fact ⇒ 写入；
+    //   · 完整字节一致 ⇒ idempotent no-op；
+    //   · 既有高度**更高** ⇒ **不写 + 非致命继续**（保留更高证据；D11-25 D3 —— runtime `R`
+    //     前进到低于已有 evidence 的高度**不是**错误，不得产生 fatal Err / 进程退出）；
+    //   · 更高高度 ⇒ 允许覆盖（证据正常前进）；
+    //   · 同高度 + 证据不同 ⇒ `FinalityFactSameHeightConflict`（fail-closed，不覆盖）。
+    // 身份判据 = `encode_fact` 的字节级比较（**不**把 byte equality 当 consensus validity）。
+    // 为**不**静默覆盖损坏文件（与模块头注释既有原则一致），无法解析的既有 fact ⇒ `FinalityFactCorrupt`。
+    if path.exists() {
+        let existing = fs::read(path).map_err(|_| NodeStartupError::StorageIo)?;
+        if existing == bytes {
+            // ② 完整编码字节一致（含同高度同内容）⇒ 幂等：不重复原子写。
+            return Ok(());
+        }
+        let old = parse_fact(&existing)?;
+        if old.height > height {
+            // ④ 既有证据更高 ⇒ 不写 / 不覆盖 / 不删除 / 不报错（D11-25 D3）：
+            //    runtime `R` 落在已有 durable evidence 之下是**合法状态**（Model B）
+            //    ⇒ 保留更高证据，非致命继续。
+            return Ok(());
+        }
+        if old.height == height {
+            // ⑤ 同高度 + 证据内容不同 ⇒ fail-closed（不覆盖）。D11-25 D4：finality evidence 是
+            //    证据对象 ⇒ 只有**完整编码字节一致**才算 idempotent。
+            return Err(NodeStartupError::FinalityFactSameHeightConflict);
+        }
+    }
     atomic_write_fact(path, &bytes)
 }
 
@@ -629,23 +697,28 @@ pub struct RestoredFinality {
     pub qc: QuorumCertificate,
 }
 
-/// D10-C Step 4 — restart 时 Finality Recovery Fact 恢复（校验全通过才返回待注入 reference）。
+/// D10-C Step 4 / **D11-23 U4-C** — restart 时 Finality Recovery Fact 恢复校验。
 ///
-/// 校验链（任一步失败 ⇒ `Err`，fail-closed）：
-/// 1. identity（network_id / chain_id / genesis_hash）；2. QC 为 Precommit 且
-///    `reference == qc.target`；3. `qc.context.height + 1 == height`（canonical-next parent-round）；
-/// 4. `reference` 已在 committed DAG ⇒ fact 已满足（**幂等 / stale ignore** —— 不注入、不回退）；
-/// 5. `BlockStore.get_content(reference)` 存在且 `block.header.height == height`
-///    （**P1-A.20-C Phase 2**：内容型读 —— legacy 或任一 encoding 同内容）；
-/// 6. canonical head 关系：未 commit 时要求 X 是 head 的严格 child（`parent == head.block_hash ∧
-///    height == head.height + 1`），否则 ⇒ `FinalityFactHeadConflict`（同高异 hash / unrelated /
-///    高度异常；**绝不选择 / 绝不猜测**）；
-/// 7. 加 genesis 根（若 rebuild 空 DAG 且 head == genesis）→ `Dag::add_block(X)`（真实 parent /
-///    height / `select_proposer` 推导 proposer）→ `verify_qc(qc, set, genesis, dag_with_X)`。
+/// 校验链（**D11-23 R1/R3 顺序**；任一步失败 ⇒ `Err`，fail-closed）：
+/// 1. structural（`parse_fact`：magic / version / 长度 / checksum / `decode_qc`）；
+/// 2. identity（network_id / chain_id / genesis_hash）；
+/// 3. QC **结构性**：Precommit 且 `reference == qc.target` 且 `qc.context.height + 1 == height`；
+/// 4. block/reference：`BlockStore.get_content(reference)` 存在且 `block.header.height == height`；
+/// 5. **QC validity：`verify_qc`**（IPC-1：**先于** head/canonical 关系判定；
+///    用 scratch DAG 克隆携带 `target`，不修改调用方 DAG）
+///    ⇒ invalid QC **不会**被 U4-C 的 ahead 规则静默忽略；
+/// 6. head / canonical 关系（**D1 保守**；禁止仅以 height 判定 ahead）：
+///    (a) reference ∈ canonical ancestry（`head → parent → … → genesis`；含 `== head`）
+///        ⇒ 既有语义（幂等 / stale ignore：不注入、不回退 head）；
+///    (b) verified valid ∧ `height(reference) > height(head)` ∧ **可证明**为 head 的 canonical
+///        descendant（沿 parent 回溯可达 head）⇒ **U4-C**：不恢复 `finalized_reference`（`R = None`）
+///        + **继续启动**（不中止）；
+///    (c) 其余（同高异 hash / unrelated parent / 关系不可证明）⇒ `FinalityFactHeadConflict`
+///        （同高异 hash / unrelated / 高度异常；**绝不选择 / 绝不猜测** / 绝不把 fork block 当 canonical）。
 ///
-/// 返回 `(dag, Option<RestoredFinality>)`：`Some(..)` = 恢复注入目标（未 commit 且 QC/block/DAG
-/// 全通过）并**携带同一 fact 中已验证的 PrecommitQC**（D10 Recovery C / D-1 证据源；
-/// 不新增信任来源、不新增校验、不放宽 Check 1–7）。
+/// 返回 `(dag, Option<RestoredFinality>)`：**D11-23 U4-C 后** ahead-of-head fact **不再注入**
+/// ⇒ 成功路径恒为 `Ok((dag, None))`；`RestoredFinality` 类型保留（既有 bridge 证据源接线不变，
+/// 当前无 production 构造点）。**不**改变任何 validity 判定、**不**新增持久化、**不**触碰 head。
 pub fn restore_finality_fact(
     path: &Path,
     adapter: &NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>,
@@ -653,7 +726,7 @@ pub fn restore_finality_fact(
     network_id: NetworkId,
     chain_id: u64,
     genesis_hash: [u8; 32],
-    mut dag: Dag,
+    dag: Dag,
 ) -> Result<(Dag, Option<RestoredFinality>), NodeStartupError> {
     // 无 fact ⇒ 正常启动（无恢复）。
     if !path.exists() {
@@ -682,10 +755,11 @@ pub fn restore_finality_fact(
         return Err(NodeStartupError::FinalityFactHeightMismatch);
     }
 
-    // 已在 committed canonical ancestry ⇒ fact 已满足（幂等 / stale ignore —— 不回退 head）。
-    if dag.contains(&fact.reference) {
-        return Ok((dag, None));
-    }
+    // ---- IPC-1（D11-23 R1/R3）—— QC validity 必须先于 head / canonical 关系判定 ----
+    // 顺序（Owner 冻结）：structural → identity → block/reference → **verify_qc** →
+    //                   validity → head/canonical relation → U4-C admission。
+    // 旧顺序把「head 关系」放在 `verify_qc` 之前 ⇒ `invalid QC + ahead reference` 会被 U4-C 的
+    // ahead 规则**静默忽略**（丢失 fail-closed 检测）。此处修正。
 
     // Check 5 — block 存在 + 高度一致（get 已 strict decode + hash 重算 == key）。
     let block_store = adapter
@@ -702,54 +776,131 @@ pub fn restore_finality_fact(
         return Err(NodeStartupError::FinalityFactHeightMismatch);
     }
 
-    // Check 6 — canonical head 关系：未 commit ⇒ X 必须是 head 的严格 child（否则冲突）。
+    // QC 验证（validity 判定，F-6a）—— **前移**（原实现位于 head 关系判定之后）。
+    // `verify_qc` 对 `dag` 的唯一要求 = `dag.contains(&qc.target)`（consensus `finality.rs`）⇒
+    // 使用 **scratch DAG 克隆**（`Dag: Clone`）+ genesis 根 + 候选 X（`parents` 空，与 genesis 根同法）
+    // **仅供验证**，用后丢弃：**不**注入、**不**修改调用方持有的 `dag`、**不**新增持久化。
+    {
+        let mut verify_dag = dag.clone();
+        if !verify_dag.contains(&genesis_hash) {
+            verify_dag
+                .add_block(BlockReference {
+                    block_hash: genesis_hash,
+                    height: 0,
+                    parents: Vec::new(),
+                    proposer: ValidatorId::from_bytes([0u8; 32]),
+                })
+                .map_err(|_| NodeStartupError::FinalityFactHeadConflict)?;
+        }
+        if !verify_dag.contains(&fact.reference) {
+            verify_dag
+                .add_block(BlockReference {
+                    block_hash: fact.reference,
+                    height: block.header.height,
+                    parents: Vec::new(),
+                    proposer: ValidatorId::from_bytes([0u8; 32]),
+                })
+                .map_err(|_| NodeStartupError::FinalityFactHeadConflict)?;
+        }
+        verify_qc(&fact.qc, set, &genesis_hash, &verify_dag)
+            .map_err(NodeStartupError::FinalityFactQc)?;
+    }
+    // ⇒ 至此 fact 已通过**全部** validity checks（structural / identity / reference / block / QC）。
+
+    // ---- head / canonical 关系判定（**D1：保守**；禁止仅以 height 判定 ahead） ----
     let head = adapter.head();
-    let is_child_of_head = block.header.parent_hash == head.block_hash
-        && block.header.height == head.height.saturating_add(1);
-    if !is_child_of_head {
-        return Err(NodeStartupError::FinalityFactHeadConflict);
+    // (a) reference 已在 canonical ancestry（`head → parent → … → genesis`；含 `== head`）
+    //     ⇒ 既有语义：不注入、不回退 head、继续启动（幂等 / stale ignore）。
+    if is_canonical_ancestor(&block_store, head, &fact.reference)? {
+        return Ok((dag, None));
     }
-
-    // Check 7 — 加入 recovery DAG（frozen `Dag::add_block`）+ QC 验证。
-    //    head == genesis（无 committed 块）时 rebuild 返回空 DAG ⇒ 先加 genesis 根作 X 的 parent。
-    if !dag.contains(&genesis_hash) {
-        dag.add_block(BlockReference {
-            block_hash: genesis_hash,
-            height: 0,
-            parents: Vec::new(),
-            proposer: ValidatorId::from_bytes([0u8; 32]),
-        })
-        .map_err(|_| NodeStartupError::FinalityFactHeadConflict)?;
+    // (b) verified valid ∧ reference **严格高于** head ∧ **可证明**为 head 的 canonical descendant
+    //     ⇒ **U4-C**（Owner 冻结）：`finalized_reference` 不恢复（`R = None`）+ 继续启动（不中止）。
+    //     注意：**不**把 X 加入返回的 DAG（不注入 ⇒ 无需 DAG 注册 ⇒ 不污染 canonical DAG）。
+    if block.header.height > head.height
+        && is_canonical_descendant(&block_store, head, &fact.reference, block.header.height)?
+    {
+        return Ok((dag, None));
     }
-    // proposer（V0.1 parent-height 语义；与 D9 / block_adapter / rebuild 同源 —— 不新造规则）。
-    let proposer = select_proposer(
-        chain_id,
-        block.header.height.saturating_sub(1),
-        0,
-        &genesis_hash,
-        set,
-    )
-    .map_err(|_| NodeStartupError::FinalityFactHeadConflict)?;
-    dag.add_block(BlockReference {
-        block_hash: fact.reference,
-        height: block.header.height,
-        parents: vec![block.header.parent_hash],
-        proposer,
-    })
-    .map_err(|_| NodeStartupError::FinalityFactHeadConflict)?;
+    // (c) 其余（同高异 hash / unrelated parent / 关系不可证明）⇒ **既有冲突语义**（fail-closed）。
+    //     禁止把 fork block 当作 canonical；禁止把「无法证明关系」当作 ahead。
+    Err(NodeStartupError::FinalityFactHeadConflict)
+}
 
-    // QC 验证（`verify_qc` 要求 target ∈ DAG —— X 已加入）。
-    verify_qc(&fact.qc, set, &genesis_hash, &dag).map_err(NodeStartupError::FinalityFactQc)?;
+/// D1（保守）—— `reference` 是否属于当前 **canonical ancestry**（`head → parent → … → genesis`）。
+///
+/// - `reference == head.block_hash` ⇒ `true`；`head.height == 0`（仅 genesis）⇒ `false`。
+/// - 从 head 沿 `parent_hash` **回溯**（只读 `get_content`）；逐块要求
+///   `block.header.height == 期望高度`（严格递减 1）⇒ 任一不符 ⇒ `false`（不可证明）。
+/// - 块缺失 / 存储损坏 ⇒ `Err`（与 `rebuild_consensus_dag` 同口径 fail-closed）。
+/// - **不**以 fork-only DAG membership 作判据；**不**按 height 猜测。
+fn is_canonical_ancestor(
+    block_store: &BlockStore,
+    head: &ChainHead,
+    reference: &[u8; 32],
+) -> Result<bool, NodeStartupError> {
+    if *reference == head.block_hash {
+        return Ok(true);
+    }
+    let mut cur = head.block_hash;
+    let mut height = head.height;
+    while height >= 1 {
+        if cur == *reference {
+            return Ok(true);
+        }
+        let block = match block_store
+            .get_content(&cur)
+            .map_err(NodeStartupError::Storage)?
+        {
+            Some(b) => b,
+            None => return Err(NodeStartupError::DagRebuildMissingAncestor(cur)),
+        };
+        if block.header.height != height {
+            // canonical 记录高度不符（结构异常）⇒ 不可证明（不猜）。
+            return Ok(false);
+        }
+        if height == 1 {
+            break;
+        }
+        cur = block.header.parent_hash;
+        height -= 1;
+    }
+    Ok(false)
+}
 
-    // D10 Recovery C（D-1）：QC 已在**此处**通过全部校验 ⇒ 随结果返回（不引入新信任来源）。
-    Ok((
-        dag,
-        Some(RestoredFinality {
-            reference: fact.reference,
-            height: fact.height,
-            qc: fact.qc,
-        }),
-    ))
+/// D1（保守）—— `reference` 是否**可证明**为 `head` 的 canonical descendant（`head → … → reference`）。
+///
+/// 方法：从 `reference` 沿 `parent_hash` **回溯**（只读 `get_content`），每步高度**严格递减 1**；
+/// 当回溯到 `head.height + 1` 的块时，要求其 `parent_hash == head.block_hash` ⇒ `true`。
+/// 任何一步不可判定（块缺失 / 高度异常 / 链底未达 head）⇒ `false`（不可证明 ⇒ **非** ahead）。
+/// 约束（Owner D1）：**不**做 forward reconstruction、**不**使用网络、**不**按 height 猜测、
+/// **不**把 fork block 当作 canonical。步数上界 = `reference_height - head.height`（严格递减 ⇒ 终止）。
+fn is_canonical_descendant(
+    block_store: &BlockStore,
+    head: &ChainHead,
+    reference: &[u8; 32],
+    reference_height: u64,
+) -> Result<bool, NodeStartupError> {
+    let mut cur = *reference;
+    let mut height = reference_height;
+    while height > head.height {
+        let block = match block_store
+            .get_content(&cur)
+            .map_err(NodeStartupError::Storage)?
+        {
+            Some(b) => b,
+            None => return Ok(false),
+        };
+        if block.header.height != height {
+            return Ok(false);
+        }
+        if height == head.height.saturating_add(1) {
+            return Ok(block.header.parent_hash == head.block_hash);
+        }
+        cur = block.header.parent_hash;
+        height -= 1;
+    }
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------

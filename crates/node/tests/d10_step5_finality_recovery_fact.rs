@@ -1,12 +1,16 @@
-//! D10-C Step 4 — Finality Recovery Fact（最小 + fail-closed）。
+//! D10-C Step 4 — Finality Recovery Fact（最小 + fail-closed）+ **D11-23 U4-C**。
 //!
-//! 证明：`Finality(X) 达成 → commit 前 crash → restart` 时，durable Recovery Fact（reference +
-//! PrecommitQC + identity）经 bootstrap 恢复校验（identity / target / height / block 存在 /
-//! canonical-head child / QC verify）后注入 finalized_reference，既有 D10-B bridge 从 BlockStore
-//! 解析 X 完成 commit；损坏 / identity 失配 / 无效 QC / 缺块 / head 冲突 ⇒ 启动 fail-closed。
+//! **D11-23 U4-C（Owner 冻结）语义**（本文件所有 crash-window 用例以此为基准）：
+//! - verified **valid** FinalityFact（structural / identity / reference / block / `verify_qc` 全通过）
+//!   且 `reference` 严格高于 ChainHead 且**可证明**为 canonical descendant ⇒
+//!   **不注入** `finalized_reference`（`R = None`）+ **继续启动**（不中止）；
+//! - `verify_qc` **先于** head/canonical 关系判定（IPC-1）⇒ invalid QC **不会**被 ahead 规则静默忽略；
+//! - 同高异 hash / unrelated parent / 关系不可证明 ⇒ 保持 `FinalityFactHeadConflict`（fail-closed）；
+//! - 写入侧 **A-1**（Rule 9；implementation safety invariant）：低高度**不得**覆盖高高度；
+//!   同高度仅允许字节一致（idempotent），否则 `FinalityFactSameHeightConflict`。
 //!
-//! 禁止：手动 submit_local_vote / state_mut / 手设 finality/head/QC/round；不伪造 QC —— 有效恢复
-//! 用例的 QC 由 genesis validator 对真实 block 的真实 precommit 签名构造（verify_qc 全验证）。
+//! 禁止：手动 submit_local_vote / state_mut / 手设 finality/head/QC/round；不伪造 QC —— 有效用例的 QC
+//! 由 genesis validator 对真实 block 的真实 precommit 签名构造（verify_qc 全验证）。
 //! restart 用「新本地 key + 新 safety dir、同 chain storage」（持久化 key 导入 = DEFERRED）。
 
 use std::path::PathBuf;
@@ -294,6 +298,19 @@ fn precommit_qc_single(
 /// BlockStore（durable、**未 commit**）+ 写 Recovery Fact(A) —— 模拟「finality durable、commit
 /// 前 crash」的持久状态（crash-window 起点）。`kp` 必须是 genesis 验证者成员（A 与 QC 由其签署）。
 fn crash_state(config: &NodeConfig, kp: &KeyPair, qc_valid: bool) -> [u8; 32] {
+    crash_state_with_fact_chain(config, kp, qc_valid, CHAIN_ID)
+}
+
+/// 同 `crash_state`，但 fact 写入的 `chain_id` 可指定（用于 identity 失配 fixture）。
+///
+/// D11-23 A-1 注记：caller 必须保证该路径上**首次**写入即使用目标 chain_id ——
+/// same-height 不同内容的重写会被 writer guard 拒绝（`FinalityFactSameHeightConflict`）。
+fn crash_state_with_fact_chain(
+    config: &NodeConfig,
+    kp: &KeyPair,
+    qc_valid: bool,
+    fact_chain_id: u64,
+) -> [u8; 32] {
     let adapter = nova_node::bootstrap::start(NoAccountsKeyResolver, config).unwrap();
     let genesis_hash = adapter.genesis_hash();
     let (a_block, _) = empty_block_at(
@@ -325,7 +342,7 @@ fn crash_state(config: &NodeConfig, kp: &KeyPair, qc_valid: bool) -> [u8; 32] {
     persist_finality_fact(
         &fact_path_from(config),
         NetworkId::Mainnet,
-        CHAIN_ID,
+        fact_chain_id,
         genesis_hash,
         1,
         a_hash,
@@ -335,28 +352,525 @@ fn crash_state(config: &NodeConfig, kp: &KeyPair, qc_valid: bool) -> [u8; 32] {
     a_hash
 }
 
-/// crash-window 完整闭环：crash 状态 → restart → 恢复 → bridge 从 BlockStore commit A。
-fn crash_and_commit(config: &NodeConfig, kp: &KeyPair) -> [u8; 32] {
-    let a_hash = crash_state(config, kp, true);
-    let cfg2 = restart_cfg(config, "restart_safety");
-    let provider2 = SoftwareKeyProvider::from_keypair(KeyPair::generate().unwrap());
-    let mut r2 = start_enabled(&cfg2, &provider2);
-    step_until_head_height(&mut r2, 1);
-    let head = r2.block_production().unwrap().head().clone();
-    assert_eq!(
-        head.block_hash, a_hash,
-        "恢复后 bridge 从 BlockStore commit A"
-    );
-    assert_eq!(
-        r2.consensus().state().finality.finalized_reference,
-        Some(a_hash)
-    );
-    r2.shutdown().unwrap();
-    a_hash
-}
-
 fn fact_path_from(config: &NodeConfig) -> PathBuf {
     config.storage_dir.join(FINALITY_FACT_FILE)
+}
+
+// ---------------------------------------------------------------------------
+// D11-23 U4-C / A-1 — 新增用例（§八 T4 / T5 / T6 / T9–T12 / T14 映射）
+// ---------------------------------------------------------------------------
+
+/// fixture：head = genesis（height 0）；A@1（parent genesis）与 B@2（parent A）均 durable
+/// 于 BlockStore；写 Fact 指向 B（**gap = 2**）。
+///
+/// `qc_valid` 控制 QC 签名真伪；`b_parent` 可覆盖 B 的 parent（fork / unrelated fixture）。
+/// 返回 `(b_hash, fact 文件字节)`。
+fn crash_state_gap2(
+    config: &NodeConfig,
+    kp: &KeyPair,
+    qc_valid: bool,
+    b_parent: Option<[u8; 32]>,
+) -> ([u8; 32], Vec<u8>) {
+    let adapter = nova_node::bootstrap::start(NoAccountsKeyResolver, config).unwrap();
+    let genesis_hash = adapter.genesis_hash();
+    let state_root = *adapter.store().state_root().as_bytes();
+    let (a_block, _) = empty_block_at(&genesis_hash, genesis_hash, 1, state_root, 0, kp);
+    let a_hash = block_hash(&a_block).unwrap();
+    let proposer = ValidatorId::from_consensus_public_key(&kp.verifying_key().to_bytes());
+    let bs = adapter.block_store().unwrap();
+    bs.put_verified(
+        &a_block,
+        proposer.as_bytes(),
+        kp.verifying_key(),
+        CHAIN_ID,
+        1,
+    )
+    .expect("A@1 durable");
+    let (b_block, _) = empty_block_at(
+        &genesis_hash,
+        b_parent.unwrap_or(a_hash),
+        2,
+        state_root,
+        0,
+        kp,
+    );
+    let b_hash = block_hash(&b_block).unwrap();
+    bs.put_verified(
+        &b_block,
+        proposer.as_bytes(),
+        kp.verifying_key(),
+        CHAIN_ID,
+        1,
+    )
+    .expect("B@2 durable");
+    let qc = precommit_qc_single(genesis_hash, kp, b_hash, 1, 0, qc_valid);
+    persist_finality_fact(
+        &fact_path_from(config),
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        genesis_hash,
+        2,
+        b_hash,
+        &qc,
+    )
+    .expect("fact 写成功");
+    (b_hash, std::fs::read(fact_path_from(config)).unwrap())
+}
+
+/// T4（D11-23 新增）— verified valid + **gap = 2** ⇒ U4-C：`R = None` + **继续启动**。
+///
+/// 验证：关系由 `is_canonical_descendant`（沿 parent **回溯**至 head）证明；不注入、不中止；
+/// fact / BlockStore 证据完全保留（`R = None` ≠ 删除 evidence）。
+#[test]
+fn d10_d23_t4_valid_gap2_ahead_not_restored_continue() {
+    let (kp, genesis) = single_genesis();
+    let env = Env::new(&genesis);
+    let config = env.config();
+    let (b_hash, fact_before) = crash_state_gap2(&config, &kp, true, None);
+    let cfg2 = restart_cfg(&config, "restart_u4c_gap2");
+    let provider2 = SoftwareKeyProvider::from_keypair(KeyPair::generate().unwrap());
+    let r2 = start_enabled(&cfg2, &provider2);
+    assert_eq!(
+        r2.consensus().state().finality.finalized_reference,
+        None,
+        "U4-C：gap>=2 ahead ⇒ 不恢复 finalized_reference"
+    );
+    assert_eq!(
+        r2.block_production().unwrap().head().height,
+        0,
+        "U4-C：startup 继续（head 不因 fact 推进）"
+    );
+    assert!(
+        !r2.recovering_finality(),
+        "U4-C：无注入 ⇒ 无 recovery window"
+    );
+    r2.shutdown().unwrap();
+    assert_eq!(
+        std::fs::read(fact_path(&env)).unwrap(),
+        fact_before,
+        "U4-C：fact 保留（字节不变）"
+    );
+    let bs = BlockStore::open(&config.storage_dir.join("blocks")).unwrap();
+    assert!(bs.contains(&b_hash).unwrap(), "X durable 于 BlockStore");
+}
+
+/// T5（D11-23 新增，**IPC-1 核心**）— invalid QC + **ahead（gap = 2）** ⇒ fail-closed。
+///
+/// 验证：`verify_qc` **先于** head/canonical 关系判定 ⇒ invalid QC 返回 `FinalityFactQc`，
+/// **绝不**被 U4-C 的 ahead 规则当作「valid-but-ahead」continue。
+#[test]
+fn d10_d23_t5_invalid_qc_ahead_gap2_fail_closed_not_continue() {
+    let (kp, genesis) = single_genesis();
+    let env = Env::new(&genesis);
+    let config = env.config();
+    let _ = crash_state_gap2(&config, &kp, false, None);
+    let cfg2 = restart_cfg(&config, "restart_u4c_gap2_bad");
+    let provider2 = SoftwareKeyProvider::from_keypair(KeyPair::generate().unwrap());
+    let err = expect_start_failure(&cfg2, &provider2);
+    assert!(
+        matches!(
+            err,
+            NodeRuntimeError::Startup(NodeStartupError::FinalityFactQc(_))
+        ),
+        "IPC-1：invalid QC 必须先被验证 ⇒ FinalityFactQc（**不得** continue / 不得 HeadConflict 混淆）实际 {err:?}"
+    );
+}
+
+/// T6（D11-23 新增）— valid QC + **fork / 非 canonical** reference 且 height 超前 ⇒ **不**准入。
+///
+/// 验证（D1 保守）：`height(X) > height(head)` **本身不足**；关系不可证明（parent 未知 ⇒
+/// 回溯不可达 head）⇒ `FinalityFactHeadConflict`（fail-closed），**不得**当作 canonical ahead。
+#[test]
+fn d10_d23_t6_fork_reference_not_admitted_as_ahead() {
+    let (kp, genesis) = single_genesis();
+    let env = Env::new(&genesis);
+    let config = env.config();
+    let _ = crash_state_gap2(&config, &kp, true, Some([0x77; 32]));
+    let cfg2 = restart_cfg(&config, "restart_u4c_fork");
+    let provider2 = SoftwareKeyProvider::from_keypair(KeyPair::generate().unwrap());
+    let err = expect_start_failure(&cfg2, &provider2);
+    assert!(
+        matches!(
+            err,
+            NodeRuntimeError::Startup(NodeStartupError::FinalityFactHeadConflict)
+        ),
+        "height 超前但关系不可证明 ⇒ 不得视为 canonical ahead（fail-closed）实际 {err:?}"
+    );
+}
+
+fn guard_fact_path(env: &Env) -> PathBuf {
+    env.chain_dir.join("guard_fact.bin")
+}
+
+/// T9（D11-23 新增）— same height + **identical** fact ⇒ idempotent（不重复写 / 字节不变）。
+#[test]
+fn d10_d23_t9_same_height_identical_fact_idempotent() {
+    let (kp, genesis) = single_genesis();
+    let env = Env::new(&genesis);
+    let p = guard_fact_path(&env);
+    let qc = precommit_qc_single(env.genesis_hash, &kp, [0xA1; 32], 0, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        1,
+        [0xA1; 32],
+        &qc,
+    )
+    .unwrap();
+    let first = std::fs::read(&p).unwrap();
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        1,
+        [0xA1; 32],
+        &qc,
+    )
+    .expect("同高度同内容 ⇒ 幂等 Ok");
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        first,
+        "A-1：identical ⇒ 无不必要的原子写（字节不变）"
+    );
+    assert_eq!(read_finality_fact(&p).unwrap(), Some((1, [0xA1; 32])));
+}
+
+/// T10（D11-23 新增）— same height + **conflicting** fact ⇒ `Err`（既有 fact 不变）。
+///
+/// 覆盖两种冲突形态：(a) 不同 reference；(b) 同 reference 但不同 QC（round 不同）。
+#[test]
+fn d10_d23_t10_same_height_conflicting_fact_rejected() {
+    let (kp, genesis) = single_genesis();
+    let env = Env::new(&genesis);
+    let p = guard_fact_path(&env);
+    let qc_a = precommit_qc_single(env.genesis_hash, &kp, [0xA1; 32], 0, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        1,
+        [0xA1; 32],
+        &qc_a,
+    )
+    .unwrap();
+    let first = std::fs::read(&p).unwrap();
+    // (a) 不同 reference（同高度）。
+    let qc_b = precommit_qc_single(env.genesis_hash, &kp, [0xB2; 32], 0, 0, true);
+    let err = persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        1,
+        [0xB2; 32],
+        &qc_b,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, NodeStartupError::FinalityFactSameHeightConflict),
+        "same height + different reference ⇒ conflict（实际 {err:?}）"
+    );
+    assert_eq!(std::fs::read(&p).unwrap(), first, "既有 fact 未被覆盖");
+    // (b) 同 reference、不同 QC（round 1）。
+    let qc_a_r1 = precommit_qc_single(env.genesis_hash, &kp, [0xA1; 32], 0, 1, true);
+    let err = persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        1,
+        [0xA1; 32],
+        &qc_a_r1,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, NodeStartupError::FinalityFactSameHeightConflict),
+        "same height + conflicting QC ⇒ conflict（实际 {err:?}）"
+    );
+    assert_eq!(std::fs::read(&p).unwrap(), first, "既有 fact 未被覆盖");
+}
+
+/// T11（D11-23 新增）— `new_height > old_height` ⇒ 写入允许（正常前进）。
+#[test]
+fn d10_d23_t11_higher_fact_write_allowed() {
+    let (kp, genesis) = single_genesis();
+    let env = Env::new(&genesis);
+    let p = guard_fact_path(&env);
+    let qc_a = precommit_qc_single(env.genesis_hash, &kp, [0xA1; 32], 0, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        1,
+        [0xA1; 32],
+        &qc_a,
+    )
+    .unwrap();
+    let qc_b = precommit_qc_single(env.genesis_hash, &kp, [0xB2; 32], 1, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        2,
+        [0xB2; 32],
+        &qc_b,
+    )
+    .expect("更高高度 ⇒ 允许写入");
+    assert_eq!(read_finality_fact(&p).unwrap(), Some((2, [0xB2; 32])));
+}
+
+/// T4（D11-25，取代 D11-23 T12）— `new_height < old_height` ⇒ **不写 + 非致命继续**。
+///
+/// D11-25 D3（Model B）：runtime `R` 前进到低于已有 durable evidence 的高度**不是**错误 ⇒
+/// 返回 `Ok`（**不得** fatal Err / 不得 `DowngradeRefused`）、保留更高证据（字节不变）。
+#[test]
+fn d10_d25_t4_lower_fact_write_skipped_non_fatal() {
+    let (kp, genesis) = single_genesis();
+    let env = Env::new(&genesis);
+    let p = guard_fact_path(&env);
+    let qc_b = precommit_qc_single(env.genesis_hash, &kp, [0xB2; 32], 1, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        2,
+        [0xB2; 32],
+        &qc_b,
+    )
+    .unwrap();
+    let second = std::fs::read(&p).unwrap();
+    let qc_a = precommit_qc_single(env.genesis_hash, &kp, [0xA1; 32], 0, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        1,
+        [0xA1; 32],
+        &qc_a,
+    )
+    .expect("D11-25 D3：低高度 ⇒ 非致命跳过（Ok）");
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        second,
+        "更高 durable evidence 保留（未改写）"
+    );
+    assert_eq!(read_finality_fact(&p).unwrap(), Some((2, [0xB2; 32])));
+}
+
+/// T14（D11-25 更新）— writer invariant（组合回归）。
+///
+/// 验证：① 低高度 ⇒ **非致命跳过**且不改写；② 同高度证据冲突 ⇒ fail-closed 且不改写；
+/// ③ 之后**更高**高度写入仍然成功（guard 不 wedged writer）。
+#[test]
+fn d10_d25_t14_writer_invariant_low_skip_conflict_fail_higher_write() {
+    let (kp, genesis) = single_genesis();
+    let env = Env::new(&genesis);
+    let p = guard_fact_path(&env);
+    let qc_b = precommit_qc_single(env.genesis_hash, &kp, [0xB2; 32], 1, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        2,
+        [0xB2; 32],
+        &qc_b,
+    )
+    .unwrap();
+    let after = std::fs::read(&p).unwrap();
+    // ① downgrade（lower height）⇒ 非致命跳过 + 不变（D11-25 D3）。
+    let qc_a = precommit_qc_single(env.genesis_hash, &kp, [0xA1; 32], 0, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        1,
+        [0xA1; 32],
+        &qc_a,
+    )
+    .expect("低高度 ⇒ Ok（非致命跳过）");
+    assert_eq!(std::fs::read(&p).unwrap(), after, "跳过不得改写既有 fact");
+    // ② same-height 证据冲突 ⇒ Err + 不变（D11-25 D4）。
+    let qc_c = precommit_qc_single(env.genesis_hash, &kp, [0xC3; 32], 1, 0, true);
+    assert!(matches!(
+        persist_finality_fact(
+            &p,
+            NetworkId::Mainnet,
+            CHAIN_ID,
+            env.genesis_hash,
+            2,
+            [0xC3; 32],
+            &qc_c
+        )
+        .unwrap_err(),
+        NodeStartupError::FinalityFactSameHeightConflict
+    ));
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        after,
+        "冲突拒绝不得改写既有 fact"
+    );
+    // ③ 更高高度仍可写（guard 不 wedged writer）。
+    let qc_d = precommit_qc_single(env.genesis_hash, &kp, [0xD4; 32], 2, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        3,
+        [0xD4; 32],
+        &qc_d,
+    )
+    .expect("更高高度 ⇒ 仍允许写入");
+    assert_eq!(read_finality_fact(&p).unwrap(), Some((3, [0xD4; 32])));
+}
+
+/// T9（D11-25 新增）— 保留更高 durable evidence 之后，**更高**高度替换仍允许（证据前进）。
+///
+/// 对应 D11-25 §5：「未来 `R = H+3` 时才允许 `Fact H+2 → H+3`」。
+#[test]
+fn d10_d25_t9_higher_replacement_after_retained_higher_fact() {
+    let (kp, genesis) = single_genesis();
+    let env = Env::new(&genesis);
+    let p = guard_fact_path(&env);
+    let qc_b = precommit_qc_single(env.genesis_hash, &kp, [0xB2; 32], 1, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        2,
+        [0xB2; 32],
+        &qc_b,
+    )
+    .unwrap();
+    // H+1（低于 fact）⇒ 非致命跳过，fact 仍为 H+2。
+    let qc_a = precommit_qc_single(env.genesis_hash, &kp, [0xA1; 32], 0, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        1,
+        [0xA1; 32],
+        &qc_a,
+    )
+    .expect("低高度非致命跳过");
+    assert_eq!(read_finality_fact(&p).unwrap(), Some((2, [0xB2; 32])));
+    // H+3（高于 fact）⇒ 允许 durable replacement。
+    let qc_c = precommit_qc_single(env.genesis_hash, &kp, [0xC3; 32], 2, 0, true);
+    persist_finality_fact(
+        &p,
+        NetworkId::Mainnet,
+        CHAIN_ID,
+        env.genesis_hash,
+        3,
+        [0xC3; 32],
+        &qc_c,
+    )
+    .expect("更高高度 ⇒ 允许 durable replacement");
+    assert_eq!(read_finality_fact(&p).unwrap(), Some((3, [0xC3; 32])));
+}
+
+/// T8（D11-25 新增，**关键 crash 场景**）— `Fact = H+2 / Head = H / R = None` restart 后，
+/// 首次 finality 落在 `H+1`（严格低于 fact）⇒ **不得**产生 downgrade 错误 / 进程终止；
+/// fact 保持 `H+2`（字节不变），runtime 继续。
+#[test]
+fn d10_d25_t8_first_finality_below_fact_is_non_fatal() {
+    let (kp, genesis) = single_genesis();
+    let env = Env::new(&genesis);
+    let config = env.config();
+    // gap = 2：A@1 + B@2 durable；fact 指向 B@2；head = 0（genesis）。
+    let (b_hash, fact_before) = crash_state_gap2(&config, &kp, true, None);
+    let cfg2 = restart_cfg(&config, "d25_gap2_catchup");
+    // 同 key 重启（validator 身份）—— 本用例需要 restart 后**真实产生**新 finality。
+    let provider2 = SoftwareKeyProvider::from_keypair(kp);
+    let mut r2 = start_enabled(&cfg2, &provider2);
+    assert_eq!(
+        r2.consensus().state().finality.finalized_reference,
+        None,
+        "U4-C：ahead fact 不注入（R = None）"
+    );
+    let mut x = None;
+    for _ in 0..40 {
+        r2.step()
+            .expect("D11-25 D3：R 低于既有 fact ⇒ 非致命继续（不得 Err / 不得退出）");
+        if let Some(r) = r2.consensus().state().finality.finalized_reference {
+            x = Some(r);
+            break;
+        }
+    }
+    let x = x.expect("首次 finality 必须出现（runtime 继续参与）");
+    let bs = BlockStore::open(&config.storage_dir.join("blocks")).unwrap();
+    let x_height = bs
+        .get_content(&x)
+        .expect("blockstore 可读")
+        .expect("R 对应块 durable")
+        .header
+        .height;
+    assert_eq!(x_height, 1, "首次 finality = H+1（严格低于 fact H+2）");
+    assert_eq!(
+        std::fs::read(fact_path(&env)).unwrap(),
+        fact_before,
+        "更高 durable evidence 保留（字节完全不变）"
+    );
+    assert_eq!(
+        read_finality_fact(&fact_path(&env)).unwrap(),
+        Some((2, b_hash)),
+        "fact 仍为 H+2"
+    );
+    r2.shutdown().unwrap();
+}
+
+/// T10（D11-25 新增）— 反复 restart（`Fact H+2 / Head H`）**不得**因 `Fact > R` 进入永久 crash loop。
+///
+/// 每轮以相同文档化状态（`Fact = H+2 / Head = H / R = None`）重启：启动必须成功、R 首次赋值
+/// 必须是 H+1（非致命）、fact 字节不变；全程不得 Err。
+#[test]
+fn d10_d25_t10_repeated_restart_no_fact_crash_loop() {
+    for round in 0..3u32 {
+        let (kp, genesis) = single_genesis();
+        let env = Env::new(&genesis);
+        let config = env.config();
+        let (_b_hash, fact_before) = crash_state_gap2(&config, &kp, true, None);
+        let cfg2 = restart_cfg(&config, &format!("d25_rep_{round}"));
+        // 同 key 重启（validator 身份）—— 保证 restart 后能真实产生新 finality。
+        let provider2 = SoftwareKeyProvider::from_keypair(kp);
+        let mut rt = start_enabled(&cfg2, &provider2);
+        assert_eq!(
+            rt.consensus().state().finality.finalized_reference,
+            None,
+            "restart {round}：U4-C 不注入"
+        );
+        for _ in 0..40 {
+            rt.step()
+                .expect("D11-25：`Fact > R` 不得造成 fatal Err / 不得 crash loop");
+            if rt
+                .consensus()
+                .state()
+                .finality
+                .finalized_reference
+                .is_some()
+            {
+                break;
+            }
+        }
+        rt.shutdown().unwrap();
+        assert_eq!(
+            std::fs::read(fact_path(&env)).unwrap(),
+            fact_before,
+            "restart {round}：fact 未被降级 / 未被覆盖"
+        );
+    }
 }
 
 fn single_genesis() -> (KeyPair, GenesisV1) {
@@ -410,22 +924,47 @@ fn d10_c4_t2_fact_decodes() {
 }
 
 // ---------------------------------------------------------------------------
-// T3 + T4 + T15 — crash-window：finality durable → commit 未发生 → restart → 恢复 →
-//              BlockStore 解析 X → bridge commit（T15 = bridge-from-BlockStore）
+// T15 / T16 / T17（D11-23 U4-C REWRITE）— crash-window 语义变更：
+//   fact X@1 durable、head=genesis（gap = 1）⇒ U4-C：**不注入** R（R = None）+ 继续启动；
+//   bridge **不再** commit X（Gate 1 要求 R = Some）；X / fact 仍 durable（不删除 / 不改写）。
 // ---------------------------------------------------------------------------
 
 #[test]
-fn d10_c4_t3_crash_window_recovery_commit() {
+fn d10_c4_t3_crash_window_no_injection_continue() {
+    // U4-C 语义（验证）：valid ahead fact ⇒ R = None + startup 继续（不中止 / 不 panic）；
+    // evidence（BlockStore X + fact 文件）完全保留。
     let (kp, genesis) = single_genesis();
     let env = Env::new(&genesis);
     let config = env.config();
-    let a_hash = crash_and_commit(&config, &kp);
-    assert_ne!(a_hash, [0u8; 32]);
+    let a_hash = crash_state(&config, &kp, true);
+    let fact_before = std::fs::read(fact_path(&env)).unwrap();
+    let cfg2 = restart_cfg(&config, "restart_safety");
+    let provider2 = SoftwareKeyProvider::from_keypair(KeyPair::generate().unwrap());
+    let r2 = start_enabled(&cfg2, &provider2);
+    assert_eq!(
+        r2.consensus().state().finality.finalized_reference,
+        None,
+        "U4-C：ahead fact **不**注入 finalized_reference"
+    );
+    assert_eq!(
+        r2.block_production().unwrap().head().height,
+        0,
+        "head 未推进（无 commit）"
+    );
+    r2.shutdown().unwrap();
+    let bs = BlockStore::open(&config.storage_dir.join("blocks")).unwrap();
+    assert!(bs.contains(&a_hash).unwrap(), "X 仍 durable 于 BlockStore");
+    assert_eq!(
+        std::fs::read(fact_path(&env)).unwrap(),
+        fact_before,
+        "U4-C：R = None **不**删除 / **不**改写 durable fact"
+    );
 }
 
 #[test]
-fn d10_c4_t4_valid_qc_recovery_ok() {
-    // 恢复（injection）发生在 start —— 验证有效 QC 恢复注入 finality（未 step 亦可见）。
+fn d10_c4_t4_valid_qc_gap1_not_restored() {
+    // U4-C 语义（验证）：valid QC + gap=1（原实现注入 `R = Some(X)`）⇒ 现为 R = None + continue；
+    // 且启动不进入 recovery window（`recovering_finality()` == false）。
     let (kp, genesis) = single_genesis();
     let env = Env::new(&genesis);
     let config = env.config();
@@ -435,24 +974,41 @@ fn d10_c4_t4_valid_qc_recovery_ok() {
     let r2 = start_enabled(&cfg2, &provider2);
     assert_eq!(
         r2.consensus().state().finality.finalized_reference,
-        Some(a_hash),
-        "有效 QC 恢复注入 finalized_reference"
+        None,
+        "U4-C：valid ahead fact 不恢复 finalize reference"
     );
+    assert!(
+        !r2.recovering_finality(),
+        "U4-C：不进入 recovery window（无注入）"
+    );
+    assert_ne!(a_hash, [0u8; 32]);
     r2.shutdown().unwrap();
 }
 
 #[test]
-fn d10_c4_t15_bridge_resolves_from_block_store() {
-    // 恢复路径无 last_proposal（新进程）；bridge 只能从 BlockStore 解析 X —— 已由
-    // crash_and_commit 覆盖；此处显式断言 committed X durable 于 BlockStore。
+fn d10_c4_t15_bridge_requires_finality_not_committed() {
+    // U4-C 语义（验证）：bridge 的 Gate 1 仍要求 `R = Some` ⇒ R = None 时**不会** commit X；
+    // 但 X 的 durable encoding 仍在（供后续正常追赶路径使用）。
     let (kp, genesis) = single_genesis();
     let env = Env::new(&genesis);
     let config = env.config();
-    let a_hash = crash_and_commit(&config, &kp);
+    let a_hash = crash_state(&config, &kp, true);
+    let cfg2 = restart_cfg(&config, "restart_safety");
+    let provider2 = SoftwareKeyProvider::from_keypair(KeyPair::generate().unwrap());
+    let mut r2 = start_enabled(&cfg2, &provider2);
+    // 若 step 失败（例如本地新 finality 触发 writer guard fail-closed），head 更不可能已被
+    // bridge 推进 ⇒ 两种情形下均断言「head 未被 bridge 提交到 X」。
+    let _ = r2.step();
+    assert_ne!(
+        r2.block_production().unwrap().head().block_hash,
+        a_hash,
+        "R = None ⇒ bridge Gate 1 失败：不得 commit X"
+    );
+    r2.shutdown().unwrap();
     let bs = BlockStore::open(&config.storage_dir.join("blocks")).unwrap();
     assert!(
         bs.contains(&a_hash).expect("blockstore 可读"),
-        "committed X durable（bridge 从 BlockStore 解析）"
+        "X 的 durable encoding 仍在（bridge 解析入口未变）"
     );
 }
 
@@ -551,20 +1107,9 @@ fn d10_c4_t8_wrong_chain_identity_fail_closed() {
     let (kp, genesis) = single_genesis();
     let env = Env::new(&genesis);
     let config = env.config();
-    let genesis_hash = env.genesis_hash;
-    let a_hash = crash_state(&config, &kp, true);
-    // 覆盖 fact：同 A 但 chain_id 错误（checksum 由 persist 重新计算 —— 合法文件、identity 失配）。
-    let qc = precommit_qc_single(genesis_hash, &kp, a_hash, 0, 0, true);
-    persist_finality_fact(
-        &fact_path_from(&config),
-        NetworkId::Mainnet,
-        CHAIN_ID + 1,
-        genesis_hash,
-        1,
-        a_hash,
-        &qc,
-    )
-    .unwrap();
+    // fact **首次写入**即使用错误 chain_id（checksum 由 persist 重新计算 —— 合法文件、identity 失配）。
+    // D11-23 A-1：same-height 不同内容的重写会被 writer guard 拒绝 ⇒ fixture 不得先写正确 fact 再改写。
+    let _a_hash = crash_state_with_fact_chain(&config, &kp, true, CHAIN_ID + 1);
     let cfg2 = restart_cfg(&config, "restart_safety");
     let provider2 = SoftwareKeyProvider::from_keypair(KeyPair::generate().unwrap());
     let err = expect_start_failure(&cfg2, &provider2);
