@@ -323,6 +323,47 @@ fn recv_matching<F: Fn(&MessageEnvelope) -> bool>(
     None
 }
 
+/// **P1-A.23** —— 有界推进 responder 并**排空**入站信封，直到出现 `SyncBlockResponse`。
+///
+/// 必须**排空**：被 dial 的 production 节点会向**所有** Established peer 持续 gossip 每个高度的
+/// `ConsensusProposal` / `GossipBlock` / `ConsensusVote`×2 / `ConsensusQc`；若每轮只读一条信封，
+/// `SyncBlockResponse` 会永远排在不断增长的 gossip backlog 之后。
+fn pump_until_sync_response(
+    a: &mut NodeRuntime,
+    t: &mut TcpTransport,
+    iters: usize,
+) -> Option<MessageEnvelope> {
+    for _ in 0..iters {
+        let _ = a.step();
+        while let Ok(Some((_from, bytes))) = t.try_recv() {
+            if let Ok(env) = decode(&bytes)
+                && env.message_type == MessageType::SyncBlockResponse
+            {
+                return Some(env);
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    None
+}
+
+/// **P1-A.23** —— 有界推进 responder 并**排空**入站信封，断言期间**没有** `SyncBlockResponse`。
+/// 返回 `true` = 期间未出现任何块响应。
+fn pump_expect_no_sync_response(a: &mut NodeRuntime, t: &mut TcpTransport, iters: usize) -> bool {
+    for _ in 0..iters {
+        let _ = a.step();
+        while let Ok(Some((_from, bytes))) = t.try_recv() {
+            if let Ok(env) = decode(&bytes)
+                && env.message_type == MessageType::SyncBlockResponse
+            {
+                return false;
+            }
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
 /// wire fixture 作为 **client**：dial runtime（listener）→ 读对端 Init → 回带本端 Init。
 ///
 /// 注意：runtime 只在 `step()` 中 accept/发送 Init ⇒ 本函数在等待期间**推进 runtime**。
@@ -695,9 +736,21 @@ fn d9s8a_t2_responder_serves_requested_hash() {
 }
 
 // ---------------------------------------------------------------------------
-// T3 — missing / walk-exceeded（不伪造 / 不返回其它块 / 不 panic）
+// T3 — missing / walk-exceeded / **P1-A.23 verified height→hash exact 服务**
+//      （不伪造 / 不返回其它块 / 不 panic / 无 artifact 仍 fail-closed）
 // ---------------------------------------------------------------------------
 
+/// **P1-A.23 覆盖（真实 TCP；真实 production responder）**：
+///
+/// - **阶段 1（Case D + future height）**：`block_hash = Some(未知 hash)` 与 `height > head`
+///   ⇒ `Missing`（**不响应**；不伪造 / 不回其它块 / 不回其它高度）。
+/// - **阶段 2（P1-A.23 正路径）**：`block_hash = None` ∧ `head - request.height > MAX_SYNC_WALK`
+///   ∧ 本地存在该高度的**已验证** `qc_history` artifact ⇒ 以 artifact 的 `target` 做 exact
+///   lookup ⇒ **恰好请求高度**的块被服务（`served_via_verified_hash` +1）。
+/// - **阶段 3（Case A：窗口内行为逐字不变）**：窗口内 `None` 请求仍走既有 parent walk
+///   （`served` +1 而 `served_via_verified_hash` **不**增加）。
+/// - **阶段 4（Case C：无 artifact ⇒ 安全边界保留）**：删除本地 `qc_history`（模拟
+///   retention 淘汰 / 服务目录缺失）⇒ 同一超窗 `None` 请求**仍** `WalkExceeded`（不响应）。
 #[test]
 fn d9s8a_t3_missing_and_walk_bounds_do_not_fabricate() {
     const SEED: [u8; 32] = [0x52; 32];
@@ -732,6 +785,9 @@ fn d9s8a_t3_missing_and_walk_bounds_do_not_fabricate() {
     });
     assert!(authed, "A 未认证 fixture");
 
+    // =====================================================================
+    // 阶段 1 —— 不伪造边界（Case D：未知 hash；future height）
+    // =====================================================================
     // ① unknown hash ⇒ Missing（不响应）。
     let rid1 = nova_network::security::random_request_id().unwrap();
     let req1 = SyncBlockRequest {
@@ -748,7 +804,44 @@ fn d9s8a_t3_missing_and_walk_bounds_do_not_fabricate() {
         )),
     )
     .expect("send req1");
-    // ② height=1（无 hash），head 远高于 1 ⇒ 回走超过 MAX_SYNC_WALK ⇒ WalkExceeded（不响应）。
+    // ② height 超过 head ⇒ Missing（不响应）。
+    let rid_future = nova_network::security::random_request_id().unwrap();
+    let req_future = SyncBlockRequest {
+        request_id: rid_future,
+        height: head_height(&a) + 5,
+        block_hash: None,
+    };
+    t.send(
+        &a_id,
+        encode(&sign_envelope(
+            &f_kp,
+            MessageType::SyncBlockRequest,
+            req_future.encode(),
+        )),
+    )
+    .expect("send req_future");
+
+    // 有界推进 + 断言**没有**任何响应（不伪造 / 不用 head 冒充 / 不回其它高度）。
+    assert!(
+        pump_expect_no_sync_response(&mut a, &mut t, 400),
+        "缺失/超限请求不得产生 SyncBlockResponse（不伪造 / 不回其它高度）"
+    );
+    let diag = a.sync_respond_diagnostics();
+    assert!(diag.missing >= 2, "missing 计数（实测 {}）", diag.missing);
+    assert_eq!(diag.served, 0, "本阶段不得有任何成功响应");
+    assert_eq!(
+        diag.served_via_verified_hash, 0,
+        "本阶段不得进入 exact 路径"
+    );
+
+    // =====================================================================
+    // 阶段 2 —— P1-A.23：超窗 + 本地已验证 artifact ⇒ exact 服务
+    // =====================================================================
+    assert!(
+        head_height(&a).saturating_sub(1) > MAX_SYNC_WALK,
+        "过窗前提不成立（head = {}）",
+        head_height(&a)
+    );
     let rid2 = nova_network::security::random_request_id().unwrap();
     let req2 = SyncBlockRequest {
         request_id: rid2,
@@ -764,11 +857,45 @@ fn d9s8a_t3_missing_and_walk_bounds_do_not_fabricate() {
         )),
     )
     .expect("send req2");
-    // ③ height 超过 head ⇒ Missing（不响应）。
+
+    let env2 = pump_until_sync_response(&mut a, &mut t, 600)
+        .expect("P1-A.23：超窗 + artifact 在场必须被服务（exact verified hash）");
+    let response2 = SyncBlockResponse::decode(&env2.payload).expect("response decode");
+    assert_eq!(response2.request_id, rid2, "request_id 原样回带");
+    assert_eq!(
+        response2.blocks.len(),
+        MAX_SYNC_BLOCKS_PER_RESPONSE,
+        "单块响应"
+    );
+    let block2 = nova_runtime::decode_block(&response2.blocks[0].0).expect("block decode");
+    assert_eq!(
+        block2.header.height, 1,
+        "P1-A.23：exact 服务必须返回**恰好请求高度**的块（不得回其它高度）"
+    );
+    assert_eq!(
+        block2.header.parent_hash, env.genesis_hash,
+        "高度 1 块的 parent 必为 genesis（非伪造 / 非 head 冒充）"
+    );
+    let diag = a.sync_respond_diagnostics();
+    assert_eq!(diag.served, 1, "阶段 2 恰好一次成功响应");
+    assert_eq!(
+        diag.served_via_verified_hash, 1,
+        "P1-A.23 exact verified-hash 路径必须命中"
+    );
+    assert_eq!(
+        diag.walk_exceeded, 0,
+        "artifact 在场时不得再返回 WalkExceeded（实测 {}）",
+        diag.walk_exceeded
+    );
+
+    // =====================================================================
+    // 阶段 3 —— Case A：窗口内请求仍走既有 parent walk（行为逐字不变）
+    // =====================================================================
+    let in_window_height = head_height(&a).saturating_sub(10);
     let rid3 = nova_network::security::random_request_id().unwrap();
     let req3 = SyncBlockRequest {
         request_id: rid3,
-        height: head_height(&a) + 5,
+        height: in_window_height,
         block_hash: None,
     };
     t.send(
@@ -781,32 +908,64 @@ fn d9s8a_t3_missing_and_walk_bounds_do_not_fabricate() {
     )
     .expect("send req3");
 
-    // 有界推进 + 断言**没有**任何响应（不伪造 / 不用 head 冒充 / 不回其它高度）。
-    let mut unexpected = None;
-    for _ in 0..400 {
-        let _ = a.step();
-        if let Ok(Some((_f, bytes))) = t.try_recv()
-            && let Ok(env) = decode(&bytes)
-            && env.message_type == MessageType::SyncBlockResponse
-        {
-            unexpected = Some(env);
-            break;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(
-        unexpected.is_none(),
-        "缺失/超限请求不得产生响应（实测收到 {:?}）",
-        unexpected.map(|e| e.message_type)
+    let env3 = pump_until_sync_response(&mut a, &mut t, 400)
+        .expect("窗口内 height-based 请求必须仍被服务（Case A）");
+    let response3 = SyncBlockResponse::decode(&env3.payload).expect("response decode");
+    assert_eq!(response3.request_id, rid3, "request_id 原样回带");
+    let block3 = nova_runtime::decode_block(&response3.blocks[0].0).expect("block decode");
+    assert_eq!(
+        block3.header.height, in_window_height,
+        "窗口内 walk 必须返回恰好请求高度的块"
     );
     let diag = a.sync_respond_diagnostics();
-    assert!(diag.missing >= 2, "missing 计数（实测 {}）", diag.missing);
+    assert_eq!(diag.served, 2, "阶段 3 累计两次成功响应");
+    assert_eq!(
+        diag.served_via_verified_hash, 1,
+        "窗口内请求**不得**使用 verified-hash 路径（walk 行为逐字不变）"
+    );
+
+    // =====================================================================
+    // 阶段 4 —— Case C：无可信 artifact ⇒ WalkExceeded 安全边界保留
+    // =====================================================================
+    // 模拟 artifact 不可用（retention 淘汰 / 服务目录缺失）：删除本地 qc_history 目录。
+    // 仅影响 node-local 服务提示，不触碰 consensus / storage schema / head。
+    let qc_dir = config
+        .storage_dir
+        .join(nova_node::qc_history::QC_HISTORY_DIR);
+    let _ = std::fs::remove_dir_all(&qc_dir);
+    assert!(!qc_dir.exists(), "测试前置：qc_history 目录必须已移除");
+
+    let rid4 = nova_network::security::random_request_id().unwrap();
+    let req4 = SyncBlockRequest {
+        request_id: rid4,
+        height: 1,
+        block_hash: None,
+    };
+    t.send(
+        &a_id,
+        encode(&sign_envelope(
+            &f_kp,
+            MessageType::SyncBlockRequest,
+            req4.encode(),
+        )),
+    )
+    .expect("send req4");
+
+    assert!(
+        pump_expect_no_sync_response(&mut a, &mut t, 400),
+        "无 artifact 时超窗请求不得产生 SyncBlockResponse"
+    );
+    let diag = a.sync_respond_diagnostics();
     assert!(
         diag.walk_exceeded >= 1,
-        "walk_exceeded 计数（实测 {}）",
+        "无 artifact ⇒ 必须仍为 WalkExceeded（实测 {}）",
         diag.walk_exceeded
     );
-    assert_eq!(diag.served, 0, "无任何成功响应");
+    assert_eq!(diag.served, 2, "无 artifact ⇒ 不得新增成功响应");
+    assert_eq!(
+        diag.served_via_verified_hash, 1,
+        "无 artifact ⇒ 不得进入 exact 路径"
+    );
     drop(t);
     drop(a);
 }

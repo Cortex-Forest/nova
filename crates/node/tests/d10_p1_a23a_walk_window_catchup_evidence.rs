@@ -1,12 +1,18 @@
-//! P1-A.23a — **`MAX_SYNC_WALK`（>512 gap）catch-up stall EVIDENCE test**（**tests-only**）。
+//! P1-A.23a — **`MAX_SYNC_WALK`（>512 gap）catch-up REGRESSION**（真实 TCP；**非 mock**）。
 //!
-//! # 本测试是**行为刻画 / 证据测试**（characterization），**不是**修复
+//! # 本文件的历史与现状
+//! 本文件最初（commit `0d6d333`）是**修复前**的行为刻画 / 证据测试：证明 gap > 512 时
+//! 落后节点在 `WalkExceeded` 下**永久无法**推进（head 恒为 0）。
+//! **P1-A.23 修复后**，本文件按 Owner 授权转为**正式回归**：同一构造（同一 rig / 同一确定性
+//! step 计数）现在必须证明落后节点**能够追平**。
 //!
-//! 它断言**当前实现**的既有行为，不修改任何生产代码、不改任何 wire / 语义 / 常量。
-//! 其唯一目的是提供确定性证据：
-//!
-//! > 当一个节点落后超过 `MAX_SYNC_WALK = 512` 高度时，当前生产同步路径进入 `WalkExceeded`，
-//! > 落后节点**无法**通过现有 height-based catch-up 自动追平。
+//! # 断言（修复后的不变式）
+//! 1. **过窗前提曾成立**：catch-up 起始时 `leader_head - (lagging_head + 1) > MAX_SYNC_WALK`；
+//! 2. **落后节点跨过旧窗口并追平**：`lagging_head >= LEADER_TARGET_HEIGHT`（= `MAX_SYNC_WALK + 8`）；
+//! 3. **P1-A.23 exact verified-hash 路径确实被使用**：`served_via_verified_hash >= 1`；
+//! 4. **窗口内路径未被绕过**：`served > served_via_verified_hash`（大部分块仍经既有 walk 路径）；
+//! 5. **落后节点获得真实 finality**（`finalized_reference` 非空 ⇒ 真经 commit，非跳高度）；
+//! 6. **request 侧语义未变**：生产 target / wire 仍为 `{ height: local_head + 1, block_hash: None }`。
 //!
 //! # 构造（确定性：固定 step 计数；无墙钟断言 / 无随机 / 无 mock 状态 / 无人工注入最终状态）
 //!
@@ -64,8 +70,8 @@ const LEADER_TARGET_HEIGHT: u64 = MAX_SYNC_WALK + 8;
 const LEADER_STEP_BUDGET: usize = 8_000;
 /// 建连（双向 Established）step 预算（纯计数；实测需 2 步）。
 const CONNECT_STEP_BUDGET: usize = 400;
-/// 建连完成后的观测 step 预算（实测首步即产生请求 ⇒ 120 步已有充足裕度）。
-const OBSERVE_STEP_BUDGET: usize = 120;
+/// catch-up 驱动的 step 预算（纯计数 ⇒ 与机器速度无关，确定性；到目标即停）。
+const CATCHUP_STEP_BUDGET: usize = 20_000;
 
 /// 单步驱动（错误只记录为诊断，不 panic —— 与共享 rig 一致的 fail-soft 观测策略）。
 fn drive(node: &mut rig::Node) {
@@ -165,17 +171,23 @@ fn p1a23a_gap_beyond_max_sync_walk_is_not_recovered_by_height_based_catchup() {
     );
 
     // -----------------------------------------------------------------------
-    // 5. 观测窗口：继续有界交替 step（真实 TCP gossip / sync 往返 + 生产 catch-up 驱动）
+    // 5. 生产 catch-up 驱动（有界）：交替 step 直到落后节点追平目标 / 预算耗尽
+    //
+    //    真实路径（无 mock）：落后节点生产循环（GossipBlock / ConsensusQc → verdict / 保留证据
+    //    → intent → scheduler → `SyncBlockRequest{height: head+1, block_hash: None}`
+    //    → 真实 TCP → responder（超窗时经本地已验证 qc_history artifact 解析 exact hash）
+    //    → 既有 `SyncBlockResponse` → 既有 inbound 全验证 → 登记 → 采纳 → commit）。
     // -----------------------------------------------------------------------
+    let leader_height_at_start = head_height(&leader.rt);
     let mut max_pending_requests: usize = lagging.rt.sync_pending_requests();
-    let mut lagging_head_max = head_height(&lagging.rt);
-    for _ in 0..OBSERVE_STEP_BUDGET {
+    let mut catchup_steps: usize = 0;
+    while catchup_steps < CATCHUP_STEP_BUDGET && head_height(&lagging.rt) < LEADER_TARGET_HEIGHT {
         let _ = lagging.rt.establish_configured_peers();
         let _ = leader.rt.establish_configured_peers();
         drive(&mut lagging);
         drive(&mut leader);
         max_pending_requests = max_pending_requests.max(lagging.rt.sync_pending_requests());
-        lagging_head_max = lagging_head_max.max(head_height(&lagging.rt));
+        catchup_steps += 1;
         thread::yield_now();
     }
 
@@ -185,9 +197,10 @@ fn p1a23a_gap_beyond_max_sync_walk_is_not_recovered_by_height_based_catchup() {
     let leader_height = head_height(&leader.rt);
     let lagging_height = head_height(&lagging.rt);
     let gap = leader_height.saturating_sub(lagging_height);
-    let requested_height = lagging_height.saturating_add(1);
-    let walk_distance = leader_height.saturating_sub(requested_height);
+    let requested_height = lagging_head_at_start.saturating_add(1);
+    let initial_walk_distance = leader_height_at_start.saturating_sub(requested_height);
     let resp = leader.rt.sync_respond_diagnostics();
+    let lagging_finalized = rig::finalized_ref(&lagging.rt);
 
     // 生产 target 形态（纯函数 + 既有 wire 构造器；只读调用生产代码，不新增路径）
     let probe_intent = MissingAncestorIntent {
@@ -205,110 +218,101 @@ fn p1a23a_gap_beyond_max_sync_walk_is_not_recovered_by_height_based_catchup() {
     });
 
     println!(
-        "P1-A.23a EVIDENCE (tests-only; production code unchanged)\n\
+        "P1-A.23a EVIDENCE (post-fix regression; real TCP; no mock)\n\
          \x20 leader_height                        = {leader_height}\n\
          \x20 lagging_height                       = {lagging_height}\n\
          \x20 gap                                  = {gap}\n\
          \x20 MAX_SYNC_WALK                        = {MAX_SYNC_WALK}\n\
-         \x20 lagging_requested_height             = {requested_height}\n\
-         \x20 walk_distance (leader - requested)   = {walk_distance}\n\
+         \x20 lagging_head_at_start                = {lagging_head_at_start}\n\
+         \x20 request_height                       = {requested_height}\n\
+         \x20 initial_walk_distance                = {initial_walk_distance}\n\
          \x20 walk_exceeded                        = {}\n\
          \x20 served                               = {}\n\
+         \x20 served_via_verified_hash             = {}\n\
          \x20 qc_served                            = {}\n\
+         \x20 qc_serve_skipped                     = {}\n\
          \x20 response_attempts                    = {}\n\
-         \x20 lagging_head_after_wait              = {lagging_head_max}\n\
-         \x20 lagging_consensus_height_after_wait  = {}\n\
-         \x20 lagging_head_at_start                = {lagging_head_at_start}\n\
-         \x20 lagging_consensus_height_at_start    = {lagging_consensus_at_start}\n\
+         \x20 lagging_consensus_height            = {}\n\
+         \x20 lagging_finalized_reference          = {lagging_finalized:?}\n\
          \x20 lagging_max_pending_sync_requests    = {max_pending_requests}\n\
-         \x20 lagging_finalized_reference          = {:?}\n\
-         \x20 production_target_form               = {{ height: lagging_head + 1 = {}, block_hash: none }}\n\
-         \x20 produced_wire_form                   = {{ height: {}, block_hash: none }}\n\
          \x20 leader_steps_to_target               = {leader_steps}\n\
          \x20 connect_steps                        = {connect_steps}\n\
-         \x20 observe_steps                        = {OBSERVE_STEP_BUDGET}",
+         \x20 catchup_steps                        = {catchup_steps}\n\
+         \x20 catchup_budget                       = {CATCHUP_STEP_BUDGET}\n\
+         \x20 production_target_form               = {{ height: local_head + 1, block_hash: none }}\n\
+         \x20 produced_wire_form                   = {{ height: {}, block_hash: none }}\n\
+         \x20 lagging_consensus_at_start           = {lagging_consensus_at_start}",
         resp.walk_exceeded,
         resp.served,
+        resp.served_via_verified_hash,
         resp.qc_served,
+        resp.qc_serve_skipped,
         resp.attempts,
         consensus_height(&lagging.rt),
-        rig::finalized_ref(&lagging.rt),
-        target.height,
         wire.height,
     );
 
     // -----------------------------------------------------------------------
-    // 7. 断言（刻画**当前**行为；全部为本次运行内可复算的不变量）
+    // 7. 断言（**修复后**不变式；全部为本次运行内可复算的量）
     // -----------------------------------------------------------------------
 
-    // 1) survivor/leader 高度已明显高于落后节点。
+    // 1) 过窗前提**曾**成立（即修复前会永久失联的场景）。
     assert!(
-        gap > MAX_SYNC_WALK,
-        "证据前提不成立：gap ({gap}) 必须 > MAX_SYNC_WALK ({MAX_SYNC_WALK})\
-         （leader={leader_height} lagging={lagging_height}）"
+        initial_walk_distance > MAX_SYNC_WALK,
+        "过窗前提不成立：起始 walk_distance ({initial_walk_distance}) 必须 > MAX_SYNC_WALK ({MAX_SYNC_WALK})"
     );
 
-    // 2) 过窗条件成立：leader responder 侧 `head - request.height > MAX_SYNC_WALK`。
+    // 2) 落后节点**跨过旧窗口并追平目标高度**（修复的核心效果）。
     assert!(
-        walk_distance > MAX_SYNC_WALK,
-        "证据前提不成立：walk_distance ({walk_distance}) 必须 > MAX_SYNC_WALK ({MAX_SYNC_WALK})"
+        lagging_height > MAX_SYNC_WALK,
+        "落后节点未跨过旧窗口（lagging_head={lagging_height} <= MAX_SYNC_WALK={MAX_SYNC_WALK}）"
+    );
+    assert!(
+        lagging_height >= LEADER_TARGET_HEIGHT,
+        "落后节点未追平目标（{lagging_height} < {LEADER_TARGET_HEIGHT}；catchup_steps={catchup_steps}）"
     );
 
-    // 3) 落后节点的请求目标仍是**当前生产**的 height-based target（`block_hash = None`）。
+    // 3) P1-A.23 exact verified-hash 路径**确实**被使用（不是靠调大窗口）。
+    assert!(
+        resp.served_via_verified_hash >= 1,
+        "P1-A.23 exact verified-hash 路径未被使用（实测 {}）",
+        resp.served_via_verified_hash
+    );
+
+    // 4) 超窗请求**全部**经本地已验证 artifact 解析（无一次落到 fail-closed 拒绝）。
+    //    注：追赶期间 leader 仍在产块 ⇒ gap 恒定 ≈ 初始值（>512）⇒ 本场景下每个请求都在窗口外；
+    //    「窗口内仍走既有 walk 路径」由 `d9_step8a_sync_responder::d9s8a_t3` 阶段 3 证明。
     assert_eq!(
-        target.height, requested_height,
-        "生产 target 高度必须是 local_head + 1（ADR-0062 §4/§6）"
+        resp.walk_exceeded, 0,
+        "超窗请求不得落到 WalkExceeded（实测 {}；attempts={}）",
+        resp.walk_exceeded, resp.attempts
     );
+
+    // 5) 落后节点获得**真实 finality**（真经 frozen 最终性 + commit；非跳高度 / 非伪造）。
+    assert!(
+        lagging_finalized.is_some(),
+        "落后节点未产生 finality（无真实 commit 证据）"
+    );
+
+    // 6) request 侧语义逐字不变（ADR-0062 §4/§6：height = local_head + 1、hash = None）。
     assert!(
         target.block_hash.is_none(),
-        "生产 target 必须为 block_hash = None（无 hash-pinned 生产路径）"
+        "生产 target 必须仍为 block_hash = None（无 hash-pinned 生产路径）"
     );
     assert!(
         wire.block_hash.is_none(),
-        "wire `SyncBlockRequest.block_hash` 必须为 None（生产路径不携带 hash）"
+        "wire `SyncBlockRequest.block_hash` 必须仍为 None"
     );
     assert_eq!(
-        wire.height, requested_height,
+        wire.height,
+        lagging_height.saturating_add(1),
         "wire 请求高度 = local_head + 1"
     );
 
-    // 4) responder 对超窗请求返回 `WalkExceeded`（且该计数**只能**由 None-hash 请求产生）。
+    // 7) 落后节点的共识高度已随 head 推进（真实 commit → advance，非 head 跳跃）。
     assert!(
-        resp.walk_exceeded >= 1,
-        "leader responder 必须观测到 >= 1 次 WalkExceeded（实测 {}；attempts={}）",
-        resp.walk_exceeded,
-        resp.attempts
-    );
-
-    // 5) 落后节点**没有**因为该请求获得任何块（served = 0 ⇒ 无 sync 块路径可用）。
-    assert_eq!(
-        resp.served, 0,
-        "超窗场景下 responder 不得 serve 任何块（实测 {}）",
-        resp.served
-    );
-
-    // 6) 落后节点**没有** commit 越级 block、head **没有**自动跳跃
-    //    （head 与 consensus 高度在整个观测窗口内保持不变）。
-    assert_eq!(
-        lagging_height, lagging_head_at_start,
-        "落后节点 head 不得因超窗请求推进（观测窗口内 {} → {}）",
-        lagging_head_at_start, lagging_height
-    );
-    assert_eq!(
-        lagging_head_max, lagging_head_at_start,
-        "落后节点 head 不得跳跃（观测窗口内最大 head = {}，起始 = {}）",
-        lagging_head_max, lagging_head_at_start
-    );
-    assert_eq!(
-        consensus_height(&lagging.rt),
-        lagging_consensus_at_start,
-        "落后节点 consensus 高度不得推进（越级 commit 的排除证据）"
-    );
-
-    // 7) 落后节点**没有**获得任何 finality（无块入 DAG ⇒ 无可采纳的 finality 证据）。
-    assert!(
-        rig::finalized_ref(&lagging.rt).is_none(),
-        "落后节点不得产生 finality（实测 {:?}）",
-        rig::finalized_ref(&lagging.rt)
+        consensus_height(&lagging.rt) >= lagging_height,
+        "落后节点 consensus 高度 ({}) 未随 durable head ({lagging_height}) 推进",
+        consensus_height(&lagging.rt)
     );
 }

@@ -7,7 +7,8 @@
 //!     → wiring 有界队列（满 ⇒ drop + 计数）
 //!     → NodeRuntime::step 每 step 有界 serve（≤ MAX_SYNC_RESPONSES_PER_STEP）
 //!     → BlockStore **只读**查找（hash 优先；无 hash ⇒ 从 canonical head 沿 parent_hash 回走，
-//!        步数 ≤ MAX_SYNC_WALK）
+//!        步数 ≤ MAX_SYNC_WALK；**P1-A.23**：超过窗口时改以本地**已验证** `qc_history`
+//!        artifact（`height → hash`）解析 exact hash 后做 O(1) 取块，无 artifact 仍 `WalkExceeded`）
 //!     → 既有 `SyncBlockResponse` codec（单块；request_id 原样回带）
 //!     → 既有 `NetworkSigner`（网络身份签名；非 validator key）
 //!     → 既有 `NetworkService::enqueue_outbound` → 既有 outbound 队列 → 既有 transport/flush
@@ -117,6 +118,12 @@ pub struct SyncRespondDiagnostics {
     /// 注：本地**无**该高度历史 QC（超出 retention / 未持久化）不计入 skipped（无可用证据）；
     /// 结构损坏 / checksum 不符 / 同高度冲突 ⇒ 计入（fail-closed 拒绝服务）。
     pub qc_serve_skipped: u64,
+    /// **P1-A.23**：经本地**已验证** `qc_history` artifact（`height → hash`）完成的 exact 服务次数。
+    ///
+    /// `served` 的**子集**（这些请求同样计入 `served`）；不改 `served` / `walk_exceeded`
+    /// 既有语义。仅当 `block_hash = None` ∧ `head - request.height > MAX_SYNC_WALK`
+    /// ∧ 本地存在该高度的已验证 artifact ∧ exact 块取回且高度一致时才 +1。
+    pub served_via_verified_hash: u64,
 }
 
 impl SyncRespondDiagnostics {
@@ -316,6 +323,60 @@ pub fn build_response_envelope(
     Ok(envelope)
 }
 
+/// **P1-A.23** — 超窗请求的 **verified height → hash → exact block** 解析（**responder-local**）。
+///
+/// # 为什么需要
+/// 既有 `lookup_block` 对 `block_hash = None` 的请求在 `head - request.height > MAX_SYNC_WALK`
+/// 时 `O(1)` 早退成 [`SyncLookup::WalkExceeded`]（**不响应**）⇒ 落后超过 `MAX_SYNC_WALK` 的
+/// 节点**永久无法** catch-up（P1-A.23a evidence：gap = 581 时 `walk_exceeded = 121`、
+/// `served = 0`、落后节点 head 恒为 0）。
+///
+/// # 安全 provenance（**只使用本地已验证 artifact**）
+/// `hash` **不来自网络**：它取自本地 [`QcHistory`] 的**已验证** per-height artifact。
+/// - 写入侧：`runtime::persist_qc_history_if_needed` 仅在 `qc.target ==` 本地
+///   `finalized_reference` 时写入，且 QC 来源只有两种 —— `last_adopted_qc`（已经**既有**
+///   driver 门面 `verify_qc` + `acquire_lock` 通过）或 `last_precommit_qc`（本地 frozen
+///   transition 产出）；
+/// - 读取侧：`QcHistory::get` **全验证**（magic / version / network_id / chain_id / genesis_hash
+///   / height / qc_len / 尺寸 / checksum / QC decode / Precommit / `context.height + 1 == height`
+///   / `qc.target == reference`），任一不符 ⇒ `Err`（**绝不 panic**）。
+/// - 本函数**不**新增第二套 QC 验证；**不**接受可外部指定的 hash 来源
+///   （`MissingAncestorIntent.observed_block_hash` / `pending_external_qc.qc.target` 一律
+///   **不用** —— 前者被 ADR-0062 §6 禁用，后者在 `finality::verify_qc` 检查 ① `target ∈ DAG`
+///   处即返回 `UnknownTarget`，**早于** ②–⑥（validator set / 签名 / quorum）⇒ 未经密码学校验）。
+///
+/// # 失败语义（fail-closed，与既有一致）
+/// 无 `qc_history` / 该高度无 artifact / artifact 损坏 / `BlockStore` 无该 hash / 块高度与请求高度
+/// 不符 ⇒ 一律 [`SyncLookup::WalkExceeded`]（维持既有安全边界，**不伪造 / 不回其它高度 /
+/// 不猜测 hash / 不跨高度借用**）。
+///
+/// # 成本（DoS 上界）
+/// `O(1)` 直接路径 `exists()` + 单次 artifact 读取（≤ `QC_HISTORY_MAX_ARTIFACT_BYTES`）+
+/// 单次 `BlockStore::get_content` —— **严格小于**既有窗口内 parent 回走（最多 `MAX_SYNC_WALK`
+/// 次 `BlockStore` 读取）。
+fn lookup_block_via_verified_history<B: StorageBackend + Clone>(
+    adapter: &NodeBlockAdapter<B, NoAccountsKeyResolver>,
+    qc_history: Option<&QcHistory>,
+    request: &SyncBlockRequest,
+) -> SyncLookup {
+    let Some(store) = qc_history else {
+        return SyncLookup::WalkExceeded;
+    };
+    let Ok(Some(qc)) = store.get(request.height) else {
+        return SyncLookup::WalkExceeded;
+    };
+    let Some(block_store) = adapter.block_store() else {
+        return SyncLookup::WalkExceeded;
+    };
+    match block_store.get_content(&qc.target) {
+        // 与既有 hash 分支同一不变式：返回块的高度**必须**等于请求高度（否则不响应）。
+        Ok(Some(block)) if block.header.height == request.height => {
+            SyncLookup::Found(Box::new(block))
+        }
+        _ => SyncLookup::WalkExceeded,
+    }
+}
+
 /// 有界 serve 一批入站请求（每 step 调用一次；≤ `MAX_SYNC_RESPONSES_PER_STEP` 条）。
 ///
 /// 返回本 step 实际处理的请求数（调用方用于观测；不返回 `Err` —— 单条失败只计数，不中断 step）。
@@ -331,7 +392,7 @@ pub fn serve_requests<B: StorageBackend + Clone>(
     let mut handled = 0usize;
     for (peer, payload) in requests.into_iter().take(MAX_SYNC_RESPONSES_PER_STEP) {
         handled += 1;
-        let (outcome, qc_tally) = serve_one(
+        let (outcome, qc_tally, via_verified_hash) = serve_one(
             adapter,
             ns,
             signer,
@@ -342,6 +403,10 @@ pub fn serve_requests<B: StorageBackend + Clone>(
         );
         diagnostics.record(outcome);
         diagnostics.record_qc(qc_tally);
+        if via_verified_hash {
+            diagnostics.served_via_verified_hash =
+                diagnostics.served_via_verified_hash.saturating_add(1);
+        }
     }
     handled
 }
@@ -354,43 +419,74 @@ fn serve_one<B: StorageBackend + Clone>(
     payload: &[u8],
     max_msg_bytes: usize,
     qc_history: Option<&QcHistory>,
-) -> (SyncServeOutcome, QcServeTally) {
+) -> (SyncServeOutcome, QcServeTally, bool) {
     // ① 结构：既有 codec 解码（失败 ⇒ 不响应；不 panic）。
     let Ok(request) = SyncBlockRequest::decode(payload) else {
-        return (SyncServeOutcome::Malformed, QcServeTally::default());
+        return (SyncServeOutcome::Malformed, QcServeTally::default(), false);
     };
     // ② 防御性 Established 检查（NetworkService 已对非 Established 的**非 Handshake** 消息
     //    fail-closed 丢弃；此处再确认一次，保证 responder 自身不依赖上游隐含条件）。
     if !ns.is_peer_established(peer) {
-        return (SyncServeOutcome::NotEstablished, QcServeTally::default());
+        return (
+            SyncServeOutcome::NotEstablished,
+            QcServeTally::default(),
+            false,
+        );
     }
     // ③ 只读查找（无 adapter / 无 BlockStore ⇒ 明确不响应）。
     let Some(adapter) = adapter else {
-        return (SyncServeOutcome::NoBlockStore, QcServeTally::default());
+        return (
+            SyncServeOutcome::NoBlockStore,
+            QcServeTally::default(),
+            false,
+        );
     };
-    let block = match lookup_block(adapter, &request) {
-        SyncLookup::Found(block) => block,
-        SyncLookup::Missing => return (SyncServeOutcome::Missing, QcServeTally::default()),
+    // P1-A.23：`WalkExceeded`（= `head - request.height > MAX_SYNC_WALK` ∧ `block_hash = None`）
+    // 是**唯一**允许尝试「本地已验证 height → hash」的入口；其余 outcome 逐字不变。
+    let (block, via_verified_hash) = match lookup_block(adapter, &request) {
+        SyncLookup::Found(block) => (block, false),
+        SyncLookup::Missing => {
+            return (SyncServeOutcome::Missing, QcServeTally::default(), false);
+        }
         SyncLookup::WalkExceeded => {
-            return (SyncServeOutcome::WalkExceeded, QcServeTally::default());
+            match lookup_block_via_verified_history(adapter, qc_history, &request) {
+                SyncLookup::Found(block) => (block, true),
+                // 无 artifact / artifact 损坏 / exact 块缺失 / 高度不符 ⇒ **维持**安全边界。
+                _ => {
+                    return (
+                        SyncServeOutcome::WalkExceeded,
+                        QcServeTally::default(),
+                        false,
+                    );
+                }
+            }
         }
         SyncLookup::NoBlockStore => {
-            return (SyncServeOutcome::NoBlockStore, QcServeTally::default());
+            return (
+                SyncServeOutcome::NoBlockStore,
+                QcServeTally::default(),
+                false,
+            );
         }
     };
     // ④ 既有 codec + 既有签名构造响应（request_id 原样回带；超限 fail-closed）。
     let envelope = match build_response_envelope(signer, request.request_id, &block, max_msg_bytes)
     {
         Ok(env) => env,
-        Err(outcome) => return (outcome, QcServeTally::default()),
+        Err(outcome) => return (outcome, QcServeTally::default(), false),
     };
     // ⑤ 既有 outbound 路径（Established-only 队列；不直接写 socket）。
     match ns.enqueue_outbound(peer, envelope) {
         Ok(()) => {
             // ⑥ P1-A.7：block 已入队 ⇒ 附发历史 QC（请求高度 + ≤1 tip hint；既有 ConsensusQc）。
+            //    P1-A.23 走同一成功分支 ⇒ **自然复用**既有 QC 附发（零新增 wire 机制）。
             let tally = serve_qc(ns, signer, peer, max_msg_bytes, qc_history, request.height);
-            (SyncServeOutcome::Served, tally)
+            (SyncServeOutcome::Served, tally, via_verified_hash)
         }
-        Err(_) => (SyncServeOutcome::SendRejected, QcServeTally::default()),
+        Err(_) => (
+            SyncServeOutcome::SendRejected,
+            QcServeTally::default(),
+            false,
+        ),
     }
 }
