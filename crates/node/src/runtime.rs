@@ -852,7 +852,7 @@ fn finality_commit_bridge(
     restored_qc: Option<&QuorumCertificate>,
 ) -> Result<(), RuntimeError> {
     let Some(adapter) = adapter else {
-        return Ok(()); // full-node / 无 canonical adapter ⇒ 无 commit
+        return Ok(()); // 无 canonical adapter（P1-A.24 后仅防御性不可达）⇒ 无 commit
     };
     // Gate 1：无 finality ⇒ NO COMMIT。
     let Some(x) = driver.consensus().state().finality.finalized_reference else {
@@ -1584,31 +1584,31 @@ impl NodeRuntime {
         let (genesis, identity) =
             bootstrap::load_genesis(config).map_err(NodeRuntimeError::Startup)?;
 
-        // 4. chain storage owner：
-        //    - validator mode：bootstrap 装配 NodeBlockAdapter（canonical StateStore + ChainHead +
-        //      genesis 参数；首启 bootstrap genesis state，单一 backend owner，不另开裸 handle）。
-        //    - full-node：Phase 1 裸 PersistentBackend handle（现状；不触碰 Provider / validator）。
-        let (chain_storage, block_production, consensus_start_height) = if config.validator_enabled
-        {
+        // 4. chain storage owner（**P1-A.24**：canonical adapter 与 validator 权威 **解耦**）：
+        //    - validator mode：canonical adapter（＋下方 5–11 的 validator actor）；
+        //    - full-node / observer：**同一个** canonical adapter —— 获得 validation /
+        //      registration / external-finality adoption / commit / sync-serve 能力，
+        //      但 actors = []（无 key / 无 signer / 无 safety journal ⇒ 结构性不可能
+        //      propose / vote / 签名；见 5–11 分支与 `runtime_propose` 的 `driver.actor(0)` gate）。
+        //    `bootstrap::start` 只做：genesis 加载 + storage 打开 + state/head 恢复（首启 bootstrap
+        //    genesis state）+ BlockStore 装配 + committed-head 一致性校验 —— **不读**
+        //    `validator_enabled` / **不触碰** KeyProvider / **不创建** actor / **不产生**共识输出。
+        let (chain_storage, block_production, consensus_start_height) = {
             let adapter = bootstrap::start(NoAccountsKeyResolver, config)
                 .map_err(NodeRuntimeError::Startup)?;
             let head_height = adapter.head().height;
             (None, Some(adapter), head_height)
-        } else {
-            std::fs::create_dir_all(&config.storage_dir)
-                .map_err(|_| NodeRuntimeError::Startup(NodeStartupError::StorageIo))?;
-            let backend = PersistentBackend::open(&config.storage_dir)
-                .map_err(NodeStartupError::Storage)
-                .map_err(NodeRuntimeError::Startup)?;
-            (Some(backend), None, 0)
         };
 
         // 10. ConsensusNode（canonical state owner）——随后装配进 NodeConsensusDriver。
-        //     validator：初始共识高度 = canonical head height（ChainHead 单一高度源）；full-node = 0。
+        //     初始共识高度 = canonical head height（ChainHead 单一高度源；validator 与
+        //     full-node / observer 同源 —— P1-A.24）。
         let set = ValidatorSet::from_genesis(&genesis);
 
         // P1-A.7 / P1-A.20-C Phase 2：per-height PrecommitQC history（ADR-0064）。
-        // - 仅在有 canonical adapter（能验证 / 提交）时装配 —— full-node 不产生无主 artifact。
+        // - 仅在有 canonical adapter（能验证 / 提交）时装配 —— 无 adapter 的形态不产生无主 artifact。
+        //   （P1-A.24：validator 与 full-node / observer 均有 adapter ⇒ 两者都会产出/使用 artifact；
+        //   full-node 的 artifact 来自**采纳**的外部 QC，使其能作为 P1-A.23 exact catch-up 的 responder。）
         // - **D11-25 D5**：tip 必须 ≤ 实际可用 coverage ⇒ fact 高度仅作**上界**，由
         //   `seed_tip_from_store` 向下**有界**探测现有 artifact（不扫描目录 / 不遍历历史）；
         //   未命中 ⇒ tip 保持 `None`（不发 hint）；fact 缺失 / 不可读 ⇒ 同样不播种。
@@ -1634,8 +1634,8 @@ impl NodeRuntime {
         // D10-C Step 2 — DAG Restart Rebuild：validator（bootstrap 装配 canonical BlockStore）在
         //    restart 后沿 canonical head → parent 链重建 Consensus DAG ancestry（consensus DAG 不
         //    persisted 的补偿 seam），使 safety lock / ancestry 判定在重启后可安全继续；重建只读
-        //    storage、fail closed。首启（head == genesis）⇒ 仅 genesis 根。full-node（无 adapter）
-        //    维持空 DAG（既有语义）。
+        //    storage、fail closed。首启（head == genesis）⇒ 仅 genesis 根。无 adapter 的形态
+        //    维持空 DAG（P1-A.24 后仅防御性不可达）。
         // D10-C Step 4 — Finality Recovery Fact 恢复：在 rebuild 后读取 durable fact；未 commit 的
         //    finalized 候选经 identity / block / QC / head-relation 全验证后注入 finalized_reference
         //    （fail-closed；见 bootstrap::restore_finality_fact）。
@@ -2991,7 +2991,8 @@ impl NodeRuntime {
                     (BlockInboundSource::SyncResponse, outcomes, wires)
                 }
                 (None, _) => {
-                    // full-node / 无 canonical adapter：无法验证（无 state/head 上下文）→ 丢弃并计数。
+                    // 无 canonical adapter（P1-A.24 后仅防御性不可达）：无法验证
+                    // （无 state/head 上下文）→ 丢弃并计数。
                     self.block_inbound_skipped += 1;
                     continue;
                 }

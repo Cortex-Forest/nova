@@ -834,7 +834,8 @@ struct RunSummary {
     steps: u64,
     /// 本进程的 step 预算（`--run-steps`）。
     run_steps: u64,
-    /// canonical head 高度（full-node 形态无 adapter ⇒ 0）。
+    /// canonical head 高度（无对端 / 未收到块时为 genesis head；P1-A.24 起 full-node 同样具备
+    /// canonical adapter，可随链推进）。
     head_height: u64,
     /// configured peers 中已认证 `Established` 的数量。
     established_peers: usize,
@@ -2124,7 +2125,7 @@ mod tests {
         let s = outcome.summary;
         assert_eq!(s.steps, 3, "run_steps=3 ⇒ 恰好 3 次 step（无 N+1）");
         assert_eq!(s.run_steps, 3);
-        assert_eq!(s.head_height, 0, "full-node 无 canonical adapter");
+        assert_eq!(s.head_height, 0, "无对端 ⇒ head 停在 genesis head");
         assert_eq!(s.configured_peers, 0);
         assert_eq!(s.established_peers, 0);
         assert_eq!(s.inbound_connections, 0);

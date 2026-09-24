@@ -4,19 +4,25 @@
 //! full-node 收到 validator 对端广播的 PrecommitQC 后，既有 `NodeRuntime::step()` 会沿
 //! `take_commands → process_command → driver.submit_inbound_qc → verify_qc` 命中冻结检查 ①
 //! 「`target ∈ DAG`」（`crates/consensus/src/finality.rs:229-232`，`FinalityError::UnknownTarget`）——
-//! 因为 full-node 无 canonical adapter（`block_production = None`）⇒ 远端区块被跳过（不计入 DAG），
-//! 于是返回 `DriverError::QcVerification` ⇒ `RuntimeError::Driver` ⇒ 节点 fail-closed 退出。
+//! 在 P1-A.24 **之前** full-node 无 canonical adapter（`block_production = None`）⇒ 远端区块被跳过
+//! （不计入 DAG），于是返回 `DriverError::QcVerification` ⇒ `RuntimeError::Driver` ⇒ 节点 fail-closed 退出。
 //!
 //! # P1-A.4 修复边界（本测试验证）
 //! **只有** `take_commands() → process_command(..)` 这条**网络来源**路径改为「拒绝 + 计数 + 继续」；
 //! 本地路径（`auto_drive` / proposer / commit bridge / DAG 登记 / egress）仍 fail-closed。
 //! 被拒命令**零 canonical 变更**（driver verify-then-transition；无 lock / 无 outbound）。
 //!
+//! # P1-A.24 后的语义（本文件 Test A 已更新）
+//! full-node **获得** canonical adapter（`bootstrap::start`），因此远端区块会正常进入既有
+//! inbound 验证 → 登记 → 采纳已验证外部 finality → commit：A 现在会**跟随** B。
+//! **不变**的是角色隔离与安全内核：A 仍无 validator actor / 无 key / 无 safety journal，
+//! 永不成为 validator、不提案、不投票；畸形或不可应用的入站命令仍不得改变 canonical 状态、
+//! 不得令 runtime 崩溃。Test B 的安全断言**逐字保留**。
+//!
 //! # 测试矩阵
-//! - **A**：A = full-node（真实 listener，端口由内核分配）+ B = validator（dial A，真实 TCP）；
-//!   B 产生真实共识流量（proposal / vote / **PrecommitQC** / gossip block）；A 必须**存活**、
-//!   计入 `inbound_consensus_rejected >= 1`、保持零验证者权威（无 actor / 无 adapter / height 0）。
-//! - **B**：full-node + `MemoryTransport` 精确注入（既有 C-2 套路）：
+//! - **A**（本文件）：A = full-node（真实 listener，端口由内核分配）+ B = validator（dial A，真实 TCP）；
+//!   B 产生真实共识流量；A 必须**存活**、保持零验证者权威（无 actor），并（P1-A.24）跟随 B 的 head。
+//! - **B**（本文件）：full-node + `MemoryTransport` 精确注入（既有 C-2 套路）：
 //!   ① 结构合法但签名无效的 vote（`DriverError::VoteVerification`）；
 //!   ② 结构合法但 `target ∉ DAG` 的 QC（`DriverError::QcVerification(UnknownTarget)`）。
 //!   两者都必须：`step()` 成功、计数 +1、round 状态零变更、无 outbound、节点仍可用。
@@ -280,8 +286,8 @@ fn p1a4_full_node_survives_validator_consensus_traffic() {
         "A 不得持有任何 actor（零验证者权威）"
     );
     assert!(
-        a.block_production().is_none(),
-        "A 无 canonical adapter（因此远端区块不会进入其 DAG）"
+        a.block_production().is_some(),
+        "P1-A.24：A 必须有 canonical adapter（可验证 / 登记 / 采纳 / commit）"
     );
     let a_addr = a.network_listen_addr().expect("A 必须绑定真实 listener");
     assert_ne!(a_addr.port(), 0, "端口 0 必须被内核分配为真实端口");
@@ -319,13 +325,16 @@ fn p1a4_full_node_survives_validator_consensus_traffic() {
         if a.inbound_consensus_rejected() >= 1 && head_height(&b) >= 1 {
             break;
         }
+        // P1-A.24：A 作为 follower 应跟随 B 的 head（两者都至少 1 块即可进入断言阶段）。
+        if head_height(&a) >= 1 && head_height(&b) >= 1 {
+            break;
+        }
         if Instant::now() >= deadline {
             break;
         }
         thread::sleep(Duration::from_millis(1));
     }
 
-    assert!(a_failure.is_none(), "{}", a_failure.unwrap_or_default());
     assert!(b_failure.is_none(), "{}", b_failure.unwrap_or_default());
 
     // ---------- A 侧：认证 + Established 成立 ----------
@@ -338,23 +347,60 @@ fn p1a4_full_node_survives_validator_consensus_traffic() {
         "B 必须与 A 达到 Established"
     );
 
-    // ---------- 核心：A 计入被拒入站 consensus command 且仍存活 ----------
+    // ---------- A 侧观测（**不**断言具体值）：被拒入站 consensus command 计数 ----------
+    // P1-A.4（修复当时）：A 无 canonical adapter ⇒ 入站 PrecommitQC 的 target 永远 ∉ DAG
+    // ⇒ 必然拒绝 >= 1 条（这就是 P1-A.4 的故障现场）。
+    // P1-A.24：A 有 canonical adapter ⇒ 区块先被验证 / 登记 ⇒ 同一 QC 转为**可应用**
+    //（走既有采纳路径）⇒ 本计数可能为 0。属**预期语义变更**。
+    // 「不可应用的入站命令必须零 canonical 变更」由本文件 Test B 逐字覆盖（保持原样）。
     let rejected = a.inbound_consensus_rejected();
-    assert!(
-        rejected >= 1,
-        "A 必须拒绝至少一条不可应用的入站 consensus command（实测 iterations={iterations}）"
+    println!(
+        "P1-A.4/P1-A.24 EVIDENCE: a_head={} b_head={} a_block_inbound_skipped={} \
+         a_inbound_consensus_rejected={} iterations={iterations}",
+        head_height(&a),
+        head_height(&b),
+        a.block_inbound_skipped(),
+        rejected
     );
 
-    // ---------- A 仍是 full-node：零验证者权威 / 零 canonical 推进 ----------
-    assert!(!a.validator_enabled(), "A 不得变成 validator");
-    assert!(a.validator().is_none(), "A 不得持有 actor（无 lock 获取）");
-    assert!(a.block_production().is_none(), "A 无 canonical adapter");
-    assert_eq!(
-        a.consensus().state().round.height,
-        0,
-        "A 的 canonical 高度不得因入站命令推进"
+    // ---------- 核心（P1-A.4 安全内核，逐字保留）：A 存活且入站 peer 流量从不致命 ----------
+    assert!(
+        a_failure.is_none(),
+        "full-node 收到 validator peer 的 proposal/vote/QC/gossip block 后不得致命"
     );
-    assert_eq!(head_height(&a), 0, "A 不得提交任何区块");
+
+    // ---------- A 仍是 full-node：零验证者权威 ----------
+    assert!(!a.validator_enabled(), "A 不得变成 validator");
+    assert!(
+        a.validator().is_none(),
+        "A 不得持有 actor（无 key / 无签名 / 无 safety journal）"
+    );
+    assert!(
+        a.block_production().is_some(),
+        "P1-A.24：A 有 canonical adapter"
+    );
+
+    // ---------- P1-A.24：A 作为 canonical follower 跟随链 ----------
+    assert!(
+        head_height(&a) >= 1,
+        "P1-A.24：A 必须确认并 commit 至少 1 个远端 canonical block（head={} iterations={iterations}）",
+        head_height(&a)
+    );
+    assert_eq!(
+        a.block_inbound_skipped(),
+        0,
+        "A 不得跳过任何远端 block（实测 {}）",
+        a.block_inbound_skipped()
+    );
+    assert!(
+        a.consensus().state().round.height >= 1,
+        "A 的 canonical 高度必须随 commit 推进（实测 {}）",
+        a.consensus().state().round.height
+    );
+    assert!(
+        a.consensus().state().finality.finalized_reference.is_some(),
+        "A 必须采纳经 frozen 验证的外部 finality"
+    );
 
     // ---------- B 继续正常出块（validator 行为不变）----------
     assert!(
