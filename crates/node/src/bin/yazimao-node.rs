@@ -254,13 +254,17 @@ enum StartupError {
     Runtime(NodeRuntimeError),
     /// 运行循环中 `NodeRuntime::step()` 失败（fail-closed）。
     ///
-    /// 载荷 = 既有 `RuntimeError` 的**变体名**（`&'static str`），仅记录类别：
+    /// 载荷 = **稳定类别名**（绝大多数变体）或「类别名 + `BlockCommit` 的真实 inner error」：
     /// - 既有 `RuntimeError` 仅实现 `Debug`（`crates/node/src/runtime.rs`，本轮**冻结不可改**）
-    ///   ⇒ 无法满足 `StartupError` 的 `Clone/PartialEq/Eq` 派生；
-    /// - 其 `Debug` 文本可能包含 session/nonce 类运行期材料 ⇒ 入口层不复制底层载荷文本。
+    ///   ⇒ 无法整体搬入 `StartupError` 的 `Clone/PartialEq/Eq` 派生；
+    /// - 其 `Debug` 文本可能包含 session/nonce 类运行期材料 ⇒ 入口层不复制底层载荷文本；
+    /// - 而 `RuntimeError::BlockCommit` 的 payload 是 **typed 且确定性**的
+    ///   `NodeBlockApplicationError`（`Display` 沿四域分类链展开 decode / validation /
+    ///   execution / storage），不含运行期材料 ⇒ 允许以 `String` 保留其 `Display`
+    ///   （**P1-A.17 F-1 诊断**，Owner 授权；否则失败闸门不可判定）。
     ///
     /// 错误事实仍 fail-closed 传播（非 0 退出，未吞错）。
-    Run(&'static str),
+    Run(String),
     /// 既有 `NodeRuntime::shutdown` 失败（D-A2-1 ② 资源释放）。
     Shutdown,
     /// CLI 契约输出写失败（stdout）。
@@ -849,6 +853,14 @@ struct RunSummary {
     round: u64,
     /// P1-A.9（P1-3）—— 有界 sync pending intent 数。
     sync_pending: usize,
+    /// P1-A.12-DIAG（**仅观测**）—— `block_inbound_skipped` 累计数（既有只读 accessor；
+    /// 用于区分「未收到响应」与「收到但 A3 轮次证据不一致而 skip」）。
+    block_inbound_skipped: u64,
+    /// P1-A.12-DIAG（**仅观测**）—— 当前 pending external QC 条数（≤ `PENDING_EXTERNAL_QC_CAP`；
+    /// A3 sync 分支轮次证据的唯一来源）。
+    pending_external_qc: usize,
+    /// P1-A.12-DIAG（**仅观测**）—— 已附发历史 QC 数（sync responder 服务能力）。
+    qc_served: u64,
     /// P1-A.9（P1-3）—— 本进程是否 validator 形态（proposal/vote/finality 推进）。
     validator_enabled: bool,
     /// P1-A.9（P1-3）—— A.8 dial 尝试总数（saturating；恒定观测）。
@@ -882,6 +894,9 @@ fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
         consensus_height,
         round,
         sync_pending: runtime.sync_pending_requests(),
+        block_inbound_skipped: runtime.block_inbound_skipped(),
+        pending_external_qc: runtime.pending_external_qc_len(),
+        qc_served: runtime.qc_served(),
         validator_enabled: runtime.validator_enabled(),
         peer_dial_attempts_total: runtime.peer_dial_attempts_total(),
         peer_dial_failures_total: runtime.peer_dial_failures_total(),
@@ -899,7 +914,8 @@ fn status_line(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> String {
     format!(
         "{PROGRAM}: status steps={} head_height={} finalized_height={} consensus_height={} \
          round={} configured_peers={} established_peers={} inbound_connections={} \
-         sync_pending={} validator_enabled={}\n",
+         sync_pending={} block_inbound_skipped={} pending_external_qc={} qc_served={} \
+         validator_enabled={}\n",
         s.steps,
         s.head_height,
         finalized,
@@ -909,6 +925,9 @@ fn status_line(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> String {
         s.established_peers,
         s.inbound_connections,
         s.sync_pending,
+        s.block_inbound_skipped,
+        s.pending_external_qc,
+        s.qc_served,
         s.validator_enabled,
     )
 }
@@ -974,6 +993,22 @@ fn run_fault_kind(e: &RuntimeError) -> &'static str {
         RuntimeError::BlockStore(_) => "BlockStore",
         RuntimeError::BlockDecode(_) => "BlockDecode",
         RuntimeError::FinalityFact(_) => "FinalityFact",
+    }
+}
+
+/// 入口层错误载荷：`BlockCommit` 保留 **inner error 的真实 `Display`**（其余变体沿用类别名）。
+///
+/// **P1-A.17 F-1 诊断（Owner 授权；仅错误格式化）** —— 语义逐项不变：
+/// - 控制流不变（`runtime.step()` 返回 `Err` ⇒ 仍 fail-closed 立即停止，不继续下一轮）；
+/// - 退出码不变（仍为非 0）；
+/// - 除 `BlockCommit` 外，**所有**变体载荷文本逐字不变（仍取 `run_fault_kind` 的稳定类别名）；
+/// - 只多出 inner error 的 `Display`（typed / 确定性；`NodeBlockApplicationError` →
+///   `block application pipeline: <decode|validation|execution|storage>: …`），
+///   不引入 `RuntimeError` 的 `Debug` 文本 / 不含 session/nonce 类运行期材料。
+fn run_fault_message(e: &RuntimeError) -> String {
+    match e {
+        RuntimeError::BlockCommit(inner) => format!("BlockCommit: {inner}"),
+        other => run_fault_kind(other).to_string(),
     }
 }
 
@@ -1053,7 +1088,7 @@ fn run_node_loop(runtime: &mut NodeRuntime, cli: &Cli) -> RunLoopOutcome {
         }
         steps += 1;
         if let Err(e) = runtime.step() {
-            error = Some(StartupError::Run(run_fault_kind(&e)));
+            error = Some(StartupError::Run(run_fault_message(&e)));
             break;
         }
         // P1-A.9（P1-3）：固定 interval 观测行（best-effort；写失败不中断 / 不吞错）。
@@ -2209,6 +2244,11 @@ mod tests {
         let (_identity, set) = preflight(&cli).expect("preflight ok");
         let (runtime, _report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
 
+        let summary = summarize(&runtime, &cli, STATUS_INTERVAL_STEPS);
+        assert_eq!(summary.block_inbound_skipped, runtime.block_inbound_skipped());
+        assert_eq!(summary.pending_external_qc, runtime.pending_external_qc_len());
+        assert_eq!(summary.qc_served, runtime.qc_served());
+
         let a = status_line(&runtime, &cli, STATUS_INTERVAL_STEPS);
         let b = status_line(&runtime, &cli, STATUS_INTERVAL_STEPS);
         assert_eq!(a, b, "status 行必须确定性（无墙钟 / 无随机）");
@@ -2224,6 +2264,9 @@ mod tests {
             "established_peers=",
             "inbound_connections=",
             "sync_pending=",
+            "block_inbound_skipped=",
+            "pending_external_qc=",
+            "qc_served=",
             "validator_enabled=",
         ] {
             assert!(a.contains(key), "status 行缺少字段 {key}: {a}");
@@ -2233,6 +2276,20 @@ mod tests {
             "status 必须报告当前 steps: {a}"
         );
         runtime.shutdown().expect("shutdown ok");
+    }
+
+    // T49b（P1-A.17 F-1）— `BlockCommit` 错误格式化必须保留真实 inner error 文本
+    #[test]
+    fn t49b_blockcommit_fault_message_keeps_inner_error_display() {
+        let err = RuntimeError::BlockCommit(nova_node::NodeBlockApplicationError::Pipeline(
+            nova_runtime::BlockPipelineError::Storage(
+                nova_storage::error::StorageError::BackendFailure,
+            ),
+        ));
+        let msg = run_fault_message(&err);
+        assert!(msg.starts_with("BlockCommit: "), "{msg:?}");
+        assert!(msg.contains("block application pipeline:"), "{msg:?}");
+        assert!(msg.contains("backend primitive failure"), "{msg:?}");
     }
 
     // T50（P1-A.9 / P1-3）— 退出摘要：保留 P1-A.3 契约字段 + 新增 A.8/P1-A.9 观测字段
