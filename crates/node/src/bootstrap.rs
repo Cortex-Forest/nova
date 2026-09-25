@@ -615,13 +615,13 @@ fn parse_fact(bytes: &[u8]) -> Result<ParsedFact, NodeStartupError> {
 /// - **语义（D11-25 D1 = Model B）**：fact = **durable finality evidence snapshot**，
 ///   **不是** runtime `finalized_reference` 的 mirror；`Fact > R` / `Fact > ChainHead` 为合法状态。
 /// - **写入状态机（D11-25 D3/D4）**：
-///     ① 无既有 fact ⇒ 写入；
-///     ② 完整编码字节一致 ⇒ idempotent no-op（不重复原子写）；
-///     ③ `new.height > existing.height` ⇒ 写入（证据前进）；
-///     ④ `new.height < existing.height` ⇒ **不写 / 不覆盖 / 不删除 / 不报错**（非致命继续；
-///        保留更高 durable evidence —— runtime `R` 落后**不是**错误）；
-///     ⑤ `new.height == existing.height` 且证据内容不同（不同 reference，或同 reference 但
-///        QC / evidence 字节不同）⇒ `FinalityFactSameHeightConflict`（fail-closed，不覆盖）。
+///   ① 无既有 fact ⇒ 写入；
+///   ② 完整编码字节一致 ⇒ idempotent no-op（不重复原子写）；
+///   ③ `new.height > existing.height` ⇒ 写入（证据前进）；
+///   ④ `new.height < existing.height` ⇒ **不写 / 不覆盖 / 不删除 / 不报错**（非致命继续；
+///   保留更高 durable evidence —— runtime `R` 落后**不是**错误）；
+///   ⑤ `new.height == existing.height` 且证据内容不同（不同 reference，或同 reference 但
+///   QC / evidence 字节不同）⇒ `FinalityFactSameHeightConflict`（fail-closed，不覆盖）。
 /// - 失败 ⇒ `Err`（fail-closed；不影响 canonical commit —— commit 由 bridge 后续执行）。
 pub fn persist_finality_fact(
     path: &Path,
@@ -709,12 +709,12 @@ pub struct RestoredFinality {
 ///    ⇒ invalid QC **不会**被 U4-C 的 ahead 规则静默忽略；
 /// 6. head / canonical 关系（**D1 保守**；禁止仅以 height 判定 ahead）：
 ///    (a) reference ∈ canonical ancestry（`head → parent → … → genesis`；含 `== head`）
-///        ⇒ 既有语义（幂等 / stale ignore：不注入、不回退 head）；
+///    ⇒ 既有语义（幂等 / stale ignore：不注入、不回退 head）；
 ///    (b) verified valid ∧ `height(reference) > height(head)` ∧ **可证明**为 head 的 canonical
-///        descendant（沿 parent 回溯可达 head）⇒ **U4-C**：不恢复 `finalized_reference`（`R = None`）
-///        + **继续启动**（不中止）；
-///    (c) 其余（同高异 hash / unrelated parent / 关系不可证明）⇒ `FinalityFactHeadConflict`
-///        （同高异 hash / unrelated / 高度异常；**绝不选择 / 绝不猜测** / 绝不把 fork block 当 canonical）。
+///    descendant（沿 parent 回溯可达 head）⇒ **U4-C**：不恢复 `finalized_reference`（`R = None`）
+///    + **继续启动**（不中止）；
+///      (c) 其余（同高异 hash / unrelated parent / 关系不可证明）⇒ `FinalityFactHeadConflict`
+///      （同高异 hash / unrelated / 高度异常；**绝不选择 / 绝不猜测** / 绝不把 fork block 当 canonical）。
 ///
 /// 返回 `(dag, Option<RestoredFinality>)`：**D11-23 U4-C 后** ahead-of-head fact **不再注入**
 /// ⇒ 成功路径恒为 `Ok((dag, None))`；`RestoredFinality` 类型保留（既有 bridge 证据源接线不变，
@@ -811,14 +811,14 @@ pub fn restore_finality_fact(
     let head = adapter.head();
     // (a) reference 已在 canonical ancestry（`head → parent → … → genesis`；含 `== head`）
     //     ⇒ 既有语义：不注入、不回退 head、继续启动（幂等 / stale ignore）。
-    if is_canonical_ancestor(&block_store, head, &fact.reference)? {
+    if is_canonical_ancestor(block_store, head, &fact.reference)? {
         return Ok((dag, None));
     }
     // (b) verified valid ∧ reference **严格高于** head ∧ **可证明**为 head 的 canonical descendant
     //     ⇒ **U4-C**（Owner 冻结）：`finalized_reference` 不恢复（`R = None`）+ 继续启动（不中止）。
     //     注意：**不**把 X 加入返回的 DAG（不注入 ⇒ 无需 DAG 注册 ⇒ 不污染 canonical DAG）。
     if block.header.height > head.height
-        && is_canonical_descendant(&block_store, head, &fact.reference, block.header.height)?
+        && is_canonical_descendant(block_store, head, &fact.reference, block.header.height)?
     {
         return Ok((dag, None));
     }

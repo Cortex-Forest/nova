@@ -2246,8 +2246,14 @@ mod tests {
         let (runtime, _report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
 
         let summary = summarize(&runtime, &cli, STATUS_INTERVAL_STEPS);
-        assert_eq!(summary.block_inbound_skipped, runtime.block_inbound_skipped());
-        assert_eq!(summary.pending_external_qc, runtime.pending_external_qc_len());
+        assert_eq!(
+            summary.block_inbound_skipped,
+            runtime.block_inbound_skipped()
+        );
+        assert_eq!(
+            summary.pending_external_qc,
+            runtime.pending_external_qc_len()
+        );
         assert_eq!(summary.qc_served, runtime.qc_served());
 
         let a = status_line(&runtime, &cli, STATUS_INTERVAL_STEPS);
