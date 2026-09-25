@@ -121,6 +121,7 @@ impl Env {
             expected_network_id: NetworkId::Mainnet,
             storage_dir: self.chain_dir.clone(),
             validator_enabled: false, // full-node（C-1..C-5/C-7 聚焦网络组合，不经 validator）
+            validator_safety_init: false,
             safety_dir: self.dir.join("safety"),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::Software,
             peers: Vec::new(),

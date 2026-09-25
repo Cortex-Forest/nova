@@ -149,6 +149,8 @@ impl Env {
             expected_network_id: NetworkId::Mainnet,
             storage_dir: self.chain_dir.clone(),
             validator_enabled: true,
+            // G5-D.7.2：仅在 safety journal 不存在时声明显式初始化（fresh validator startup）。
+            validator_safety_init: !self.safety_dir.join("safety.journal").exists(),
             safety_dir: self.safety_dir.clone(),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::Software,
             peers: Vec::new(),
@@ -169,6 +171,8 @@ fn node_id_of(kp: &KeyPair) -> NodeId {
 fn restart_cfg(config: &NodeConfig, tag: &str) -> NodeConfig {
     let mut c = config.clone();
     c.safety_dir = config.safety_dir.join(tag);
+    // G5-D.7.2：新 safety dir（tag 唯一）⇒ journal 不存在 ⇒ 声明「新的安全状态初始化」。
+    c.validator_safety_init = !c.safety_dir.join("safety.journal").exists();
     c
 }
 

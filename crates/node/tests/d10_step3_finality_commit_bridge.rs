@@ -129,6 +129,8 @@ impl Env {
             expected_network_id: NetworkId::Mainnet,
             storage_dir: self.chain_dir.clone(),
             validator_enabled: true,
+            // G5-D.7.2：仅在 safety journal 不存在时声明显式初始化（fresh validator startup）。
+            validator_safety_init: !self.safety_dir.join("safety.journal").exists(),
             safety_dir: self.safety_dir.clone(),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::Software,
             peers: Vec::new(),
@@ -359,6 +361,8 @@ fn d10_b2_t6_t7_restart_recovers_committed_head() {
     //    head/state/block（链持久化与本地 validator 身份无关）。
     let mut cfg2 = config.clone();
     cfg2.safety_dir = cfg2.safety_dir.join("restart_safety");
+    // G5-D.7.2：新 safety dir ⇒ journal 不存在 ⇒ 必须显式声明「新的安全状态初始化」。
+    cfg2.validator_safety_init = !cfg2.safety_dir.join("safety.journal").exists();
     let kp2 = KeyPair::generate().unwrap();
     let provider2 = SoftwareKeyProvider::from_keypair(kp2);
     let mut r2 = start_enabled(&cfg2, &provider2);

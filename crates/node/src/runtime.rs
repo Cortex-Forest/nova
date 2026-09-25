@@ -16,6 +16,9 @@
 //!     vote history 在 ValidatorSafetyStore / actor ledger）。
 //! - chain storage（`config.storage_dir`）与 validator safety storage（`config.safety_dir`）
 //!   **目录分离**，绝不混用；SafetyStore recover 失败 = validator mode 启动失败（fail closed）。
+//! - **G5-D.7.2（missing-journal fail closed）**：`safety.journal` 缺失时**不**隐式初始化 ——
+//!   未声明 `validator_safety_init` ⇒ [`NodeRuntimeError::SafetyJournalMissing`]（启动失败）；
+//!   已声明 ⇒ 显式 `create_new`（已存在则 [`NodeRuntimeError::SafetyJournalAlreadyExists`]）。
 //! - full-node（`validator_enabled=false`）：跳过 key / safety / validator，不触碰 Provider。
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -1235,6 +1238,15 @@ pub enum NodeRuntimeError {
     KeyProvider(KeyProviderError),
     /// SafetyStore create / recover / identity 校验失败。
     Safety(ValidatorSafetyError),
+    /// G5-D.7.2：validator safety journal **缺失**且未声明显式初始化 ⇒ fail closed。
+    ///
+    /// 语义（可诊断；**不**伪装为普通 IO failure）：
+    /// *Safety journal is missing; validator startup requires explicit safety
+    /// initialization or restoration from backup.*
+    /// 初始化（`validator_safety_init = true`）建立的是**新的**安全状态，不是恢复。
+    SafetyJournalMissing,
+    /// G5-D.7.2：已声明显式初始化但 safety journal **已存在** ⇒ 拒绝（既有历史保持不变）。
+    SafetyJournalAlreadyExists,
     /// ValidatorActor 构造 / 恢复失败（含 identity mismatch）。
     Validator(ValidatorActorError),
     /// configured connection target 校验失败（self / duplicate；dial **前** fail-closed）。
@@ -1785,6 +1797,9 @@ impl NodeRuntime {
 
     /// validator mode 生命周期装配（key provider → derive id → safety store → recover → actor）。
     /// 返回 `(actor, journal_path)`；actor 随后移入 Driver（ownership）。
+    ///
+    /// G5-D.7.2（missing-journal fail closed）：journal 缺失时**绝不**隐式初始化 ——
+    /// 必须由 `config.validator_safety_init` 显式声明；已存在时声明初始化亦被拒绝。
     fn build_validator(
         config: &NodeConfig,
         identity: &ChainIdentity,
@@ -1807,12 +1822,19 @@ impl NodeRuntime {
             identity.genesis_hash,
             &validator_id,
         );
+        // G5-D.7.2：「缺失即 fail closed」——不隐式初始化；显式初始化亦不覆盖既有历史。
+        //   (exists, init) = (true, false) ⇒ 绑定既有 journal（恢复由 recover() 严格校验）；
+        //                    (true, true)  ⇒ 拒绝（既有 journal 字节保持不变）；
+        //                    (false, true) ⇒ 显式 create（`create_new(true)`；竞态下 AlreadyExists ⇒ fail closed）；
+        //                    (false, false) ⇒ 启动失败（可诊断；不伪装为 IO failure）。
         let journal_path = config.safety_dir.join("safety.journal");
-        let store = if journal_path.exists() {
-            ValidatorSafetyStore::at(&journal_path, safety_identity)
-        } else {
-            ValidatorSafetyStore::create(&journal_path, safety_identity)
-                .map_err(NodeRuntimeError::Safety)?
+        let journal_exists = journal_path.exists();
+        let store = match (journal_exists, config.validator_safety_init) {
+            (true, false) => ValidatorSafetyStore::at(&journal_path, safety_identity),
+            (true, true) => return Err(NodeRuntimeError::SafetyJournalAlreadyExists),
+            (false, true) => ValidatorSafetyStore::create(&journal_path, safety_identity)
+                .map_err(NodeRuntimeError::Safety)?,
+            (false, false) => return Err(NodeRuntimeError::SafetyJournalMissing),
         };
 
         // 8/9. strict recover（restore 内部执行）→ 构造 ValidatorActor。

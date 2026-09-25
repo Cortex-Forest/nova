@@ -206,6 +206,8 @@ impl Env {
             expected_network_id: NetworkId::Mainnet,
             storage_dir: root.join("chain"),
             validator_enabled: true,
+            // G5-D.7.2：仅在 safety journal 不存在时声明显式初始化（fresh validator startup）。
+            validator_safety_init: !root.join("safety").join("safety.journal").exists(),
             safety_dir: root.join("safety"),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::Software,
             peers,

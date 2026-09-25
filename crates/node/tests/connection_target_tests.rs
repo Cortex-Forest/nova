@@ -29,6 +29,7 @@ fn config(peers: Vec<ConnectionTarget>) -> NodeConfig {
         expected_network_id: NetworkId::Mainnet,
         storage_dir: PathBuf::from("dummy-chain"),
         validator_enabled: false,
+        validator_safety_init: false,
         safety_dir: PathBuf::from("dummy-safety"),
         key_provider_config: KeyProviderConfig::Software,
         peers,

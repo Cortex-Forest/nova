@@ -141,6 +141,8 @@ impl Env {
             expected_network_id: NetworkId::Mainnet,
             storage_dir: self.chain_dir.clone(),
             validator_enabled: true,
+            // G5-D.7.2：仅在 safety journal 不存在时声明显式初始化（fresh validator startup）。
+            validator_safety_init: !self.safety_dir.join("safety.journal").exists(),
             safety_dir: self.safety_dir.clone(),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::Software,
             peers: Vec::new(),
@@ -264,6 +266,8 @@ fn d10_c2_t1_single_chain_rebuilds_on_restart() {
     // ② restart：新本地 key + 新 safety dir、同 chain storage —— start_inner 走 rebuild seam。
     let mut cfg2 = config.clone();
     cfg2.safety_dir = cfg2.safety_dir.join("restart_safety");
+    // G5-D.7.2：新 safety dir ⇒ journal 不存在 ⇒ 必须显式声明「新的安全状态初始化」。
+    cfg2.validator_safety_init = !cfg2.safety_dir.join("safety.journal").exists();
     let provider2 = SoftwareKeyProvider::from_keypair(KeyPair::generate().unwrap());
     let r2 = NodeRuntime::start(&cfg2, Some(&provider2)).expect("restart ok");
 
@@ -330,6 +334,8 @@ fn d10_c2_t2_multi_block_ancestry_rebuilds() {
     // ② restart：真实 bootstrap 恢复 + rebuild。
     let mut cfg2 = config.clone();
     cfg2.safety_dir = cfg2.safety_dir.join("restart_safety");
+    // G5-D.7.2：新 safety dir ⇒ journal 不存在 ⇒ 必须显式声明「新的安全状态初始化」。
+    cfg2.validator_safety_init = !cfg2.safety_dir.join("safety.journal").exists();
     let provider2 = SoftwareKeyProvider::from_keypair(KeyPair::generate().unwrap());
     let r2 = NodeRuntime::start(&cfg2, Some(&provider2)).expect("restart ok");
 

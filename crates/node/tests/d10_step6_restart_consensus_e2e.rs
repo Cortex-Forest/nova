@@ -186,6 +186,8 @@ impl Env {
             expected_network_id: NetworkId::Mainnet,
             storage_dir: self.chain_dir.clone(),
             validator_enabled: true,
+            // G5-D.7.2：仅在 safety journal 不存在时声明显式初始化（fresh validator startup）。
+            validator_safety_init: !self.safety_dir.join("safety.journal").exists(),
             safety_dir: self.safety_dir.clone(),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::Software,
             peers: Vec::new(),
@@ -200,7 +202,12 @@ fn node_id_of(kp: &KeyPair) -> NodeId {
 
 /// REAL RESTART：同一 `config`（同 storage/safety/fact 目录）→ **新 provider 实例**（同 seed）
 /// → **新 runtime 实例**。
+///
+/// G5-D.7.2：初始化声明在**每次启动时**按当前 journal 状态判定 —— fresh（journal 不存在）⇒
+/// 声明初始化；既有 journal（restart）⇒ **不**声明（既有历史必须保持不变）。
 fn build_test_runtime(config: &NodeConfig, seed: [u8; 32]) -> NodeRuntime {
+    let mut config = config.clone();
+    config.validator_safety_init = !config.safety_dir.join("safety.journal").exists();
     let provider = SeedKeyProvider::new(seed);
     let net_kp = KeyPair::generate().unwrap();
     let (tx_a, _tx_b) = MemoryTransport::pair(
@@ -208,7 +215,7 @@ fn build_test_runtime(config: &NodeConfig, seed: [u8; 32]) -> NodeRuntime {
         node_id_of(&KeyPair::generate().unwrap()),
     );
     let identity = SoftwareNetworkIdentity::new(net_kp);
-    NodeRuntime::start_with_network(config, Some(&provider), Box::new(tx_a), Box::new(identity))
+    NodeRuntime::start_with_network(&config, Some(&provider), Box::new(tx_a), Box::new(identity))
         .expect("同 key validator + network 启动")
 }
 

@@ -125,9 +125,14 @@ target/release/yazimao-node \
   --network-seed-file   /etc/yazimao/network-seed-a.hex \
   --validator-seed-file /etc/yazimao/validator-seed-a.hex \
   --validator \
+  --init-validator-safety \
   --listen 10.0.0.1:17777 \
   --idle-ms 1 --run-steps 0
 ```
+
+> **`--init-validator-safety` 仅用于首次启动**（`--safety-dir` 下 `safety.journal` 尚不存在）。
+> 重启（journal 已存在）**不得**携带：携带会被拒绝且报 `SafetyJournalAlreadyExists`（§6.6）。
+> 该 flag 表示「创建新的 SafetyStore 状态」，**不是恢复**；mainnet 下被拒绝。
 
 ### 3.3 Validator（Node-B）
 
@@ -142,10 +147,13 @@ target/release/yazimao-node \
   --network-seed-file   /etc/yazimao/network-seed-b.hex \
   --validator-seed-file /etc/yazimao/validator-seed-b.hex \
   --validator \
+  --init-validator-safety \
   --listen 10.0.0.2:17777 \
   --peer <A_node_id_hex>@10.0.0.1:17777 \
   --idle-ms 1 --run-steps 0
 ```
+
+> 同上：`--init-validator-safety` **仅首次启动**携带；重启不得携带（§6.6）。
 
 ### 3.4 peer 配置
 
@@ -189,7 +197,7 @@ target/release/yazimao-node \
 | 2 | block height 增长 | `head_height` 随 `steps` 递增；3 个节点最终一致 | periodic status 行 |
 | 3 | finality 产生 | `finalized_height` 递增并最终 **== `head_height`**（不落后、不回退） | periodic status 行 |
 | 4 | peer 连接成功 | `established_peers >= 1`；被 dial 方 `inbound_connections >= 1` | periodic status 行 |
-| 5 | restart 恢复成功 | 同 `--storage-dir` / `--safety-dir` 重启后，`head_height` 与 `finalized_height` **不低于**重启前，且继续增长 | 重启前后 status 行 |
+| 5 | restart 恢复成功 | 同 `--storage-dir` / `--safety-dir` 重启后，`head_height` 与 `finalized_height` **不低于**重启前，且继续增长；重启命令**不得**携带 `--init-validator-safety` | 重启前后 status 行 |
 
 periodic status 行（每 `STATUS_INTERVAL_STEPS = 100` 步一行）字段：
 
@@ -253,6 +261,59 @@ yazimao-node: status steps=<n> head_height=<h> finalized_height=<f> consensus_he
 2. 若三者均为 0 且 `head_height` 不增：确认本地是否为**当选 proposer**（多数节点应能在若干步内推进）。
 3. 单节点卡住而其他节点正常 ⇒ 重启该节点（同目录），观察是否追平（catch-up）。
 4. 全网无高度增长 ⇒ 立即停止演练，保留全部 status 行/日志片段，上报 Owner 判定。
+
+### 6.6 safety journal 缺失（验证者拒绝启动）
+
+validator 模式下，`--safety-dir` 下的 `safety.journal` 是本地 vote/lock 历史的**唯一 durable 记录**
+（double-vote 防护）。因此它是启动**前置条件**：缺失时**拒绝启动**，绝不被隐式创建（ADR-0065）。
+
+| 现象 | 含义 | 处置 |
+|---|---|---|
+| `Error: Runtime(SafetyJournalMissing)` | `safety.journal` 不存在：卷丢失 / 目录误删 / `--safety-dir` 变更 | 见下方流程；**不得**直接重新初始化 |
+| `Error: Runtime(SafetyJournalAlreadyExists)` | 携带了 `--init-validator-safety`，但 journal **已存在** | 去掉该 flag（这是重启，不是初始化）；既有 journal 未被改动 |
+
+**正常重启（journal 存在）**
+
+```
+journal exists
+      ↓
+strict recovery（header / identity / checksum 全部校验）
+      ↓
+继续参与（不带 --init-validator-safety）
+```
+
+**safety 卷丢失（journal 不存在）**
+
+```
+volume loss detected
+      ↓
+node refuses validator startup（fail closed；不产生 vote / 不重建 journal）
+      ↓
+operator 从备份恢复 safety 目录（整目录复制）
+      ↓
+restart（不带 --init-validator-safety）
+```
+
+**无备份可用**
+
+```
+no backup exists
+      ↓
+DO NOT silently initialize
+      ↓
+由 Owner 明确决定是否为该 validator 初始化新的安全状态
+```
+
+只有在 Owner 明确批准「该 validator 以**新的**安全状态重新开始」时，才可携带：
+
+```
+--init-validator-safety
+```
+
+> **`--init-validator-safety` 不是恢复。** 它创建**新的** SafetyStore 状态（空 vote/lock 历史），
+> **不恢复**任何历史；旧状态无法由此找回。既有 journal 存在时该 flag **被拒绝**（journal 字节不变）。
+> `--network-id mainnet` 下该 flag **被拒绝**：mainnet 丢失安全状态必须经备份恢复 / 单独授权。
+> full-node / observer 不触碰 safety 路径，无 journal 也可以正常启动。
 
 ---
 

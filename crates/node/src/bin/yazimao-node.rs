@@ -137,6 +137,9 @@ Options:
                                 --validator-seed-file; refused with --network-id mainnet)
   --safety-dir <path>           validator safety journal directory
   --validator-seed-file <path>  32-byte validator identity seed (hex64)
+  --init-validator-safety       declare a NEW validator safety store initialization
+                                (requires --validator; refused with --network-id mainnet;
+                                 rejected if a safety journal already exists; NOT a recovery)
   --idle-ms <n>                 bounded idle interval in ms (default 1, maximum 50)
   --run-steps <n>               run for n steps and exit (default 5000)
   --run-steps 0                 run continuously without a step limit
@@ -177,6 +180,10 @@ enum CliError {
     ValidatorRequiresSeedFile,
     /// `--validator` + `--network-id mainnet`（Mainnet 级密钥管理未实现）。
     MainnetValidatorUnsupported,
+    /// `--init-validator-safety` 未同时提供 `--validator`（不静默忽略）。
+    InitValidatorSafetyRequiresValidator,
+    /// `--init-validator-safety` + `--network-id mainnet`（禁止以 flag 初始化安全状态）。
+    InitValidatorSafetyUnsupportedOnMainnet,
 }
 
 /// genesis pre-flight 错误（fail-closed；非零退出）。
@@ -295,6 +302,8 @@ struct Cli {
     validator: bool,
     safety_dir: Option<PathBuf>,
     validator_seed_file: Option<PathBuf>,
+    /// G5-D.7.2：显式声明“本次启动是一次**新的** validator safety store 初始化”（非恢复）。
+    init_validator_safety: bool,
     network_seed_file: PathBuf,
     idle_ms: u64,
     /// 本进程最多执行的 `NodeRuntime::step()` 次数（`--run-steps`；必 > 0）。
@@ -400,6 +409,7 @@ fn parse_args(args: &[String]) -> Result<Cli, CliError> {
     let mut validator = false;
     let mut safety_dir: Option<PathBuf> = None;
     let mut validator_seed_file: Option<PathBuf> = None;
+    let mut init_validator_safety = false;
     let mut network_seed_file: Option<PathBuf> = None;
     let mut idle_ms: Option<u64> = None;
     let mut run_steps: Option<u64> = None;
@@ -461,6 +471,13 @@ fn parse_args(args: &[String]) -> Result<Cli, CliError> {
                     return Err(CliError::DuplicateArgument("--validator"));
                 }
                 validator = true;
+                i += 1;
+            }
+            "--init-validator-safety" => {
+                if init_validator_safety {
+                    return Err(CliError::DuplicateArgument("--init-validator-safety"));
+                }
+                init_validator_safety = true;
                 i += 1;
             }
             "--safety-dir" => {
@@ -528,7 +545,16 @@ fn parse_args(args: &[String]) -> Result<Cli, CliError> {
     let network_seed_file =
         network_seed_file.ok_or(CliError::MissingRequired("--network-seed-file"))?;
 
-    // 交叉校验（validator 模式 + Mainnet 安全门）。
+    // 交叉校验（validator 模式 + Mainnet 安全门 + 显式初始化安全门）。
+    // Guard A（G5-D.7.2）：`--init-validator-safety` 必须与 `--validator` 同时提供（不静默忽略）。
+    if init_validator_safety && !validator {
+        return Err(CliError::InitValidatorSafetyRequiresValidator);
+    }
+    // Guard B（G5-D.7.2）：mainnet 下禁止以 flag 初始化安全状态
+    //（mainnet 丢失安全状态必须经备份恢复 / 单独授权，不能由启动 flag 自修复）。
+    if init_validator_safety && network_id == NetworkId::Mainnet {
+        return Err(CliError::InitValidatorSafetyUnsupportedOnMainnet);
+    }
     if validator {
         if safety_dir.is_none() {
             return Err(CliError::ValidatorRequiresSafetyDir);
@@ -552,6 +578,7 @@ fn parse_args(args: &[String]) -> Result<Cli, CliError> {
         validator,
         safety_dir,
         validator_seed_file,
+        init_validator_safety,
         network_seed_file,
         idle_ms: idle_ms.unwrap_or(IDLE_MS_DEFAULT),
         run_steps: run_steps.unwrap_or(RUN_STEPS_DEFAULT),
@@ -596,10 +623,10 @@ fn preflight(cli: &Cli) -> Result<(ChainIdentity, ValidatorSet), PreflightError>
 }
 
 // ---------------------------------------------------------------------------
-// NodeConfig 组装（不新增 / 不修改 NodeConfig 字段）
+// NodeConfig 组装（G5-D.7.2：新增且仅新增 `validator_safety_init`）
 // ---------------------------------------------------------------------------
 
-/// 由已校验 CLI 组装既有 `NodeConfig`（字段一一映射；无新字段）。
+/// 由已校验 CLI 组装既有 `NodeConfig`（字段一一映射；G5-D.7.2 新增 `validator_safety_init`）。
 fn build_node_config(cli: &Cli) -> NodeConfig {
     NodeConfig {
         genesis_path: cli.genesis.clone(),
@@ -608,6 +635,8 @@ fn build_node_config(cli: &Cli) -> NodeConfig {
         expected_network_id: cli.network_id,
         storage_dir: cli.storage_dir.clone(),
         validator_enabled: cli.validator,
+        // G5-D.7.2：显式初始化信号（runtime 只在 journal 缺失且该值为 true 时 create）。
+        validator_safety_init: cli.init_validator_safety,
         // full-node 形态下 runtime 不触碰 safety 路径（仅 validator 模式经 build_validator 使用）；
         // 未显式提供时取 storage_dir 下的确定性占位路径（不创建、不读取）。
         safety_dir: cli
@@ -1613,6 +1642,87 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // G5-D.7.2 tests：`--init-validator-safety` 契约（Guard A / Guard B / 重复 / HELP）
+    // -----------------------------------------------------------------------
+
+    /// 构造“合法 validator 模式”参数（含 safety-dir 与 validator seed）。
+    fn valid_validator_items() -> Vec<&'static str> {
+        let mut items = valid_base();
+        items.push("--validator");
+        items.push("--safety-dir");
+        items.push("/tmp/safety");
+        items.push("--validator-seed-file");
+        items.push("/tmp/val.seed");
+        items
+    }
+
+    // G1 — 显式初始化 + --validator ⇒ accept；且默认（无 flag）为 false。
+    #[test]
+    fn g1_init_validator_safety_accepted_with_validator() {
+        let mut items = valid_validator_items();
+        items.push("--init-validator-safety");
+        let cli = parse(&items).expect("validator + init flag ⇒ accept");
+        assert!(cli.validator);
+        assert!(
+            cli.init_validator_safety,
+            "显式声明的初始化信号必须保留到 NodeConfig"
+        );
+
+        let plain = valid_validator_items();
+        assert!(
+            !parse(&plain)
+                .expect("validator 模式无 flag ⇒ accept")
+                .init_validator_safety,
+            "默认必须为 false（不得隐式初始化）"
+        );
+    }
+
+    // G2 — Guard A：--init-validator-safety 无 --validator ⇒ reject（不静默忽略）。
+    #[test]
+    fn g2_init_validator_safety_without_validator_rejected() {
+        let mut items = valid_base();
+        items.push("--init-validator-safety");
+        assert_eq!(
+            parse(&items),
+            Err(CliError::InitValidatorSafetyRequiresValidator)
+        );
+    }
+
+    // G3 — Guard B：--init-validator-safety + mainnet ⇒ reject。
+    #[test]
+    fn g3_init_validator_safety_on_mainnet_rejected() {
+        let mut items = valid_validator_items();
+        let idx = items.iter().position(|s| *s == "devnet").unwrap();
+        items[idx] = "mainnet";
+        items.push("--init-validator-safety");
+        assert_eq!(
+            parse(&items),
+            Err(CliError::InitValidatorSafetyUnsupportedOnMainnet)
+        );
+    }
+
+    // G4 — 重复 --init-validator-safety ⇒ reject。
+    #[test]
+    fn g4_init_validator_safety_duplicate_rejected() {
+        let mut items = valid_validator_items();
+        items.push("--init-validator-safety");
+        items.push("--init-validator-safety");
+        assert_eq!(
+            parse(&items),
+            Err(CliError::DuplicateArgument("--init-validator-safety"))
+        );
+    }
+
+    // G5 — HELP 必须含该 flag（CLI 契约可见性）。
+    #[test]
+    fn g5_help_lists_init_validator_safety() {
+        assert!(
+            HELP.contains("--init-validator-safety"),
+            "HELP 必须列出 --init-validator-safety"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // P1-A.2 tests（T24–T39）：seed / 身份 / transport / 装配（无事件循环、无拨号、无 sleep）
     // -----------------------------------------------------------------------
 
@@ -1990,6 +2100,8 @@ mod tests {
                 env.path("safety").to_string_lossy().to_string(),
                 "--validator-seed-file".to_string(),
                 val_path.to_string_lossy().to_string(),
+                // G5-D.7.2：fresh safety dir（journal 不存在）⇒ 显式声明初始化。
+                "--init-validator-safety".to_string(),
             ],
         );
         let (_identity, set) = preflight(&cli).expect("preflight ok");
@@ -2171,6 +2283,8 @@ mod tests {
                 val_path.to_string_lossy().to_string(),
                 "--run-steps".to_string(),
                 "1".to_string(),
+                // G5-D.7.2：fresh safety dir（journal 不存在）⇒ 显式声明初始化。
+                "--init-validator-safety".to_string(),
             ],
         );
         let (_identity, set) = preflight(&cli).expect("preflight ok");

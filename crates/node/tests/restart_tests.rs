@@ -151,6 +151,7 @@ impl TestNode {
             storage_dir: self.storage_dir.clone(),
             // STEP 10-16：既有重启测试为 full-node（不启用 validator）。
             validator_enabled: false,
+            validator_safety_init: false,
             safety_dir: self.dir.join("safety"),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::default(),
             peers: Vec::new(),

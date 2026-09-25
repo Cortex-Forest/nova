@@ -19,13 +19,17 @@ use nova_crypto::identity::{
     AccountInit, EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit,
     canonical_genesis_bytes, compute_genesis_hash,
 };
+use nova_crypto::domain::SigningMessageHash;
 use nova_crypto::key::KeyPair;
+use nova_crypto::signature::{Signature, SigningKey, VerifyingKey, sign_message_hash};
 
 use nova_node::bootstrap::NodeConfig;
-use nova_node::key_provider::SoftwareKeyProvider;
+use nova_node::key_provider::{KeyProvider, KeyProviderError, SoftwareKeyProvider};
 use nova_node::runtime::{NodeRuntime, NodeRuntimeError, derive_validator_id};
 use nova_node::safety_store::{SafetyIdentity, ValidatorSafetyStore};
+use nova_node::signer::{SigningCapability, SigningError};
 use nova_node::validator::LocalVoteRequest;
+use nova_node::vote_ledger::VoteKey;
 use nova_node::wiring::NodeConsensusCommand;
 
 const CHAIN_ID: u64 = 1001;
@@ -123,6 +127,8 @@ impl Env {
             expected_network_id: NetworkId::Mainnet,
             storage_dir: self.chain_dir.clone(),
             validator_enabled,
+            // G5-D.7.2：仅在 safety journal 不存在时声明显式初始化（fresh validator startup）。
+            validator_safety_init: !self.safety_dir.join("safety.journal").exists(),
             safety_dir: self.safety_dir.clone(),
             key_provider_config: nova_node::key_provider::KeyProviderConfig::Software,
             peers: Vec::new(),
@@ -286,6 +292,10 @@ fn rt_28_validator_id_mismatch_startup_fails() {
     let sid_a = SafetyIdentity::new(NetworkId::Mainnet, CHAIN_ID, env.genesis_hash, &id_a);
     let journal = env.safety_dir.join("safety.journal");
     ValidatorSafetyStore::create(&journal, sid_a).unwrap();
+    // G5-D.7.2：既有 journal ⇒ 不得声明显式初始化（init + exists ⇒ 启动拒绝，
+    // 会掩盖本用例要验证的 identity mismatch 语义）。
+    let mut config = config;
+    config.validator_safety_init = false;
 
     // 用 key B 启动（validator_id 与 store header 不符）
     let provider_b = SoftwareKeyProvider::from_keypair(kp_b);
@@ -436,4 +446,168 @@ fn rt_bp_timestamp_changes_block_hash() {
     rb.step().expect("B step");
     let hb = rb.last_proposal().expect("B proposal").block_hash;
     assert_ne!(ha, hb, "timestamp 显式变化 ⇒ BlockHash 变化");
+}
+
+// ---------- G5-D.7.2 : validator safety journal fail-closed（Option B） ----------
+
+/// 测试 provider：由 seed 确定性重建 signer（每次 `load_signer` 均成功 ⇒ 支持同一身份重启）。
+struct SeedKeyProvider {
+    seed: [u8; 32],
+}
+
+struct SeedSigner {
+    key: SigningKey,
+}
+
+impl SigningCapability for SeedSigner {
+    fn public_key(&self) -> VerifyingKey {
+        self.key.verifying_key()
+    }
+
+    fn sign(&self, message_hash: &SigningMessageHash) -> Result<Signature, SigningError> {
+        Ok(sign_message_hash(&self.key, message_hash))
+    }
+}
+
+impl KeyProvider for SeedKeyProvider {
+    fn load_signer(&self) -> Result<Box<dyn SigningCapability>, KeyProviderError> {
+        Ok(Box::new(SeedSigner {
+            key: SigningKey::from_seed(self.seed),
+        }))
+    }
+}
+
+/// seed → 共识公钥（genesis 成员与重启身份同源）。
+fn seed_pk(seed: [u8; 32]) -> [u8; 32] {
+    SigningKey::from_seed(seed).verifying_key().to_bytes()
+}
+
+/// Test A（G5-D.7.2）：既有 validator 已建立 durable safety 状态 → 进程停止 → journal 被删除
+/// → **未**声明显式初始化重启 ⇒ 启动失败（可诊断变体），且 journal **不得被重建**、
+/// validator 不参与（未经 Safety 路径构造出 actor）。
+#[test]
+fn g5d72_t1_missing_journal_fails_closed_and_is_not_recreated() {
+    // 确定性 seed ⇒ 重启时同一 validator 身份（provider 可重建，非一次性）。
+    const SEED: [u8; 32] = [0x5A; 32];
+    let pk = seed_pk(SEED);
+    let env = Env::new(&genesis_for(pk));
+    let provider = SeedKeyProvider { seed: SEED };
+
+    // 1. fresh 启动（显式声明初始化）⇒ journal 建立。
+    let runtime = NodeRuntime::start(&env.config(true, env.genesis_hash), Some(&provider))
+        .expect("fresh validator 启动（显式初始化）");
+    assert!(runtime.validator_enabled());
+    drop(runtime);
+
+    let journal = env.safety_dir.join("safety.journal");
+    assert!(journal.exists(), "初始化后 journal 必须存在");
+
+    // 2. 建立真实 durable safety 状态（append-only record；等价于既往 validator 活动）。
+    let id = derive_validator_id(&pk);
+    let sid = SafetyIdentity::new(NetworkId::Mainnet, CHAIN_ID, env.genesis_hash, &id);
+    let key = VoteKey {
+        height: 7,
+        round: 0,
+        vote_type: VoteType::Prevote,
+    };
+    ValidatorSafetyStore::at(&journal, sid)
+        .commit_vote_intent(&key, [0xAA; 32], [0u8; 32], 0)
+        .expect("持久化 vote intent（durable 历史）");
+    assert!(
+        std::fs::read(&journal).unwrap().len() > 114,
+        "journal 已包含真实 record（非仅 header）"
+    );
+
+    // 3. 外部删除（模拟 safety 卷丢失 / 误删）。
+    std::fs::remove_file(&journal).expect("删除 journal");
+    assert!(!journal.exists());
+
+    // 4. 重启：**不**声明初始化 ⇒ fail closed。
+    let mut cfg = env.config(true, env.genesis_hash);
+    cfg.validator_safety_init = false; // 等同“未传 --init-validator-safety”
+    let err = match NodeRuntime::start(&cfg, Some(&provider)) {
+        Err(e) => e,
+        Ok(_) => panic!("missing journal 必须启动失败（绝不隐式初始化）"),
+    };
+    assert!(
+        matches!(err, NodeRuntimeError::SafetyJournalMissing),
+        "期望 SafetyJournalMissing（可诊断；非普通 IO failure），got {err:?}"
+    );
+
+    // 5. 关键断言：journal **未被重建**（不是只检查错误码）。
+    assert!(
+        !journal.exists(),
+        "missing journal 绝不得被隐式重建 / 不得产生无历史的新安全状态"
+    );
+}
+
+/// Test B（G5-D.7.2）：全新的 validator + 显式初始化声明 ⇒ 启动成功、journal 存在且合法。
+#[test]
+fn g5d72_t2_fresh_explicit_initialization_creates_valid_journal() {
+    let kp = KeyPair::generate().unwrap();
+    let pk = kp.verifying_key().to_bytes();
+    let env = Env::new(&genesis_for(pk));
+    let provider = SoftwareKeyProvider::from_keypair(kp);
+
+    let cfg = env.config(true, env.genesis_hash);
+    assert!(
+        cfg.validator_safety_init,
+        "fresh（journal 不存在）⇒ 必须显式声明初始化"
+    );
+
+    let runtime = NodeRuntime::start(&cfg, Some(&provider)).expect("显式初始化 ⇒ 启动成功");
+    assert!(runtime.validator_enabled());
+    drop(runtime);
+
+    let journal = env.safety_dir.join("safety.journal");
+    assert!(journal.exists(), "显式初始化后 journal 必须存在");
+
+    // journal 合法：header / identity / checksum 全部通过 recover 校验，且新状态为空。
+    let id = derive_validator_id(&pk);
+    let sid = SafetyIdentity::new(NetworkId::Mainnet, CHAIN_ID, env.genesis_hash, &id);
+    let recovered = ValidatorSafetyStore::at(&journal, sid)
+        .recover()
+        .expect("新初始化的 journal 必须合法（canonical header）");
+    assert_eq!(recovered.ledger.len(), 0, "全新安全状态不含历史 vote");
+}
+
+/// Test C（G5-D.7.2）：既有 journal + 显式初始化声明 ⇒ **拒绝**（非幂等成功），
+/// 且既有 journal **字节不变**（绝不 truncate / overwrite / append / replace）。
+#[test]
+fn g5d72_t3_existing_journal_rejects_initialization_and_keeps_bytes() {
+    let kp = KeyPair::generate().unwrap();
+    let pk = kp.verifying_key().to_bytes();
+    let env = Env::new(&genesis_for(pk));
+    let provider = SoftwareKeyProvider::from_keypair(kp);
+
+    // 预置既有 journal + 真实 durable record（模拟既有 validator 历史）。
+    let id = derive_validator_id(&pk);
+    let sid = SafetyIdentity::new(NetworkId::Mainnet, CHAIN_ID, env.genesis_hash, &id);
+    let journal = env.safety_dir.join("safety.journal");
+    let store = ValidatorSafetyStore::create(&journal, sid).expect("预置 journal");
+    let key = VoteKey {
+        height: 3,
+        round: 0,
+        vote_type: VoteType::Prevote,
+    };
+    store
+        .commit_vote_intent(&key, [0xBB; 32], [0u8; 32], 0)
+        .expect("既有 durable 历史");
+    let before = std::fs::read(&journal).expect("读取既有 journal");
+
+    // 声明初始化（等同 `--init-validator-safety`）⇒ 必须拒绝。
+    let mut cfg = env.config(true, env.genesis_hash);
+    cfg.validator_safety_init = true;
+    let err = match NodeRuntime::start(&cfg, Some(&provider)) {
+        Err(e) => e,
+        Ok(_) => panic!("既有 journal + 初始化声明必须被拒绝"),
+    };
+    assert!(
+        matches!(err, NodeRuntimeError::SafetyJournalAlreadyExists),
+        "期望 SafetyJournalAlreadyExists，got {err:?}"
+    );
+
+    // 关键断言：既有 journal 字节完全不变。
+    let after = std::fs::read(&journal).expect("读取既有 journal（拒绝后）");
+    assert_eq!(before, after, "既有 journal 必须 byte-for-byte 不变");
 }

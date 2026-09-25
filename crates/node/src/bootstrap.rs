@@ -66,6 +66,19 @@ pub struct NodeConfig {
     pub storage_dir: PathBuf,
     /// 是否启用验证者模式（STEP 10-16；默认 false：不初始化 signer / safety / validator）。
     pub validator_enabled: bool,
+    /// **显式声明**本次启动是一次**新的** validator safety store 初始化（G5-D.7.2；默认 false）。
+    ///
+    /// 语义（仅 `validator_enabled == true` 时有意义）：
+    /// - `false`（默认）：`safety.journal` 必须已存在 ⇒ 绑定 + 严格恢复；
+    ///   **缺失 ⇒ validator mode 启动失败**（`NodeRuntimeError::SafetyJournalMissing`）。
+    ///   绝不隐式创建 / 绝不把缺失伪装为普通 IO failure。
+    /// - `true`：仅当 `safety.journal` **不存在**时创建新的空安全状态
+    ///   （底层 `create_new(true)`）；journal 已存在 ⇒
+    ///   `NodeRuntimeError::SafetyJournalAlreadyExists`（拒绝；既有 journal 保持不变）。
+    ///
+    /// 语义边界：这是**全新安全状态初始化**，**不是**恢复 / 修复 / 重置 ——
+    /// 不恢复任何既往 vote / lock 历史（初始化动作本身不提供历史）。
+    pub validator_safety_init: bool,
     /// validator safety journal 目录（STEP 10-16；仅 validator_enabled=true；与 storage_dir 分离）。
     pub safety_dir: PathBuf,
     /// KeyProvider 配置（STEP 10-16 Phase 1：`None` = 由调用方注入 provider 实例）。

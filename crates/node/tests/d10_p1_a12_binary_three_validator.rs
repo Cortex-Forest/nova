@@ -695,6 +695,8 @@ fn p1a12_three_real_validator_processes_reach_durable_finality() {
         .collect();
 
     let build_args = |i: usize| -> Vec<String> {
+        // G5-D.7.2：仅 fresh safety dir（journal 不存在）声明显式初始化。
+        let safety_dir = env.path(&format!("safety-{i}"));
         let mut args: Vec<String> = vec![
             "--genesis".into(),
             genesis_path.to_string_lossy().into(),
@@ -707,7 +709,7 @@ fn p1a12_three_real_validator_processes_reach_durable_finality() {
             "--storage-dir".into(),
             env.path(&format!("chain-{i}")).to_string_lossy().into(),
             "--safety-dir".into(),
-            env.path(&format!("safety-{i}")).to_string_lossy().into(),
+            safety_dir.to_string_lossy().into(),
             "--network-seed-file".into(),
             net_seed_paths[i].to_string_lossy().into(),
             "--validator".into(),
@@ -720,6 +722,10 @@ fn p1a12_three_real_validator_processes_reach_durable_finality() {
             "--idle-ms".into(),
             IDLE_MS.into(),
         ];
+        // G5-D.7.2：仅 fresh safety dir（journal 不存在）声明显式初始化。
+        if !safety_dir.join("safety.journal").exists() {
+            args.push("--init-validator-safety".into());
+        }
         for p in &peers[i] {
             args.push("--peer".into());
             args.push(p.clone());
@@ -792,6 +798,8 @@ fn f2_node_args(
     hash_hex: &str,
     run_steps: &str,
 ) -> Vec<String> {
+    // G5-D.7.2：仅 fresh safety dir（journal 不存在）声明显式初始化。
+    let safety_dir = env.path(&format!("f2-{n}-safety-{i}"));
     let mut args: Vec<String> = vec![
         "--genesis".into(),
         genesis_path.to_string_lossy().into(),
@@ -806,9 +814,7 @@ fn f2_node_args(
             .to_string_lossy()
             .into(),
         "--safety-dir".into(),
-        env.path(&format!("f2-{n}-safety-{i}"))
-            .to_string_lossy()
-            .into(),
+        safety_dir.to_string_lossy().into(),
         "--network-seed-file".into(),
         env.path(&format!("f2-{n}-net-{i}.seed"))
             .to_string_lossy()
@@ -825,6 +831,10 @@ fn f2_node_args(
         "--idle-ms".into(),
         IDLE_MS.into(),
     ];
+    // G5-D.7.2：仅 fresh safety dir（journal 不存在）声明显式初始化。
+    if !safety_dir.join("safety.journal").exists() {
+        args.push("--init-validator-safety".into());
+    }
     for j in 0..n {
         if j != i {
             args.push("--peer".into());

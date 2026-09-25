@@ -292,6 +292,8 @@ fn node_args(
     genesis_path: &Path,
     hash_hex: &str,
 ) -> Vec<String> {
+    // G5-D.7.2：仅 fresh safety dir（journal 不存在）声明显式初始化。
+    let safety_dir = env.path(&format!("a21-{n}-safety-{i}"));
     let mut args: Vec<String> = vec![
         "--genesis".into(),
         genesis_path.to_string_lossy().into(),
@@ -306,9 +308,7 @@ fn node_args(
             .to_string_lossy()
             .into(),
         "--safety-dir".into(),
-        env.path(&format!("a21-{n}-safety-{i}"))
-            .to_string_lossy()
-            .into(),
+        safety_dir.to_string_lossy().into(),
         "--network-seed-file".into(),
         env.path(&format!("a21-{n}-net-{i}.seed"))
             .to_string_lossy()
@@ -325,6 +325,10 @@ fn node_args(
         "--idle-ms".into(),
         IDLE_MS.into(),
     ];
+    // G5-D.7.2：仅 fresh safety dir（journal 不存在）声明显式初始化。
+    if !safety_dir.join("safety.journal").exists() {
+        args.push("--init-validator-safety".into());
+    }
     for j in 0..n {
         if j != i {
             args.push("--peer".into());
