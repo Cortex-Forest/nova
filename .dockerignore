@@ -1,0 +1,79 @@
+# =============================================================================
+# YAZIMAO — Docker / Container build context 排除清单（G5-D.6 Container Delivery）
+#
+# 作用：即使未来有人把 `Containerfile` 改成 `COPY . .`，也**必须**阻断
+#       秘密材料与无关内容进入 build context。
+#       当前 `Containerfile` 使用**显式 COPY 列表**
+#       （`Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml` / `crates/` / `tests/vectors/`），
+#       本文件是第二道防线。
+#
+# 红线：seed / private key / mnemonic / keystore / 本地 runtime state
+#       永久禁止成为 build context 的输入（Master Prompt §18/§19）。
+#
+# ⚠️ 维护警告（务必阅读）：
+#   不要在本文件中添加宽泛的目录名模式，例如 `**/storage`、`**/runtime`、
+#   `**/core`、`**/network`、`**/consensus`、`**/execution`、`**/crypto`。
+#   这些名字与 **workspace 成员目录**（`crates/storage`、`crates/runtime`、
+#   `crates/core`、`crates/network`、`crates/consensus`、`crates/execution`、
+#   `crates/crypto`）同名，会导致 `COPY crates/ ...` 静默丢弃源码 ⇒ 构建失败
+#   或产出错误 artifact。同理由，不要使用 `*seed*` 这类宽泛通配符
+#   （可能命中 `SeedKeyProvider` 之外的源码文件名）。
+# =============================================================================
+
+# --- VCS / 仓库元数据（构建不需要）---
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- Rust 构建产物（本机 target 绝不入 context）---
+target
+**/target
+
+# --- 本地环境 / 虚拟环境（含 G5-D.4C 离线 seed 生成所用的 Python 环境）---
+.venv
+.env
+.env.*
+!.env.example
+
+# --- 非交付子项目（不参与 `-p nova-node --bin yazimao-node` 构建）---
+nova-web
+simulation
+fuzz
+scripts
+test-results
+
+# --- 文档（已核验：生产 `src/` 对 `docs/` 的引用 = 0；
+#     `include_str!` 仅出现在 test 目标且仅指向 `tests/vectors/**`）---
+docs
+
+# --- 本地 runtime state / 安全日志 / 日志残留（绝不可入 context）---
+*.log
+logs
+*.qcf
+finality_fact.bin
+safety.journal
+
+# --- 秘密材料（永久禁止；均为"扩展名/显式文件名"级别，不误伤源码）---
+**/*.seed
+**/*.mnemonic
+**/*.keystore
+**/keystore
+**/keystore/**
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+**/*.jks
+**/secrets
+**/secrets/**
+**/*.hex
+*seed*.hex
+validator-seed-g5d-smoke.hex
+network-seed-g5d-smoke.hex
+
+# --- Genesis 产物（公开，但不参与 node 二进制构建；如需构建 genesis 镜像，
+#     应单独定义 context/Containerfile，而不是放宽本文件）---
+genesis.bin
+genesis_hash.txt
+genesis_summary.json
