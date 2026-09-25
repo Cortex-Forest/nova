@@ -314,7 +314,7 @@ mod tests {
     /// 走**真实路径** `Dag::causal_order`（→ `collect_reachable`），不测孤立 helper：
     /// - 修复前：该链在测试线程栈（2 MiB，≈368 B/帧 ⇒ ~5.4k 帧）处溢出，进程 abort；
     /// - 修复后：显式栈完成，且拓扑序语义不变（可达闭包完整、parent 先于 child、tip 最后）。
-    /// 不放大线程栈、不使用任何特殊运行期配置、不加深度上限。
+    ///   不放大线程栈、不使用任何特殊运行期配置、不加深度上限。
     #[test]
     fn causal_order_deep_chain_12000_is_stack_safe() {
         const DEPTH: u64 = 12_000;
@@ -343,10 +343,12 @@ mod tests {
             hashes.push(hash);
             prev = hash;
         }
-        assert!(
-            DEPTH >= 10_000,
-            "回归深度必须 ≥ 10,000（覆盖 2,584 生产故障点）"
-        );
+        const {
+            assert!(
+                DEPTH >= 10_000,
+                "回归深度必须 ≥ 10,000（覆盖 2,584 生产故障点）"
+            );
+        };
         assert_eq!(dag.len(), DEPTH as usize + 1);
 
         let order = dag.causal_order(&prev);
