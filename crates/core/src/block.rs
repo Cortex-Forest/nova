@@ -27,7 +27,7 @@ pub struct BlockExecutionResult {
 }
 
 /// Block 协议版本（ADR-0042；V0.1 = 0x01；未知 version ⇒ 拒）。
-pub const BLOCK_VERSION: u8 = 0x01;
+pub const BLOCK_VERSION: u8 = 0x02;
 
 /// Block 结构错误（P7-2，ADR-0042 §10 rejection；**结构级，非 semantic**——验证归 P7-3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +98,11 @@ pub struct BlockHeader {
     pub chain_id: u64,
     /// 区块高度（LE；`parent.height < height`）。
     pub height: u64,
+    /// **生产轮**（LE；ADR-P1：= proposer 创建该 block 时的 `ConsensusRoundState.round`）。
+    ///
+    /// 语义（MUST）：本字段是该块**生产轮的唯一可信来源**；进入 canonical header ⇒ 同时进入
+    /// 签名 payload 与 block hash input（因此不得在保留签名的前提下被改写）。
+    pub round: u64,
     /// 父区块 block_hash（单父；genesis 父 = 零哈希）。
     pub parent_hash: [u8; 32],
     /// 前序 finality 引用（指向过去 finalized block_hash；无循环）。
@@ -130,15 +135,18 @@ pub struct Block {
     pub proposer_signature: [u8; 64],
 }
 
-/// Canonical BlockHeader（ADR-0042 §7）：
-/// `version(1) ‖ chain_id(8LE) ‖ height(8LE) ‖ parent_hash(32) ‖ finality_ref(1 tag [+32])
+/// Canonical BlockHeader v2（ADR-0042 §7 + ADR-P1）：
+/// `version(1) ‖ chain_id(8LE) ‖ height(8LE) ‖ round(8LE) ‖ parent_hash(32) ‖ finality_ref(1 tag [+32])
 ///  ‖ transaction_root(32) ‖ state_root(32) ‖ validator_set_hash(32) ‖ timestamp(8LE)`。
-/// 定长：None = 154B；Some = 186B。
+/// 定长：None = 162B；Some = 194B（= v1 长度 + 8B）。
+///
+/// v1 长度（154/186）为历史记录，v2 下不再产生；`round` 为**必选、定长、u64 LE**。
 pub fn encode_block_header(h: &BlockHeader) -> Vec<u8> {
-    let mut out = Vec::with_capacity(186);
+    let mut out = Vec::with_capacity(194);
     out.push(h.version);
     out.extend_from_slice(&h.chain_id.to_le_bytes());
     out.extend_from_slice(&h.height.to_le_bytes());
+    out.extend_from_slice(&h.round.to_le_bytes());
     out.extend_from_slice(&h.parent_hash);
     match h.finality_reference {
         Some(r) => {
@@ -156,8 +164,8 @@ pub fn encode_block_header(h: &BlockHeader) -> Vec<u8> {
 
 /// Decode BlockHeader（structure only；长度严格 / version / tag 校验；拒 trailing）。
 pub fn decode_block_header(bytes: &[u8]) -> Result<BlockHeader, BlockCodecError> {
-    const MIN_LEN: usize = 154;
-    const FULL_LEN: usize = 186;
+    const MIN_LEN: usize = 162;
+    const FULL_LEN: usize = 194;
     if bytes.len() < MIN_LEN {
         return Err(BlockCodecError::InvalidLength {
             expected: MIN_LEN,
@@ -170,21 +178,22 @@ pub fn decode_block_header(bytes: &[u8]) -> Result<BlockHeader, BlockCodecError>
     }
     let chain_id = u64::from_le_bytes(bytes[1..9].try_into().expect("len checked"));
     let height = u64::from_le_bytes(bytes[9..17].try_into().expect("len checked"));
+    let round = u64::from_le_bytes(bytes[17..25].try_into().expect("len checked"));
     let mut parent_hash = [0u8; 32];
-    parent_hash.copy_from_slice(&bytes[17..49]);
-    let tag = bytes[49];
+    parent_hash.copy_from_slice(&bytes[25..57]);
+    let tag = bytes[57];
     let (finality_reference, tx_off, st_off, vs_off, ts_off) = match tag {
-        0 => (None, 50, 82, 114, 146),
+        0 => (None, 58, 90, 122, 154),
         1 => (
             {
                 let mut r = [0u8; 32];
-                r.copy_from_slice(&bytes[50..82]);
+                r.copy_from_slice(&bytes[58..90]);
                 Some(r)
             },
-            82,
-            114,
-            146,
-            178,
+            90,
+            122,
+            154,
+            186,
         ),
         _ => return Err(BlockCodecError::InvalidOptionTag(tag)),
     };
@@ -206,6 +215,7 @@ pub fn decode_block_header(bytes: &[u8]) -> Result<BlockHeader, BlockCodecError>
         version,
         chain_id,
         height,
+        round,
         parent_hash,
         finality_reference,
         transaction_root,
@@ -281,18 +291,18 @@ pub fn encode_block(b: &Block) -> Result<Vec<u8>, BlockCodecError> {
 
 /// Decode Block（structure only；header + body + 恰好 64B signature；拒 missing/truncated/oversized/trailing）。
 pub fn decode_block(bytes: &[u8]) -> Result<Block, BlockCodecError> {
-    const MIN_HEADER: usize = 154;
+    const MIN_HEADER: usize = 162;
     const SIGNATURE_LEN: usize = 64;
-    // 最小：header(154) + signature(64)；body 可为空（至少 4B count）。
+    // 最小：header(162) + signature(64)；body 可为空（至少 4B count）。
     if bytes.len() < MIN_HEADER + SIGNATURE_LEN {
         return Err(BlockCodecError::InvalidLength {
             expected: MIN_HEADER + SIGNATURE_LEN,
             actual: bytes.len(),
         });
     }
-    let header_len = match bytes[49] {
+    let header_len = match bytes[57] {
         0 => MIN_HEADER,
-        1 => 186,
+        1 => 194,
         t => return Err(BlockCodecError::InvalidOptionTag(t)),
     };
     // 即使 tag=1（header 186B），也需为 signature 留足 64B。
@@ -491,6 +501,7 @@ mod tests {
             version: BLOCK_VERSION,
             chain_id: 1001,
             height: 1,
+            round: 0,
             parent_hash: [0xaa; 32],
             finality_reference: finality,
             transaction_root: [0x11; 32],
@@ -514,6 +525,16 @@ mod tests {
             let h = mk_header(f);
             assert_eq!(decode_block_header(&encode_block_header(&h)), Ok(h));
         }
+    }
+
+    #[test]
+    fn header_roundtrip_non_zero_round() {
+        let mut h = mk_header(None);
+        h.round = 7;
+        let bytes = encode_block_header(&h);
+        let decoded = decode_block_header(&bytes).unwrap();
+        assert_eq!(decoded.round, 7);
+        assert_eq!(decoded, h);
     }
 
     #[test]
@@ -557,14 +578,15 @@ mod tests {
         assert_eq!(bytes[0], BLOCK_VERSION);
         assert_eq!(&bytes[1..9], &1001u64.to_le_bytes());
         assert_eq!(&bytes[9..17], &1u64.to_le_bytes());
-        assert_eq!(&bytes[17..49], &[0xaa; 32]);
-        assert_eq!(bytes[49], 1);
-        assert_eq!(&bytes[50..82], &[0xbb; 32]);
-        assert_eq!(&bytes[82..114], &[0x11; 32]);
-        assert_eq!(&bytes[114..146], &[0x22; 32]);
-        assert_eq!(&bytes[146..178], &[0x33; 32]);
-        assert_eq!(&bytes[178..186], &0u64.to_le_bytes());
-        assert_eq!(bytes.len(), 186);
+        assert_eq!(&bytes[17..25], &0u64.to_le_bytes());
+        assert_eq!(&bytes[25..57], &[0xaa; 32]);
+        assert_eq!(bytes[57], 1);
+        assert_eq!(&bytes[58..90], &[0xbb; 32]);
+        assert_eq!(&bytes[90..122], &[0x11; 32]);
+        assert_eq!(&bytes[122..154], &[0x22; 32]);
+        assert_eq!(&bytes[154..186], &[0x33; 32]);
+        assert_eq!(&bytes[186..194], &0u64.to_le_bytes());
+        assert_eq!(bytes.len(), 194);
     }
 
     #[test]
@@ -592,11 +614,12 @@ mod tests {
     #[test]
     fn decode_rejects_unknown_version() {
         let mut h = mk_header(None);
-        h.version = 0x02;
+        // BLOCK_VERSION = 0x02（v2）⇒ 以 v1（0x01）作为"未知版本"输入（同时覆盖 v1 拒绝语义）。
+        h.version = 0x01;
         let bytes = encode_block_header(&h);
         assert_eq!(
             decode_block_header(&bytes),
-            Err(BlockCodecError::UnknownVersion(0x02))
+            Err(BlockCodecError::UnknownVersion(0x01))
         );
     }
 
@@ -605,7 +628,7 @@ mod tests {
         let mut h = mk_header(None);
         h.finality_reference = None;
         let mut bytes = encode_block_header(&h);
-        bytes[49] = 0x02;
+        bytes[57] = 0x02;
         assert_eq!(
             decode_block_header(&bytes),
             Err(BlockCodecError::InvalidOptionTag(0x02))
