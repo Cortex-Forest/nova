@@ -5,7 +5,7 @@ YAZIMAO 是一条面向 **AI、数字创作、数字娱乐和开放应用生态*
 > **⚠️ 当前状态：PHASE 2 — Protocol Design COMPLETE / FROZEN；Implementation & Integration In Progress**
 >
 > **完整可运行区块链尚未发布。**
-> 本仓库已完成：Cargo Workspace 工程基础、代码质量工具、CI、文档体系、ADR 治理框架（ADR-0001~0063 tracked）、
+> 本仓库已完成：Cargo Workspace 工程基础、代码质量工具、CI、文档体系、ADR 治理框架（tracked ADR 至 ADR-0077；编号不连续）、
 > Crypto / Genesis / Consensus 协议规范冻结，以及 **Consensus 纯计算核心**（STEP 10-1~10-14 COMPLETE / FINAL FROZEN）。
 > **实现已推进至节点运行时 / 集成层与持久化**：node-driven consensus + production consensus auto-drive + finality
 > commit bridge + DAG restart rebuild / finality recovery + canonical commit + 远程 canonical block 持久化（follower
@@ -53,6 +53,7 @@ Storage（RocksDB + 状态树）
 - **Consensus**: 协议设计 FINAL FROZEN + 纯计算核心已实现（STEP 10-1~10-14 COMPLETE / FINAL FROZEN）；
   node-driven consensus + production consensus auto-drive + finality commit bridge + DAG restart rebuild /
   finality recovery + canonical commit 已实现（D9 / D10 集成与 E2E 通过）
+- **Block**: block header 已引入 `round` 字段并完成全链路传播（block header round propagation；core / network / runtime / storage，已提交）
 - **WASM Execution**: `NOT IMPLEMENTED`（state transition / block 执行纯计算已实现）
 - **Network / P2P**: 运行时基础设施已实现（message / transport / security / session / network_service / event_loop /
   gossip / sync，含生产 std::net TcpTransport）；**出站握手 initiation、配置化连接目标、多 peer 生命周期、
@@ -122,7 +123,7 @@ cargo fmt --all -- --check
 
 见 [docs/architecture/overview.md](docs/architecture/overview.md)。开发顺序为 PHASE 1 → PHASE 24（Project Foundation → Crypto → Address → Transaction → State → Storage → Block/DAG → P2P → PoS → BFT → Node → WASM → RPC → Explorer → Wallet → Staking → Mobile → Website → Creator → Devnet → Public Testnet → Security/Chaos/Economic → Mainnet Candidate → Mainnet）。
 
-**已推进 / 已实现**：PHASE 2 Protocol Design（Crypto / Genesis / 协议规范）COMPLETE / FROZEN；Consensus 协议与纯计算核心（STEP 10-1~10-14）COMPLETE / FINAL FROZEN；node-driven consensus、production consensus auto-drive、finality commit bridge、DAG restart rebuild / finality recovery、canonical commit、follower sync persistence、Node 运行时 / 集成层、Storage 持久化（block store / chain head / crash-consistent）、Network 运行时基础设施（出站握手 / 配置化连接目标 / 多 peer 生命周期 / sync 握手集成）、区块生命周期、D8 / D9 / D10 集成与 E2E 均已实现（持续 hardening）。
+**已推进 / 已实现**：PHASE 2 Protocol Design（Crypto / Genesis / 协议规范）COMPLETE / FROZEN；Consensus 协议与纯计算核心（STEP 10-1~10-14）COMPLETE / FINAL FROZEN；node-driven consensus、production consensus auto-drive、finality commit bridge、DAG restart rebuild / finality recovery、canonical commit、follower sync persistence、Node 运行时 / 集成层、Storage 持久化（block store / chain head / crash-consistent）、Network 运行时基础设施（出站握手 / 配置化连接目标 / 多 peer 生命周期 / sync 握手集成）、区块生命周期、block header round propagation（区块头 `round` 字段）、D8 / D9 / D10 集成与 E2E 均已实现（持续 hardening）。
 **未推进 / 未完成**：libp2p（未采用）、WASM Execution、RPC、Wallet、Explorer、Staking 等，均为 `PLANNED` / `NOT IMPLEMENTED`；Devnet / Testnet / Mainnet：`NOT RELEASED`。
 
 ---
