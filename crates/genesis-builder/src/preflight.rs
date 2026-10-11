@@ -1,6 +1,12 @@
 //! Genesis 预检（preflight）：在生成 canonical bytes / hash **之前**给出**带路径**的人可读错误。
 //!
 //! 检查项（Owner 指定）：
+//! 0. **ADR-0051 冻结经济政策**（FINAL FREEZE，不可变 cap）：`economics_parameters.total_supply`
+//!    必须 `== 1,000,000,000`（固定供应），且 `fee_burn_bps` 必须 `== 0`（no-burn；ADR-0022
+//!    burn 公式在本版本「参数禁用」）。二者均为**已冻结的协议决定**，非本工具新增政策。
+//!    分配桶（Community/Public 500M · Ecosystem 200M · Team 120M · Foundation 80M ·
+//!    Genesis Validator 100M）属**链外 provenance 分类**、不进 Genesis schema（ADR-0051 §11
+//!    禁止 `allocation_type` 等字段）⇒ **不由本模块校验**（见 Owner data template GATE-3/GATE-8）。
 //! 1. `total_supply` 与账户 liquid 合计一致（协议供应不变量）。
 //! 2. **allocation 求和一致性**：每 validator 的 liquid 可覆盖其 `bonded_stake`，
 //!    且 `Σ bonded_stake ≤ Σ validator liquid`（本模块**不**硬编码任何分配政策数值）。
@@ -20,6 +26,14 @@ use nova_crypto::address::YazimaoAddress;
 use nova_crypto::identity::{GenesisError, GenesisV1, validate_genesis};
 
 use crate::normalize::{DerivationError, check_derivation_consistency};
+
+/// ADR-0051（FINAL FREEZE）固定的 Genesis 供应总量：`1,000,000,000 NOVA`。
+///
+/// 依据：ADR-0051 §4「MAX_SUPPLY = 1,000,000,000 NOVA（不可变 cap）」+「Genesis 时
+/// Σ(initial_accounts.liquid_balance) == 1,000,000,000 NOVA」+ §5 Allocation 合计 100%。
+/// 该数值是**已冻结的协议决定**（不是本工具新增的政策）⇒ 在本预检中显式执行；
+/// 任何**小于**该值的 total_supply 同样违反「fixed supply」⇒ 一并拒绝。
+pub const ADR_0051_FIXED_SUPPLY: u128 = 1_000_000_000;
 
 /// 预检统计（写入 `genesis_summary.json`，供人工核对分配）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +103,10 @@ pub enum PreflightError {
     BondedSumExceedsValidatorLiquid { bonded: u128, liquid: u128 },
     /// `Σ accounts liquid != total_supply`。
     SupplyMismatch { computed: u128, declared: u128 },
+    /// `total_supply != ADR_0051_FIXED_SUPPLY`（固定供应 = 不可变 cap；ADR-0051 §4/§5/§12）。
+    FixedSupplyMismatch { declared: u128 },
+    /// `fee_burn_bps != 0`（ADR-0051 §11：no-burn；ADR-0022 burn 公式参数禁用）。
+    BurnPolicyViolation { value: u16 },
     /// 求和溢出 u128。
     SupplyOverflow,
     /// 地址 ↔ 公钥派生一致性失败。
@@ -167,6 +185,15 @@ impl fmt::Display for PreflightError {
                 f,
                 "supply: Σ accounts liquid ({computed}) != total_supply ({declared})"
             ),
+            Self::FixedSupplyMismatch { declared } => write!(
+                f,
+                "economics_params.total_supply: 必须 == {ADR_0051_FIXED_SUPPLY}（ADR-0051 固定供应不可变 cap；\
+                 实际 {declared}）"
+            ),
+            Self::BurnPolicyViolation { value } => write!(
+                f,
+                "economics_params.fee_burn_bps: 必须 == 0（ADR-0051 §11 no-burn；实际 {value}）"
+            ),
             Self::SupplyOverflow => write!(f, "supply: Σ liquid 求和溢出 u128"),
             Self::Derivation(e) => write!(f, "{e}"),
             Self::Genesis(e) => write!(f, "协议校验失败：{e}"),
@@ -203,6 +230,13 @@ pub fn check_preconditions(genesis: &GenesisV1) -> Result<PreflightReport, Prefl
     }
     if ep.fee_burn_bps > 10_000 {
         return Err(PreflightError::FeeBurnOutOfRange {
+            value: ep.fee_burn_bps,
+        });
+    }
+    // ADR-0051 §11（FINAL）：no-burn ⇒ `fee_burn_bps == 0`（ADR-0022 burn 公式参数禁用）。
+    // 置于既有「≤ 10000 范围」检查**之后** ⇒ 既有越界用例的错误变体保持不变。
+    if ep.fee_burn_bps != 0 {
+        return Err(PreflightError::BurnPolicyViolation {
             value: ep.fee_burn_bps,
         });
     }
@@ -301,6 +335,18 @@ pub fn check_preconditions(genesis: &GenesisV1) -> Result<PreflightReport, Prefl
         return Err(PreflightError::BondedSumExceedsValidatorLiquid {
             bonded: validator_bonded_sum,
             liquid: validator_liquid_sum,
+        });
+    }
+
+    // ---- ADR-0051 §4/§5（FINAL FREEZE）固定供应 = 不可变 cap ----
+    // 位置：**结构性 / 逐条**错误（供应不变量、validator stake、唯一性）之后 ⇒ 既有以
+    // 非 1e9 供应隔离「单一错误」的 fixture（如 `rejects_validator_account_missing_from_accounts`
+    // 用 total_supply = 980_000_000 把缺失账户错误与其供应不变量分开）保持其**具体**错误变体；
+    // 本检查只负责捕获「Σ liquid == total_supply（自洽）但 ≠ 1e9」这一在修复前**可以通过**
+    // 并产出 genesis.bin 的、违反 ADR-0051 不可变 cap 的输入。仍在**写任何产物之前** fail-closed。
+    if ep.total_supply != ADR_0051_FIXED_SUPPLY {
+        return Err(PreflightError::FixedSupplyMismatch {
+            declared: ep.total_supply,
         });
     }
 

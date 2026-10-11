@@ -496,6 +496,97 @@ fn rejects_supply_mismatch() {
     );
 }
 
+/// **ADR-0051 §4/§5（FINAL FREEZE）固定供应**：`Σ liquid == total_supply` 自洽，但二者均
+/// `!= 1,000,000,000` ⇒ 必须拒绝（不可变 cap）。修复前该输入**可以通过**并产出 genesis.bin。
+#[test]
+fn rejects_total_supply_not_adr0051_fixed_supply() {
+    let (v0, v1, t) = (make_node(), make_node(), make_node());
+    let mut value = baseline(&v0, &v1, &t);
+    // Σ liquid = 20M + 20M + 1060M = 1,100,000,000 == total_supply（供应不变量自洽）。
+    value["accounts"][2]["liquid_balance"] = json!("1060000000");
+    value["economics_params"]["total_supply"] = json!("1100000000");
+    let err = expect_preflight(&value, "rej-adr0051-supply");
+    assert!(
+        matches!(
+            err,
+            PreflightError::FixedSupplyMismatch {
+                declared: 1_100_000_000
+            }
+        ),
+        "got {err:?}"
+    );
+}
+
+/// **ADR-0051 §11（FINAL）no-burn**：`fee_burn_bps != 0` ⇒ 必须拒绝（ADR-0022 burn 参数禁用）。
+#[test]
+fn rejects_non_zero_fee_burn_bps() {
+    let (v0, v1, t) = (make_node(), make_node(), make_node());
+    let mut value = baseline(&v0, &v1, &t);
+    value["economics_params"]["fee_burn_bps"] = json!(100u32);
+    let err = expect_preflight(&value, "rej-burn-bps");
+    assert!(
+        matches!(err, PreflightError::BurnPolicyViolation { value: 100 }),
+        "got {err:?}"
+    );
+}
+
+/// **范围检查优先级**：`fee_burn_bps > 10_000` 必须**先**命中既有范围错误
+/// `FeeBurnOutOfRange`（而非 `BurnPolicyViolation`）⇒ 锁定新增 no-burn 检查
+/// 不改变既有越界用例的错误变体。
+#[test]
+fn rejects_fee_burn_out_of_range() {
+    let (v0, v1, t) = (make_node(), make_node(), make_node());
+    let mut value = baseline(&v0, &v1, &t);
+    value["economics_params"]["fee_burn_bps"] = json!(10_001u32);
+    let err = expect_preflight(&value, "rej-burn-over");
+    assert!(
+        matches!(err, PreflightError::FeeBurnOutOfRange { value: 10_001 }),
+        "got {err:?}"
+    );
+}
+
+/// **Preflight 失败不得产生工件**：ADR-0051 固定供应检查在**首次文件系统变更之前**
+/// 返回 ⇒ 输出目录与三个工件均不得存在。
+/// 本测试**不删除任何预先存在的路径**（可能含用户数据）：若唯一临时路径意外已存在，
+/// 前置断言立即失败并报告，而不做任何清理。
+#[test]
+fn preflight_failure_creates_no_artifacts() {
+    let (v0, v1, t) = (make_node(), make_node(), make_node());
+    let mut value = baseline(&v0, &v1, &t);
+    // Σ liquid = 20M + 20M + 1060M = 1,100,000,000 == total_supply（供应不变量自洽），
+    // 仅违反 ADR-0051 不可变 cap。
+    value["accounts"][2]["liquid_balance"] = json!("1060000000");
+    value["economics_params"]["total_supply"] = json!("1100000000");
+
+    let dir = temp_dir("rej-no-artifacts");
+    // 只读前置检查（不删除、不创建）。
+    assert!(
+        !dir.exists(),
+        "stale temp dir must not pre-exist: {}",
+        dir.display()
+    );
+
+    let err = build_artifacts(&value.to_string(), &dir, false).expect_err("preflight must fail");
+    assert!(
+        matches!(
+            err,
+            BuildError::Preflight(PreflightError::FixedSupplyMismatch {
+                declared: 1_100_000_000
+            })
+        ),
+        "got {err:?}"
+    );
+
+    assert!(!dir.exists(), "output directory must not be created");
+    for name in [
+        nova_genesis_builder::emit::ARTIFACT_GENESIS_BIN,
+        nova_genesis_builder::emit::ARTIFACT_GENESIS_HASH,
+        nova_genesis_builder::emit::ARTIFACT_SUMMARY,
+    ] {
+        assert!(!dir.join(name).exists(), "{name} must not exist");
+    }
+}
+
 #[test]
 fn rejects_zero_chain_id() {
     let (v0, v1, t) = (make_node(), make_node(), make_node());
