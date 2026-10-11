@@ -125,6 +125,7 @@ fn block_signed_by(sk: &SigningKey) -> Block {
         version: BLOCK_VERSION,
         chain_id: CHAIN_ID,
         height: 1,
+        round: 0,
         parent_hash: GENESIS_HASH,
         finality_reference: None,
         transaction_root: compute_transaction_root(&body),

@@ -113,6 +113,7 @@ fn empty_block(
         version: BLOCK_VERSION,
         chain_id,
         height,
+        round: 0,
         parent_hash,
         finality_reference: None,
         transaction_root: compute_transaction_root(&body),
@@ -398,6 +399,7 @@ fn biv_10_non_canonical_tx_ordering_rejected() {
         version: BLOCK_VERSION,
         chain_id: CHAIN_ID,
         height: 1,
+        round: 0,
         parent_hash: GENESIS_HASH,
         finality_reference: None,
         transaction_root: compute_transaction_root(&body), // 与 body 自洽（避免误报 tx-root）
@@ -582,6 +584,7 @@ fn biv_unsupported_state_execution_with_txs() {
         version: BLOCK_VERSION,
         chain_id: CHAIN_ID,
         height: 1,
+        round: 0,
         parent_hash: GENESIS_HASH,
         finality_reference: None,
         transaction_root: compute_transaction_root(&body),

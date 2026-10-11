@@ -219,6 +219,7 @@ fn empty_block_at(
         version: BLOCK_VERSION,
         chain_id: CHAIN_ID,
         height,
+        round: 0,
         parent_hash: parent,
         finality_reference: None,
         transaction_root: compute_transaction_root(&body),

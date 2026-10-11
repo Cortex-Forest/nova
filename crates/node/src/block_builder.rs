@@ -103,6 +103,9 @@ pub struct CandidateTransaction {
 pub struct BlockContext {
     /// 拟产出高度（`parent.height < height`；ADR-0042）。
     pub height: u64,
+    /// **生产轮**（ADR-P1）：caller 必须提供真实 `ConsensusRoundState.round`；
+    /// 本字段直接写入 `header.round`（⇒ 进入签名 payload 与 block hash input）。
+    pub round: u64,
     /// 父区块 block_hash（单父；genesis 父 = 零哈希）。
     pub parent_hash: [u8; 32],
     /// 前序 finality 引用（指向过去 finalized block_hash；无循环）。
@@ -178,6 +181,7 @@ pub fn build_block<B: StorageBackend + Clone>(
         version: BLOCK_VERSION,
         chain_id: exec_ctx.chain.chain_id,
         height: context.height,
+        round: context.round,
         parent_hash: context.parent_hash,
         finality_reference: context.finality_reference,
         transaction_root,
@@ -298,6 +302,7 @@ mod tests {
     fn block_ctx() -> BlockContext {
         BlockContext {
             height: 1,
+            round: 0,
             parent_hash: [0x11; 32],
             finality_reference: None,
             validator_set_hash: [0x33; 32],

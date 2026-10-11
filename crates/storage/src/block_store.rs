@@ -454,6 +454,7 @@ mod tests {
                 version: BLOCK_VERSION,
                 chain_id: 1001,
                 height: 1,
+                round: 0,
                 parent_hash: [tag; 32],
                 finality_reference: None,
                 transaction_root: [0u8; 32],

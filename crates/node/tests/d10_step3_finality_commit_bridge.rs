@@ -463,6 +463,7 @@ fn d10_b2_t9_remote_valid_block_not_committed() {
         version: nova_runtime::BLOCK_VERSION,
         chain_id: CHAIN_ID,
         height: 1,
+        round: 0,
         parent_hash: genesis_hash,
         finality_reference: None,
         transaction_root: nova_runtime::compute_transaction_root(&body),

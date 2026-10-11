@@ -131,6 +131,9 @@ pub fn build_proposal<B: StorageBackend + Clone>(
     // BlockContext（全部来自 canonical head / genesis / 显式输入；无系统时钟 / 无伪造 parent）。
     let context = BlockContext {
         height: next_height,
+        // ADR-P1：header.round = 真实 `ConsensusRoundState.round`（与上方 `select_proposer` **同一来源**，
+        // 不得重新计算 / 不得读取 arrival evidence / 不得由 QC 推断）。
+        round: rs.round,
         parent_hash: head.block_hash,
         finality_reference: None, // 本轮无已应用 finalized block 可引用（head 不推进）
         validator_set_hash: set_id,

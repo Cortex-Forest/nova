@@ -500,6 +500,7 @@ mod tests {
             version: BLOCK_VERSION,
             chain_id,
             height,
+            round: 0,
             parent_hash: parent.parent_hash,
             finality_reference: None,
             transaction_root: tx_root,

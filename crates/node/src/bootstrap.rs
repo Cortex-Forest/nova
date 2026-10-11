@@ -1022,6 +1022,7 @@ mod tests {
             version: BLOCK_VERSION,
             chain_id: T9_CHAIN_ID,
             height,
+            round: 0,
             parent_hash: genesis_hash,
             finality_reference: None,
             transaction_root: compute_transaction_root(&body),

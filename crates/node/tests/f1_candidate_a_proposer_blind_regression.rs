@@ -144,6 +144,7 @@ fn next_empty_block(adapter: &FileAdapter, kp: &KeyPair) -> (Block, Vec<u8>) {
         version: BLOCK_VERSION,
         chain_id: CHAIN_ID,
         height,
+        round: 0,
         parent_hash: head.block_hash,
         finality_reference: None,
         transaction_root: compute_transaction_root(&body),

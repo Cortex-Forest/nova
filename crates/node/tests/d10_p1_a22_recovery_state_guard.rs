@@ -46,6 +46,7 @@ fn signed_block_a(genesis_hash: [u8; 32], state_root: [u8; 32]) -> Block {
         version: BLOCK_VERSION,
         chain_id: CHAIN_ID,
         height: 1,
+        round: 0,
         parent_hash: genesis_hash,
         finality_reference: None,
         transaction_root: compute_transaction_root(&body),

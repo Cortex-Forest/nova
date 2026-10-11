@@ -235,6 +235,7 @@ mod tests {
                 version: nova_core::block::BLOCK_VERSION,
                 chain_id: 1001,
                 height: 1,
+                round: 0,
                 parent_hash: [0xaa; 32],
                 finality_reference: None,
                 transaction_root: [0x11; 32],

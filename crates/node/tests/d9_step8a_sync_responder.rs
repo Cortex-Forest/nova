@@ -455,6 +455,7 @@ fn remote_block(
         version: BLOCK_VERSION,
         chain_id: CHAIN_ID,
         height,
+        round: 0,
         parent_hash,
         finality_reference: None,
         transaction_root: compute_transaction_root(&body),

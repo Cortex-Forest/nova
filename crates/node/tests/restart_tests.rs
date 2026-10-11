@@ -264,6 +264,7 @@ fn make_valid_block(
         version: BLOCK_VERSION,
         chain_id,
         height,
+        round: 0,
         parent_hash: parent.parent_hash,
         finality_reference: None,
         transaction_root: tx_root,

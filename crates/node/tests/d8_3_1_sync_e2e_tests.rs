@@ -202,6 +202,7 @@ fn future_gossip_bytes() -> Vec<u8> {
         version: nova_runtime::BLOCK_VERSION,
         chain_id: CHAIN_ID,
         height: 2,
+        round: 0,
         parent_hash: [0u8; 32],
         finality_reference: None,
         transaction_root: nova_runtime::compute_transaction_root(&body),
