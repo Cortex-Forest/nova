@@ -280,7 +280,10 @@ fn biv_4_wrong_version_rejected() {
         *store.state_root().as_bytes(),
         kp.signing_key(),
     );
-    block.header.version = 0x02; // 未知版本（decode 拒）
+    // BLOCK_VERSION = 0x02（v2，ADR-P1 加入 `round`）⇒ 真正的“未知版本”= 已退役的 v1 `0x01`。
+    // （旧 fixture 用 `0x02` 作未知版本，在 v2 落地后已失效 ⇒ 改为 `0x01`，与
+    //  `crates/core/src/block.rs` 的 unknown-version 约定一致；只修 fixture，不改协议。）
+    block.header.version = 0x01;
     let wire = encode_block(&block).unwrap();
     let err = validate_block_inbound(&wire, &ctx).unwrap_err();
     assert!(matches!(err, InboundBlockError::WrongVersion { .. }));
