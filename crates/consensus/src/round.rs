@@ -391,6 +391,161 @@ mod tests {
         assert_eq!(cfg.timeout_for(100), 5000);
     }
 
+    /// 参考实现（朴素 `round` 次迭代 = 语义定义）—— **仅**用于等价性比对（round 取小值）。
+    fn reference_timeout_for(cfg: &RoundTimeoutConfig, round: u64) -> u64 {
+        let mut t = cfg.initial_timeout;
+        for _ in 0..round {
+            t = t.saturating_mul(cfg.backoff_factor).min(cfg.max_timeout);
+            if t == cfg.max_timeout {
+                break;
+            }
+        }
+        t
+    }
+
+    #[test]
+    fn timeout_for_matches_reference_semantics() {
+        let configs = [
+            // 生产默认（ADR-0049 §3.5 数值 OPEN，单位由调用方解释）
+            RoundTimeoutConfig {
+                initial_timeout: 1000,
+                max_timeout: 60_000,
+                backoff_factor: 2,
+            },
+            RoundTimeoutConfig {
+                initial_timeout: 1000,
+                max_timeout: 5000,
+                backoff_factor: 2,
+            },
+            // 平坦 / 退化（非增长）：闭式解路径
+            RoundTimeoutConfig {
+                initial_timeout: 5,
+                max_timeout: 1_000_000,
+                backoff_factor: 1,
+            },
+            RoundTimeoutConfig {
+                initial_timeout: 5,
+                max_timeout: 1_000,
+                backoff_factor: 0,
+            },
+            RoundTimeoutConfig {
+                initial_timeout: 0,
+                max_timeout: 60_000,
+                backoff_factor: 2,
+            },
+            // 边界：零上限、initial > max、极限上限、全 MAX
+            RoundTimeoutConfig {
+                initial_timeout: 7,
+                max_timeout: 0,
+                backoff_factor: 3,
+            },
+            RoundTimeoutConfig {
+                initial_timeout: 9,
+                max_timeout: 4,
+                backoff_factor: 2,
+            },
+            RoundTimeoutConfig {
+                initial_timeout: 1,
+                max_timeout: u64::MAX,
+                backoff_factor: 2,
+            },
+            RoundTimeoutConfig {
+                initial_timeout: u64::MAX,
+                max_timeout: u64::MAX,
+                backoff_factor: u64::MAX,
+            },
+        ];
+        for cfg in configs {
+            for round in [0u64, 1, 2, 3, 5, 7, 10, 31, 63, 64, 65, 100, 1_000] {
+                assert_eq!(
+                    cfg.timeout_for(round),
+                    reference_timeout_for(&cfg, round),
+                    "cfg={cfg:?} round={round} 必须与朴素定义逐值一致"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_for_terminates_for_degenerate_configs_and_huge_rounds() {
+        // 旧实现（`for _ in 0..round`）在以下输入上会迭代 ~2^64 次 ⇒ 若回归为 O(round)，
+        // 本测试将**不终止**（终止性即判据）。
+        let flat = RoundTimeoutConfig {
+            initial_timeout: 5,
+            max_timeout: 1_000_000,
+            backoff_factor: 1,
+        };
+        assert_eq!(flat.timeout_for(u64::MAX), 5);
+        let zero_initial = RoundTimeoutConfig {
+            initial_timeout: 0,
+            max_timeout: 60_000,
+            backoff_factor: 2,
+        };
+        assert_eq!(zero_initial.timeout_for(u64::MAX), 0);
+        let saturating = RoundTimeoutConfig {
+            initial_timeout: 1,
+            max_timeout: u64::MAX,
+            backoff_factor: 2,
+        };
+        assert_eq!(saturating.timeout_for(u64::MAX), u64::MAX);
+        // 期望值由**当前配置**派生（不硬编码默认数值；ADR-0049 §3.5 数值 OPEN）。
+        // 恒真上界：`round ≥ 1 ⇒ 结果 ≤ max_timeout`。“已达 cap” 仅在前提成立时断言：
+        // `initial_timeout ≤ max_timeout` 且 `backoff_factor ≥ 2` ⇒ 至多 64 步即达 cap
+        // （见 `MAX_BACKOFF_STEPS`）；前提不成立（序列不增长）时**不**假设达到 cap。
+        let capped = RoundTimeoutConfig::default();
+        assert!(
+            capped.timeout_for(u64::MAX) <= capped.max_timeout,
+            "极大 round ⇒ 结果不超过 cap"
+        );
+        if capped.initial_timeout <= capped.max_timeout && capped.backoff_factor >= 2 {
+            assert_eq!(
+                capped.timeout_for(u64::MAX),
+                capped.max_timeout,
+                "前提成立 ⇒ 极大 round 达到 cap"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_for_is_monotonic_and_bounded_by_cap() {
+        let cfg = RoundTimeoutConfig::default();
+        // round 0 = initial（**不施 cap** —— 既有行为，见本测试末尾 `invalid` 用例）；
+        // 期望值由**当前配置**派生，不硬编码默认数值。
+        assert_eq!(
+            cfg.timeout_for(0),
+            cfg.initial_timeout,
+            "round 0 = initial（不施 cap，既有行为）"
+        );
+        // 自 round 1 起：`结果 ≤ cap` 恒成立；且序列非递减（round 0 → 1 在非法配置
+        // `initial > max` 下是既有例外，故不在此处断言，仍由末尾 `invalid` 用例覆盖）。
+        let mut prev = cfg.timeout_for(1);
+        assert!(prev <= cfg.max_timeout, "round 1: 不超过 cap");
+        for round in 2..80u64 {
+            let v = cfg.timeout_for(round);
+            assert!(v >= prev, "round {round}: 序列非递减（round ≥ 1）");
+            assert!(v <= cfg.max_timeout, "round {round}: 不超过 cap");
+            prev = v;
+        }
+        // “已在 64 步内达到 cap” 的前提：`initial ≤ max` 且 `backoff ≥ 2`（否则序列不增长，
+        // 不应无条件假设达到 cap）。
+        if cfg.initial_timeout <= cfg.max_timeout && cfg.backoff_factor >= 2 {
+            assert_eq!(
+                cfg.timeout_for(64),
+                cfg.max_timeout,
+                "前提成立 ⇒ 64 步内达到 cap"
+            );
+        }
+        // initial > max 的非法配置：round 0 仍返回 initial（既有行为）；round ≥ 1 ⇒ cap
+        let invalid = RoundTimeoutConfig {
+            initial_timeout: 9,
+            max_timeout: 4,
+            backoff_factor: 2,
+        };
+        assert_eq!(invalid.timeout_for(0), 9);
+        assert_eq!(invalid.timeout_for(1), 4);
+        assert_eq!(invalid.timeout_for(u64::MAX), 4);
+    }
+
     #[test]
     fn set_proposal_only_in_propose_step() {
         let mut state = RoundState::new(1, 0);
