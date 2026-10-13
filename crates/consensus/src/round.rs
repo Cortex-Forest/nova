@@ -244,10 +244,38 @@ impl Default for RoundTimeoutConfig {
 }
 
 impl RoundTimeoutConfig {
+    /// 退避循环的迭代上界（**只**约束终止性，不改变任何输出数值）。
+    ///
+    /// `initial_timeout ≥ 1` 且 `backoff_factor ≥ 2` 时，`initial × 2^64` 必然 saturate 到
+    /// `u64::MAX` ⇒ 最迟第 64 次乘幂即达 `max_timeout`（`max_timeout ≤ u64::MAX`）。
+    /// 非增长配置（`backoff_factor ≤ 1` 或 `initial_timeout == 0`）走闭式解，不进入循环。
+    const MAX_BACKOFF_STEPS: u64 = 64;
+
     /// `timeout(round) = initial × backoff^round`，cap 于 `max_timeout`。
+    ///
+    /// - **语义形状**由 ADR-0049 §3.5 冻结；**数值与单位**属 node-local 配置
+    ///   （ADR-0049 §3.5 / §10「exact timeout numeric values = OPEN」）⇒ 本类型**不假定单位**，
+    ///   由调用方解释（例如 node 层以逻辑 step tick 解释）。本函数**不**做任何单位换算。
+    /// - **终止性**：对任意 `round`（含 `u64::MAX`）均在常数步数（≤ [`Self::MAX_BACKOFF_STEPS`]）
+    ///   内返回；输出与朴素 `round` 次迭代定义**逐值一致**（见 `timeout_for_matches_reference_semantics`）。
+    /// - `round == 0` 返回 `initial_timeout`（**不**施加 cap —— 与既有行为一致；合法配置应满足
+    ///   `initial_timeout ≤ max_timeout`）。
+    /// - 不引入新的 panic / unwrap：全程 `saturating_mul` + `min`，无溢出、无 `round` 次循环。
     pub fn timeout_for(&self, round: u64) -> u64 {
+        // 非增长序列（`backoff_factor ≤ 1` 或 `initial_timeout == 0`）：首次乘幂后数值恒定
+        // （`saturating_mul` 与 `min` 对非负输入单调）⇒ 闭式解，避免 O(round) 迭代。
+        if self.backoff_factor <= 1 || self.initial_timeout == 0 {
+            if round == 0 {
+                return self.initial_timeout;
+            }
+            return self
+                .initial_timeout
+                .saturating_mul(self.backoff_factor)
+                .min(self.max_timeout);
+        }
+        // 增长序列：至多 `MAX_BACKOFF_STEPS` 次乘幂即达 cap（见常量 doc）。
         let mut t = self.initial_timeout;
-        for _ in 0..round {
+        for _ in 0..round.min(Self::MAX_BACKOFF_STEPS) {
             t = t.saturating_mul(self.backoff_factor).min(self.max_timeout);
             if t == self.max_timeout {
                 break;
