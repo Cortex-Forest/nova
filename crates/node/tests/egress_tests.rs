@@ -322,7 +322,7 @@ fn nimpl2_proposal_semantic_to_signed_envelope() {
     assert_eq!(env.payload.len(), 64);
     verify_message(&net_vk, &env).expect("network identity signature valid");
     // semantic 编码（不经签名）与 envelope payload 一致。
-    let (mt, payload) = encode_semantic(&OutboundConsensusMessage::Proposal(pr));
+    let (mt, payload) = encode_semantic(&OutboundConsensusMessage::Proposal(pr)).expect("encode");
     assert_eq!(mt, MessageType::ConsensusProposal);
     assert_eq!(payload, env.payload);
 }

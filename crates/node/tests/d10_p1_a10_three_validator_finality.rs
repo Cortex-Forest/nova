@@ -124,6 +124,10 @@ fn t1_three_validator_real_tcp_finality() {
         nodes.iter().map(|n| n.last_err.clone()).collect::<Vec<_>>(),
     );
     eprintln!("T1 diagnostics: {diag}");
+    // PHASE 6H-A11 DIAG（**只读**，仅诊断输出）— pending / guard 拒绝原因 / recovery / block 入站 计数。
+    for (i, n) in nodes.iter().enumerate() {
+        eprintln!("A11 diag node{i}: {}", n.rt.a11_diag_summary());
+    }
     // proposer 选择诊断（只读；用于定位为何无提案）。
     {
         use nova_consensus::proposer::select_proposer;

@@ -85,8 +85,8 @@ fn diag(tag: &str, nodes: &[Node]) -> String {
         nodes
             .iter()
             .map(|n| (
-                n.rt.round_timeout_window_ticks(),
-                n.rt.round_timeout_elapsed_ticks()
+                n.rt.round_timeout_window_ms(),
+                n.rt.round_timeout_elapsed_ms()
             ))
             .collect::<Vec<_>>(),
         nodes

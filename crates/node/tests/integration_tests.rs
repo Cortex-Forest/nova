@@ -171,6 +171,16 @@ fn envelope_for(net_key: &KeyPair, msg: &OutboundConsensusMessage) -> MessageEnv
         }
         // D9 Egress：block wire 原样透传（与 `egress::encode_semantic` 同映射）。
         OutboundConsensusMessage::GossipBlock(wire) => (MessageType::GossipBlock, wire.clone()),
+        // PHASE 6H-Z：O2 证书 → 0x0D（与 `egress::encode_semantic` 同映射；冻结 ADR-0070 codec）。
+        OutboundConsensusMessage::RoundChange(cert) => (
+            MessageType::ConsensusRoundChange,
+            nova_consensus::round_change::encode_certificate(cert).expect("encode"),
+        ),
+        // PHASE 6H-AF：O2 attestation → 0x0E（与 `egress::encode_semantic` 同映射；冻结 ADR-0074 codec）。
+        OutboundConsensusMessage::AbandonAttestation(attestation) => (
+            MessageType::ConsensusAbandonAttestation,
+            nova_network::abandon_attestation::encode(attestation),
+        ),
     };
     sign_envelope(net_key, message_type, payload)
 }

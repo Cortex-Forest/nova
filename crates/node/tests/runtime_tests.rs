@@ -26,6 +26,7 @@ use nova_crypto::signature::{Signature, SigningKey, VerifyingKey, sign_message_h
 use nova_node::bootstrap::NodeConfig;
 use nova_node::key_provider::{KeyProvider, KeyProviderError, SoftwareKeyProvider};
 use nova_node::runtime::{NodeRuntime, NodeRuntimeError, derive_validator_id};
+use nova_node::block_safety::{BlockSafetyIdentity, BlockSafetyJournal};
 use nova_node::safety_store::{SafetyIdentity, ValidatorSafetyStore};
 use nova_node::signer::{SigningCapability, SigningError};
 use nova_node::validator::LocalVoteRequest;
@@ -610,4 +611,173 @@ fn g5d72_t3_existing_journal_rejects_initialization_and_keeps_bytes() {
     // 关键断言：既有 journal 字节完全不变。
     let after = std::fs::read(&journal).expect("读取既有 journal（拒绝后）");
     assert_eq!(before, after, "既有 journal 必须 byte-for-byte 不变");
+}
+
+// ---------- P-6：Safety Journal **半完成状态**（仅一枚存在）回归测试 ----------
+//
+// 目标：任何“仅一枚 journal 存在”的状态必须 fail-closed，且启动失败路径**不得**产生状态副作用：
+//   · 不自动补建另一枚 journal；
+//   · 不改动既有文件字节；
+//   · 不删除、不替换任何 journal。
+//
+// 预置手段：直接使用**生产 create API** 写入 canonical header（不手写二进制格式，不造生产密钥）。
+// 本组测试仅使用临时目录（`Env` 使用 `std::env::temp_dir()`），不涉及任何真实安全目录。
+
+/// 预置**仅 vote journal**（canonical header；block journal 不存在）。
+fn preset_vote_journal(env: &Env, pk: &[u8; 32]) -> PathBuf {
+    let id = derive_validator_id(pk);
+    let sid = SafetyIdentity::new(NetworkId::Mainnet, CHAIN_ID, env.genesis_hash, &id);
+    let path = env.safety_dir.join("safety.journal");
+    ValidatorSafetyStore::create(&path, sid).expect("预置 vote journal（生产 create API）");
+    path
+}
+
+/// 预置**仅 block journal**（canonical header；vote journal 不存在）。
+fn preset_block_journal(env: &Env, pk: &[u8; 32]) -> PathBuf {
+    let id = derive_validator_id(pk);
+    let bid = BlockSafetyIdentity::new(NetworkId::Mainnet, CHAIN_ID, env.genesis_hash, &id);
+    let path = env.safety_dir.join("block-safety.journal");
+    BlockSafetyJournal::create(&path, bid).expect("预置 block journal（生产 create API）");
+    path
+}
+
+/// T1（P-6）：仅 vote journal 存在 + **无**初始化 flag ⇒ 启动失败；vote 字节不变；block 不得被创建。
+#[test]
+fn rt_safety_journal_partial_vote_only_without_init_fails_closed() {
+    let kp = KeyPair::generate().unwrap();
+    let pk = kp.verifying_key().to_bytes();
+    let env = Env::new(&genesis_for(pk));
+    let provider = SoftwareKeyProvider::from_keypair(kp);
+
+    let vote = preset_vote_journal(&env, &pk);
+    let block = env.safety_dir.join("block-safety.journal");
+    let before = std::fs::read(&vote).expect("读取预置 vote journal");
+
+    let mut cfg = env.config(true, env.genesis_hash);
+    cfg.validator_safety_init = false; // 等同：未传 `--init-validator-safety`
+    let err = match NodeRuntime::start(&cfg, Some(&provider)) {
+        Err(e) => e,
+        Ok(_) => panic!("仅 vote journal + 无初始化 flag 必须启动失败（绝不隐式创建 block journal）"),
+    };
+    assert!(
+        matches!(err, NodeRuntimeError::SafetyJournalMissing),
+        "期望 SafetyJournalMissing，got {err:?}"
+    );
+
+    assert_eq!(
+        std::fs::read(&vote).expect("读取 vote journal（失败后）"),
+        before,
+        "既有 vote journal 必须 byte-for-byte 不变"
+    );
+    assert!(
+        !block.exists(),
+        "block journal 绝不得被自动创建（半完成状态不得被静默补齐）"
+    );
+}
+
+/// T2（P-6）：仅 block journal 存在 + **无**初始化 flag ⇒ 启动失败；block 字节不变；vote 不得被创建。
+#[test]
+fn rt_safety_journal_partial_block_only_without_init_fails_closed() {
+    let kp = KeyPair::generate().unwrap();
+    let pk = kp.verifying_key().to_bytes();
+    let env = Env::new(&genesis_for(pk));
+    let provider = SoftwareKeyProvider::from_keypair(kp);
+
+    let block = preset_block_journal(&env, &pk);
+    let vote = env.safety_dir.join("safety.journal");
+    let before = std::fs::read(&block).expect("读取预置 block journal");
+
+    let mut cfg = env.config(true, env.genesis_hash);
+    cfg.validator_safety_init = false;
+    let err = match NodeRuntime::start(&cfg, Some(&provider)) {
+        Err(e) => e,
+        Ok(_) => panic!("仅 block journal + 无初始化 flag 必须启动失败（绝不隐式创建 vote journal）"),
+    };
+    assert!(
+        matches!(err, NodeRuntimeError::SafetyJournalMissing),
+        "期望 SafetyJournalMissing，got {err:?}"
+    );
+
+    assert_eq!(
+        std::fs::read(&block).expect("读取 block journal（失败后）"),
+        before,
+        "既有 block journal 必须 byte-for-byte 不变"
+    );
+    assert!(
+        !vote.exists(),
+        "vote journal 绝不得被自动创建（半完成状态不得被静默补齐）"
+    );
+}
+
+/// T3（P-6）：仅 vote journal 存在 + **有**初始化 flag ⇒ 拒绝初始化；vote 字节不变；无任何创建/替换。
+#[test]
+fn rt_safety_journal_partial_vote_only_with_init_flag_fails_closed() {
+    let kp = KeyPair::generate().unwrap();
+    let pk = kp.verifying_key().to_bytes();
+    let env = Env::new(&genesis_for(pk));
+    let provider = SoftwareKeyProvider::from_keypair(kp);
+
+    let vote = preset_vote_journal(&env, &pk);
+    let block = env.safety_dir.join("block-safety.journal");
+    let before = std::fs::read(&vote).expect("读取预置 vote journal");
+
+    let mut cfg = env.config(true, env.genesis_hash);
+    cfg.validator_safety_init = true; // 等同：传 `--init-validator-safety`
+    let err = match NodeRuntime::start(&cfg, Some(&provider)) {
+        Err(e) => e,
+        Ok(_) => panic!("既有 vote journal + 初始化 flag 必须被拒绝"),
+    };
+    assert!(
+        matches!(err, NodeRuntimeError::SafetyJournalAlreadyExists),
+        "期望 SafetyJournalAlreadyExists，got {err:?}"
+    );
+
+    assert_eq!(
+        std::fs::read(&vote).expect("读取 vote journal（拒绝后）"),
+        before,
+        "既有 vote journal 必须 byte-for-byte 不变（不得 truncate/overwrite/replace）"
+    );
+    assert!(
+        !block.exists(),
+        "block journal 绝不得被静默创建/替换（半完成状态不得被静默补齐）"
+    );
+}
+
+/// T4（P-6）：仅 block journal 存在 + **有**初始化 flag ⇒ 必须拒绝且**不得**静默创建/替换任何 journal。
+///
+/// ⚠️ **本用例为	extbf{预期失败}（RED）证据**：当前生产实现在 vote 分支的 `(false, true)` 会**先执行**
+/// `ValidatorSafetyStore::create`（`runtime.rs:3745-3746`），随后才在 block 分支的 `(true, true)` 拒绝
+/// （`runtime.rs:3767`）⇒ 启动失败路径会**创建一枚空历史 vote journal**。
+/// 该断言是本任务要求的“不得静默创建”断言；**不得**为得到绿灯而删改它。
+#[test]
+fn rt_safety_journal_partial_block_only_with_init_flag_fails_closed() {
+    let kp = KeyPair::generate().unwrap();
+    let pk = kp.verifying_key().to_bytes();
+    let env = Env::new(&genesis_for(pk));
+    let provider = SoftwareKeyProvider::from_keypair(kp);
+
+    let block = preset_block_journal(&env, &pk);
+    let vote = env.safety_dir.join("safety.journal");
+    let before = std::fs::read(&block).expect("读取预置 block journal");
+
+    let mut cfg = env.config(true, env.genesis_hash);
+    cfg.validator_safety_init = true;
+    let err = match NodeRuntime::start(&cfg, Some(&provider)) {
+        Err(e) => e,
+        Ok(_) => panic!("既有 block journal + 初始化 flag 必须被拒绝"),
+    };
+    assert!(
+        matches!(err, NodeRuntimeError::SafetyJournalAlreadyExists),
+        "期望 SafetyJournalAlreadyExists，got {err:?}"
+    );
+
+    assert_eq!(
+        std::fs::read(&block).expect("读取 block journal（拒绝后）"),
+        before,
+        "既有 block journal 必须 byte-for-byte 不变"
+    );
+    assert!(
+        !vote.exists(),
+        "启动失败路径不得静默创建 vote journal（当前生产实现会创建空历史 journal ⇒ 待 Owner/设计裁定）"
+    );
 }

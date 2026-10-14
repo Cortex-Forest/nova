@@ -22,5 +22,6 @@ pub mod domain;
 pub mod genesis;
 pub mod hex;
 pub mod json;
+pub mod round_change;
 pub mod signature;
 pub mod transaction;

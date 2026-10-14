@@ -25,7 +25,7 @@ use nova_crypto::address::{
 use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
 use nova_crypto::identity::{EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit};
 use nova_crypto::key::KeyPair;
-use nova_crypto::signature::sign_message_hash;
+use nova_crypto::signature::{VerifyingKey, sign_message_hash};
 use nova_network::security::RequestId;
 use nova_network::sync::{BlockPayload, SyncBlockResponse};
 use nova_runtime::{
@@ -41,8 +41,8 @@ use nova_node::block_adapter::{ChainHead, NoAccountsKeyResolver, NodeBlockAdapte
 use nova_node::block_dispatch::{
     dispatch_gossip_block, dispatch_gossip_block_round_aware,
     dispatch_gossip_block_with_validator_set, dispatch_sync_block_response_round_aware,
-    dispatch_sync_block_response_with_validator_set, resolve_proposer_round_evidence,
-    resolve_proposer_round_from_evidences,
+    dispatch_sync_block_response_with_validator_set, resolve_inbound_block_round,
+    resolve_proposer_round_evidence, resolve_proposer_round_from_evidences,
 };
 use nova_node::block_inbound::{InboundBlockError, InboundBlockVerdict, UnverifiableItem};
 
@@ -186,6 +186,35 @@ fn canonical_next_block(kp: &KeyPair) -> Block {
 
 fn wire(block: &Block) -> Vec<u8> {
     encode_block(block).unwrap()
+}
+
+/// canonical-next 空块，**显式指定** `header.round`（其余与 [`canonical_next_block`] 逐字相同）。
+///
+/// 用于 M3 回归：`header.round` 必须是**被签名绑定**（`verify_block_signature` 覆盖整 canonical
+/// header）且**被 block hash 承诺覆盖**的值 ⇒ 本 fixture 在签名**之前**设置 `round`。
+fn canonical_next_block_round(kp: &KeyPair, round: u64) -> Block {
+    let body = BlockBody { txs: Vec::new() };
+    let header = BlockHeader {
+        version: BLOCK_VERSION,
+        chain_id: CHAIN_ID,
+        height: 1,
+        round,
+        parent_hash: GENESIS_HASH,
+        finality_reference: None,
+        transaction_root: compute_transaction_root(&body),
+        state_root: empty_root(),
+        validator_set_hash: [0u8; 32],
+        timestamp: 0,
+    };
+    let payload = encode_block_header(&header);
+    let signed =
+        build_signed_bytes(AlgorithmId::Ed25519, DomainId::Block, CHAIN_ID, &payload).unwrap();
+    let msg = hash_signing_message(&signed);
+    Block {
+        header,
+        body,
+        proposer_signature: sign_message_hash(kp.signing_key(), &msg).to_bytes(),
+    }
 }
 
 /// P1-A.18 Stage 2 —— 单块 `SyncBlockResponse` payload（既有 codec；固定测试 RequestId）。
@@ -411,6 +440,336 @@ fn p1a18_t1_no_evidence_is_identical_to_round0_entry() {
     assert_eq!(
         dispatch_gossip_block_round_aware(&adapter, MAX_BLOCK_BYTES, &w, &set, None, None, None),
         expected
+    );
+}
+
+/// **PHASE 6H-A30-ROOTFIX-M2（Task B 回归钉）** —— 「零证据 canonical-next gossip 块」**不得**被归类为
+/// [`InboundBlockError::UnsupportedValidation`]。
+///
+/// 缺陷模型（3-validator 真实 TCP 首次未发生的状态转移之根因）：M1 门槛把「无绑定轮证据」一律判为
+/// `UnsupportedValidation(ProposerSignature)` ⇒ 新区块首轮永不落盘 / 永不登记 ⇒ U3 recovery
+/// checkpoint（**只在登记成功后**调用）不可达 ⇒ 跟随者提案永远 pending（`admitted=0`）⇒ 无本地
+/// Prevote ⇒ 聚合权重恒为自身 1×STAKE < quorum ⇒ 无 QC / 无 finality / head 恒 0（`pended=1`、
+/// `register_ok=0`、`heads=[0,0,0]`）。
+///
+/// 本测试固定两条不可回归的契约（与 `p1a18_t1` / `p1a18_t2` 同一冻结语义）：
+/// 1. round-0 当选者签名的 canonical-next 块 + **零证据** ⇒ `Ok(CanonicalNextCandidate)`（可登记）；
+/// 2. round-`r`（`r > 0`）块 + **零证据** ⇒ `InvalidProposerSignature`
+///    （按 round 0 期望 proposer 判定 —— *不是* `UnsupportedValidation`）。
+#[test]
+fn rootfix_m2_no_evidence_never_deadlocks_via_unsupported_validation() {
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let kp_c = KeyPair::generate().unwrap();
+    let kps: [&KeyPair; 3] = [&kp_a, &kp_b, &kp_c];
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![
+        vin(&kp_a, 100),
+        vin(&kp_b, 100),
+        vin(&kp_c, 100),
+    ]));
+
+    // 1. 新区块（round 0）+ 零证据 ⇒ 必须完成验证（否则 proposal ⇄ block 证据死锁）。
+    let p0 = select_proposer(CHAIN_ID, 0, 0, &GENESIS_HASH, &set).unwrap();
+    let block0 = canonical_next_block(key_for(p0, &kps));
+    let w0 = wire(&block0);
+    let h0 = nova_runtime::block_hash(&block0).unwrap();
+    assert_eq!(
+        dispatch_gossip_block_round_aware(&adapter, MAX_BLOCK_BYTES, &w0, &set, None, None, None),
+        Ok(InboundBlockVerdict::CanonicalNextCandidate {
+            block_hash: h0,
+            height: 1,
+        }),
+        "零证据的 round-0 canonical-next 块必须被验证（否则登记不可达 ⇒ 恢复检查点不可达）"
+    );
+
+    // 2. round r > 0 且零证据 ⇒ 回退 round 0 期望 proposer ⇒ 签名不符（**非** UnsupportedValidation）。
+    let r = first_round_with_different_proposer(&set, 0);
+    let p_r = select_proposer(CHAIN_ID, 0, r, &GENESIS_HASH, &set).unwrap();
+    let w_r = wire(&canonical_next_block(key_for(p_r, &kps)));
+    let got =
+        dispatch_gossip_block_round_aware(&adapter, MAX_BLOCK_BYTES, &w_r, &set, None, None, None);
+    assert_eq!(got, Err(InboundBlockError::InvalidProposerSignature));
+    assert!(
+        !matches!(got, Err(InboundBlockError::UnsupportedValidation(_))),
+        "分类不得退化为 UnsupportedValidation（该变体会阻断登记 + U3 recovery ⇒ 活性死锁）"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M3（Owner 授权）— 入站轮次派生：证据优先 / `header.round` 兜底 / 冲突拒绝
+// ---------------------------------------------------------------------------
+
+/// **M3-1（纯函数契约）** —— `resolve_inbound_block_round` 的三条规则（gossip / sync / registration
+/// **共用**的唯一规则）。
+#[test]
+fn m3_round_resolver_contract() {
+    let h = [0x11u8; 32];
+    let other = [0x22u8; 32];
+    // (1) 无绑定证据 ⇒ `header.round`（含 0；旧隐式 round-0 回退已被取代）。
+    assert_eq!(resolve_inbound_block_round(h, 0, None, None), Ok(0));
+    assert_eq!(resolve_inbound_block_round(h, 7, None, None), Ok(7));
+    // (2) 恰一源绑定 ⇒ 证据轮（**优先**于 `header.round`）。
+    assert_eq!(resolve_inbound_block_round(h, 9, Some((3, h)), None), Ok(3));
+    assert_eq!(resolve_inbound_block_round(h, 9, None, Some((4, h))), Ok(4));
+    assert_eq!(
+        resolve_inbound_block_round(h, 0, Some((2, h)), Some((2, h))),
+        Ok(2),
+        "same round from both sources is not a conflict"
+    );
+    // (3) 冲突（两源绑定同 hash 但轮不同）⇒ `Err(())`（不静默择一）。
+    assert_eq!(
+        resolve_inbound_block_round(h, 9, Some((2, h)), Some((3, h))),
+        Err(())
+    );
+    // (4) 证据未绑定本 hash ⇒ 视为无证据 ⇒ `header.round`。
+    assert_eq!(
+        resolve_inbound_block_round(h, 5, Some((3, other)), Some((4, other))),
+        Ok(5)
+    );
+}
+
+/// **M3-2（无证据 + `header.round = 0`）** —— 保持既有 round-0 行为（与 round-0 兼容入口一致）。
+#[test]
+fn m3_no_evidence_header_round_zero_keeps_round0_behaviour() {
+    let kp = KeyPair::generate().unwrap();
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![vin(&kp, 100)]));
+    let block = canonical_next_block_round(&kp, 0);
+    let w = wire(&block);
+    let hash = nova_runtime::block_hash(&block).unwrap();
+    assert_eq!(
+        dispatch_gossip_block_round_aware(&adapter, MAX_BLOCK_BYTES, &w, &set, None, None, None),
+        Ok(InboundBlockVerdict::CanonicalNextCandidate {
+            block_hash: hash,
+            height: 1,
+        })
+    );
+}
+
+/// **M3-3（无证据 + `header.round = r > 0`）** —— 由**该轮当选 proposer** 正确签名的
+/// canonical-next 块必须被接受（round≥1 入站验证；修复前为 `InvalidProposerSignature` ⇒ 死锁）。
+#[test]
+fn m3_no_evidence_header_round_gt0_elected_proposer_accepted() {
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let kp_c = KeyPair::generate().unwrap();
+    let kps: [&KeyPair; 3] = [&kp_a, &kp_b, &kp_c];
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![
+        vin(&kp_a, 100),
+        vin(&kp_b, 100),
+        vin(&kp_c, 100),
+    ]));
+
+    let r = first_round_with_different_proposer(&set, 0);
+    let p_r = select_proposer(CHAIN_ID, 0, r, &GENESIS_HASH, &set).unwrap();
+    let signer = key_for(p_r, &kps);
+    let block = canonical_next_block_round(signer, r);
+    let w = wire(&block);
+    let hash = nova_runtime::block_hash(&block).unwrap();
+
+    assert_eq!(
+        dispatch_gossip_block_round_aware(&adapter, MAX_BLOCK_BYTES, &w, &set, None, None, None),
+        Ok(InboundBlockVerdict::CanonicalNextCandidate {
+            block_hash: hash,
+            height: 1,
+        }),
+        "round-{r} 的当选 proposer 签名 + header.round = {r} ⇒ 必须接受（M3）"
+    );
+    // 只读：dispatch 不改 head / 不落盘。
+    assert_eq!(adapter.head().height, 0);
+}
+
+/// **M3-4（`header.round` 与签名者不匹配）** —— `header.round = r` 但由**非**该轮当选者签名 ⇒ 拒绝。
+#[test]
+fn m3_header_round_proposer_mismatch_rejected() {
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let kp_c = KeyPair::generate().unwrap();
+    let kps: [&KeyPair; 3] = [&kp_a, &kp_b, &kp_c];
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![
+        vin(&kp_a, 100),
+        vin(&kp_b, 100),
+        vin(&kp_c, 100),
+    ]));
+
+    let r = first_round_with_different_proposer(&set, 0);
+    let p_r = select_proposer(CHAIN_ID, 0, r, &GENESIS_HASH, &set).unwrap();
+    let other = first_round_with_proposer_other_than(&set, 0, p_r);
+    let signer_other = key_for(
+        select_proposer(CHAIN_ID, 0, other, &GENESIS_HASH, &set).unwrap(),
+        &kps,
+    );
+    // `header.round = r`（声称 r 轮）但实际由 `other` 轮当选者签名。
+    let w = wire(&canonical_next_block_round(signer_other, r));
+    assert_eq!(
+        dispatch_gossip_block_round_aware(&adapter, MAX_BLOCK_BYTES, &w, &set, None, None, None),
+        Err(InboundBlockError::InvalidProposerSignature),
+        "header.round 声称的轮与签名者不一致 ⇒ 必须拒绝"
+    );
+}
+
+/// **M3-5（已绑定证据轮 ≠ `header.round`）** —— 保持**证据优先**语义（`p1a18_t2` 的冻结断言不变）。
+#[test]
+fn m3_bound_evidence_wins_over_header_round() {
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let kp_c = KeyPair::generate().unwrap();
+    let kps: [&KeyPair; 3] = [&kp_a, &kp_b, &kp_c];
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![
+        vin(&kp_a, 100),
+        vin(&kp_b, 100),
+        vin(&kp_c, 100),
+    ]));
+
+    let r = first_round_with_different_proposer(&set, 0);
+    let p_r = select_proposer(CHAIN_ID, 0, r, &GENESIS_HASH, &set).unwrap();
+    let signer = key_for(p_r, &kps);
+    // fixture：`header.round = 0`（与证据轮 r 不同 ⇒ 只用证据轮 ⇒ 接受）。
+    let block = canonical_next_block_round(signer, 0);
+    let w = wire(&block);
+    let hash = nova_runtime::block_hash(&block).unwrap();
+    assert_eq!(
+        resolve_inbound_block_round(hash, 0, Some((r, hash)), None),
+        Ok(r)
+    );
+    assert_eq!(
+        dispatch_gossip_block_round_aware(
+            &adapter,
+            MAX_BLOCK_BYTES,
+            &w,
+            &set,
+            None,
+            Some((r, hash)),
+            None
+        ),
+        Ok(InboundBlockVerdict::CanonicalNextCandidate {
+            block_hash: hash,
+            height: 1,
+        }),
+        "证据优先：绑定证据轮 r 覆盖 header.round（= 0）"
+    );
+}
+
+/// **M3-6（validation 轮 ⇒ 签名自洽；registration 复用同一不变量）** ——
+/// `resolve_inbound_block_round` 给出的轮，其当选 proposer 的 key **必须**能验证块签名；
+/// 否则（本轮修复前）registration 的 `put_verified` 会把标签错报为 `CorruptedState` ⇒ 致命退出。
+#[test]
+fn m3_resolved_round_is_signature_consistent() {
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let kp_c = KeyPair::generate().unwrap();
+    let kps: [&KeyPair; 3] = [&kp_a, &kp_b, &kp_c];
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![
+        vin(&kp_a, 100),
+        vin(&kp_b, 100),
+        vin(&kp_c, 100),
+    ]));
+    let r = first_round_with_different_proposer(&set, 0);
+    let p_r = select_proposer(CHAIN_ID, 0, r, &GENESIS_HASH, &set).unwrap();
+    let signer = key_for(p_r, &kps);
+    let block = canonical_next_block_round(signer, r);
+    let hash = nova_runtime::block_hash(&block).unwrap();
+
+    // validation 与 registration **共用**同一 helper（`register_remote_canonical_block` 以同一
+    // `(header.round, proposal_evidence, qc_evidence)` 调用它）⇒ 二者轮一致。
+    let round = resolve_inbound_block_round(hash, block.header.round, None, None).unwrap();
+    assert_eq!(round, r, "无证据 ⇒ header.round");
+    // registration 侧同口径：该轮 ⇒ proposer ⇒ key ⇒ 签名必须通过（登记前自验的核心不变量）。
+    let info = set.info(&p_r).expect("proposer 在集合内");
+    let vk = VerifyingKey::from_bytes(&info.consensus_public_key).unwrap();
+    assert!(
+        nova_runtime::validate_block_signature(&block, &vk, CHAIN_ID).is_ok(),
+        "解析轮 ⇒ 当选 proposer 的 key 必须验证块签名（否则登记必须保守 no-op）"
+    );
+}
+
+/// **M3-7（malformed block 不进入登记路径）** —— 结构损坏 ⇒ `Malformed`（**非** `Ok`）。
+///
+/// `step()` 只在 `if let Ok(verdict) = &outcome` 且 verdict = `CanonicalNextCandidate` 时才调用
+/// `register_remote_canonical_block` ⇒ `Err(Malformed)` 的块**不可能**进入登记路径
+/// （也不可能有轮次回退导致其被登记）。
+#[test]
+fn m3_malformed_block_never_reaches_registration() {
+    let kp = KeyPair::generate().unwrap();
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![vin(&kp, 100)]));
+    let mut w = wire(&canonical_next_block_round(&kp, 3));
+    w.truncate(w.len() - 8); // 截断 ⇒ decode 失败
+    let got =
+        dispatch_gossip_block_round_aware(&adapter, MAX_BLOCK_BYTES, &w, &set, None, None, None);
+    assert_eq!(got, Err(InboundBlockError::Malformed));
+}
+
+/// **M3-8（sync 路径同一规则）** —— `qc_evidences` 为空且 `header.round = r` ⇒ 用 `header.round`
+/// （与 gossip 路径逐字同规则）；且与 round-0 情形保持既有等价性。
+#[test]
+fn m3_sync_no_evidence_uses_header_round() {
+    let kp_a = KeyPair::generate().unwrap();
+    let kp_b = KeyPair::generate().unwrap();
+    let kp_c = KeyPair::generate().unwrap();
+    let kps: [&KeyPair; 3] = [&kp_a, &kp_b, &kp_c];
+    let chain = TestChain::new();
+    let adapter = create_adapter(&chain);
+    let set = ValidatorSet::from_genesis(&genesis_with(vec![
+        vin(&kp_a, 100),
+        vin(&kp_b, 100),
+        vin(&kp_c, 100),
+    ]));
+    let r = first_round_with_different_proposer(&set, 0);
+    let p_r = select_proposer(CHAIN_ID, 0, r, &GENESIS_HASH, &set).unwrap();
+    let signer = key_for(p_r, &kps);
+    let block = canonical_next_block_round(signer, r);
+    let hash = nova_runtime::block_hash(&block).unwrap();
+    let payload = sync_payload(&block);
+
+    assert_eq!(
+        dispatch_sync_block_response_round_aware(
+            &adapter,
+            MAX_BLOCK_BYTES,
+            &payload,
+            &set,
+            None,
+            &[]
+        ),
+        vec![Ok(InboundBlockVerdict::CanonicalNextCandidate {
+            block_hash: hash,
+            height: 1,
+        })],
+        "sync 无 QC 证据 ⇒ header.round = {r}"
+    );
+
+    // round-0 情形与既有实现**逐字等价**（`p1a18_t1` 已固化；此处再固定为显式断言）。
+    let b0 = canonical_next_block_round(
+        key_for(
+            select_proposer(CHAIN_ID, 0, 0, &GENESIS_HASH, &set).unwrap(),
+            &kps,
+        ),
+        0,
+    );
+    let h0 = nova_runtime::block_hash(&b0).unwrap();
+    assert_eq!(
+        dispatch_sync_block_response_round_aware(
+            &adapter,
+            MAX_BLOCK_BYTES,
+            &sync_payload(&b0),
+            &set,
+            None,
+            &[]
+        ),
+        vec![Ok(InboundBlockVerdict::CanonicalNextCandidate {
+            block_hash: h0,
+            height: 1,
+        })]
     );
 }
 

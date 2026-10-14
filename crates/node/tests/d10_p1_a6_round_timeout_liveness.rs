@@ -1,8 +1,8 @@
 //! P1-A.6 — **Round Timeout Liveness**（node-local pacemaker；ADR-0049 冻结语义的 node 层落地）。
 //!
 //! # 被验证的不变量
-//! - `window(round) = min(initial × backoff^round, max)`（冻结 `RoundTimeoutConfig` 语义；**逻辑 step
-//!   tick** 解释，非协议常量）。
+//! - `window(round) = min(initial × backoff^round, max)`（冻结 `RoundTimeoutConfig` 语义；
+//!   **A3：毫秒**解释，非协议常量；到期条件为单调已历时 ≥ 窗口）。
 //! - 计时器绑 `(height, round)`：新轮 / 新高度 ⇒ **不继承** elapsed（ADR-0049 §3.3）。
 //! - 到期 ⇒ 调用**既有** `ConsensusNode::round_timeout()`（不新增共识语义、不产生 vote / QC /
 //!   finality / lock / DAG 变更、不广播）；新当选 proposer 随后走**既有**提案路径。
@@ -14,15 +14,18 @@
 //! - 计时器**不持久化**：restart 后全新窗口（无 stale deadline），round 亦不持久化。
 //!
 //! # 确定性
-//! 全部测试用 **逻辑 tick**（无 `sleep` / 无墙钟 / 无并发）：`set_round_timeout_config` 提供
-//! node-local 测试 seam（非生产配置面：无 CLI flag、不进 `NodeConfig`、不改共识语义）；
-//! fixture 由**固定 seed 扫描**构造（无 RNG 依赖 ⇒ 每次运行同一 fixture）。
+//! 全部测试用 **A3 注入式确定性时钟**（`StepClock`：每 step 前进 1ms，无 `sleep` / 无墙钟 /
+//! 无并发）：`set_round_timeout_config` + `set_clock` 提供 node-local 测试 seam（非生产配置面：
+//! 无 CLI flag、不进 `NodeConfig`、不改共识语义）；fixture 由**固定 seed 扫描**构造
+//!（无 RNG 依赖 ⇒ 每次运行同一 fixture）。
 //!
 //! 纪律：不修改 consensus / driver / assembly / bin / bootstrap / D8；不新增依赖；fixture 仅写
 //! 系统临时目录。
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use nova_consensus::finality::{FinalityError, QcContext, QuorumCertificate};
 use nova_consensus::proposer::select_proposer;
@@ -45,7 +48,7 @@ use nova_node::bootstrap::NodeConfig;
 use nova_node::driver::DriverError;
 use nova_node::key_provider::{KeyProvider, KeyProviderError};
 use nova_node::network_identity::SoftwareNetworkIdentity;
-use nova_node::runtime::{NodeRuntime, derive_validator_id};
+use nova_node::runtime::{MonotonicClock, NodeRuntime, derive_validator_id};
 use nova_node::signer::{SigningCapability, SigningError};
 use nova_node::wiring::NodeConsensusCommand;
 
@@ -54,15 +57,39 @@ const STAKE: u128 = 200_000;
 /// 注入用的「不在本节点 DAG 的 target」。
 const TARGET: [u8; 32] = [0xAA; 32];
 
-/// 测试用极小窗口：round 0 ⇒ 3 tick，round 1 ⇒ 6 tick（backoff ×2），round 2+ ⇒ cap 6。
-const WINDOW_ROUND0: u64 = 3;
-const WINDOW_CAP: u64 = 6;
+/// 测试用极小窗口（**A3：毫秒**）：round 0 ⇒ 2 ms，round 1 ⇒ 4 ms（backoff ×2），round 2+ ⇒ cap 4 ms。
+const WINDOW_ROUND0: u64 = 2;
+const WINDOW_CAP: u64 = 4;
 
 fn tiny_timeout() -> RoundTimeoutConfig {
     RoundTimeoutConfig {
         initial_timeout: WINDOW_ROUND0,
         max_timeout: WINDOW_CAP,
         backoff_factor: 2,
+    }
+}
+
+/// A3 — 确定性「每 step 前进 1ms」测试时钟（**无 sleep**；与 step 一一对应）。
+///
+/// 第 k 次读数返回 `(k-1) ms`（k = 1,2,…）⇒ 恰好等价于"每 step 1 ms"的单调时间轴
+///（`step()` 每步只读一次时钟）⇒ 旧的"step tick"期望只需按 **ARM 时刻已历时 = 0** 平移。
+struct StepClock {
+    reads: Cell<u64>,
+}
+
+impl StepClock {
+    fn new() -> Self {
+        Self {
+            reads: Cell::new(0),
+        }
+    }
+}
+
+impl MonotonicClock for StepClock {
+    fn elapsed(&self) -> Duration {
+        let n = self.reads.get();
+        self.reads.set(n.saturating_add(1));
+        Duration::from_millis(n)
     }
 }
 
@@ -259,13 +286,19 @@ fn start_runtime(env: &Env, provider: Option<&dyn KeyProvider>) -> NodeRuntime {
     .expect("start_with_network")
 }
 
+/// A3：本文件的**所有** runtime 都注入确定性「每 step 1ms」时钟（无 sleep / 与机器负载无关）。
+fn with_step_clock(mut rt: NodeRuntime) -> NodeRuntime {
+    rt.set_clock(Box::new(StepClock::new()));
+    rt
+}
+
 fn start_full_node(env: &Env) -> NodeRuntime {
-    start_runtime(env, None)
+    with_step_clock(start_runtime(env, None))
 }
 
 fn start_validator(env: &Env, seed: [u8; 32]) -> NodeRuntime {
     let provider = SeedKeyProvider::new(seed);
-    start_runtime(env, Some(&provider as &dyn KeyProvider))
+    with_step_clock(start_runtime(env, Some(&provider as &dyn KeyProvider)))
 }
 
 /// 「round-0 当选者缺席」确定性 fixture。
@@ -338,20 +371,21 @@ fn p1a6_timer_expires_deterministically_with_backoff_and_cap() {
     assert!(!rt.validator_enabled(), "full-node（无提案 / 无投票）");
     rt.set_round_timeout_config(tiny_timeout());
 
-    assert_eq!(rt.round_timeout_window_ticks(), None, "尚未 arm");
-    assert_eq!(rt.round_timeout_elapsed_ticks(), None, "尚未 arm");
+    assert_eq!(rt.round_timeout_window_ms(), None, "尚未 arm");
+    assert_eq!(rt.round_timeout_elapsed_ms(), None, "尚未 arm");
     assert_eq!(rt.round_timeouts(), 0);
 
     let mut trace = Vec::new();
-    for step in 1..=WINDOW_ROUND0 {
+    // A3：ARM 时刻已历时 = 0 ⇒ 窗口 2ms 需**第 3 步**（now = 2ms）才恰好到期。
+    for step in 1..=(WINDOW_ROUND0 + 1) {
         rt.step().expect("step");
         trace.push((
             rt.consensus().state().round.round,
             rt.round_timeouts(),
-            rt.round_timeout_elapsed_ticks(),
-            rt.round_timeout_window_ticks(),
+            rt.round_timeout_elapsed_ms(),
+            rt.round_timeout_window_ms(),
         ));
-        if step < WINDOW_ROUND0 {
+        if step < WINDOW_ROUND0 + 1 {
             assert_eq!(rt.round_timeouts(), 0, "第 {step} step 未到期");
             assert_eq!(rt.consensus().state().round.round, 0, "round 不提前推进");
         }
@@ -360,33 +394,33 @@ fn p1a6_timer_expires_deterministically_with_backoff_and_cap() {
     assert_eq!(rt.round_timeouts(), 1, "window 到期 ⇒ 恰好一次 timeout");
     assert_eq!(rt.consensus().state().round.round, 1, "round 0 → 1");
     assert_eq!(
-        rt.round_timeout_window_ticks(),
+        rt.round_timeout_window_ms(),
         Some(WINDOW_CAP),
-        "backoff：round 0 = 3 → round 1 = 6"
+        "backoff：round 0 = 2 → round 1 = 4"
     );
     assert_eq!(
-        rt.round_timeout_elapsed_ticks(),
-        Some(1),
-        "新 round 立即重开（elapsed 不继承）"
+        rt.round_timeout_elapsed_ms(),
+        Some(0),
+        "新 round 立即重开（已历时不继承）"
     );
-    // 逐 step elapsed（arming step 记 1；无进展 ⇒ 单调 +1）
-    assert_eq!(trace[0].2, Some(1), "arming step elapsed = 1");
-    assert_eq!(trace[1].2, Some(2));
-    // 到期 step：计数 +1 且**同 step 内**已按新 round 重开（故观测 elapsed = 1，而非 window）。
+    // 逐 step 已历时（A3：ARM 时刻 = 0；无进展 ⇒ 单调 +1ms）
+    assert_eq!(trace[0].2, Some(0), "arming step 已历时 = 0");
+    assert_eq!(trace[1].2, Some(1));
+    // 到期 step：计数 +1 且**同 step 内**已按新 round 重开（故观测已历时 = 0）。
     assert_eq!(trace[2].1, 1, "到期 step ⇒ timeout 计数 = 1");
-    assert_eq!(trace[2].2, Some(1), "到期后立即 re-arm（elapsed 不继承）");
+    assert_eq!(trace[2].2, Some(0), "到期后立即 re-arm（已历时不继承）");
 
-    // cap：round 1 窗口 = 6；到期后 round 2 的窗口仍 = 6（max）
-    // （arming 已计 1 tick ⇒ 从 re-arm 到下次到期需 window - 1 个 step。）
-    for _ in 0..(WINDOW_CAP - 2) {
+    // cap：round 1 窗口 = 4；到期后 round 2 的窗口仍 = 4（max）。
+    // A3：re-arm 时刻已历时 = 0 ⇒ 从 re-arm 到下次到期需**整整一个窗口**（4 步）。
+    for _ in 0..(WINDOW_CAP - 1) {
         rt.step().expect("step");
         assert_eq!(rt.round_timeouts(), 1, "新窗口未到期");
     }
     rt.step().expect("step");
-    assert_eq!(rt.round_timeouts(), 2, "第 {WINDOW_CAP} tick 到期");
+    assert_eq!(rt.round_timeouts(), 2, "窗口满 ⇒ 到期");
     assert_eq!(rt.consensus().state().round.round, 2);
     assert_eq!(
-        rt.round_timeout_window_ticks(),
+        rt.round_timeout_window_ms(),
         Some(WINDOW_CAP),
         "窗口 cap 于 max（不再增长）"
     );
@@ -401,8 +435,8 @@ fn p1a6_timer_expires_deterministically_with_backoff_and_cap() {
         trace2.push((
             rt2.consensus().state().round.round,
             rt2.round_timeouts(),
-            rt2.round_timeout_elapsed_ticks(),
-            rt2.round_timeout_window_ticks(),
+            rt2.round_timeout_elapsed_ms(),
+            rt2.round_timeout_window_ms(),
         ));
     }
     assert_eq!(trace, trace2, "同输入同输出（无墙钟 / 无随机 / 无线程）");
@@ -444,8 +478,8 @@ fn p1a6_absent_proposer_recovers_liveness_after_timeout() {
         assert!(s.finality.finalized_reference.is_none());
     }
 
-    // 无进展 ⇒ 窗口到期（前 W-1 step 不得触发）
-    for step in 1..WINDOW_ROUND0 {
+    // 无进展 ⇒ 窗口到期（前 W step 不得触发；A3：ARM 时刻已历时 = 0 ⇒ 第 W+1 步到期）
+    for step in 1..=WINDOW_ROUND0 {
         rt.step().expect("step");
         assert_eq!(rt.round_timeouts(), 0, "第 {step} step 不得提前 timeout");
         assert_eq!(rt.consensus().state().round.round, 0);
@@ -573,6 +607,132 @@ fn p1a6_finalized_without_finality_still_times_out() {
 }
 
 // ---------------------------------------------------------------------------
+// T7 — SAFETY-REJECT-SKIP：同高度后续轮**再次**当选 ⇒ 安全门拒签必须是可恢复跳过（非 fatal）
+// ---------------------------------------------------------------------------
+
+/// 「本地权重 < quorum + 同高度连续两轮当选本地」确定性 fixture。
+///
+/// 构造：3 验证者各 `STAKE` 权重 ⇒ `quorum = 2 × STAKE` ⇒ 本地单独**无法** finality
+/// （⇒ 该高度不会推进 ⇒ 会再次进入 Propose）。要求：
+/// - `select_proposer(0, 0) != local`（round 0 无本地提案 ⇒ 靠超时进入 round 1）；
+/// - `select_proposer(0, 1) == local`（round 1 本地首次出块 + 签名）；
+/// - `select_proposer(0, 2) == local`（round 2 同高度再次尝试出块 ⇒ `block_safety` F2/F3 冲突）。
+fn repeat_proposer_fixture(tag: &str) -> Fixture {
+    const LOCAL_SEED: [u8; 32] = [0x5A; 32];
+    let local_pk = pubkey_from_seed(LOCAL_SEED);
+    let local_id = derive_validator_id(&local_pk);
+    for byte in 1u8..=255 {
+        let other1_pk = pubkey_from_seed([byte; 32]);
+        let other2_pk = pubkey_from_seed([!byte; 32]);
+        if other1_pk == local_pk || other2_pk == local_pk || other1_pk == other2_pk {
+            continue;
+        }
+        let genesis = genesis_for(&[(other1_pk, STAKE), (other2_pk, STAKE), (local_pk, STAKE)]);
+        let genesis_hash = compute_genesis_hash(&genesis).expect("genesis hash");
+        let set = ValidatorSet::from_genesis(&genesis);
+        let proposer_at = |round: u64| {
+            select_proposer(CHAIN_ID, 0, round, &genesis_hash, &set).expect("proposer")
+        };
+        if proposer_at(0) == local_id || proposer_at(1) != local_id || proposer_at(2) != local_id {
+            continue;
+        }
+        return Fixture {
+            env: Env::new(&genesis, tag),
+            local_seed: LOCAL_SEED,
+            local_id,
+            genesis_hash,
+        };
+    }
+    panic!("未能在 255 个确定性 seed 内找到「同高度连续两轮本地当选」fixture");
+}
+
+/// SAFETY-REJECT-SKIP 回归（Owner 授权）：同一高度第二轮再次当选 ⇒ 重新构造的块
+/// `header.round` 不同 ⇒ target 不同 ⇒ `block_safety` F2/F3 正确拒签。
+///
+/// 修复前：拒签被当作 `RuntimeError::Validator` ⇒ **进程退出**；
+/// 修复后：**放弃本次提案**（不签名 / 不提交 / 不广播），节点继续运行，并精确计数。
+#[test]
+fn p1a6_conflicting_reproposal_is_skipped_and_node_survives() {
+    let fixture = repeat_proposer_fixture("t7");
+    let mut rt = start_validator(&fixture.env, fixture.local_seed);
+    rt.set_round_timeout_config(tiny_timeout());
+
+    // 前提：本地不是 round-0 当选者；是 round-1 / round-2 当选者（否则本测试无意义）。
+    let set = rt.consensus().validator_set().clone();
+    let proposer_at = |round: u64| {
+        select_proposer(CHAIN_ID, 0, round, &fixture.genesis_hash, &set).expect("proposer")
+    };
+    assert_ne!(proposer_at(0), fixture.local_id, "前提：round 0 非本地当选");
+    assert_eq!(proposer_at(1), fixture.local_id, "前提：round 1 本地当选");
+    assert_eq!(proposer_at(2), fixture.local_id, "前提：round 2 本地当选");
+
+    // ── round 0（当选者对端缺席）⇒ 计时窗口到期 ⇒ 进入 round 1 ──
+    let mut guard = 0;
+    while rt.consensus().state().round.round < 1 {
+        rt.step().expect("step（round 0 ⇒ 1）");
+        guard += 1;
+        assert!(guard <= 64, "有界");
+    }
+
+    // round 1：本地当选 ⇒ 构造 + **签名** + 提交（block_safety 首次记录 height=1）⇒ 正常路径可用。
+    let live = rt.liveness_snapshot();
+    assert_eq!(live.prop_build_ok, 1, "round 1 本地成功出块（首次签名）");
+    assert_eq!(live.egress_prop_enqueued, 1, "round 1 提案已登记出站");
+    assert_eq!(live.prop_skip_conflict_target, 0, "此时尚无冲突拒绝");
+    let first_hash = rt
+        .consensus()
+        .state()
+        .round
+        .proposal
+        .as_ref()
+        .map(|p| p.block_hash)
+        .expect("round 1 本地提案已安装");
+    assert!(
+        rt.consensus().state().round.prevotes.weight_of(&first_hash) > 0,
+        "本地投票路径正常（节点仍处理有效工作）"
+    );
+    assert_eq!(
+        head_height(&rt),
+        0,
+        "无 quorum ⇒ 该高度不推进（同高度会再进 Propose）"
+    );
+
+    // ── round 2：同高度**再次**当选 ⇒ 新块（round=2）target ≠ 已签 target ⇒ F2/F3 正确拒签。
+    //   修复后：本 step 仍为 `Ok`（不是 fatal），被拒提案不入 BlockStore / 不 submit / 不广播。
+    let mut guard = 0;
+    while rt.consensus().state().round.round < 2 {
+        rt.step()
+            .expect("step（round 1 ⇒ 2）不得 Err：常态安全拒绝 ≠ 故障");
+        guard += 1;
+        assert!(guard <= 64, "有界");
+    }
+    let live = rt.liveness_snapshot();
+    assert!(
+        live.prop_skip_conflict_target >= 1,
+        "冲突拒绝必须被精确计数（prop_skip_conflict_target）"
+    );
+    assert_eq!(live.prop_build_ok, 1, "被拒提案**未**被提交（无重复签名）");
+    assert_eq!(live.egress_prop_enqueued, 1, "被拒提案**未**广播");
+    assert_eq!(head_height(&rt), 0, "被拒提案未产生任何 commit");
+
+    // 节点仍存活并继续正常推进（多个 step 均为 Ok；pacemaker 继续工作）。
+    let timeouts_before = rt.round_timeouts();
+    for _ in 0..8 {
+        rt.step().expect("step（冲突拒绝后节点仍可运行）");
+    }
+    assert!(
+        rt.round_timeouts() >= timeouts_before && rt.round_timeouts() >= 2,
+        "本地 pacemaker 仍在推进 round（节点未因安全拒绝而退出）"
+    );
+    assert_eq!(
+        rt.liveness_snapshot().prop_build_ok,
+        1,
+        "冲突 target 绝不被反复签名/提交（无重试循环成功）"
+    );
+    rt.shutdown().expect("shutdown");
+}
+
+// ---------------------------------------------------------------------------
 // T4 — 陈旧（旧轮）proposal 不产生投票 / 不回退 / 不产生 conflicting finality
 // ---------------------------------------------------------------------------
 
@@ -582,7 +742,7 @@ fn p1a6_stale_old_round_proposal_is_not_voted() {
     let mut rt = start_validator(&fixture.env, fixture.local_seed);
     rt.set_round_timeout_config(tiny_timeout());
 
-    for _ in 0..WINDOW_ROUND0 {
+    for _ in 0..(WINDOW_ROUND0 + 1) {
         rt.step().expect("step");
     }
     assert_eq!(rt.round_timeouts(), 1, "round 0 到期");
@@ -773,7 +933,7 @@ fn p1a6_restart_uses_fresh_timer_without_regression() {
     let mut rt = start_validator(&fixture.env, fixture.local_seed);
     rt.set_round_timeout_config(tiny_timeout());
 
-    for _ in 0..WINDOW_ROUND0 {
+    for _ in 0..(WINDOW_ROUND0 + 1) {
         rt.step().expect("step");
     }
     assert_eq!(rt.round_timeouts(), 1, "round 0 到期");
@@ -802,7 +962,7 @@ fn p1a6_restart_uses_fresh_timer_without_regression() {
         "round 不持久化 ⇒ 回到 round 0"
     );
     assert_eq!(rt2.round_timeouts(), 0, "计时器状态不持久化");
-    assert_eq!(rt2.round_timeout_elapsed_ticks(), None, "restart 后未 arm");
+    assert_eq!(rt2.round_timeout_elapsed_ms(), None, "restart 后未 arm");
     assert_eq!(head_height(&rt2), 0, "head 不前进 / 不回退");
     assert!(
         rt2.consensus()
@@ -813,9 +973,9 @@ fn p1a6_restart_uses_fresh_timer_without_regression() {
         "finality 不回滚 / 不新增"
     );
 
-    // 无 stale deadline：fresh 窗口 ⇒ 前 W-1 step 不得触发，第 W step 确定触发（可继续推进）
+    // 无 stale deadline：fresh 窗口（A3：ARM 时刻已历时 = 0）⇒ 前 W step 不得触发，第 W+1 step 确定触发
     rt2.set_round_timeout_config(tiny_timeout());
-    for step in 1..WINDOW_ROUND0 {
+    for step in 1..=WINDOW_ROUND0 {
         rt2.step().expect("step");
         assert_eq!(
             rt2.round_timeouts(),
@@ -824,7 +984,11 @@ fn p1a6_restart_uses_fresh_timer_without_regression() {
         );
     }
     rt2.step().expect("step");
-    assert_eq!(rt2.round_timeouts(), 1, "fresh 窗口 ⇒ 确定在第 W step 触发");
+    assert_eq!(
+        rt2.round_timeouts(),
+        1,
+        "fresh 窗口 ⇒ 确定在第 W+1 step 触发"
+    );
     assert_eq!(
         rt2.consensus().state().round.round,
         1,

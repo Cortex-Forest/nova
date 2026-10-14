@@ -19,6 +19,9 @@ nova-core = { path = "../../crates/core" }
 nova-execution = { path = "../../crates/execution" }
 # STEP 8C-3：7H 向量在 StateStore（nova-storage）上验证完整执行链（seed → apply_transaction → StateStore::apply）
 nova-storage = { path = "../../crates/storage" }
+# PHASE 6H-Y §17：O2 round-change 向量的期望值必须由【实际实现 codec】重算
+# （禁止手工构造字节）⇒ 依赖 nova-consensus（依赖方向仍为 tests/vectors → crates/*）
+nova-consensus = { path = "../../crates/consensus" }
 # STEP 5：地址向量生成器用 bech32 构造破坏/越权情形（仅 bin；本 crate 为 dev-only）
 bech32.workspace = true
 

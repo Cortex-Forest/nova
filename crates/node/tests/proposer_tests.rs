@@ -26,6 +26,7 @@ use nova_node::block_adapter::{ChainHead, NoAccountsKeyResolver, NodeBlockAdapte
 use nova_node::driver::NodeConsensusDriver;
 use nova_node::proposer::build_proposal;
 use nova_node::signer::SoftwareSigner;
+use nova_node::block_safety::{BlockSafetyIdentity, BlockSafetyJournal};
 use nova_node::validator::{LocalVoteRequest, ValidatorActor};
 use nova_storage::memory::MemoryBackend;
 use nova_storage::store::StateStore;
@@ -70,8 +71,25 @@ fn genesis_with(vals: Vec<ValidatorInit>) -> GenesisV1 {
 fn actor_of(kp: KeyPair) -> (ValidatorActor<SoftwareSigner>, VerifyingKey) {
     let vk = *kp.verifying_key();
     let id = ValidatorId::from_consensus_public_key(&vk.to_bytes());
-    let actor = ValidatorActor::new(id, SoftwareSigner::new(kp), CHAIN_ID).unwrap();
+    let actor = ValidatorActor::new(id, SoftwareSigner::new(kp), CHAIN_ID)
+        .unwrap()
+        .with_block_safety(block_safety_for(id));
     (actor, vk)
+}
+
+/// D-5.3.4：为测试 actor 附加 B2-B signer-owned Block safety journal（与 actor 身份匹配）。
+fn block_safety_for(id: ValidatorId) -> BlockSafetyJournal {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("nova_int_pt_bs_{}_{}", std::process::id(), unique));
+    std::fs::create_dir_all(&dir).unwrap();
+    BlockSafetyJournal::create(
+        &dir.join("block-safety.journal"),
+        BlockSafetyIdentity::new(NetworkId::Mainnet, CHAIN_ID, [0x42; 32], &id),
+    )
+    .unwrap()
 }
 
 fn dag1() -> Dag {

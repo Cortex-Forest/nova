@@ -1,0 +1,45 @@
+{
+  "algorithm_id": 1,
+  "canonical_payload": "07000000000000000300000000000000",
+  "category": "round_change",
+  "certificate_bytes": "abababababababababababababababababababababababababababababababab07000000000000000300000000000000020010ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d43f4c83d71608d5293f3369af48cf658911cf794c9c288f75e6573888b626ddba8750834b3717378030c68f754ada4afbd1a3f7a51e7dbed9cf90e9cc4e32f031325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e6b2fd8e86f4f4d85df44d1ec02c2977f5286b030b1f67a87d1af695d6a478b0385f21bf369177b765566ccb39f655f106aeeb6be304eb8b54a19f95f8b4e75e02",
+  "certificate_len": 242,
+  "chain_id": 1,
+  "domain_id": 16,
+  "evidence": [
+    {
+      "signature": "43f4c83d71608d5293f3369af48cf658911cf794c9c288f75e6573888b626ddba8750834b3717378030c68f754ada4afbd1a3f7a51e7dbed9cf90e9cc4e32f03",
+      "validator_id": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d"
+    },
+    {
+      "signature": "b2fd8e86f4f4d85df44d1ec02c2977f5286b030b1f67a87d1af695d6a478b0385f21bf369177b765566ccb39f655f106aeeb6be304eb8b54a19f95f8b4e75e02",
+      "validator_id": "1325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e6"
+    }
+  ],
+  "expected": "VALID",
+  "from_round": 3,
+  "height": 7,
+  "id": "round-change-certificate-valid-001",
+  "message_hash": "aa52ce9f68f208d56c11904de6e5544245a0fba7a88f477a8bb3a62d7d625ef6",
+  "signed_bytes": "011001000000000000001000000007000000000000000300000000000000",
+  "source": "ADR-0066 (FROZEN) / ADR-0070 (FROZEN) / ADR-0067 (FROZEN)",
+  "to_round": 4,
+  "validator_set_id": "abababababababababababababababababababababababababababababababab",
+  "validators": [
+    {
+      "public_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
+      "validator_id": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
+      "weight": 1
+    },
+    {
+      "public_key": "a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0",
+      "validator_id": "1325b850c2871916eae203f0efc3c8987f64e5e3cdb27679e6d1fa97808357e6",
+      "weight": 1
+    },
+    {
+      "public_key": "17cb79fb2b4120f2b1ec65e4198d6e08b28e813feb01e4a400839b85e18080ce",
+      "validator_id": "6c8f8607dbe87077a62a2990ce07d94aaf749df76f87b98eb786a6d10f030765",
+      "weight": 1
+    }
+  ]
+}

@@ -9,6 +9,7 @@ use nova_test_vectors::address::validate_address_vector;
 use nova_test_vectors::block::validate_block_vector;
 use nova_test_vectors::domain::validate_domain_vector;
 use nova_test_vectors::genesis::validate_genesis_vector;
+use nova_test_vectors::round_change::validate_round_change_vector;
 use nova_test_vectors::signature::validate_signature_vector;
 use nova_test_vectors::transaction::{
     validate_transaction_vector, validate_transaction_vector_on_store,
@@ -521,4 +522,43 @@ fn block_vectors_state_root_validate() {
         );
     }
     assert_eq!(BLOCK_VECTORS.len(), 5);
+}
+// ---------------------------------------------------------------------------
+// O2 round-change certificate vector（ADR-0066 / ADR-0070 / ADR-0067，均 FROZEN）
+// ---------------------------------------------------------------------------
+const ROUND_CHANGE_VECTORS: &[(&str, &str)] = &[(
+    "round-change-certificate-valid-001",
+    include_str!("../round_change/round-change-certificate-valid-001.json"),
+)];
+
+/// PHASE 6H-Y §17：向量由【实际实现 codec】生成；loader 独立重算比对
+/// （canonical payload / signed_bytes / message_hash / 证书编码 / 长度 / 派生 to_round /
+/// evidence 顺序与唯一性 / validator_id 派生 / Ed25519 验签 / quorum 算术）。
+#[test]
+fn round_change_vectors_validate() {
+    for (id, json) in ROUND_CHANGE_VECTORS {
+        let r = validate_round_change_vector(json);
+        assert!(
+            r.ok,
+            "ROUND CHANGE VECTOR FAILED\nID: {id}\nEXPECTED: valid\nACTUAL: {:?}\nSPEC: ADR-0066 / ADR-0070 / ADR-0067",
+            r.errors
+        );
+        assert_eq!(r.id, *id);
+    }
+    assert_eq!(ROUND_CHANGE_VECTORS.len(), 1);
+}
+
+/// 证明 loader **不是恒真**：篡改 `chain_id` 后，canonical payload / `signed_bytes` /
+/// `message_hash` / 签名验证链路必须失败。
+#[test]
+fn round_change_vector_detects_tampering() {
+    let json = ROUND_CHANGE_VECTORS[0].1;
+    let tampered = json.replacen("\"chain_id\": 1", "\"chain_id\": 2", 1);
+    assert_ne!(tampered, json, "tamper setup failed");
+    let r = validate_round_change_vector(&tampered);
+    assert!(
+        !r.ok,
+        "loader accepted a tampered vector (validation is vacuous): {:?}",
+        r.errors
+    );
 }
