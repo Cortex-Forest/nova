@@ -31,8 +31,9 @@
 |---|---|---|
 | OS | Linux x86_64（生产/CI 目标）；Windows 可用于本地演练 | `.github/workflows/ci.yml`（ubuntu-latest） |
 | Rust | 工具链由 `rust-toolchain.toml` 锁定：**channel `1.96.1`** + `rustfmt` / `clippy`（workspace `rust-version = 1.96`） | `rust-toolchain.toml`、根 `Cargo.toml` |
-| 网络 | 节点间 TCP 可达（默认示例端口 `17777`）；**无 discovery**，必须手工配置 peer | bin `--peer` 文档 |
-| 磁盘 | 每节点独立 `chain` 与 `safety` 目录（持久化 + 安全日志） | §3.1 |
+| 网络 | 节点间 TCP 可达；`--listen` **省略即不监听**（代码**无**默认端口，`17777` 仅为示例） | bin `--listen` 实现 |
+| peer | **无 discovery**，必须手工静态配置（Testnet 端口规划：Seed `17770`、Validator `17771`–`17777`，见 §4.1） | bin `--peer` 实现 |
+| 磁盘 | 每节点独立 `chain` 与 `safety` 目录，且**两者都必须落在持久化卷**上 | §3.1、§6.6 |
 
 ### 1.1 编译
 
@@ -62,6 +63,10 @@ yazimao-node --genesis <path> --genesis-hash <hex64> --chain-id <u64> \
 ---
 
 ## 2. Genesis 流程
+
+> **Testnet 定制参数与端到端流程**：`docs/genesis/testnet-parameters-v1.md`
+> （`chain_id=2002`、`network_id=2`、7 个验证者各 10,000,000 NOVA bonded、总供应 1,000,000,000、`fee_burn_bps=0`）。
+> 本节命令对任何网络通用；**不得**把 devnet 夹具或 `tests/vectors/genesis/*.json` 当作 Testnet Genesis。
 
 ### 2.1 生成（仅 genesis 负责人执行）
 
@@ -110,7 +115,11 @@ cargo run -p nova-genesis-builder --bin yazimao-genesis -- \
 /var/lib/yazimao/<node>/chain         # --storage-dir（区块 / 状态 / WAL / head）
 /var/lib/yazimao/<node>/safety        # --safety-dir（仅验证者；vote/lock/identity journal）
 ```
-seed 文件格式：**64 位小写 hex**（允许结尾换行）；文件权限 `0600`，属主为节点运行账号。
+seed 文件格式：**64 位 hex**（代码大小写均接受；仅**结尾**空白被 trim，前导空白不 trim）；
+文件权限 `0600`、属主为节点运行账号属**操作规范**（运行时**不**强制校验）。
+
+> `--storage-dir` 与 `--safety-dir` **必须分离**属**操作规则**（运行时无相等性校验）；
+> 两者**都必须落在持久化卷**上——safety journal 丢失 ⇒ 验证者**拒绝启动**（§6.6）。
 
 ### 3.2 Seed node（Node-A：seed + validator）
 
@@ -164,11 +173,34 @@ target/release/yazimao-node \
   ```
   （`--run-steps` 有限时显示 `entering bounded run loop (run_steps=<n> ...)`。）
 - 双向可达性：被 dial 的节点**必须**提供 `--listen`；否则对端无法建立连接。
-- **无自动重连策略**：socket 断开后不会自动重连（见 §6.4）。
+- **自动重连：有**。主循环每步会对“未建立”的 configured peer 重新 dial，并带指数退避（上限 4096 tick）；
+  断开后**无需**人工重启。但**没有**自动 peer 发现（discovery）与持久化：peer 列表仍必须静态给出（见 §6.4）。
 
 ---
 
-## 4. 网络拓扑示例（3 节点最小闭环）
+## 4. 网络拓扑
+
+### 4.1 正式 Testnet（**已批准**：1 Seed + 7 Validator，共 8 个工作负载）
+
+```
+  +----------------+          +----------------+              +----------------+
+  | Seed           |          | Validator-1    |     ......   | Validator-7    |
+  | 仅 bootstrap   |<-------->| :17771         |<------------>| :17777         |
+  | :17770         |          +----------------+              +----------------+
+  +----------------+               ↑  全互联（静态 --peer）        ↑
+```
+
+| 节点 | `--validator` | `--listen` | `--peer` | 说明 |
+|---|---|---|---|---|
+| Seed | **否** | `0.0.0.0:17770` | 7 个 Validator | **仅引导**：不参与共识 / finality，无管理权限 |
+| Validator-1…7 | 是 | `0.0.0.0:17771` … `17777` | Seed + 其余 6 个 Validator | 各自独立身份 / 存储 / 密钥；**静态全互联** |
+
+- **全互联是必需的**：gossip 只发给“已连接且已建立”的 peer，且无转发/中继保证 ⇒
+  只连 Seed 的星型拓扑不足以让提案与投票到达全部验证者。
+- 验证者集合由 **Genesis 静态集合**决定（7 × 10,000,000 NOVA bonded = 70,000,000；quorum 46,666,667）。
+- 8 个工作负载的 Akash 部署描述：`deploy/akash/testnet-sdl-v1.yaml`；说明：`akash-deployment-v1.md`。
+
+### 4.2 本地演练（3 节点最小闭环）
 
 ```
         +--------------------+        +--------------------+        +--------------------+
@@ -194,10 +226,11 @@ target/release/yazimao-node \
 | # | 验收项 | 判据 | 观测来源 |
 |---|---|---|---|
 | 1 | 节点成功启动 | stdout 出现启动行；进程存活；**无** `Error:` 输出 | stdout |
-| 2 | block height 增长 | `head_height` 随 `steps` 递增；3 个节点最终一致 | periodic status 行 |
+| 2 | block height 增长 | `head_height` 随 `steps` 递增；**所有在线节点最终一致**（Testnet = 1 Seed + 7 Validator） | periodic status 行 |
 | 3 | finality 产生 | `finalized_height` 递增并最终 **== `head_height`**（不落后、不回退） | periodic status 行 |
 | 4 | peer 连接成功 | `established_peers >= 1`；被 dial 方 `inbound_connections >= 1` | periodic status 行 |
 | 5 | restart 恢复成功 | 同 `--storage-dir` / `--safety-dir` 重启后，`head_height` 与 `finalized_height` **不低于**重启前，且继续增长；重启命令**不得**携带 `--init-validator-safety` | 重启前后 status 行 |
+| 6 | 七验证者拓扑与 quorum 成立 | 7 个验证者 `established_peers >= 6`（全互联）；`finalized_height` 持续推进。**在线验收不得用单机 / Devnet / 单元测试替代** | 8 个节点 status 行 + 部署记录 |
 
 periodic status 行（每 `STATUS_INTERVAL_STEPS = 100` 步一行）字段：
 
@@ -216,7 +249,9 @@ yazimao-node: status steps=<n> head_height=<h> finalized_height=<f> consensus_he
 | B | | | | | | | | | | PASS/FAIL |
 | C | | | | | | | | | | PASS/FAIL |
 
-`genesis_hash`（三方必须一致）：`________________________________`
+`genesis_hash`（**所有节点**必须一致；Testnet = 8 个）：`________________________________`
+
+> Testnet 正式验收请把上表扩展为 8 行（Seed + V1–V7）；3 行版本仅用于本地演练。
 
 ---
 
@@ -252,7 +287,7 @@ yazimao-node: status steps=<n> head_height=<h> finalized_height=<f> consensus_he
 | 现象 | 可能原因 | 处置 |
 |---|---|---|
 | `established_peers = 0`（配置了 peer） | 目标未 `--listen`、地址/端口错、防火墙拦截 | 核对 `--listen`、`ip:port`、防火墙；用 `node_id` 与启动行核对 |
-| 连接曾建立后断开 | **无自动重连策略**（当前实现） | 重启该节点使其重新 dial；持续掉线则记录并上报 |
+| 连接曾建立后断开 | 网络抖动 / NAT 状态失效 | 主循环**会自动重连**（指数退避，上限 4096 tick）；若 `established_peers` 长期为 0 ⇒ 核对对端 `--listen` 与防火墙；持续掉线记录并上报 |
 | 只有单向连接 | 单向可达（NAT/安全组） | 两侧都配置 `--listen`（如需双向） |
 
 ### 6.5 停滞（无高度增长）
@@ -325,7 +360,8 @@ DO NOT silently initialize
 - 不得为"让测试变绿"而修改共识规则 / genesis 算法 / tokenomics / validator 经济模型。
 
 **当前能力边界（诚实声明）**
-- 无 peer discovery、无自动重连策略；zero-operator / permissionless bootstrap **未完成**。
+- **无** peer discovery（peer 必须静态配置）；**有**自动重连（主循环重新 dial + 指数退避）；
+  zero-operator / permissionless bootstrap **未完成**。
 - 无结构化日志与遥测（仅 periodic status 行与退出摘要行）；无 Explorer；无 RPC 服务。
 - 交易路径未启用：出块为**空交易列表**；wallet / tx 客户端为占位。
 - 无运行期质押/罚没/奖励；验证者集合为 Genesis 静态集合。

@@ -1,0 +1,52 @@
+# =============================================================================
+# YAZIMAO L1 — G1-D：genesis-enabled node image（独立 build context，最小衍生镜像）
+#
+# 目的：将**已冻结、并已通过 G1-C 独立验证**的 G5-D genesis 以受控方式放入
+#       /read-only/genesis/genesis.bin，得到一个 genesis-enabled 节点镜像。
+#
+# 设计原则（不改变任何既有交付契约）：
+#   · 本 context 与普通 node 镜像 context **完全分离**。
+#     根 .dockerignore:75-79 已明确指引：“如需构建 genesis 镜像，应单独定义
+#     context/Containerfile，而不是放宽本文件。”
+#   · 根 Containerfile 与 .dockerignore **不做任何修改**。
+#   · 基础镜像 = 冻结的 node 镜像 **digest**（不可变）⇒ ENTRYPOINT / CMD / USER /
+#     其余文件系统内容全部**继承**；本层只新增一个文件。
+#   · 本 context 只允许两种文件：Containerfile + genesis.bin。
+#     无脚本、无 RUN、无 ADD、无网络下载、无 secret、无 host 挂载。
+#
+# 被烘入工件（G1-C 独立验证结论；公开数据，不含任何密钥类材料）：
+#   genesis.bin         243 B
+#   SHA256              c9a823c6163676448f88f4fa4ea758b86a1c1ea5db83d2146cea04bd6d441019
+#   network_id          3 (= devnet)      chain_id 3004
+#   genesis_timestamp   1790812800
+#   validators 1 / accounts 1 / total_supply 1000000000 / min_validator_stake 5000000
+#
+# 构建（需 BuildKit / buildx；本机无容器运行时 ⇒ 须在具备运行时的机器或 CI 上执行）：
+#   docker buildx build --platform linux/amd64 \
+#     -f genesis-image/Containerfile genesis-image/ \
+#     -t yazimao-node:g1-d-local --load
+#
+# 继承契约（由基础 digest 决定；构建后必须核验，见 G1-D PHASE 7）：
+#   USER        10001:10001
+#   ENTRYPOINT  ["/usr/local/bin/yazimao-node"]
+#   CMD         ["--help"]
+#   目录        /read-only/genesis = root:root 0555（基础镜像已创建；本层不改动、不覆盖）
+# =============================================================================
+
+FROM --platform=linux/amd64 ghcr.io/cortex-forest/nova@sha256:1a394c1da7b3ee4b41920aa5a6edf590c9e40812fe7f93b3e04703056e172924
+
+# 仅新增被冻结的 genesis 公开产物：
+#   --chown=root:root  只读运行期资源由 root 拥有
+#   --chmod=0444       world-readable；UID 10001 可读、任何非 root 用户不可写
+# 若构建前端不支持 COPY --chmod，可退化为普通 COPY（默认 root:root 0644：同样
+# world-readable 且对 UID 10001 不可写）；不得改为任何可写模式。
+COPY --chown=root:root --chmod=0444 genesis.bin /read-only/genesis/genesis.bin
+
+# 溯源标注：使镜像元数据自带被烘入 genesis 的内容标识（均为公开值）。
+LABEL org.opencontainers.image.title="yazimao-node-genesis" org.opencontainers.image.description="YAZIMAO L1 node with embedded G5-D disposable devnet genesis (genesis-enabled image)" io.yazimao.genesis.sha256="c9a823c6163676448f88f4fa4ea758b86a1c1ea5db83d2146cea04bd6d441019" io.yazimao.genesis.chain-id="3004" io.yazimao.genesis.network-id="3"
+
+# 说明：
+#   · 不重复声明 USER / ENTRYPOINT / CMD —— 由上面的 digest 基础镜像继承，
+#     并在构建后用 image config 核验其未变。
+#   · 不新增 RUN（不使用 shell）、不下载、不写 /storage 或 /safety、不触碰其它路径。
+#   · 本文件不包含任何 seed / 私钥 / mnemonic / keystore 引用。

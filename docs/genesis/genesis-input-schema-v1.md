@@ -97,10 +97,10 @@
 
 | 字段 | 类型 | 规则 |
 |---|---|---|
-| `total_supply` | **十进制字符串** u128 | `> 0`，且 `== Σ accounts[].liquid_balance`（checked 求和，溢出即失败） |
-| `min_validator_stake` | **十进制字符串** u128 | `> 0`，且 `≤` 每个 validator 的 `bonded_stake` |
+| `total_supply` | **十进制字符串** u128 | `> 0`；`== Σ accounts[].liquid_balance`（checked 求和，溢出即失败）；**且必须 `== 1_000_000_000`**（ADR-0051 固定供应，工具以 `ADR_0051_FIXED_SUPPLY` **强制**；不符 ⇒ `FixedSupplyMismatch`） |
+| `min_validator_stake` | **十进制字符串** u128 | `> 0`，且 `≤` 每个 validator 的 `bonded_stake`（**取值**由 Owner 决策，工具无默认值） |
 | `unbonding_period_seconds` | u64 | `> 0` |
-| `fee_burn_bps` | u16 | `≤ 10000`（ADR-0051 FINAL 政策值：`0`） |
+| `fee_burn_bps` | u16 | **必须 `== 0`**（ADR-0051 §11 no-burn，工具**强制**；非 0 ⇒ `BurnPolicyViolation`；超出 u16 范围 ⇒ `FeeBurnOutOfRange`） |
 
 ---
 
@@ -121,8 +121,17 @@
 1. **重复 JSON 键**：`serde_json` 以"后者覆盖"解析，工具**无法**检测重复键。
    缓解：输入经人工复核，并以 `genesis_summary.json` 的最终取值为准。
 2. **十进制字符串首尾空白**会被 trim（宽松）；其余非 canonical 形式一律拒绝。
-3. 工具**不校验**分配政策（例如"Genesis Validator 合计 = 100,000,000"）；
-   该政策由 ADR-0051 与 Owner 复核保证，`genesis_summary.json` 会列出各分项合计供核对。
+3. 工具**不校验**分配政策（例如"Genesis Validator 合计 = 100,000,000"）、**验证者数量**、
+   分配桶边界与 `min_validator_stake` 的**政策取值**；这些由 ADR-0051 与 Owner GATE-3/3V 保证，
+   `genesis_summary.json` 会列出各分项合计供核对。工具**强制**的只有：固定供应 `1_000_000_000`、
+   `fee_burn_bps == 0`，以及 §2/§3/§4/§5 的逐条一致性规则。
+   > **后果提醒**：一份"能通过全部检查"的输入**不必然**符合 Testnet 政策（例如验证者数 ≠ 7）。
+   > 上线前必须按 `testnet-parameters-v1.md` 逐项核对，不得以"工具已通过"代替政策核对。
+4. `chain_id` 与 `network_id` **无绑定**（ADR-0011：`chain_id` 非派生，同一 `network_id` 可有多个链）
+   ⇒ 工具**不会**拒绝 "`network_id = 2` 但 `chain_id ≠ 2002`"。Testnet 采用 `chain_id = 2002` 属
+   **Owner 决策**，须人工核对（见 `testnet-parameters-v1.md` §1）。
+5. `verify` 路径**不**运行预检（设计如此：只做 decode + 语义/哈希校验）⇒ ADR-0051 固定供应与
+   no-burn 的强制点在 **`build`** 阶段。
 
 ---
 

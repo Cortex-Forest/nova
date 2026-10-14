@@ -46,7 +46,8 @@ cargo run -p nova-genesis-builder --bin yazimao-genesis -- \
 
 ```
 strict JSON 解析（未知字段/敏感字段/占位值/u128 编码）
-  → 预检（供应不变量、账户存在性、stake 记账、commission、唯一性、地址↔公钥派生一致性）
+  → 预检（供应不变量、账户存在性、stake 记账、commission、唯一性、地址↔公钥派生一致性、
+          **ADR-0051：`total_supply == 1_000_000_000`、`fee_burn_bps == 0`**）
   → canonical_genesis_bytes（nova-crypto）
   → compute_genesis_hash（nova-crypto）
   → decode_genesis_bytes(输出) + validate_genesis_with_expected(..., hash)   ← 自校验
@@ -167,6 +168,8 @@ accounts（数量/顺序/地址/余额）· protocol_params（7）· economics_p
 | `占位值/空值不被接受` | 残留 `TBD`/`PENDING`/空串 | 补齐真实值 |
 | `与 consensus_public_key 派生结果不一致` | 地址与公钥不匹配（多为手抄错误） | 由公钥重新派生地址 |
 | `Σ accounts liquid != total_supply` | 分配未对齐 | 修正余额，使合计等于 `total_supply` |
+| `FixedSupplyMismatch` | `total_supply ≠ 1_000_000_000`（ADR-0051 固定供应，工具**强制**） | 改回 ADR-0051 固定值；**不得**改变供应政策 |
+| `BurnPolicyViolation` | `fee_burn_bps ≠ 0`（ADR-0051 §11 no-burn，工具**强制**） | 改为 `0`；**不得**引入销毁政策 |
 | `genesis_hash mismatch`（verify） | 文件被修改 / 分发了不同版本 | 回到 §2 重新取权威文件与 hash |
 | 节点启动 `ChainIdMismatch` / `NetworkIdMismatch` | CLI 参数与文件不一致 | 用公告值启动 |
 | 握手 `WrongGenesisHash` | 同行节点使用了不同 genesis | 统一分发权威文件 |
@@ -179,3 +182,5 @@ accounts（数量/顺序/地址/余额）· protocol_params（7）· economics_p
   —— **本流程不修改、不重述**这些规则，只调用其生产实现。
 - Owner 数据收集：`docs/genesis/genesis-owner-data-template.md`（模板）。
 - 输入文件书写规范：`docs/genesis/genesis-input-schema-v1.md`。
+- Testnet 已批准参数 + Owner 待提供项 + 端到端可执行流程：`docs/genesis/testnet-parameters-v1.md`。
+- 运行手册（启动/验收/故障处置）：`docs/testnet/testnet-runbook-v1.md`。

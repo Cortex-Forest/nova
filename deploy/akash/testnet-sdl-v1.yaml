@@ -1,0 +1,581 @@
+# =============================================================================
+# YAZIMAO L1 — Akash SDL v2（Testnet：1 Seed + 7 Validator）
+# =============================================================================
+# 状态：DRAFT FOR OWNER REVIEW — **不可直接部署**，见下方 PENDING 清单
+#       （其中 **P-6 = 重启生命周期实质性阻断；2026-10-14 审计结论 = BLOCKED**，
+#        另新增 **P-9 = 持久化存储语法缺陷（严重，需 Owner 授权才能改结构）**，
+#        详见 docs/testnet/akash-deployment-v1.md §12 / §13）。
+#
+# 依据（全部经仓库核验）：
+#   · CLI 参数集与拒绝规则：crates/node/src/bin/yazimao-node.rs（--genesis/--genesis-hash/
+#     --chain-id/--network-id/--storage-dir/--network-seed-file/--safety-dir/
+#     --validator-seed-file/--validator/--init-validator-safety/--listen/--peer/--idle-ms/--run-steps）
+#   · 容器内路径与运行用户：Containerfile（USER 10001:10001；/storage、/safety、/read-only/genesis）
+#   · genesis 内置镜像的放置路径与权限：genesis-image/Containerfile
+#     （COPY genesis.bin /read-only/genesis/genesis.bin, 0444）
+#   · 端口：代码**无**默认端口；本文件按已批准端口规划显式给出（Seed 17770，Validator 17771–17777）
+#   · 参数值：docs/genesis/testnet-parameters-v1.md（chain_id 2002 / network_id 2 / 7×(10,000,000)）
+#   · 持久化卷隔离语义（2026-10-14 官方文档复核）：Akash 官方文档 “Persistent Storage → Limitations →
+#     **Not Shared Between Services**” 明确：“Each service gets its own storage volume. Services cannot
+#     share persistent storage.”；同页另述 “The first storage entry is always the root filesystem.
+#     Additional entries are mounted as separate volumes.”
+#     ⇒ 本文件以 **7 个独立 service（各自 `count: 1`）** 表达 7 个 Validator，天然满足“每 service 独立持久卷”；
+#       **禁止**把 7 个 Validator 合并为单一 service + `count: 7`（那会被视为同一 service 的多个副本）。
+#     来源：https://akash.network/docs/learn/core-concepts/persistent-storage
+#     本轮**未**改变本文件的 8 service 结构（无结构性缺陷需修复）。
+#     校验工具：scripts/check_akash_sdl.py（**CUSTOM_STATIC_CHECK**，非官方 Akash 校验）。
+#
+# PENDING（部署前必须由 Owner 完成/授权，未完成前本文件不可用）：
+#   P-1 镜像：必须发布**含正式 Testnet genesis** 的镜像（由 genesis-image/Containerfile +
+#       正式 genesis.bin 构建）并取得 **digest**；当前仓库内置的 genesis 是 devnet（chain_id 3004），
+#       **不得**用于 Testnet。仓库**不存在**已发布的 Testnet 镜像 digest，故此处为显式占位。
+#   P-2 genesis：正式 `genesis.bin` + 冻结 `genesis_hash`（64 hex）尚不存在（见 testnet-parameters-v1.md §4）。
+#   P-3 身份 seed 投递：节点**必须**以文件提供两枚 32 字节 seed（`--network-seed-file` /
+#       `--validator-seed-file`）；CLI **不读环境变量**，Akash **无** secret 文件注入 ⇒ 投递机制
+#       待 Owner 决定（禁止把 seed 写入镜像/SDL/仓库）。
+#   P-4 peer 列表：`nodeid_hex` 由 network seed 派生、**仅**在启动行打印 ⇒ 需先离线导出 8 个 NodeId，
+#       再结合 lease 端点填写 `<...>@<host>:<port>`（本文件中的 REPLACE_* 令牌即为此处）。
+#   P-5 卷属主：容器以 UID/GID 10001 运行；Akash 持久卷默认由 root 创建 ⇒ 需在首次启动时
+#       解决 `/storage` `/safety` 可写性，否则 `BlockStore`/safety journal 写入失败（fail-closed）。
+#   P-6 **【实质性阻断 · 已实测】** 本文件各 Validator 的 `command` **无条件**携带
+#       `--init-validator-safety`；而节点对“journal 已存在 + 该参数存在”是 fail-closed：
+#       `crates/node/src/runtime.rs:3744`（`safety.journal`）与 `:3767`（`block-safety.journal`）
+#       ⇒ 第 2 次启动会报 `Error: Runtime(SafetyJournalAlreadyExists)` 并拒绝启动。
+#       处置（二选一，详见 `docs/testnet/akash-deployment-v1.md` §9）：
+#         (A) **推荐、无新增构件**：首次部署用本文件原样；此后任何重启/更新**必须移除**该参数。
+#             安全性由节点自身保证：journal 缺失且未声明 ⇒ 拒绝启动；已存在且未声明 ⇒ 严格恢复；
+#             代码中**不存在**删除/重建既有 journal 的路径。
+#         (B) 入口包装脚本（按两枚 journal 的存在性选择参数，不完整状态显式失败）——
+#             已给出可审查脚本，但**未在容器中执行验证**（本机无 shell / 容器运行时）⇒ 需 Owner 批准后落地。
+#   P-7 本文件仅通过**本地结构校验**；尚未用 akash/provider-services 工具链校验（本地无该 CLI）。
+#   P-8 **【已实测】** 占位符未替换前不可启动：`--genesis-hash REPLACE_...`
+#       ⇒ `Error: Cli(InvalidGenesisHash)`，退出码 1；`--peer` 的 `REPLACE_*@…` 同理
+#       （格式必须为 `<64 hex>@<ip:port>`）。
+#   P-9 **【已修复 · 2026-10-14】** 存储条目已按 Akash 官方语法改写：临时 root 卷（仅 `size`，1 Gi）、
+#       命名持久卷 `data` / `safety` 均带 `attributes: { persistent: true }`（官方 “Survives restarts”）。
+#       每工作负载：Seed = 1 + 59 = 60 GiB（持久 59）；Validator = 1 + 54 + 5 = 60 GiB（持久 59）。
+#       遗留（非 P-9）：容量口径歧义（“持久≥ 60 GiB”？）与官方工具链校验未执行 ⇒ 见部署文档 §14.1。
+#       证据：Akash 官方 “SDL Syntax Reference”（Profiles → compute → storage）。
+#   P-10 **【已核实 · 无需结构变更】** 卷隔离：见上方“依据”中的官方语义引用 ⇒ “7 个独立 service +
+#       `count: 1`”已保证每 Validator 独立持久卷（Proof：官方文档 “Not Shared Between Services”）。
+#       若未来采取“每 Validator 独立 compute profile + 卷名唯一”的**防御性加固**（资源预算不变，但文件
+#       体积显著增大），须经 Owner 授权后实施；本轮不做，避免无证据支撑的结构重组。
+#   P-11 **【未解决 · 需 Owner 决定】** 存储类 `attributes.class`：本文件未指定 ⇒ 官方默认 `beta1`（HDD）；
+#       官方对 I/O 密集型工作负载**推荐** `beta3`（NVMe）。改动会影响费用与 Provider 匹配范围 ⇒
+#       **不得**由 AI 静默修改（见 docs/testnet/akash-deployment-v1.md §14.2）。官方另明确：部署后
+#       **不可**调整卷大小，且持久卷**不跨** lease 关闭 / Provider 迁移存活 ⇒ 身份与 journal 必须带外备份。
+# =============================================================================
+---
+version: "2.0"
+
+services:
+  seed:
+    image: ghcr.io/cortex-forest/nova@sha256:REPLACE_WITH_TESTNET_GENESIS_IMAGE_DIGEST  # P-1
+    command:
+      - "/usr/local/bin/yazimao-node"
+      - "--genesis"
+      - "/read-only/genesis/genesis.bin"
+      - "--genesis-hash"
+      - "REPLACE_WITH_FROZEN_GENESIS_HASH_64HEX"          # P-2
+      - "--chain-id"
+      - "2002"
+      - "--network-id"
+      - "testnet"
+      - "--storage-dir"
+      - "/storage"
+      - "--network-seed-file"
+      - "/read-only/secrets/network-seed.hex"             # P-3（仅引导；Seed **不**参与共识）
+      - "--listen"
+      - "0.0.0.0:17770"
+      - "--peer"
+      - "REPLACE_V1_NODEID@REPLACE_V1_HOST:17771"         # P-4
+      - "--peer"
+      - "REPLACE_V2_NODEID@REPLACE_V2_HOST:17772"
+      - "--peer"
+      - "REPLACE_V3_NODEID@REPLACE_V3_HOST:17773"
+      - "--peer"
+      - "REPLACE_V4_NODEID@REPLACE_V4_HOST:17774"
+      - "--peer"
+      - "REPLACE_V5_NODEID@REPLACE_V5_HOST:17775"
+      - "--peer"
+      - "REPLACE_V6_NODEID@REPLACE_V6_HOST:17776"
+      - "--peer"
+      - "REPLACE_V7_NODEID@REPLACE_V7_HOST:17777"
+      - "--idle-ms"
+      - "1"
+      - "--run-steps"
+      - "0"
+    params:
+      storage:
+        data:
+          mount: /storage
+    expose:
+      - port: 17770
+        as: 17770
+        proto: tcp
+        to:
+          - global: true
+
+  validator-1:
+    image: ghcr.io/cortex-forest/nova@sha256:REPLACE_WITH_TESTNET_GENESIS_IMAGE_DIGEST  # P-1
+    command:
+      - "/usr/local/bin/yazimao-node"
+      - "--genesis"
+      - "/read-only/genesis/genesis.bin"
+      - "--genesis-hash"
+      - "REPLACE_WITH_FROZEN_GENESIS_HASH_64HEX"          # P-2
+      - "--chain-id"
+      - "2002"
+      - "--network-id"
+      - "testnet"
+      - "--storage-dir"
+      - "/storage"
+      - "--safety-dir"
+      - "/safety"
+      - "--network-seed-file"
+      - "/read-only/secrets/network-seed.hex"             # P-3
+      - "--validator-seed-file"
+      - "/read-only/secrets/validator-seed.hex"           # P-3
+      - "--validator"
+      - "--init-validator-safety"                         # P-6：重启必须删除
+      - "--listen"
+      - "0.0.0.0:17771"
+      - "--peer"
+      - "REPLACE_SEED_NODEID@REPLACE_SEED_HOST:17770"     # P-4
+      - "--peer"
+      - "REPLACE_V2_NODEID@REPLACE_V2_HOST:17772"
+      - "--peer"
+      - "REPLACE_V3_NODEID@REPLACE_V3_HOST:17773"
+      - "--peer"
+      - "REPLACE_V4_NODEID@REPLACE_V4_HOST:17774"
+      - "--peer"
+      - "REPLACE_V5_NODEID@REPLACE_V5_HOST:17775"
+      - "--peer"
+      - "REPLACE_V6_NODEID@REPLACE_V6_HOST:17776"
+      - "--peer"
+      - "REPLACE_V7_NODEID@REPLACE_V7_HOST:17777"
+      - "--idle-ms"
+      - "1"
+      - "--run-steps"
+      - "0"
+    params:
+      storage:
+        data:
+          mount: /storage
+        safety:
+          mount: /safety
+    expose:
+      - port: 17771
+        as: 17771
+        proto: tcp
+        to:
+          - global: true
+
+  validator-2:
+    image: ghcr.io/cortex-forest/nova@sha256:REPLACE_WITH_TESTNET_GENESIS_IMAGE_DIGEST  # P-1
+    command:
+      - "/usr/local/bin/yazimao-node"
+      - "--genesis"
+      - "/read-only/genesis/genesis.bin"
+      - "--genesis-hash"
+      - "REPLACE_WITH_FROZEN_GENESIS_HASH_64HEX"
+      - "--chain-id"
+      - "2002"
+      - "--network-id"
+      - "testnet"
+      - "--storage-dir"
+      - "/storage"
+      - "--safety-dir"
+      - "/safety"
+      - "--network-seed-file"
+      - "/read-only/secrets/network-seed.hex"
+      - "--validator-seed-file"
+      - "/read-only/secrets/validator-seed.hex"
+      - "--validator"
+      - "--init-validator-safety"
+      - "--listen"
+      - "0.0.0.0:17772"
+      - "--peer"
+      - "REPLACE_SEED_NODEID@REPLACE_SEED_HOST:17770"
+      - "--peer"
+      - "REPLACE_V1_NODEID@REPLACE_V1_HOST:17771"
+      - "--peer"
+      - "REPLACE_V3_NODEID@REPLACE_V3_HOST:17773"
+      - "--peer"
+      - "REPLACE_V4_NODEID@REPLACE_V4_HOST:17774"
+      - "--peer"
+      - "REPLACE_V5_NODEID@REPLACE_V5_HOST:17775"
+      - "--peer"
+      - "REPLACE_V6_NODEID@REPLACE_V6_HOST:17776"
+      - "--peer"
+      - "REPLACE_V7_NODEID@REPLACE_V7_HOST:17777"
+      - "--idle-ms"
+      - "1"
+      - "--run-steps"
+      - "0"
+    params:
+      storage:
+        data:
+          mount: /storage
+        safety:
+          mount: /safety
+    expose:
+      - port: 17772
+        as: 17772
+        proto: tcp
+        to:
+          - global: true
+
+  validator-3:
+    image: ghcr.io/cortex-forest/nova@sha256:REPLACE_WITH_TESTNET_GENESIS_IMAGE_DIGEST  # P-1
+    command:
+      - "/usr/local/bin/yazimao-node"
+      - "--genesis"
+      - "/read-only/genesis/genesis.bin"
+      - "--genesis-hash"
+      - "REPLACE_WITH_FROZEN_GENESIS_HASH_64HEX"
+      - "--chain-id"
+      - "2002"
+      - "--network-id"
+      - "testnet"
+      - "--storage-dir"
+      - "/storage"
+      - "--safety-dir"
+      - "/safety"
+      - "--network-seed-file"
+      - "/read-only/secrets/network-seed.hex"
+      - "--validator-seed-file"
+      - "/read-only/secrets/validator-seed.hex"
+      - "--validator"
+      - "--init-validator-safety"
+      - "--listen"
+      - "0.0.0.0:17773"
+      - "--peer"
+      - "REPLACE_SEED_NODEID@REPLACE_SEED_HOST:17770"
+      - "--peer"
+      - "REPLACE_V1_NODEID@REPLACE_V1_HOST:17771"
+      - "--peer"
+      - "REPLACE_V2_NODEID@REPLACE_V2_HOST:17772"
+      - "--peer"
+      - "REPLACE_V4_NODEID@REPLACE_V4_HOST:17774"
+      - "--peer"
+      - "REPLACE_V5_NODEID@REPLACE_V5_HOST:17775"
+      - "--peer"
+      - "REPLACE_V6_NODEID@REPLACE_V6_HOST:17776"
+      - "--peer"
+      - "REPLACE_V7_NODEID@REPLACE_V7_HOST:17777"
+      - "--idle-ms"
+      - "1"
+      - "--run-steps"
+      - "0"
+    params:
+      storage:
+        data:
+          mount: /storage
+        safety:
+          mount: /safety
+    expose:
+      - port: 17773
+        as: 17773
+        proto: tcp
+        to:
+          - global: true
+
+  validator-4:
+    image: ghcr.io/cortex-forest/nova@sha256:REPLACE_WITH_TESTNET_GENESIS_IMAGE_DIGEST  # P-1
+    command:
+      - "/usr/local/bin/yazimao-node"
+      - "--genesis"
+      - "/read-only/genesis/genesis.bin"
+      - "--genesis-hash"
+      - "REPLACE_WITH_FROZEN_GENESIS_HASH_64HEX"
+      - "--chain-id"
+      - "2002"
+      - "--network-id"
+      - "testnet"
+      - "--storage-dir"
+      - "/storage"
+      - "--safety-dir"
+      - "/safety"
+      - "--network-seed-file"
+      - "/read-only/secrets/network-seed.hex"
+      - "--validator-seed-file"
+      - "/read-only/secrets/validator-seed.hex"
+      - "--validator"
+      - "--init-validator-safety"
+      - "--listen"
+      - "0.0.0.0:17774"
+      - "--peer"
+      - "REPLACE_SEED_NODEID@REPLACE_SEED_HOST:17770"
+      - "--peer"
+      - "REPLACE_V1_NODEID@REPLACE_V1_HOST:17771"
+      - "--peer"
+      - "REPLACE_V2_NODEID@REPLACE_V2_HOST:17772"
+      - "--peer"
+      - "REPLACE_V3_NODEID@REPLACE_V3_HOST:17773"
+      - "--peer"
+      - "REPLACE_V5_NODEID@REPLACE_V5_HOST:17775"
+      - "--peer"
+      - "REPLACE_V6_NODEID@REPLACE_V6_HOST:17776"
+      - "--peer"
+      - "REPLACE_V7_NODEID@REPLACE_V7_HOST:17777"
+      - "--idle-ms"
+      - "1"
+      - "--run-steps"
+      - "0"
+    params:
+      storage:
+        data:
+          mount: /storage
+        safety:
+          mount: /safety
+    expose:
+      - port: 17774
+        as: 17774
+        proto: tcp
+        to:
+          - global: true
+
+  validator-5:
+    image: ghcr.io/cortex-forest/nova@sha256:REPLACE_WITH_TESTNET_GENESIS_IMAGE_DIGEST  # P-1
+    command:
+      - "/usr/local/bin/yazimao-node"
+      - "--genesis"
+      - "/read-only/genesis/genesis.bin"
+      - "--genesis-hash"
+      - "REPLACE_WITH_FROZEN_GENESIS_HASH_64HEX"
+      - "--chain-id"
+      - "2002"
+      - "--network-id"
+      - "testnet"
+      - "--storage-dir"
+      - "/storage"
+      - "--safety-dir"
+      - "/safety"
+      - "--network-seed-file"
+      - "/read-only/secrets/network-seed.hex"
+      - "--validator-seed-file"
+      - "/read-only/secrets/validator-seed.hex"
+      - "--validator"
+      - "--init-validator-safety"
+      - "--listen"
+      - "0.0.0.0:17775"
+      - "--peer"
+      - "REPLACE_SEED_NODEID@REPLACE_SEED_HOST:17770"
+      - "--peer"
+      - "REPLACE_V1_NODEID@REPLACE_V1_HOST:17771"
+      - "--peer"
+      - "REPLACE_V2_NODEID@REPLACE_V2_HOST:17772"
+      - "--peer"
+      - "REPLACE_V3_NODEID@REPLACE_V3_HOST:17773"
+      - "--peer"
+      - "REPLACE_V4_NODEID@REPLACE_V4_HOST:17774"
+      - "--peer"
+      - "REPLACE_V6_NODEID@REPLACE_V6_HOST:17776"
+      - "--peer"
+      - "REPLACE_V7_NODEID@REPLACE_V7_HOST:17777"
+      - "--idle-ms"
+      - "1"
+      - "--run-steps"
+      - "0"
+    params:
+      storage:
+        data:
+          mount: /storage
+        safety:
+          mount: /safety
+    expose:
+      - port: 17775
+        as: 17775
+        proto: tcp
+        to:
+          - global: true
+
+  validator-6:
+    image: ghcr.io/cortex-forest/nova@sha256:REPLACE_WITH_TESTNET_GENESIS_IMAGE_DIGEST  # P-1
+    command:
+      - "/usr/local/bin/yazimao-node"
+      - "--genesis"
+      - "/read-only/genesis/genesis.bin"
+      - "--genesis-hash"
+      - "REPLACE_WITH_FROZEN_GENESIS_HASH_64HEX"
+      - "--chain-id"
+      - "2002"
+      - "--network-id"
+      - "testnet"
+      - "--storage-dir"
+      - "/storage"
+      - "--safety-dir"
+      - "/safety"
+      - "--network-seed-file"
+      - "/read-only/secrets/network-seed.hex"
+      - "--validator-seed-file"
+      - "/read-only/secrets/validator-seed.hex"
+      - "--validator"
+      - "--init-validator-safety"
+      - "--listen"
+      - "0.0.0.0:17776"
+      - "--peer"
+      - "REPLACE_SEED_NODEID@REPLACE_SEED_HOST:17770"
+      - "--peer"
+      - "REPLACE_V1_NODEID@REPLACE_V1_HOST:17771"
+      - "--peer"
+      - "REPLACE_V2_NODEID@REPLACE_V2_HOST:17772"
+      - "--peer"
+      - "REPLACE_V3_NODEID@REPLACE_V3_HOST:17773"
+      - "--peer"
+      - "REPLACE_V4_NODEID@REPLACE_V4_HOST:17774"
+      - "--peer"
+      - "REPLACE_V5_NODEID@REPLACE_V5_HOST:17775"
+      - "--peer"
+      - "REPLACE_V7_NODEID@REPLACE_V7_HOST:17777"
+      - "--idle-ms"
+      - "1"
+      - "--run-steps"
+      - "0"
+    params:
+      storage:
+        data:
+          mount: /storage
+        safety:
+          mount: /safety
+    expose:
+      - port: 17776
+        as: 17776
+        proto: tcp
+        to:
+          - global: true
+
+  validator-7:
+    image: ghcr.io/cortex-forest/nova@sha256:REPLACE_WITH_TESTNET_GENESIS_IMAGE_DIGEST  # P-1
+    command:
+      - "/usr/local/bin/yazimao-node"
+      - "--genesis"
+      - "/read-only/genesis/genesis.bin"
+      - "--genesis-hash"
+      - "REPLACE_WITH_FROZEN_GENESIS_HASH_64HEX"
+      - "--chain-id"
+      - "2002"
+      - "--network-id"
+      - "testnet"
+      - "--storage-dir"
+      - "/storage"
+      - "--safety-dir"
+      - "/safety"
+      - "--network-seed-file"
+      - "/read-only/secrets/network-seed.hex"
+      - "--validator-seed-file"
+      - "/read-only/secrets/validator-seed.hex"
+      - "--validator"
+      - "--init-validator-safety"
+      - "--listen"
+      - "0.0.0.0:17777"
+      - "--peer"
+      - "REPLACE_SEED_NODEID@REPLACE_SEED_HOST:17770"
+      - "--peer"
+      - "REPLACE_V1_NODEID@REPLACE_V1_HOST:17771"
+      - "--peer"
+      - "REPLACE_V2_NODEID@REPLACE_V2_HOST:17772"
+      - "--peer"
+      - "REPLACE_V3_NODEID@REPLACE_V3_HOST:17773"
+      - "--peer"
+      - "REPLACE_V4_NODEID@REPLACE_V4_HOST:17774"
+      - "--peer"
+      - "REPLACE_V5_NODEID@REPLACE_V5_HOST:17775"
+      - "--peer"
+      - "REPLACE_V6_NODEID@REPLACE_V6_HOST:17776"
+      - "--idle-ms"
+      - "1"
+      - "--run-steps"
+      - "0"
+    params:
+      storage:
+        data:
+          mount: /storage
+        safety:
+          mount: /safety
+    expose:
+      - port: 17777
+        as: 17777
+        proto: tcp
+        to:
+          - global: true
+
+profiles:
+  compute:
+    # 每个工作负载：2 CPU / 4 GiB RAM / 持久化卷（GPU OFF、TEE OFF = SDL 中不请求 gpu/tee 段）
+    seed:
+      resources:
+        cpu:
+          units: 2
+        memory:
+          size: 4Gi
+        storage:
+          - size: 1Gi                        # 临时 root 卷（官方要求：至少一个临时卷条目）
+          - name: data
+            size: 59Gi                       # 持久化 chain 数据（Survives restarts）
+            attributes:
+              persistent: true
+              class: beta1                     # P-12：官方 schema 要求的显式 class（= 官方文档默认 beta1，不改变成本）
+    validator:
+      resources:
+        cpu:
+          units: 2
+        memory:
+          size: 4Gi
+        storage:
+          - size: 1Gi                        # 临时 root 卷（官方要求）
+          - name: data
+            size: 54Gi                       # 持久化 chain 数据
+            attributes:
+              persistent: true
+              class: beta1                     # P-12：官方 schema 要求的显式 class（默认值，不改变成本）
+          - name: safety
+            size: 5Gi                        # 持久化 safety journal
+            attributes:
+              persistent: true
+              class: beta1                     # P-12：官方 schema 要求的显式 class（默认值，不改变成本）
+              # data(54) + safety(5) + root(1) = 60 GiB / 节点
+  placement:
+    akash:
+      pricing:
+        seed:
+          denom: uakt
+          amount: 10000
+        validator:
+          denom: uakt
+          amount: 10000
+
+deployment:
+  seed:
+    akash:
+      profile: seed
+      count: 1
+  validator-1:
+    akash:
+      profile: validator
+      count: 1
+  validator-2:
+    akash:
+      profile: validator
+      count: 1
+  validator-3:
+    akash:
+      profile: validator
+      count: 1
+  validator-4:
+    akash:
+      profile: validator
+      count: 1
+  validator-5:
+    akash:
+      profile: validator
+      count: 1
+  validator-6:
+    akash:
+      profile: validator
+      count: 1
+  validator-7:
+    akash:
+      profile: validator
+      count: 1

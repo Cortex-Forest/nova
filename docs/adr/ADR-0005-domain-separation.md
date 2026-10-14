@@ -53,13 +53,18 @@ message_hash = SHA-256(signed_bytes)
 | `0x05` | Address | 地址派生（key_hash 计算，ADR-0004） |
 | `0x06` | Witness | Witness availability proof（ADR-0036 W-5；FROZEN） |
 | `0x07` | Contribution | Proof of Contribution / Contribution protocol domain（ADR-0043，FROZEN） |
-| `0x00` / `0x08+` | — | **Reserved / 未注册 ⇒ 必须拒绝** |
+| `0x10` | RoundChangeCertificate | O2 round-transition 权威**签名域**（O2 设计见 ADR-0066；本表不重复其规格）。**Owner 批准的 Registry Amendment（2026-10-07）**：分配规则 = ADR-0069；登记 = ADR-0067 §0.6 |
+| `0x00` | — | **Reserved / 未注册 ⇒ 必须拒绝** |
+| `0x08` – `0x0F` | — | **Reserved / 未注册 ⇒ 必须拒绝**（未分配） |
+| `0x11+` | — | **Reserved / 未注册 ⇒ 必须拒绝**（未分配） |
 
 > **Registry 同步说明（PHASE 1.5 STEP 4）**：
 > - `0x06` Witness 由 ADR-0036（FROZEN）分配（W-5）。
 > - `0x07` Contribution 由 ADR-0043（FROZEN）分配：`DomainId::Contribution = 0x07`，
 >   Purpose = Proof of Contribution / Contribution protocol domain。
-> - `0x08+` 保留给未来协议域（不得分配 0x08 / 0x09 等）。
+> - `0x08`–`0x0F` 与 `0x11+` 保留给未来协议域（不得静默分配）。
+> - `0x10` 已于 **2026-10-07** 由 Owner 授权的 Registry Amendment 分配给 `RoundChangeCertificate`
+>   （见下表与变更记录）。
 > - 本同步仅登记**已冻结协议事实**；不改变任何签名/域分离语义（canonical signing structure /
 >   algorithm binding / chain_id binding / length encoding / payload handling / message hash
 >   构造均保持 ADR-0005 原文不变）。
@@ -102,3 +107,4 @@ message_hash = SHA-256(signed_bytes)
 | 日期 | 变更 | 依据 |
 |---|---|---|
 | 2026-08-31 | **PHASE 1.5 STEP 4 — Domain Registry Synchronization**：Registry 同步 `0x06` Witness（ADR-0036，FROZEN）与 `0x07` Contribution（ADR-0043，FROZEN）；`0x08+` 保持 Reserved；与已冻结 ADR-0043（`DomainId::Contribution = 0x07`）一致。**未改变** canonical signing structure / algorithm binding / chain_id binding / length encoding / payload handling / message hash construction；未改 consensus / economics；**未实现代码**（协议文档同步） | 项目所有者授权 ADR-0005 Registry Synchronization（DOCUMENT SYNCHRONIZATION ONLY） |
+| 2026-10-07 | **Owner-authorized Registry Amendment**：正式登记 `DomainId 0x10 = RoundChangeCertificate`（O2 round-transition 权威签名域，签署陈述定义于 ADR-0066）。`0x01`–`0x07` 语义不变（含 `0x07 = Contribution`）；`0x00` 保持 Reserved；`0x08`–`0x0F` 与 `0x11+` 保持 Reserved / Unallocated。**本 amendment 仅更新权威 registry**：**不**实现 `RoundChangeCertificate`，**不**授权 network / signing / pacemaker / consensus / finality / lock 集成；未改 canonical signing structure / 签名编码 / `build_signed_bytes`。本 ADR 的整体 Status **不变**（仍为 `Proposed（待批准）`）。The registry has subsequently been treated as authoritative by later governance records; this amendment does not alter the ADR's overall approval status | Owner 授权 PHASE 6H-D — OWNER-AUTHORIZED MINIMAL GOVERNANCE AMENDMENT（分配来源：PHASE 6H-B2 Owner 批准 `0x10`；分配规则 ADR-0069；登记 ADR-0067 §0.6） |
