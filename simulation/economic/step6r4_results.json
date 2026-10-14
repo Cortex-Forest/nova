@@ -1,0 +1,743 @@
+{
+  "E_GLID_1_group_splitting": {
+    "cases": {
+      "K=1": {
+        "baseline_reward": 0.05,
+        "split_reward": 0.05,
+        "gain_ratio": 1.0,
+        "total_weight": 311,
+        "top1": 0.05
+      },
+      "K=2": {
+        "baseline_reward": 0.05,
+        "split_reward": 0.1,
+        "gain_ratio": 2.0,
+        "total_weight": 570,
+        "top1": 0.05
+      },
+      "K=4": {
+        "baseline_reward": 0.05,
+        "split_reward": 0.2,
+        "gain_ratio": 4.0,
+        "total_weight": 1012,
+        "top1": 0.05
+      },
+      "K=8": {
+        "baseline_reward": 0.05,
+        "split_reward": 0.4,
+        "gain_ratio": 8.0,
+        "total_weight": 1748,
+        "top1": 0.05
+      },
+      "K=16": {
+        "baseline_reward": 0.05,
+        "split_reward": 0.8,
+        "gain_ratio": 16.0,
+        "total_weight": 2900,
+        "top1": 0.05
+      }
+    },
+    "max_gain": 16.0,
+    "avg_gain": 6.2,
+    "scaling_curve": [
+      {
+        "K": 1,
+        "gain": 1.0
+      },
+      {
+        "K": 2,
+        "gain": 2.0
+      },
+      {
+        "K": 4,
+        "gain": 4.0
+      },
+      {
+        "K": 8,
+        "gain": 8.0
+      },
+      {
+        "K": 16,
+        "gain": 16.0
+      }
+    ],
+    "gain_gt_1_detected": true,
+    "note": "per-group independent cap: reward scales ~linearly with attacker-created group count. RECORDS ONLY; no G1/G2/G3 selection."
+  },
+  "E_GLID_2_canonical_serialization": {
+    "same_group_same_id": true,
+    "replay_same_id": true,
+    "different_group_diff_id": true,
+    "determinism": true,
+    "note": "canonical serialization simulation (sha256 of canonical-sorted member set); NOT a GLID protocol implementation"
+  },
+  "E_GLID_3_cross_domain": {
+    "cases": {
+      "D=1": {
+        "reward": 0.05,
+        "gain_ratio": 1.0
+      },
+      "D=2": {
+        "reward": 0.05,
+        "gain_ratio": 1.0
+      },
+      "D=4": {
+        "reward": 0.05,
+        "gain_ratio": 1.0
+      }
+    },
+    "amplification_detected": false,
+    "note": "cross-domain aggregation under I2 group aggregation; RECORDS ONLY"
+  },
+  "E_EPOCH_1": {
+    "created_finalized_same_epoch": {
+      "alloc": 1000000000,
+      "share_A": 500000000,
+      "share_B": 500000000
+    },
+    "late_finalized_eval3": {
+      "alloc": 1000000000,
+      "note": "counted at eval E=3; created ep0"
+    },
+    "replay_idempotent_after_dedup": true,
+    "raw_engine_duplicate_inflates_share": true,
+    "duplicate_allocation_detected_raw": {
+      "share_A_once": 500000000,
+      "share_A_twice_raw": 571428571
+    },
+    "accounting_consistency": {
+      "conservation": true,
+      "alloc_nonneg": true
+    },
+    "note": "epoch attribution/replay/accounting checks; reward_cap disabled to isolate duplicate effect; no E-a/E-b/E-c selection"
+  },
+  "C_discrimination": {
+    "heavy_tail": {
+      "C1": {
+        "split_gain": 0.9741,
+        "top1": 0.05,
+        "total_share": 0.5382,
+        "gini": 0.0304
+      },
+      "C2": {
+        "split_gain": 0.9741,
+        "top1": 0.05,
+        "total_share": 0.5382,
+        "gini": 0.0304
+      },
+      "C5": {
+        "split_gain": 0.9741,
+        "top1": 0.05,
+        "total_share": 0.5382,
+        "gini": 0.0304
+      },
+      "C3": {
+        "split_gain": 3.2174,
+        "top1": 0.05,
+        "total_share": 0.7932,
+        "gini": 0.0005
+      },
+      "C4": {
+        "split_gain": 0.9741,
+        "top1": 0.05,
+        "total_share": 0.5382,
+        "gini": 0.0304
+      }
+    },
+    "whale": {
+      "C1": {
+        "split_gain": 59.1809,
+        "top1": 0.0333,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C2": {
+        "split_gain": 59.1809,
+        "top1": 0.0333,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C5": {
+        "split_gain": 59.1809,
+        "top1": 0.0333,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C3": {
+        "split_gain": 11.7073,
+        "top1": 0.0333,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C4": {
+        "split_gain": 30.0,
+        "top1": 0.0333,
+        "total_share": 1.0,
+        "gini": 0.0
+      }
+    },
+    "many_small": {
+      "C1": {
+        "split_gain": 0.9516,
+        "top1": 0.02,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C2": {
+        "split_gain": 0.9516,
+        "top1": 0.02,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C5": {
+        "split_gain": 0.9516,
+        "top1": 0.02,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C3": {
+        "split_gain": 8.5938,
+        "top1": 0.02,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C4": {
+        "split_gain": 0.9516,
+        "top1": 0.02,
+        "total_share": 1.0,
+        "gini": 0.0
+      }
+    },
+    "burst": {
+      "C1": {
+        "split_gain": 39.209,
+        "top1": 0.05,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C2": {
+        "split_gain": 39.209,
+        "top1": 0.05,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C5": {
+        "split_gain": 39.209,
+        "top1": 0.05,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C3": {
+        "split_gain": 8.2143,
+        "top1": 0.05,
+        "total_share": 1.0,
+        "gini": 0.0
+      },
+      "C4": {
+        "split_gain": 20.0,
+        "top1": 0.05,
+        "total_share": 1.0,
+        "gini": 0.0
+      }
+    },
+    "long_horizon": {
+      "C1": {
+        "split_gain": 10.2664,
+        "top1": 0.05,
+        "total_share": 0.5,
+        "gini": 0.0
+      },
+      "C2": {
+        "split_gain": 10.2664,
+        "top1": 0.05,
+        "total_share": 0.5,
+        "gini": 0.0
+      },
+      "C5": {
+        "split_gain": 10.2664,
+        "top1": 0.05,
+        "total_share": 0.5,
+        "gini": 0.0
+      },
+      "C3": {
+        "split_gain": 12.9531,
+        "top1": 0.05,
+        "total_share": 0.5,
+        "gini": 0.0
+      },
+      "C4": {
+        "split_gain": 10.2664,
+        "top1": 0.05,
+        "total_share": 0.5,
+        "gini": 0.0
+      }
+    },
+    "note": "C1/C2/C5 are IDENTICAL in the current toy engine (single aggregate-before-diminishing branch); C3/C4 differ. Discrimination among C1/C2/C5 requires Owner-defined variant semantics. No winner declared."
+  },
+  "Cap_Stress": {
+    "extreme_whale": {
+      "A": {
+        "top1": 0.05,
+        "topk": 0.1364,
+        "total_share": 0.9143,
+        "gini": 0.0071,
+        "conservation": true
+      },
+      "B": {
+        "top1": 0.0539,
+        "topk": 0.1485,
+        "total_share": 1.0,
+        "gini": 0.0063,
+        "conservation": true
+      },
+      "C": {
+        "top1": 0.05,
+        "topk": 0.1364,
+        "total_share": 0.9143,
+        "gini": 0.0071,
+        "conservation": true
+      }
+    },
+    "many_contributors": {
+      "A": {
+        "top1": 0.0125,
+        "topk": 0.0375,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "conservation": true
+      },
+      "B": {
+        "top1": 0.0125,
+        "topk": 0.0375,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "conservation": true
+      },
+      "C": {
+        "top1": 0.0125,
+        "topk": 0.0375,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "conservation": true
+      }
+    },
+    "multi_domain": {
+      "A": {
+        "top1": 0.0125,
+        "topk": 0.0375,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "conservation": true
+      },
+      "B": {
+        "top1": 0.0125,
+        "topk": 0.0375,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "conservation": true
+      },
+      "C": {
+        "top1": 0.0125,
+        "topk": 0.0375,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "conservation": true
+      }
+    },
+    "cross_epoch": {
+      "A": {
+        "top1": 0.0161,
+        "topk": 0.0484,
+        "total_share": 1.0,
+        "gini": 0.1142,
+        "conservation": true
+      },
+      "B": {
+        "top1": 0.0161,
+        "topk": 0.0484,
+        "total_share": 1.0,
+        "gini": 0.1142,
+        "conservation": true
+      },
+      "C": {
+        "top1": 0.0161,
+        "topk": 0.0484,
+        "total_share": 1.0,
+        "gini": 0.1142,
+        "conservation": true
+      }
+    },
+    "note": "HYPOTHETICAL toy cap-ordering semantics (A=normalize->cap, B=cap->normalize via weight ceiling, C=MaxScore-before-cap); engine pipelines otherwise unmodeled (Q4 masking). No cap ordering frozen."
+  },
+  "ab_sensitivity": {
+    "grid": {
+      "a=1,b=1": {
+        "split_gain": 0.1667,
+        "gini": 0.0034,
+        "top1": 0.05,
+        "total_share": 0.9802,
+        "retention": 2.0761
+      },
+      "a=1,b=2": {
+        "split_gain": 0.1667,
+        "gini": 0.0034,
+        "top1": 0.05,
+        "total_share": 0.9802,
+        "retention": 2.0761
+      },
+      "a=1,b=3": {
+        "split_gain": 0.1667,
+        "gini": 0.0034,
+        "top1": 0.05,
+        "total_share": 0.9802,
+        "retention": 2.0761
+      },
+      "a=1,b=4": {
+        "split_gain": 0.1667,
+        "gini": 0.0034,
+        "top1": 0.05,
+        "total_share": 0.9802,
+        "retention": 2.0761
+      },
+      "a=1,b=5": {
+        "split_gain": 0.1667,
+        "gini": 0.0034,
+        "top1": 0.05,
+        "total_share": 0.9802,
+        "retention": 2.0761
+      },
+      "a=2,b=1": {
+        "split_gain": 0.0867,
+        "gini": 0.0029,
+        "top1": 0.05,
+        "total_share": 0.9898,
+        "retention": 2.0761
+      },
+      "a=2,b=2": {
+        "split_gain": 0.0867,
+        "gini": 0.0029,
+        "top1": 0.05,
+        "total_share": 0.9898,
+        "retention": 2.0761
+      },
+      "a=2,b=3": {
+        "split_gain": 0.0867,
+        "gini": 0.0029,
+        "top1": 0.05,
+        "total_share": 0.9898,
+        "retention": 2.0761
+      },
+      "a=2,b=4": {
+        "split_gain": 0.0867,
+        "gini": 0.0029,
+        "top1": 0.05,
+        "total_share": 0.9898,
+        "retention": 2.0761
+      },
+      "a=2,b=5": {
+        "split_gain": 0.0867,
+        "gini": 0.0029,
+        "top1": 0.05,
+        "total_share": 0.9898,
+        "retention": 2.0761
+      },
+      "a=3,b=1": {
+        "split_gain": 0.0583,
+        "gini": 0.0064,
+        "top1": 0.0479,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=3,b=2": {
+        "split_gain": 0.0583,
+        "gini": 0.0064,
+        "top1": 0.0479,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=3,b=3": {
+        "split_gain": 0.0583,
+        "gini": 0.0064,
+        "top1": 0.0479,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=3,b=4": {
+        "split_gain": 0.0583,
+        "gini": 0.0064,
+        "top1": 0.0479,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=3,b=5": {
+        "split_gain": 0.0583,
+        "gini": 0.0064,
+        "top1": 0.0479,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=4,b=1": {
+        "split_gain": 0.045,
+        "gini": 0.0163,
+        "top1": 0.0484,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=4,b=2": {
+        "split_gain": 0.045,
+        "gini": 0.0163,
+        "top1": 0.0484,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=4,b=3": {
+        "split_gain": 0.045,
+        "gini": 0.0163,
+        "top1": 0.0484,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=4,b=4": {
+        "split_gain": 0.045,
+        "gini": 0.0163,
+        "top1": 0.0484,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=4,b=5": {
+        "split_gain": 0.045,
+        "gini": 0.0163,
+        "top1": 0.0484,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=5,b=1": {
+        "split_gain": 0.035,
+        "gini": 0.0223,
+        "top1": 0.0487,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=5,b=2": {
+        "split_gain": 0.035,
+        "gini": 0.0223,
+        "top1": 0.0487,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=5,b=3": {
+        "split_gain": 0.035,
+        "gini": 0.0223,
+        "top1": 0.0487,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=5,b=4": {
+        "split_gain": 0.035,
+        "gini": 0.0223,
+        "top1": 0.0487,
+        "total_share": 1.0,
+        "retention": 2.0761
+      },
+      "a=5,b=5": {
+        "split_gain": 0.035,
+        "gini": 0.0223,
+        "top1": 0.0487,
+        "total_share": 1.0,
+        "retention": 2.0761
+      }
+    },
+    "note": "2D alpha x beta sweep under C1; direction only; NO final parameters, NO freeze"
+  },
+  "Decay_Stress": {
+    "D2": {
+      "early_weight": 26,
+      "persistent_weight": 600,
+      "late_weight": 114,
+      "boundary_inside_weight": 95,
+      "boundary_outside_weight": 0,
+      "late_finalized_weight": 22,
+      "floor_effect": "floor NOT invented; early weights can decay toward 0 at long horizon",
+      "boundary_gaming_flag": true
+    },
+    "D4": {
+      "early_weight": 0,
+      "persistent_weight": 600,
+      "late_weight": 114,
+      "boundary_inside_weight": 114,
+      "boundary_outside_weight": 0,
+      "late_finalized_weight": 0,
+      "floor_effect": "floor NOT invented; early weights can decay toward 0 at long horizon",
+      "boundary_gaming_flag": true
+    },
+    "note": "records only; no D2/D4 selection; floor/duration OPEN"
+  },
+  "Remainder_Long_Horizon": {
+    "H=100": {
+      "R-a": {
+        "final_budget": 111112,
+        "pool": 0,
+        "alloc_total": 99888888,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      },
+      "R-b": {
+        "final_budget": 0,
+        "pool": 10000000,
+        "alloc_total": 90000000,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      },
+      "R-c": {
+        "final_budget": 0,
+        "pool": 0,
+        "alloc_total": 100000000,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      }
+    },
+    "H=1000": {
+      "R-a": {
+        "final_budget": 111112,
+        "pool": 0,
+        "alloc_total": 999888888,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      },
+      "R-b": {
+        "final_budget": 0,
+        "pool": 100000000,
+        "alloc_total": 900000000,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      },
+      "R-c": {
+        "final_budget": 0,
+        "pool": 0,
+        "alloc_total": 1000000000,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      }
+    },
+    "H=10000": {
+      "R-a": {
+        "final_budget": 111112,
+        "pool": 0,
+        "alloc_total": 9999888888,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      },
+      "R-b": {
+        "final_budget": 0,
+        "pool": 1000000000,
+        "alloc_total": 9000000000,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      },
+      "R-c": {
+        "final_budget": 0,
+        "pool": 0,
+        "alloc_total": 10000000000,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      }
+    },
+    "H=100000": {
+      "R-a": {
+        "final_budget": 111112,
+        "pool": 0,
+        "alloc_total": 99999888888,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      },
+      "R-b": {
+        "final_budget": 0,
+        "pool": 10000000000,
+        "alloc_total": 90000000000,
+        "starved_epochs": 0,
+        "overflow_risk": true,
+        "starvation_detected": false
+      },
+      "R-c": {
+        "final_budget": 0,
+        "pool": 0,
+        "alloc_total": 100000000000,
+        "starved_epochs": 0,
+        "overflow_risk": false,
+        "starvation_detected": false
+      }
+    },
+    "note": "toy integer accounting model (fixed per-epoch inflow, 90% alloc); NOT the engine pipeline; R-a/R-b accumulate reserve -> long-horizon overflow risk (cf. Q8 saturation). No remainder policy selected."
+  },
+  "Citation_Attack": {
+    "cases": {
+      "self": {
+        "N1": {
+          "total_score": 240,
+          "amplification": 1.0
+        },
+        "N2": {
+          "total_score": 260,
+          "amplification": 1.0833
+        },
+        "N3": {
+          "total_score": 240,
+          "amplification": 1.0
+        }
+      },
+      "circular": {
+        "N1": {
+          "total_score": 240,
+          "amplification": 1.0
+        },
+        "N2": {
+          "total_score": 280,
+          "amplification": 1.1667
+        },
+        "N3": {
+          "total_score": 240,
+          "amplification": 1.0
+        }
+      },
+      "farming": {
+        "N1": {
+          "total_score": 240,
+          "amplification": 1.0
+        },
+        "N2": {
+          "total_score": 360,
+          "amplification": 1.5
+        },
+        "N3": {
+          "total_score": 240,
+          "amplification": 1.0
+        }
+      },
+      "amplification": {
+        "N1": {
+          "total_score": 240,
+          "amplification": 1.0
+        },
+        "N2": {
+          "total_score": 300,
+          "amplification": 1.25
+        },
+        "N3": {
+          "total_score": 240,
+          "amplification": 1.0
+        }
+      }
+    },
+    "note": "integer graph toy; no oracle; N1 no effect, N2 accepts all citations, N3 verified-only rejects self/cyclic. No citation model selected."
+  }
+}

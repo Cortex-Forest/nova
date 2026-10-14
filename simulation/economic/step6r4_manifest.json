@@ -1,0 +1,23 @@
+{
+  "simulation_version": "0.5-step6r4",
+  "python_version": "3.14.6",
+  "execution_timestamp": "2026-08-31 (provenance only; NOT a model variable)",
+  "classification": "TOY MODEL / NON-PROTOCOL / EXPLORATORY ONLY",
+  "no_parameter_freeze": true,
+  "goal": "execute STEP 6-R3 experiment designs: GLID split/serialization/cross-domain, epoch attribution, contribution discrimination, cap stress, alpha/beta sensitivity, decay stress, remainder long horizon, citation attack",
+  "experiments": [
+    "E_GLID_1_group_splitting",
+    "E_GLID_2_canonical_serialization",
+    "E_GLID_3_cross_domain",
+    "E_EPOCH_1",
+    "C_discrimination",
+    "Cap_Stress",
+    "ab_sensitivity",
+    "Decay_Stress",
+    "Remainder_Long_Horizon",
+    "Citation_Attack"
+  ],
+  "deterministic_ordering_rule": "canonical sort by (group, ident, domain, epoch, cid)",
+  "seed": "fixed seeds (shuffle tests only); no unseeded randomness",
+  "note": "TOY result != protocol proof; simulation pass != security proof; AI recommendation != Owner decision. NO PARAMETER FREEZE."
+}

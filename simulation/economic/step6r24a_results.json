@@ -1,0 +1,246 @@
+{
+  "scenarios": {
+    "extreme_whale": {
+      "A": {
+        "top1": 0.0539,
+        "topk": 0.1485,
+        "total_share": 1.0,
+        "gini": 0.0063,
+        "remainder": 12,
+        "conservation": true,
+        "replay": true
+      },
+      "B": {
+        "top1": 0.05,
+        "topk": 0.1364,
+        "total_share": 0.9143,
+        "gini": 0.0071,
+        "remainder": 85708880,
+        "conservation": true,
+        "replay": true
+      },
+      "weights_total": 1319
+    },
+    "identity_split": {
+      "unified": {
+        "A": {
+          "top1": 1.0,
+          "topk": 1.0,
+          "total_share": 1.0,
+          "gini": 0.0,
+          "remainder": 0,
+          "conservation": true,
+          "replay": true
+        },
+        "B": {
+          "top1": 0.05,
+          "topk": 0.05,
+          "total_share": 0.05,
+          "gini": 0.0,
+          "remainder": 950000000,
+          "conservation": true,
+          "replay": true
+        },
+        "weights_total": 311
+      },
+      "split_K4": {
+        "A": {
+          "top1": 0.25,
+          "topk": 0.75,
+          "total_share": 1.0,
+          "gini": 0.0,
+          "remainder": 0,
+          "conservation": true,
+          "replay": true
+        },
+        "B": {
+          "top1": 0.05,
+          "topk": 0.15,
+          "total_share": 0.2,
+          "gini": 0.0,
+          "remainder": 800000000,
+          "conservation": true,
+          "replay": true
+        },
+        "weights_total": 1012
+      },
+      "split_gain_A": 0.8,
+      "split_gain_B": 0.8421
+    },
+    "contribution_split": {
+      "big": {
+        "A": {
+          "top1": 1.0,
+          "topk": 1.0,
+          "total_share": 1.0,
+          "gini": 0.0,
+          "remainder": 0,
+          "conservation": true,
+          "replay": true
+        },
+        "B": {
+          "top1": 0.05,
+          "topk": 0.05,
+          "total_share": 0.05,
+          "gini": 0.0,
+          "remainder": 950000000,
+          "conservation": true,
+          "replay": true
+        },
+        "weights_total": 600
+      },
+      "small_N8": {
+        "A": {
+          "top1": 1.0,
+          "topk": 1.0,
+          "total_share": 1.0,
+          "gini": 0.0,
+          "remainder": 0,
+          "conservation": true,
+          "replay": true
+        },
+        "B": {
+          "top1": 0.05,
+          "topk": 0.05,
+          "total_share": 0.05,
+          "gini": 0.0,
+          "remainder": 950000000,
+          "conservation": true,
+          "replay": true
+        },
+        "weights_total": 64
+      },
+      "split_gain_A": 0.1067,
+      "split_gain_B": 0.1067
+    },
+    "many_small": {
+      "A": {
+        "top1": 0.0125,
+        "topk": 0.0375,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "remainder": 0,
+        "conservation": true,
+        "replay": true
+      },
+      "B": {
+        "top1": 0.0125,
+        "topk": 0.0375,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "remainder": 0,
+        "conservation": true,
+        "replay": true
+      },
+      "weights_total": 5520
+    },
+    "decay_early": {
+      "A": {
+        "top1": 1.0,
+        "topk": 1.0,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "remainder": 0,
+        "conservation": true,
+        "replay": true
+      },
+      "B": {
+        "top1": 0.05,
+        "topk": 0.05,
+        "total_share": 0.05,
+        "gini": 0.0,
+        "remainder": 950000000,
+        "conservation": true,
+        "replay": true
+      },
+      "weights_total": 21
+    },
+    "decay_late": {
+      "A": {
+        "top1": 1.0,
+        "topk": 1.0,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "remainder": 0,
+        "conservation": true,
+        "replay": true
+      },
+      "B": {
+        "top1": 0.05,
+        "topk": 0.05,
+        "total_share": 0.05,
+        "gini": 0.0,
+        "remainder": 950000000,
+        "conservation": true,
+        "replay": true
+      },
+      "weights_total": 111
+    },
+    "decay_persistent": {
+      "A": {
+        "top1": 1.0,
+        "topk": 1.0,
+        "total_share": 1.0,
+        "gini": 0.0,
+        "remainder": 0,
+        "conservation": true,
+        "replay": true
+      },
+      "B": {
+        "top1": 0.05,
+        "topk": 0.05,
+        "total_share": 0.05,
+        "gini": 0.0,
+        "remainder": 950000000,
+        "conservation": true,
+        "replay": true
+      },
+      "weights_total": 569
+    },
+    "cap_boundary": {
+      "below": {
+        "A": {
+          "top1": 0.1667,
+          "topk": 0.5,
+          "total_share": 1.0,
+          "gini": 0.0,
+          "remainder": 4,
+          "conservation": true,
+          "replay": true
+        },
+        "B": {
+          "top1": 0.05,
+          "topk": 0.15,
+          "total_share": 0.3,
+          "gini": 0.0,
+          "remainder": 700000000,
+          "conservation": true,
+          "replay": true
+        },
+        "weights_total": 211
+      },
+      "above": {
+        "A": {
+          "top1": 0.1667,
+          "topk": 0.5,
+          "total_share": 1.0,
+          "gini": 0.0,
+          "remainder": 4,
+          "conservation": true,
+          "replay": true
+        },
+        "B": {
+          "top1": 0.05,
+          "topk": 0.15,
+          "total_share": 0.3,
+          "gini": 0.0,
+          "remainder": 700000000,
+          "conservation": true,
+          "replay": true
+        },
+        "weights_total": 395
+      }
+    }
+  },
+  "note": "TOY cap-ordering semantics (A=cap-then-round, B=round-then-cap); distinguishes SR-P3 under cap-activated stress; NO parameter freeze; no cap ordering selected."
+}

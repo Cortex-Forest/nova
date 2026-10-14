@@ -1,0 +1,21 @@
+{
+  "simulation_version": "0.6-step6r24a",
+  "python_version": "3.14.6",
+  "execution_timestamp": "2026-08-31 (provenance only; NOT a model variable)",
+  "classification": "TOY MODEL / NON-PROTOCOL / VALIDATION ONLY",
+  "no_parameter_freeze": true,
+  "goal": "discriminate SR-P3 Cap Ordering: Option A (score->cap->rounding) vs Option B (score->rounding->cap) under cap-activated stress",
+  "experiments": [
+    "extreme_whale",
+    "identity_split",
+    "contribution_split",
+    "many_small",
+    "decay_interaction_early",
+    "decay_interaction_late",
+    "decay_interaction_persistent",
+    "cap_boundary"
+  ],
+  "deterministic_ordering_rule": "canonical sort by (group, ident, domain, epoch, cid)",
+  "seed": "fixed (no unseeded randomness)",
+  "note": "TOY result != protocol proof; cap-ordering semantics are toy assumptions (A=weight-level cap then floor-allocate, B=floor-allocate then per-share cap). No cap ordering selected. NO PARAMETER FREEZE."
+}
