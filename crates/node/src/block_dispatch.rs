@@ -117,35 +117,80 @@ pub fn resolve_proposer_round_evidence(
     }
 }
 
-/// 待验证 wire 的 canonical block hash（结构损坏 ⇒ `None`；此时证据不可用 ⇒ 回退 round 0，
-/// 由 validator 自身以 `Malformed` 拒绝，不在此处猜测）。
-fn wire_block_hash(wire: &[u8]) -> Option<[u8; 32]> {
-    let block = nova_runtime::decode_block(wire).ok()?;
-    nova_runtime::block_hash(&block).ok()
+/// **M3（Owner 授权）** —— 入站 canonical block 的**统一轮次派生**（gossip / sync / registration
+/// **共用同一 helper**；禁止两套不一致规则）。
+///
+/// 规则（按优先级）：
+/// 1. **绑定证据优先**：`proposal` / `qc` 中**恰一**项绑定 `block_hash`（严格相等）⇒ 用其轮
+///    （轮 `0` 是合法证据，与“无证据”严格区分）；
+/// 2. **冲突拒绝**：两项均绑定但轮不同 ⇒ `Err(())`（调用方必须拒绝 / 保守 no-op；不静默择一）；
+/// 3. **无绑定证据 ⇒ `header_round`**：即 `BlockHeader.round` —— 它**由 proposer 签名绑定**
+///    （`crates/core/src/block.rs::verify_block_signature` 的 payload = 整 `canonical_header`）
+///    且**已被 block hash 承诺覆盖**（`block_hash = SHA-256(canonical_header‖canonical_body)`），
+///    取代旧的**隐式 `round 0` 回退**（后者使 round>0 的诚实提案无法通过入站验证）。
+///
+/// 安全边界（**逐条保持**）：候选轮**至多 2 个**（`{证据轮, header.round}`）；
+/// **不**遍历轮 / **不**遍历 validator / **不**接受任意成员签名 / **不**做 membership-only 接受；
+/// 仍只注入**单个** `expected_proposer_vk`（签名必须与该轮当选 proposer 匹配，见
+/// `resolve_expected_proposer_vk_at`）；`block_inbound` seam 与其单钥验签**逐字不变**。
+///
+/// 边界（不使用 `header.round` 的场合）：
+/// - `header.round` **不**进入投票 / QC / lock / finality 授权（`Guard C` / `auto_drive` 仍只用**本地**
+///   共识轮）；
+/// - 结构损坏（无法解码）时调用方**不**调用本函数（以 `Malformed` 拒绝，**不进入登记路径**）。
+// `Err(())` = “绑定证据矛盾”单一信号（与 `resolve_proposer_round_evidence` 同约定）。
+#[allow(clippy::result_unit_err)]
+pub fn resolve_inbound_block_round(
+    block_hash: [u8; 32],
+    header_round: u64,
+    proposal: Option<ProposerRoundEvidence>,
+    qc: Option<ProposerRoundEvidence>,
+) -> Result<u64, ()> {
+    let a = proposal.filter(|(_, h)| *h == block_hash).map(|(r, _)| r);
+    let b = qc.filter(|(_, t)| *t == block_hash).map(|(r, _)| r);
+    match (a, b) {
+        // 2. 冲突：两源绑定同一 hash 但轮不同 ⇒ 拒绝（不静默择一）。
+        (Some(x), Some(y)) if x != y => Err(()),
+        // 1. 恰一源绑定（或两源同轮）⇒ 用该轮（可为 0）。
+        (Some(x), _) => Ok(x),
+        (None, Some(y)) => Ok(y),
+        // 3. 无绑定证据 ⇒ 用块自身（已签名 / 已被 hash 承诺）的 `header.round`。
+        (None, None) => Ok(header_round),
+    }
 }
 
-/// 期望 proposer 验证公钥（指定**父高轮次**）。
+/// 待验证 wire 的 canonical block hash（结构损坏 ⇒ `None`；此时轮不可用，由 validator 自身以
+/// `Malformed` 拒绝，不在此处猜测）。
+pub(crate) fn wire_block_hash(wire: &[u8]) -> Option<[u8; 32]> {
+    wire_block_hash_and_round(wire).map(|(h, _)| h)
+}
+
+/// 待验证 wire 的 `(canonical block hash, BlockHeader.round)`（**单次解码**；结构损坏 ⇒ `None`）。
 ///
-/// `ValidatorSet → select_proposer(chain_id, head.height, round, genesis_hash, set) → ValidatorId
+/// `round` 取自**解码后**的 header（= 签名 payload / hash 承诺内的同一字段）——单一来源，
+/// 不重新计算 / 不猜轮。
+pub(crate) fn wire_block_hash_and_round(wire: &[u8]) -> Option<([u8; 32], u64)> {
+    let block = nova_runtime::decode_block(wire).ok()?;
+    let hash = nova_runtime::block_hash(&block).ok()?;
+    Some((hash, block.header.round))
+}
+
+/// 期望 proposer 验证公钥（**显式父高轮高度 + 轮**；`pub(crate)` 供 node 层**单一来源**复用）。
+///
+/// `ValidatorSet → select_proposer(chain_id, height, round, genesis_hash, set) → ValidatorId
 /// → ValidatorInfo.consensus_public_key → VerifyingKey`。
 ///
-/// - `validator_set_id` = `genesis_hash`（ADR-0038 F-11；与 block_inbound 链身份一致）。
+/// - `height` = **父高轮高度**（ADR-0076 OD-11：A11 Guard C 传 `block.header.height - 1`；
+///   block 入站路径传 `adapter.head().height`）；本函数**不**自行推导高度。
 /// - 块本身**不携带** proposer 自证；期望 proposer 完全由本地 ValidatorSet 独立推导。
 /// - 空集合 / 成员缺失 / 成员 consensus key 无法构成 Ed25519 点 ⇒ `Err(UnsupportedValidation(
 ///   ProposerSignature))`（缺失 proposer identity = 验证失败；不放行、不跳过）。
-fn resolve_expected_proposer_vk_at_round<B: StorageBackend + Clone>(
+pub(crate) fn resolve_expected_proposer_vk_at<B: StorageBackend + Clone>(
     adapter: &NodeBlockAdapter<B, NoAccountsKeyResolver>,
     set: &ValidatorSet,
+    height: u64,
     round: u64,
 ) -> Result<VerifyingKey, InboundBlockError> {
-    // canonical-next 块（height == head.height + 1）由「父高度轮」的 proposer 产出：
-    // node build_proposal 高度同步 gate（rs.height == head.height）⇒ 产块轮高 = head.height；
-    // 用父高度轮而非块高，与产块方 / vote / QC 的轮高语义一致（双验证者下 (head) 与 (head+1)
-    // 选择可能不同）。
-    //
-    // P1-A.18 RC-1：`round` 来自**严格绑定**证据（见 [`resolve_proposer_round_evidence`]）；
-    // 无证据 ⇒ `0`（与 P1-A.18 之前行为逐字一致）。
-    let height = adapter.head().height;
     let id = select_proposer(
         adapter.chain_id(),
         height,
@@ -161,6 +206,22 @@ fn resolve_expected_proposer_vk_at_round<B: StorageBackend + Clone>(
         ))?;
     VerifyingKey::from_bytes(&info.consensus_public_key)
         .map_err(|_| InboundBlockError::UnsupportedValidation(UnverifiableItem::ProposerSignature))
+}
+
+/// 期望 proposer 验证公钥（指定**父高轮次**）。
+///
+/// 与 [`resolve_expected_proposer_vk_at`] **同一来源**：`height = adapter.head().height`
+/// （canonical-next 块（height == head.height + 1）由「父高度轮」的 proposer 产出；
+/// `build_proposal` 高度同步 gate `rs.height == head.height`）。
+///
+/// P1-A.18 RC-1：`round` 来自**严格绑定**证据（见 [`resolve_proposer_round_evidence`]）；
+/// 无证据 ⇒ `0`（与 P1-A.18 之前行为逐字一致）。
+pub(crate) fn resolve_expected_proposer_vk_at_round<B: StorageBackend + Clone>(
+    adapter: &NodeBlockAdapter<B, NoAccountsKeyResolver>,
+    set: &ValidatorSet,
+    round: u64,
+) -> Result<VerifyingKey, InboundBlockError> {
+    resolve_expected_proposer_vk_at(adapter, set, adapter.head().height, round)
 }
 
 /// 期望 proposer 验证公钥（**round 0 兼容入口**；行为与 P1-A.18 之前逐字一致）。
@@ -224,10 +285,11 @@ pub fn dispatch_gossip_block_with_validator_set_and_dag<B: StorageBackend + Clon
 ///   proposal 已经过 driver 的 round-aware 授权校验）；
 /// - `qc_evidence = Some((qc.context.round, qc.target))`：本地 `last_precommit_qc()`。
 ///
-/// 安全边界（P1-A.18 §4）：候选轮**至多 2 个**（`{0, evidence_round}`，去重后实际仍只注入**单个**
-/// `expected_proposer_vk`）；**不**遍历轮 / **不**遍历 validator / **不**接受任意成员签名 /
-/// **不**做 membership-only 接受；证据不成立 ⇒ **回退 round 0**（既有行为）；两个绑定证据冲突 ⇒
-/// 拒绝（`InvalidProposerSignature`）。`block_inbound` seam 与其单钥验签**逐字不变**。
+/// 安全边界（P1-A.18 §4 + M3）：候选轮**至多 2 个**（`{evidence_round, header.round}`，去重后实际仍只
+/// 注入**单个** `expected_proposer_vk`）；**不**遍历轮 / **不**遍历 validator / **不**接受任意成员
+/// 签名 / **不**做 membership-only 接受；无绑定证据 ⇒ **用 `header.round`**（M3；**不再**隐式回退
+/// round 0）；两个绑定证据冲突 ⇒ 拒绝（`InvalidProposerSignature`）。
+/// `block_inbound` seam 与其单钥验签**逐字不变**。
 pub fn dispatch_gossip_block_round_aware<B: StorageBackend + Clone>(
     adapter: &NodeBlockAdapter<B, NoAccountsKeyResolver>,
     max_block_bytes: usize,
@@ -237,11 +299,21 @@ pub fn dispatch_gossip_block_round_aware<B: StorageBackend + Clone>(
     proposal_evidence: Option<ProposerRoundEvidence>,
     qc_evidence: Option<ProposerRoundEvidence>,
 ) -> Result<InboundBlockVerdict, InboundBlockError> {
-    let round = match wire_block_hash(wire) {
-        Some(h) => resolve_proposer_round_evidence(h, proposal_evidence, qc_evidence)
-            // 冲突（两个绑定来源轮不同）⇒ 拒绝：不放宽验证、不静默择一。
-            .map_err(|_| InboundBlockError::InvalidProposerSignature)?,
-        // 结构损坏：证据不可用（不猜轮）；validator 自身以 Malformed 拒绝。
+    // PHASE 6H-A30-ROOTFIX-M3（Owner 授权）—— **统一轮次派生**（gossip 路径）。
+    //
+    // 历史（保留为记录）：M1 曾把“无绑定证据”一律判为 `UnsupportedValidation(ProposerSignature)` ⇒
+    // 造成 proposal ⇄ block 证据死锁（round-0 全线 stall）；M2 恢复 round-0 回退 ⇒ 修复 round 0，
+    // 但 **round>0 的诚实提案**（`header.round = r`）仍被按 round 0 判定 ⇒ `InvalidProposerSignature`
+    // ⇒ 块不登记 ⇒ U3 recovery 不可达 ⇒ round≥1 无法闭合（A30 `t7_3` 5/7 实测 `head=0`）。
+    //
+    // M3：改用 [`resolve_inbound_block_round`]（**证据优先 / 冲突拒绝 / `header.round` 兜底**），
+    // 与 sync 路径、registration 共用唯一规则；不再有隐式 round 0 回退。
+    let round = match wire_block_hash_and_round(wire) {
+        Some((h, header_round)) => {
+            resolve_inbound_block_round(h, header_round, proposal_evidence, qc_evidence)
+                .map_err(|_| InboundBlockError::InvalidProposerSignature)?
+        }
+        // 结构损坏：轮不可用（不猜轮）；validator 自身以 `Malformed` 拒绝 ⇒ **不进入登记路径**。
         None => 0,
     };
     let expected_vk = resolve_expected_proposer_vk_at_round(adapter, set, round)?;
@@ -285,11 +357,12 @@ pub fn resolve_proposer_round_from_evidences(
 /// `qc_history` 的键不变式（`height == qc.context.height + 1`）保证该 QC 正是**该块**的 QC；本函数
 /// 仍以 **hash 严格相等**作为唯一绑定判据（多余条件一律不用该轮）。
 ///
-/// 安全边界（与 Stage 1 完全一致）：候选轮**至多 2 个**（`{0, bound_round}`，去重后仍只注入**单个**
-/// `expected_proposer_vk`）；**不**遍历轮 / **不**遍历 validator / **不**做 membership-only 接受；
-/// 无绑定证据 ⇒ **回退 round 0**（既有行为）；两个绑定条目轮不同 ⇒ **拒绝**
-/// （`InvalidProposerSignature`）。`block_inbound` seam 与其单钥验签**逐字不变**；
-/// `qc_evidences = &[]` ⇒ 与既有 round-0 入口**逐字等价**（T1 以断言固化）。
+/// 安全边界（与 Stage 1 完全一致 + M3）：候选轮**至多 2 个**（`{bound_round, header.round}`，去重后
+/// 仍只注入**单个** `expected_proposer_vk`）；**不**遍历轮 / **不**遍历 validator / **不**做
+/// membership-only 接受；无绑定证据 ⇒ **用 `header.round`**（M3；**不再**隐式回退 round 0）；
+/// 两个绑定条目轮不同 ⇒ **拒绝**（`InvalidProposerSignature`）。`block_inbound` seam 与其单钥验签
+/// **逐字不变**；`qc_evidences = &[]` 且 `header.round = 0` ⇒ 与既有 round-0 入口**逐字等价**
+/// （`p1a18_t1` / `p1a18_t1_sync_round0_no_evidence_is_identical` 以断言固化）。
 pub fn dispatch_sync_block_response_round_aware<B: StorageBackend + Clone>(
     adapter: &NodeBlockAdapter<B, NoAccountsKeyResolver>,
     max_block_bytes: usize,
@@ -306,14 +379,20 @@ pub fn dispatch_sync_block_response_round_aware<B: StorageBackend + Clone>(
         .blocks
         .iter()
         .map(|block_payload| {
-            let round = match wire_block_hash(&block_payload.0) {
-                Some(h) => match resolve_proposer_round_from_evidences(h, qc_evidences) {
-                    Ok(Some(r)) => r,
-                    Ok(None) => 0,
-                    // 冲突（同一 block hash 两个不同绑定轮）⇒ 拒绝：不静默择一、不放宽验证。
-                    Err(()) => return Err(InboundBlockError::InvalidProposerSignature),
-                },
-                // 结构损坏：证据不可用（不猜轮）；validator 自身以 Malformed 拒绝。
+            // PHASE 6H-A30-ROOTFIX-M3（Owner 授权）—— 与 gossip 路径**同一 helper / 同一规则**：
+            // 证据（此路径只有 QC 证据）优先；冲突 ⇒ 拒绝；**无绑定证据 ⇒ `header.round`**
+            // （替代旧的隐式 round 0 回退）。
+            let round = match wire_block_hash_and_round(&block_payload.0) {
+                Some((h, header_round)) => {
+                    // 切片内“同 hash 两个不同轮” ⇒ 冲突（既有语义，保持拒绝）。
+                    let bound = match resolve_proposer_round_from_evidences(h, qc_evidences) {
+                        Ok(b) => b,
+                        Err(()) => return Err(InboundBlockError::InvalidProposerSignature),
+                    };
+                    resolve_inbound_block_round(h, header_round, None, bound.map(|r| (r, h)))
+                        .map_err(|_| InboundBlockError::InvalidProposerSignature)?
+                }
+                // 结构损坏：轮不可用（不猜轮）；validator 自身以 `Malformed` 拒绝。
                 None => 0,
             };
             let expected_vk = match resolve_expected_proposer_vk_at_round(adapter, set, round) {

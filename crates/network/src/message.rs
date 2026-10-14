@@ -41,6 +41,14 @@ pub enum MessageType {
     ConsensusQc = 0x0A,
     /// 区块 gossip（P7-5；payload = 完整 Block wire；仅 wire 注册值，Network 不解析语义）。
     GossipBlock = 0x0B,
+    /// O2 共识 round-change 证书（PHASE 6H-Y；wire 分配 = **ADR-0073（FROZEN）**：
+    /// `ConsensusRoundChange = 0x0D`；payload 编码由 **ADR-0070** 承载；Network 不解析其语义）。
+    ConsensusRoundChange = 0x0D,
+    /// O2 individual Abandon Attestation（PHASE 6H-AF；wire 分配 = **ADR-0075（FROZEN）**：
+    /// `ConsensusAbandonAttestation = 0x0E`；payload 编码由 **ADR-0074（FROZEN）** 承载：
+    /// 精确 112B canonical container；Network 不解析其语义 —— **绝不得**与 `0x0D`（证书）
+    /// 或 `0x08`（Vote）/ `0x0A`（QC）混用（ADR-0075 §6 / Rule M-3）。
+    ConsensusAbandonAttestation = 0x0E,
 }
 
 impl MessageType {
@@ -66,6 +74,9 @@ impl TryFrom<u8> for MessageType {
             0x09 => Ok(Self::ConsensusProposal),
             0x0a => Ok(Self::ConsensusQc),
             0x0b => Ok(Self::GossipBlock),
+            0x0d => Ok(Self::ConsensusRoundChange),
+            // ADR-0075（FROZEN）§4：Owner-approved allocation（`0x0E`）。
+            0x0e => Ok(Self::ConsensusAbandonAttestation),
             _ => Err(NetworkError::InvalidMessageType(v)),
         }
     }

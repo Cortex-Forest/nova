@@ -54,10 +54,30 @@ pub enum DomainId {
     Address = 0x05,
     /// Witness availability proof（ADR-0036 W-5；10-4）。
     Witness = 0x06,
-    /// Proposer selection seed domain（ADR-0050 §13/§20；STEP 10-13D）。
+    /// Proof of Contribution / Contribution protocol domain。
     ///
-    /// 与 Witness/Vote/Block 隔离：`ProposerSeed ≠ WitnessSeed`（ADR-0050 §12）。
-    Proposer = 0x07,
+    /// **注册表修复（ADR-0067 / ADR-0068）**：本取值曾被实现为 `Proposer`，
+    /// 与 ADR-0005 注册表（Nova Domain Registry）及 ADR-0043（FROZEN）的
+    /// `0x07 = Contribution` 冲突。现恢复为注册表权威分配。
+    ///
+    /// proposer 选择的**哈希域前缀**已移至**独立命名空间**
+    /// [`HashDomain::Proposer`](crate::hash_domain::HashDomain)（同为 `0x07`，但**不同命名空间**、
+    /// 二者**无隐式转换**）。
+    ///
+    /// 本变体是**签名域**语义：作为 `build_signed_bytes` 的 `domain_id`。
+    Contribution = 0x07,
+    /// O2 `RoundChangeCertificate` 专用**签名域**（Abandon attestation 的签名消息身份）。
+    ///
+    /// **Owner 批准分配（PHASE 6H-B2，2026-10-07）**：数值 `0x10`。
+    /// 分配规则 = ADR-0069；注册表变更 = ADR-0067。此前 `0x10` 属 ADR-0005 的 Reserved 区间。
+    ///
+    /// 边界（MUST）：
+    /// - 本变体**仅**建立注册表级（registry-level）数值身份 ——
+    ///   **不代表** O2 已实现（ADR-0066 的实现仍为 **BLOCKED**）。
+    /// - `0x08`–`0x0F` 保持 Reserved；`0x11+` 保持未注册 ⇒ 拒绝（fail-closed）。
+    /// - 与 `HashDomain::Proposer = 0x07`（**哈希域**，ADR-0068）**不同命名空间**；
+    ///   与 `MessageType::ConsensusVote = 0x08` 等（**网络**命名空间）亦无关。
+    RoundChangeCertificate = 0x10,
 }
 
 impl DomainId {
@@ -78,7 +98,10 @@ impl TryFrom<u8> for DomainId {
             0x04 => Ok(Self::Governance),
             0x05 => Ok(Self::Address),
             0x06 => Ok(Self::Witness),
-            0x07 => Ok(Self::Proposer),
+            0x07 => Ok(Self::Contribution),
+            // O2 RoundChangeCertificate（Owner 批准 PHASE 6H-B2；分配规则 ADR-0069 /
+            // 注册表变更 ADR-0067）。0x08–0x0F 与 0x11+ 仍必须拒绝（fail-closed）。
+            0x10 => Ok(Self::RoundChangeCertificate),
             _ => Err(DomainError::UnknownDomainId(v)),
         }
     }
@@ -245,7 +268,8 @@ mod tests {
             DomainId::Governance,
             DomainId::Address,
             DomainId::Witness,
-            DomainId::Proposer,
+            DomainId::Contribution,
+            DomainId::RoundChangeCertificate,
         ] {
             let s = build_signed_bytes(AlgorithmId::Ed25519, other, 7, payload).unwrap();
             assert_ne!(base, s, "domain must change signed_bytes");
@@ -290,17 +314,64 @@ mod tests {
             DomainId::try_from(0x08),
             Err(DomainError::UnknownDomainId(0x08))
         );
+        // 0x08–0x0F 保持 Reserved（Owner 未分配该区间）
+        assert_eq!(
+            DomainId::try_from(0x0F),
+            Err(DomainError::UnknownDomainId(0x0F))
+        );
+        // 0x11+ 保持未注册 ⇒ fail closed
+        assert_eq!(
+            DomainId::try_from(0x11),
+            Err(DomainError::UnknownDomainId(0x11))
+        );
         assert_eq!(
             DomainId::try_from(0xff),
             Err(DomainError::UnknownDomainId(0xff))
         );
-        // 已注册值必须接受
+        // 已注册值必须接受；0x01–0x07 映射保持**不变**
         assert_eq!(DomainId::try_from(0x01), Ok(DomainId::Transaction));
+        assert_eq!(DomainId::try_from(0x02), Ok(DomainId::ValidatorVote));
+        assert_eq!(DomainId::try_from(0x03), Ok(DomainId::Block));
+        assert_eq!(DomainId::try_from(0x04), Ok(DomainId::Governance));
         assert_eq!(DomainId::try_from(0x05), Ok(DomainId::Address));
         assert_eq!(DomainId::try_from(0x06), Ok(DomainId::Witness));
-        // ADR-0050：Proposer = 0x07（STEP 10-13D 注册）
-        assert_eq!(DomainId::try_from(0x07), Ok(DomainId::Proposer));
-        assert_eq!(DomainId::Proposer.as_u8(), 0x07);
+        // ADR-0005 注册表 + ADR-0043（FROZEN）：0x07 = Contribution
+        // （ADR-0067 修复：原先错误实现为 Proposer；proposer 哈希域已移至 ADR-0068）
+        assert_eq!(DomainId::try_from(0x07), Ok(DomainId::Contribution));
+        assert_eq!(DomainId::Contribution.as_u8(), 0x07);
+    }
+
+    /// **O2 `RoundChangeCertificate` 签名域（PHASE 6H-B2，Owner 批准）**。
+    ///
+    /// 本测试**仅**验证注册表级数值身份（round-trip / canonical mapping / fail-closed 边界）；
+    /// **不涉及**任何 O2 实现（certificate / verification / signing path 仍为 BLOCKED）。
+    #[test]
+    fn o2_round_change_certificate_domain_is_0x10() {
+        // canonical enum mapping + round-trip
+        assert_eq!(DomainId::RoundChangeCertificate.as_u8(), 0x10);
+        assert_eq!(
+            DomainId::try_from(0x10),
+            Ok(DomainId::RoundChangeCertificate)
+        );
+        // fail-closed 边界：0x0F（保留）与 0x11（未注册）都必须被拒绝
+        assert_eq!(
+            DomainId::try_from(0x0F),
+            Err(DomainError::UnknownDomainId(0x0F))
+        );
+        assert_eq!(
+            DomainId::try_from(0x11),
+            Err(DomainError::UnknownDomainId(0x11))
+        );
+        // 既有分配不受影响
+        assert_eq!(DomainId::ValidatorVote.as_u8(), 0x02);
+        assert_eq!(DomainId::Contribution.as_u8(), 0x07);
+        // 哈希域命名空间**不变**（ADR-0068）：HashDomain::Proposer 仍为 0x07，
+        // 且与 DomainId::RoundChangeCertificate(0x10) 数值不同 ⇒ 无混淆面。
+        assert_eq!(crate::hash_domain::HashDomain::Proposer.as_u8(), 0x07);
+        assert_ne!(
+            DomainId::RoundChangeCertificate.as_u8(),
+            crate::hash_domain::HashDomain::Proposer.as_u8()
+        );
     }
 
     #[test]

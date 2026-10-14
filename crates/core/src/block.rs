@@ -655,7 +655,7 @@ mod tests {
         let b = mk_block(vec![mk_tx(0)]);
         let hash = block_hash(&b).unwrap();
         assert_ne!(hash, [0u8; 32]);
-        // header 定长输入长度 = 154/186 + body
+        // header 定长输入长度 = 162/194（v2；v1 的 154/186 为历史记录，v2 下不再产生） + body
         let h = encode_block_header(&b.header);
         let body = encode_block_body(&b.body).unwrap();
         assert_eq!(

@@ -97,6 +97,19 @@ const BLOCK_INBOUND_CAP: usize = 256;
 /// `sync_responder` 在既有 outbound 路径上执行。
 const SYNC_REQUEST_CAP: usize = crate::sync_responder::MAX_PENDING_SYNC_REQUESTS;
 
+/// PHASE 6H-Z §11：入站 `ConsensusRoundChange`（O2 证书）队列（**bounded**；满 ⇒ drop + 计数）。
+///
+/// 只搬 `(sender, payload)`（**不** decode / **不** 验证 / **不** 应用）；语义验证（冻结
+/// `verify_certificate`）与适用性判定（`from_round == local_round`）在 Runtime 权威路径
+/// （`drive_round_change_authority`）完成。**不**产生任何 `NodeConsensusCommand`。
+const ROUND_CHANGE_CAP: usize = 64;
+
+/// PHASE 6H-AF §9：入站 `ConsensusAbandonAttestation`（`0x0E`；ADR-0075）队列（**bounded**）。
+///
+/// 只搬 `(sender, payload)`（**不** decode / **不** 验证 / **不** 入池）；ADR-0074 decode 与
+/// 冻结验签（`verify_evidence`）在 Runtime 侧（pool `admit`）。**不**产生任何 `NodeConsensusCommand`。
+const ABANDON_ATTESTATION_CAP: usize = 256;
+
 /// Node 层 EventLoop handler（Option A）：decode/classify → command queue。
 ///
 /// **不拥有 / 不引用** Driver / Runtime / NetworkService / Transport / NetworkSigner /
@@ -113,6 +126,14 @@ pub struct NodeConsensusHandler {
     sync_requests: VecDeque<(NodeId, Vec<u8>)>,
     /// 因队列满而 drop 的入站 sync 请求数（诊断）。
     sync_requests_dropped: u64,
+    /// PHASE 6H-Z §11：入站 O2 `ConsensusRoundChange`（sender, payload）队列（bounded）。
+    round_changes: VecDeque<(NodeId, Vec<u8>)>,
+    /// 因队列满而 drop 的入站 RC payload 数（诊断）。
+    round_changes_dropped: u64,
+    /// PHASE 6H-AF §9：入站 `ConsensusAbandonAttestation`（sender, payload）队列（bounded）。
+    abandon_attestations: VecDeque<(NodeId, Vec<u8>)>,
+    /// 因队列满而 drop 的入站 attestation payload 数（诊断）。
+    abandon_attestations_dropped: u64,
 }
 
 impl NodeConsensusHandler {
@@ -125,6 +146,10 @@ impl NodeConsensusHandler {
             block_inbound_dropped: 0,
             sync_requests: VecDeque::new(),
             sync_requests_dropped: 0,
+            round_changes: VecDeque::new(),
+            round_changes_dropped: 0,
+            abandon_attestations: VecDeque::new(),
+            abandon_attestations_dropped: 0,
         }
     }
 
@@ -182,6 +207,56 @@ impl NodeConsensusHandler {
     pub fn take_sync_requests_bounded(&mut self, max: usize) -> Vec<(NodeId, Vec<u8>)> {
         let take = max.min(self.sync_requests.len());
         self.sync_requests.drain(..take).collect()
+    }
+
+    /// PHASE 6H-Z §11：入站 RC 队列当前深度。
+    pub fn round_changes_len(&self) -> usize {
+        self.round_changes.len()
+    }
+
+    /// PHASE 6H-Z §11：因队列满而 drop 的入站 RC payload 数（诊断）。
+    pub fn round_changes_dropped(&self) -> u64 {
+        self.round_changes_dropped
+    }
+
+    /// PHASE 6H-Z §11：取走**至多** `max` 条入站 RC payload（FIFO；其余留在队列下一 step）。
+    pub fn take_round_changes_bounded(&mut self, max: usize) -> Vec<(NodeId, Vec<u8>)> {
+        let take = max.min(self.round_changes.len());
+        self.round_changes.drain(..take).collect()
+    }
+
+    /// PHASE 6H-Z §11：收集一条入站 RC payload（bounded：满 ⇒ drop + 计数）。
+    fn collect_round_change(&mut self, sender: NodeId, payload: Vec<u8>) {
+        if self.round_changes.len() >= ROUND_CHANGE_CAP {
+            self.round_changes_dropped += 1;
+            return;
+        }
+        self.round_changes.push_back((sender, payload));
+    }
+
+    /// PHASE 6H-AF §9：入站 attestation 队列当前深度。
+    pub fn abandon_attestations_len(&self) -> usize {
+        self.abandon_attestations.len()
+    }
+
+    /// PHASE 6H-AF §9：因队列满而 drop 的入站 attestation payload 数（诊断）。
+    pub fn abandon_attestations_dropped(&self) -> u64 {
+        self.abandon_attestations_dropped
+    }
+
+    /// PHASE 6H-AF §9：取走**至多** `max` 条入站 attestation payload（FIFO；其余留待下一 step）。
+    pub fn take_abandon_attestations_bounded(&mut self, max: usize) -> Vec<(NodeId, Vec<u8>)> {
+        let take = max.min(self.abandon_attestations.len());
+        self.abandon_attestations.drain(..take).collect()
+    }
+
+    /// PHASE 6H-AF §9：收集一条入站 attestation payload（bounded：满 ⇒ drop + 计数）。
+    fn collect_abandon_attestation(&mut self, sender: NodeId, payload: Vec<u8>) {
+        if self.abandon_attestations.len() >= ABANDON_ATTESTATION_CAP {
+            self.abandon_attestations_dropped += 1;
+            return;
+        }
+        self.abandon_attestations.push_back((sender, payload));
     }
 
     /// 收集一条入站 `SyncBlockRequest`（bounded：满 ⇒ drop + 计数）。
@@ -255,6 +330,23 @@ impl EventHandler for NodeConsensusHandler {
                 self.collect_sync_request(*sender, payload.clone());
                 Ok(())
             }
+            // PHASE 6H-Z §11：入站 O2 `RoundChangeCertificate`（wire 0x0D；ADR-0073 FROZEN）
+            // → **bounded** 队列 → Runtime 权威路径（decode / 冻结验证 / 适用性 / 应用/暂存/拒绝）。
+            // 本 handler 只搬 payload（**不** decode / **不** verify / **不** 推进 round）——
+            // 仍计入 `non_consensus_seen`（保持既有计数语义：**未**产生 driver command）。
+            NodeEvent::Network(NetworkEvent::ConsensusRoundChange { sender, payload }) => {
+                self.non_consensus_seen += 1;
+                self.collect_round_change(*sender, payload.clone());
+                Ok(())
+            }
+            // PHASE 6H-AF §9：入站 `ConsensusAbandonAttestation`（`0x0E`；ADR-0075）
+            // → **bounded** 队列 → Runtime（ADR-0074 decode → 冻结 `verify_evidence` → pool）。
+            // 本 handler 只搬 payload（**不** decode / **不** verify / **不** 入池）。
+            NodeEvent::Network(NetworkEvent::ConsensusAbandonAttestation { sender, payload }) => {
+                self.non_consensus_seen += 1;
+                self.collect_abandon_attestation(*sender, payload.clone());
+                Ok(())
+            }
             // 其它非 consensus：status/handshake/ping/pong/timer/internal/block —— future
             // handler seam；不产生 command（尤其 Block Sync 不得借 ConsensusNode 伪装）。
             _ => {
@@ -288,5 +380,69 @@ pub fn process_command<S: SigningCapability>(
             driver.process_transition_derived(&result)
         }
         NodeConsensusCommand::InboundQc(qc) => driver.submit_inbound_qc(qc),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1-A.30 **D0′** — 四条入站队列的**溢出丢弃**语义（确定性；不改容量 / 保留策略 / 广播语义）。
+    ///
+    /// 每条队列：填满到 cap（`len == cap`、`dropped == 0`）⇒ 再收一条 ⇒ `dropped == 1` 且
+    /// `len` **不变**（丢弃**不**驱逐既有条目）；并断言**跨队列不串扰**（一次溢出只动本队列计数）。
+    #[test]
+    fn inbound_queue_overflow_drops_are_counted_per_queue() {
+        let sender = NodeId::from_bytes([0x5A; 32]);
+        let mut h = NodeConsensusHandler::new();
+
+        // ① block inbound（`block_inbound`）
+        for _ in 0..BLOCK_INBOUND_CAP {
+            h.collect_block_inbound(BlockInboundMessage::GossipBlock(vec![0x01]));
+        }
+        assert_eq!(h.block_inbound_len(), BLOCK_INBOUND_CAP);
+        assert_eq!(h.block_inbound_dropped(), 0);
+        h.collect_block_inbound(BlockInboundMessage::SyncBlockResponse(vec![0x02]));
+        assert_eq!(
+            h.block_inbound_len(),
+            BLOCK_INBOUND_CAP,
+            "溢出不得驱逐既有条目"
+        );
+        assert_eq!(h.block_inbound_dropped(), 1);
+
+        // ② sync requests
+        for _ in 0..SYNC_REQUEST_CAP {
+            h.collect_sync_request(sender, vec![0x03]);
+        }
+        assert_eq!(h.sync_requests_len(), SYNC_REQUEST_CAP);
+        h.collect_sync_request(sender, vec![0x04]);
+        assert_eq!(h.sync_requests_len(), SYNC_REQUEST_CAP);
+        assert_eq!(h.sync_requests_dropped(), 1);
+
+        // ③ round change
+        for _ in 0..ROUND_CHANGE_CAP {
+            h.collect_round_change(sender, vec![0x05]);
+        }
+        assert_eq!(h.round_changes_len(), ROUND_CHANGE_CAP);
+        h.collect_round_change(sender, vec![0x06]);
+        assert_eq!(h.round_changes_len(), ROUND_CHANGE_CAP);
+        assert_eq!(h.round_changes_dropped(), 1);
+
+        // ④ abandon attestations
+        for _ in 0..ABANDON_ATTESTATION_CAP {
+            h.collect_abandon_attestation(sender, vec![0x07]);
+        }
+        assert_eq!(h.abandon_attestations_len(), ABANDON_ATTESTATION_CAP);
+        h.collect_abandon_attestation(sender, vec![0x08]);
+        assert_eq!(h.abandon_attestations_len(), ABANDON_ATTESTATION_CAP);
+        assert_eq!(h.abandon_attestations_dropped(), 1);
+
+        // 跨队列不串扰：各队列恰好 1 次丢弃；有界取走语义不变。
+        assert_eq!(h.block_inbound_dropped(), 1);
+        assert_eq!(h.sync_requests_dropped(), 1);
+        assert_eq!(h.round_changes_dropped(), 1);
+        assert_eq!(h.abandon_attestations_dropped(), 1);
+        assert_eq!(h.take_round_changes_bounded(8).len(), 8);
+        assert_eq!(h.round_changes_len(), ROUND_CHANGE_CAP - 8);
     }
 }

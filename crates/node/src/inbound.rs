@@ -85,6 +85,28 @@ pub struct InboundDiagnostics {
     pub closed_drops: u64,
     /// 当前并存入站连接数。
     pub connections: usize,
+    // ---- NETDIAG（**仅诊断**；Owner 授权；零行为变更）----
+    /// `inbound_accept_and_greet` KEEP-FIRST（我方已 connected/established）丢弃的**新入站**连接数。
+    pub greet_keepfirst_drops: u64,
+    /// `inbound_accept_and_greet` 中 `connect_peer` 失败而回收入站连接数。
+    pub greet_connect_failed_drops: u64,
+    /// `inbound_reconcile` 握手失败（frozen `close_peer`）回收入站连接数。
+    pub handshake_failed_drops: u64,
+    /// `inbound_reconcile` 挂起超时（`INBOUND_PENDING_TIMEOUT_STEPS`）回收入站连接数。
+    pub pending_timeout_drops: u64,
+}
+
+/// NETDIAG — `drop_peer` 的**移除原因**（**仅**用于诊断计数；不参与任何判定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundDropReason {
+    /// `inbound_accept_and_greet`：我方已 `connected`/`Established` ⇒ 丢弃新入站连接。
+    GreetKeepFirst,
+    /// `inbound_accept_and_greet`：`connect_peer` 失败 ⇒ 回收入站连接。
+    GreetConnectFailed,
+    /// `inbound_reconcile`：frozen 握手失败（`close_peer`）⇒ 回收入站连接。
+    HandshakeFailed,
+    /// `inbound_reconcile`：挂起超时 ⇒ 回收入站连接。
+    PendingTimeout,
 }
 
 /// 连接表键：`NodeId` 字节（`NodeId` 无 `Ord` ⇒ 用 `[u8; 32]` 保证**确定性字典序**，
@@ -111,6 +133,11 @@ struct InboundState {
     header_drops: u64,
     accept_error_drops: u64,
     closed_drops: u64,
+    // NETDIAG（仅诊断计数）
+    greet_keepfirst_drops: u64,
+    greet_connect_failed_drops: u64,
+    handshake_failed_drops: u64,
+    pending_timeout_drops: u64,
 }
 
 impl InboundState {
@@ -220,6 +247,10 @@ impl InboundListenerState {
                 header_drops: 0,
                 accept_error_drops: 0,
                 closed_drops: 0,
+                greet_keepfirst_drops: 0,
+                greet_connect_failed_drops: 0,
+                handshake_failed_drops: 0,
+                pending_timeout_drops: 0,
             })),
         })
     }
@@ -252,6 +283,31 @@ impl InboundListenerState {
         let removed = st.conns.remove(&peer_key(&peer)).is_some();
         if removed {
             st.closed_drops += 1;
+            st.normalize_cursor();
+        }
+        removed
+    }
+
+    /// NETDIAG — 同上，但按**移除原因**计数（**仅诊断**；移除行为与 [`Self::drop_peer`] 逐字相同）。
+    pub fn drop_peer_reason(&self, peer: NodeId, reason: InboundDropReason) -> bool {
+        let mut st = self.inner.borrow_mut();
+        let removed = st.conns.remove(&peer_key(&peer)).is_some();
+        if removed {
+            st.closed_drops += 1;
+            match reason {
+                InboundDropReason::GreetKeepFirst => {
+                    st.greet_keepfirst_drops = st.greet_keepfirst_drops.saturating_add(1);
+                }
+                InboundDropReason::GreetConnectFailed => {
+                    st.greet_connect_failed_drops = st.greet_connect_failed_drops.saturating_add(1);
+                }
+                InboundDropReason::HandshakeFailed => {
+                    st.handshake_failed_drops = st.handshake_failed_drops.saturating_add(1);
+                }
+                InboundDropReason::PendingTimeout => {
+                    st.pending_timeout_drops = st.pending_timeout_drops.saturating_add(1);
+                }
+            }
             st.normalize_cursor();
         }
         removed
@@ -292,6 +348,10 @@ impl InboundListenerState {
             accept_error_drops: st.accept_error_drops,
             closed_drops: st.closed_drops,
             connections: st.conns.len(),
+            greet_keepfirst_drops: st.greet_keepfirst_drops,
+            greet_connect_failed_drops: st.greet_connect_failed_drops,
+            handshake_failed_drops: st.handshake_failed_drops,
+            pending_timeout_drops: st.pending_timeout_drops,
         }
     }
 

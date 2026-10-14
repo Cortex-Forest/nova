@@ -30,7 +30,7 @@
 //! ConsensusState / Finality / QC / Vote / ValidatorActor / VoteLedger / LockedState / ForkChoice /
 //! Network / EventLoop / Gossip / BlockSync / Mempool / 持久化 / 私钥存储 / Genesis 变更 / 经济。
 
-use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
+use nova_consensus::validator::ValidatorId;
 use nova_crypto::identity::address_payload_bytes;
 use nova_crypto::signature::VerifyingKey;
 use nova_crypto::transaction::TransactionV1;
@@ -42,6 +42,7 @@ use nova_runtime::{
 use nova_storage::backend::StorageBackend;
 use nova_storage::store::StateStore;
 
+use crate::block_safety::{BlockSafetyError, BlockSafetyJournal, BlockSigningRequest};
 use crate::signer::SigningCapability;
 
 /// BlockBuilder 错误（node-local；区分集合级 invalid / 底层管线 / 结构级 assembly / 签名）。
@@ -58,6 +59,12 @@ pub enum BlockBuilderError {
     SignatureEncoding,
     /// signer 签名失败（node-local；HSM / remote 载体可失败）。
     SigningFailed,
+    /// **B2-B signer-owned Block safety gate** 拒绝 / 失败（D-5.3.4 生产集成）。
+    ///
+    /// 承载 [`BlockSafetyJournal`] 的全部 fail-closed 原因（F2/F3/F4 冲突、identity 不符、
+    /// journal 未恢复 / 损坏 / 冲突、target 重建失败、签名自检失败等）。
+    /// **不得**被 `unwrap` / 静默回退 / 绕过安全层直接调用 signer 掩盖。
+    BlockSafety(BlockSafetyError),
 }
 
 impl From<BlockPipelineError> for BlockBuilderError {
@@ -77,6 +84,7 @@ impl core::fmt::Display for BlockBuilderError {
             Self::Encode(e) => write!(f, "block assembly encode: {e}"),
             Self::SignatureEncoding => write!(f, "proposer signature domain bytes construction"),
             Self::SigningFailed => write!(f, "proposer signing capability failed"),
+            Self::BlockSafety(e) => write!(f, "block signing safety gate: {e}"),
         }
     }
 }
@@ -204,34 +212,48 @@ pub fn build_block<B: StorageBackend + Clone>(
     })
 }
 
-/// 签名 seam（STEP 10-19-5；ProposerService integration 保留点）。
+/// 签名 seam（STEP 10-19-5；**D-5.3.4 B2-B 生产集成 = 强制 safety gate**）。
 ///
-/// 用既有 [`SigningCapability`]（node-local，接受 domain-bound [`nova_crypto::domain::SigningMessageHash`]）
-/// 对 **canonical header** 签名并回填 `block.proposer_signature`：
-/// `payload = canonical_header`；`DomainId::Block` + `chain_id` 域分离（与 core P7-3
-/// `verify_block_signature` 同构）。
+/// 生产 Block 签名的**唯一**入口：
 ///
+/// ```text
+/// block → BlockSafetyJournal（B2-B safety gate）→ signer
+/// ```
+///
+/// - **无任何不携带 journal 的 Block 签名入口**（编译期保证）：不要为了绕过 safety 而新增
+///   直调 `signer.sign(..)` 的 Block 签名函数。
+/// - exact signing target（`SigningMessageHash`）**只**由 [`BlockSafetyJournal`] 内的冻结
+///   canonical 构造产生（`alg ‖ domain=0x03 ‖ chain_id ‖ len ‖ encode_block_header(header)`` ⇒ SHA-256）；
+///   本函数**不再自行计算**第二个 Block signing hash（单一口径）。
+/// - `declared_round` 在本 seam 固定为 `0`：本 seam 无 round 上下文，且 round **不是** safety slot
+///   维度、**不进入** 摘要 ⇒ `F3`（同 height 不同 round 不创建新 slot）由 **height-only slot** 结构性保证。
+/// - `request_id` 仅为请求追踪（本 seam 置 `0`），**不是** safety 身份。
 /// - **signature ∉ block_hash**（ADR-0042 §6）：attach 前后 `block_hash` 不变。
-/// - 不持有/不暴露私钥；不持久化；同步。
+/// - 不持有/不暴露私钥；同步；safety 状态由 signer-owned journal 持久化。
 pub fn attach_proposer_signature(
     block: &mut Block,
+    safety: &BlockSafetyJournal,
     signer: &dyn SigningCapability,
 ) -> Result<(), BlockBuilderError> {
-    let chain_id = block.header.chain_id;
-    let payload = encode_block_header(&block.header);
-    let signed = build_signed_bytes(AlgorithmId::Ed25519, DomainId::Block, chain_id, &payload)
-        .map_err(|_| BlockBuilderError::SignatureEncoding)?;
-    let message_hash = hash_signing_message(&signed);
-    let signature = signer
-        .sign(&message_hash)
-        .map_err(|_| BlockBuilderError::SigningFailed)?;
-    block.proposer_signature = signature.to_bytes();
+    let request = BlockSigningRequest {
+        identity: *safety.identity(),
+        declared_height: block.header.height,
+        canonical_header_payload: encode_block_header(&block.header),
+        declared_round: 0,
+        declared_proposer: ValidatorId::from_consensus_public_key(&signer.public_key().to_bytes()),
+        request_id: 0,
+    };
+    let outcome = safety
+        .authorize_and_sign(signer, &request)
+        .map_err(BlockBuilderError::BlockSafety)?;
+    block.proposer_signature = outcome.signature();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_safety::BlockSafetyIdentity;
     use nova_crypto::address::{
         ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
     };
@@ -729,7 +751,7 @@ mod tests {
         );
     }
 
-    // ---- 签名 seam roundtrip：attach ⇒ verify OK 且 block_hash 不变 ----
+    // ---- 签名 seam roundtrip（D-5.3.4：经 B2-B safety gate）：attach ⇒ verify OK 且 block_hash 不变 ----
     #[test]
     fn signature_seam_attaches_and_verifies() {
         let kp = KeyPair::generate().unwrap();
@@ -740,11 +762,226 @@ mod tests {
         let res = build(&store, &exec_ctx(CHAIN_ID, 0), &[cand]);
         let hash_before = res.block_hash;
         let signer = SoftwareSigner::new(KeyPair::generate().unwrap());
+        let journal = bs_journal("seam", &signer.public_key());
         let mut block = res.block;
-        attach_proposer_signature(&mut block, &signer).unwrap();
+        attach_proposer_signature(&mut block, &journal, &signer).unwrap();
         assert_eq!(hash_before, block_hash(&block).unwrap(), "sig ∉ block hash");
         validate_block_signature(&block, &signer.public_key(), CHAIN_ID)
             .expect("attached signature verifies (core P7-3)");
+    }
+
+    // ==================================================================
+    // D-5.3.4：生产 Block signing 集成（B2-B safety gate）测试 I-1 … I-8
+    // ==================================================================
+
+    /// 建一个与 `vk` 身份匹配的 block safety journal（临时目录；每调用唯一）。
+    fn bs_journal(tag: &str, vk: &VerifyingKey) -> BlockSafetyJournal {
+        let id = ValidatorId::from_consensus_public_key(&vk.to_bytes());
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "nova_bb_bs_{}_{}_{}",
+            std::process::id(),
+            tag,
+            unique
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        BlockSafetyJournal::create(
+            &dir.join("block-safety.journal"),
+            BlockSafetyIdentity::new(NetworkId::Mainnet, CHAIN_ID, [0x42; 32], &id),
+        )
+        .unwrap()
+    }
+
+    /// 构造一个候选 block（用于签名量级测试）。
+    fn unsigned_block() -> Block {
+        let kp = KeyPair::generate().unwrap();
+        let sender = sender_addr(kp.signing_key());
+        let store = seed_store(&[(sender, 1_000_000)]);
+        let cand = signed_candidate(kp.signing_key(), addr([0xCC; 32]), 0, 100, CHAIN_ID);
+        build(&store, &exec_ctx(CHAIN_ID, 0), &[cand]).block
+    }
+
+    // ---- I-1：正常路径（新 height）⇒ 签名成功、可验证、block_hash 不变 ----
+    #[test]
+    fn bs_i1_production_seam_signs_new_height() {
+        let signer = SoftwareSigner::new(KeyPair::generate().unwrap());
+        let journal = bs_journal("i1", &signer.public_key());
+        let mut block = unsigned_block();
+        let hash_before = block_hash(&block).unwrap();
+        attach_proposer_signature(&mut block, &journal, &signer).unwrap();
+        validate_block_signature(&block, &signer.public_key(), CHAIN_ID).unwrap();
+        assert_eq!(hash_before, block_hash(&block).unwrap(), "sig ∉ block_hash");
+        assert_eq!(journal.is_signed(block.header.height), Some(true));
+        assert!(journal.recorded_target(block.header.height).is_some());
+    }
+
+    // ---- I-2：同 height 同 target ⇒ F1 幂等；签名仍对同一 target 有效 ----
+    #[test]
+    fn bs_i2_same_height_same_target_is_idempotent() {
+        let signer = SoftwareSigner::new(KeyPair::generate().unwrap());
+        let journal = bs_journal("i2", &signer.public_key());
+        let mut block = unsigned_block();
+        attach_proposer_signature(&mut block, &journal, &signer).unwrap();
+        let target_after_first = journal.recorded_target(block.header.height).unwrap();
+        attach_proposer_signature(&mut block, &journal, &signer)
+            .expect("same height + same target ⇒ 幂等（F1-B）");
+        assert_eq!(
+            journal.recorded_target(block.header.height),
+            Some(target_after_first),
+            "target 不变（幂等）"
+        );
+        validate_block_signature(&block, &signer.public_key(), CHAIN_ID).unwrap();
+    }
+
+    // ---- I-3：同 height 不同 target ⇒ F2 冲突；**不产生第二份签名** ----
+    #[test]
+    fn bs_i3_same_height_different_target_conflicts() {
+        let signer = SoftwareSigner::new(KeyPair::generate().unwrap());
+        let journal = bs_journal("i3", &signer.public_key());
+        let mut first = unsigned_block();
+        attach_proposer_signature(&mut first, &journal, &signer).unwrap();
+        let target_first = journal.recorded_target(first.header.height).unwrap();
+
+        // 同 height、不同 timestamp ⇒ 不同 target
+        let mut second = unsigned_block();
+        second.header.height = first.header.height;
+        second.header.parent_hash = first.header.parent_hash;
+        second.header.timestamp = first.header.timestamp.wrapping_add(1);
+        let err = attach_proposer_signature(&mut second, &journal, &signer).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BlockBuilderError::BlockSafety(BlockSafetyError::ConflictingTarget { .. })
+            ),
+            "F2 必须为 ConflictingTarget，实际 {err:?}"
+        );
+        assert_eq!(second.proposer_signature, [0u8; 64], "不得产生第二份签名");
+        assert_eq!(
+            journal.recorded_target(first.header.height),
+            Some(target_first),
+            "旧 target 保持权威"
+        );
+        validate_block_signature(&first, &signer.public_key(), CHAIN_ID).unwrap();
+    }
+
+    // ---- I-4：同 height、新 round（不同 target）⇒ 拒绝（round 不创建新 slot） ----
+    #[test]
+    fn bs_i4_same_height_later_round_target_rejected() {
+        let signer = SoftwareSigner::new(KeyPair::generate().unwrap());
+        let journal = bs_journal("i4", &signer.public_key());
+        let mut first = unsigned_block();
+        attach_proposer_signature(&mut first, &journal, &signer).unwrap();
+
+        // 新 round 产出的“另一个提案”：同 height、不同 header 字节 ⇒ 不同 target
+        let mut reproposal = unsigned_block();
+        reproposal.header.height = first.header.height;
+        reproposal.header.timestamp = first.header.timestamp.wrapping_add(9);
+        let err = attach_proposer_signature(&mut reproposal, &journal, &signer).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockBuilderError::BlockSafety(BlockSafetyError::ConflictingTarget { .. })
+        ));
+        assert_eq!(reproposal.proposer_signature, [0u8; 64]);
+        assert_eq!(journal.occupied_slots(), 1, "round 未创建新 slot");
+    }
+
+    // ---- I-5：外来签名者 ⇒ 拒绝（F4 proposer identity / 签名者 identity） ----
+    #[test]
+    fn bs_i5_foreign_signer_identity_is_rejected() {
+        let signer = SoftwareSigner::new(KeyPair::generate().unwrap());
+        let journal = bs_journal("i5", &signer.public_key());
+        let foreign = SoftwareSigner::new(KeyPair::generate().unwrap());
+        let mut block = unsigned_block();
+        let err = attach_proposer_signature(&mut block, &journal, &foreign).unwrap_err();
+        // 本 seam 从 **signer 公钥**派生 `declared_proposer` ⇒ 外来签名者的声明 proposer
+        // 不等于 journal namespace 的 validator_id ⇒ F4 规则拒绝（若该规则通过，
+        // signer 派生身份校验同样会以 `SignerIdentityMismatch` 拒绝）。
+        assert!(
+            matches!(
+                err,
+                BlockBuilderError::BlockSafety(BlockSafetyError::ProposerIdentityMismatch)
+            ),
+            "外来签名者必须被拒绝（F4），实际 {err:?}"
+        );
+        assert_eq!(block.proposer_signature, [0u8; 64]);
+        assert!(journal.recorded_target(block.header.height).is_none());
+    }
+
+    // ---- I-6：restart（恢复后同请求）⇒ F1 幂等 ----
+    #[test]
+    fn bs_i6_restart_then_same_request_is_idempotent() {
+        let signer = SoftwareSigner::new(KeyPair::generate().unwrap());
+        let journal = bs_journal("i6", &signer.public_key());
+        let path = journal.path().to_path_buf();
+        let identity = *journal.identity();
+        let mut block = unsigned_block();
+        attach_proposer_signature(&mut block, &journal, &signer).unwrap();
+        let target = journal.recorded_target(block.header.height).unwrap();
+        drop(journal);
+
+        let restarted = BlockSafetyJournal::at(&path, identity);
+        restarted.recover().unwrap();
+        assert_eq!(restarted.recorded_target(block.header.height), Some(target));
+        attach_proposer_signature(&mut block, &restarted, &signer)
+            .expect("restart 后同 height + 同 target ⇒ F1 幂等");
+        validate_block_signature(&block, &signer.public_key(), CHAIN_ID).unwrap();
+    }
+
+    // ---- I-7：journal 损坏 ⇒ fail-closed（不签名） ----
+    #[test]
+    fn bs_i7_corrupt_journal_fails_closed() {
+        use std::io::Write as _;
+        let signer = SoftwareSigner::new(KeyPair::generate().unwrap());
+        let journal = bs_journal("i7", &signer.public_key());
+        let path = journal.path().to_path_buf();
+        let identity = *journal.identity();
+        let mut block = unsigned_block();
+        attach_proposer_signature(&mut block, &journal, &signer).unwrap();
+        drop(journal);
+
+        // 追加垃圾字节 ⇒ 尾部 record 不完整 ⇒ 恢复必须拒绝
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&[0xFF; 7]).unwrap();
+        f.sync_all().unwrap();
+
+        let broken = BlockSafetyJournal::at(&path, identity);
+        assert!(broken.recover().is_err(), "损坏 journal 必须 fail-closed");
+        let mut fresh = unsigned_block();
+        let err = attach_proposer_signature(&mut fresh, &broken, &signer).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockBuilderError::BlockSafety(BlockSafetyError::NotRecovered)
+        ));
+        assert_eq!(fresh.proposer_signature, [0u8; 64]);
+    }
+
+    // ---- I-8：未恢复的 safety 状态 ⇒ seam 拒绝，绝不隐式签名（无 direct-sign fallback） ----
+    #[test]
+    fn bs_i8_unrecovered_safety_state_cannot_sign() {
+        let signer = SoftwareSigner::new(KeyPair::generate().unwrap());
+        let journal = bs_journal("i8", &signer.public_key());
+        let path = journal.path().to_path_buf();
+        let identity = *journal.identity();
+        drop(journal);
+
+        let bound = BlockSafetyJournal::at(&path, identity);
+        assert!(!bound.is_recovered());
+        let mut block = unsigned_block();
+        let err = attach_proposer_signature(&mut block, &bound, &signer).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockBuilderError::BlockSafety(BlockSafetyError::NotRecovered)
+        ));
+        assert_eq!(
+            block.proposer_signature, [0u8; 64],
+            "无有效 safety 状态时绝不签名（无直签回退）"
+        );
     }
 
     // 测试辅助：BURN_ADDRESS 地址（与 core `burn_address` 同构；node 不直接依赖 core，自建同构引用）。

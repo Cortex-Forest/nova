@@ -31,6 +31,7 @@ pub mod fork_choice;
 pub mod integration;
 pub mod proposer;
 pub mod round;
+pub mod round_change;
 pub mod validator;
 pub mod vote;
 pub mod witness;

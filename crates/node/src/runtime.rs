@@ -21,23 +21,35 @@
 //!   已声明 ⇒ 显式 `create_new`（已存在则 [`NodeRuntimeError::SafetyJournalAlreadyExists`]）。
 //! - full-node（`validator_enabled=false`）：跳过 key / safety / validator，不触碰 Provider。
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use nova_consensus::dag::Dag;
 use nova_consensus::finality::{FinalityError, QuorumCertificate};
 use nova_consensus::integration::{ConsensusState, TransitionResult};
 use nova_consensus::proposer::select_proposer;
-use nova_consensus::round::{RoundStep, RoundTimeoutConfig};
+use nova_consensus::round::{ProposalRef, RoundStep, RoundTimeoutConfig};
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_consensus::vote::VoteType;
+// PHASE 6H-Z（Owner D1-1 = D1-B）— O2 入站 `RoundChangeCertificate` 权威路径（仅 decode +
+// 有界暂存存储；验证 / 适用性 / 应用均在 `round_change_inbound` 的冻结委托路径中）。
+use nova_consensus::round_change::{
+    AdmitOutcome, RoundChangeCertificate, RoundChangeError, RoundChangeEvidence, RoundChangeStore,
+    decode_certificate,
+};
 use nova_crypto::identity::ChainIdentity;
 use nova_crypto::signature::VerifyingKey;
 use nova_network::event_loop::{EventLoop, EventLoopConfig, EventLoopError};
 use nova_network::message::{MessageEnvelope, MessageType};
 use nova_network::network_service::{NetworkService, NetworkServiceConfig, NetworkServiceError};
 use nova_network::node_id::NodeId;
+// PHASE 6H-AF：ADR-0074（FROZEN）canonical attestation container（精确 112B）。
+use nova_network::abandon_attestation::{
+    ABANDON_ATTESTATION_LEN, AbandonAttestation, decode as decode_abandon_attestation,
+};
 use nova_network::security::{NetworkSecurityError, random_request_id};
 use nova_network::session::{
     HandshakeKind, PeerAuthConfig, SessionError, handshake_payload_encode, random_session_nonce,
@@ -51,14 +63,16 @@ use crate::assembly::{AdoptionOutcome, ConsensusNode};
 use crate::block_adapter::{NoAccountsKeyResolver, NodeBlockAdapter, NodeBlockApplicationError};
 use crate::block_dispatch::{
     dispatch_gossip_block_round_aware, dispatch_sync_block_response_round_aware,
-    resolve_proposer_round_evidence, resolve_proposer_round_from_evidences,
+    resolve_expected_proposer_vk_at, resolve_inbound_block_round,
+    resolve_proposer_round_evidence, resolve_proposer_round_from_evidences, wire_block_hash,
 };
 use crate::block_inbound::{InboundBlockError, InboundBlockVerdict};
+use crate::block_safety::{BlockSafetyError, BlockSafetyIdentity, BlockSafetyJournal};
 use crate::bootstrap::{self, ConnectionTargetError, NodeConfig, NodeStartupError};
 use crate::driver::{DriverError, NodeConsensusDriver};
 use crate::inbound::{
-    InboundDiagnostics, InboundListenerError, InboundListenerState, InboundMultiplexTransport,
-    peer_key,
+    InboundDiagnostics, InboundDropReason, InboundListenerError, InboundListenerState,
+    InboundMultiplexTransport, peer_key,
 };
 use crate::intent_ledger::{
     BlockInboundSource, MissingAncestorIntent, MissingAncestorIntentLedger,
@@ -68,6 +82,8 @@ use crate::network_identity::{NetworkSigner, NetworkSigningError};
 use crate::outbound::OutboundConsensusMessage;
 use crate::proposer::{ProposalBuild, ProposerError, build_proposal};
 use crate::qc_history::{QcHistory, QcHistoryError};
+use crate::round_change_inbound::{RoundChangeApplication, apply_verified_round_change};
+use crate::round_change_pool::{LocalExpireObservation, PoolOutcome, RoundChangeAttestationPool};
 use crate::safety_store::{SafetyIdentity, ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
 use crate::sync_correlator::{LogicalTick, SyncRequestCorrelator, SyncRequestTarget};
@@ -131,6 +147,443 @@ const PENDING_EXTERNAL_QC_CAP: usize = 8;
 
 /// P1-A.7 — 每 step 最多尝试采纳的外部 QC 数（bounded work；其余留待下一 step）。
 const EXTERNAL_QC_ADOPT_MAX_PER_STEP: usize = 2;
+
+// ---------------------------------------------------------------------------
+// PHASE 6H-A11 U1 — Bounded Pending Proposal Store（ADR-0076 PADR-5.2 / PADR-5.3）
+// ---------------------------------------------------------------------------
+//
+// 授权：PHASE 6H-A11-IMPLEMENT-AUTHORIZATION（OD-C1 = A / OD-C3 / OD-C5）。
+// 本单元（U1）**仅**实现容器基础设施：容量 / 去重 / 到期（确定性 tick）/ 计数。
+// **不含** admission guard、**不含** recovery checkpoint（归 U2 / U3）⇒ 本单元
+// **不改变任何共识流程**（零共识状态变更 / 无 progress / 无 RESET 影响）。
+
+/// PHASE 6H-A11 U1 — pending proposal 有界容量（ADR-0076 PADR-5.2；OD-21 冻结）。
+///
+/// 满 ⇒ **FIFO deterministic** 淘汰最旧 + `evicted` 计数；**MUST NOT 无限缓存**。
+/// 容量是内存有界性的最终保证（独立于到期机制）。
+pub const MAX_PENDING_PROPOSALS: usize = 64;
+
+/// PHASE 6H-A11 U1 — 到期换算因子（ADR-0076 `MAX_PENDING_TICKS = 2 rounds`；OD-C3 冻结）。
+///
+/// `expiry_tick = arrival_tick + 2 * round_timeout_window_ticks(config, arrival_round)`（饱和算术）。
+///
+/// **A3 变更告知（行为影响已评估）**：`round_timeout_window_ticks` 返回的仍是
+/// `RoundTimeoutConfig` 的**数值**，而 A3 把该配置的默认单位从「逻辑 step tick」
+/// （1000 / 60_000）改为**毫秒**（10_000 / 120_000）⇒ 该函数返回值随之变大，
+/// 因此 pending 提案在**步数**上的保留期也等比变长（round 0：2 × 10_000 步，饱和）。
+/// 评估：这不改变任何共识判定（pending 仅缓存 incoming proposal），且内存有界性仍由
+/// [`MAX_PENDING_PROPOSALS`]（FIFO 淘汰）**硬保证**；A3 授权范围仅覆盖 round-timeout
+/// 计时器，故此处**不**重设计 pending 到期模型（保持冻结公式），仅记录该后果。
+pub const PENDING_EXPIRY_ROUNDS: u64 = 2;
+
+/// PHASE 6H-A11 U1 — 每次 sweep 的**固定**检查上界（OD-C3 附加冻结 2：禁止非确定性扫描）。
+pub const PENDING_SWEEP_MAX_PER_STEP: usize = 64;
+
+/// PHASE 6H-A11 U1 — 计算 pending 条目到期 tick（确定性；无 wall clock / 无新增 timer）。
+///
+/// 语义（OD-C3）：
+/// - 使用**既有**逻辑 step tick 与**既有**冻结函数 [`round_timeout_window_ticks`]；
+/// - 全程 `saturating_*`（**饱和/有界**）：不 panic / 不环绕；极端取值下 `expiry_tick` 可能
+///   大到实际不可达 —— 此时内存有界性仍由 [`MAX_PENDING_PROPOSALS`] 保证（FIFO 淘汰）。
+pub fn pending_expiry_tick(
+    config: &RoundTimeoutConfig,
+    arrival_tick: u64,
+    arrival_round: u64,
+) -> u64 {
+    let window = round_timeout_window_ticks(config, arrival_round);
+    arrival_tick.saturating_add(window.saturating_mul(PENDING_EXPIRY_ROUNDS))
+}
+
+/// PHASE 6H-A11 U1 — 单个 pending 提案条目（binding metadata；**不**参与任何共识状态）。
+///
+/// `arrival_round` 的冻结用法（OD-C2）：**仅**作为 proposal-bound 证据输入
+/// （`resolve_proposer_round_evidence` 的 `proposal` 参数）；**不得**当作 `round_now`、
+/// **不得**覆盖 proposer evidence、**不得**修改 consensus round / finality / QC / lock。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingProposal {
+    /// 原始提案引用（`block_hash` + `proposer`）。
+    pub proposal_ref: ProposalRef,
+    /// 去重键（= `proposal_ref.block_hash`；显式保存以便 O(1) 比较/检索）。
+    pub block_hash: [u8; 32],
+    /// 到达时的共识高度（父高轮语义；**仅**元数据）。
+    pub arrival_height: u64,
+    /// 到达时的本地共识轮（**仅** binding metadata；OD-C2）。
+    pub arrival_round: u64,
+    /// 到达时的确定性 tick（逻辑 step 计数；无墙钟）。
+    pub received_tick: u64,
+    /// 到期 tick（[`pending_expiry_tick`] 结果；饱和）。
+    pub expiry_tick: u64,
+}
+
+/// PHASE 6H-A11 U1 — [`PendingProposalStore::insert`] 结果（确定性）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingInsertOutcome {
+    /// 已插入（可能伴随一次 FIFO 容量淘汰，见 [`PendingProposalStore::evicted_count`]）。
+    Inserted,
+    /// 同 `block_hash` 已存在 ⇒ **不**产生第二条目（幂等）。
+    Duplicate,
+}
+
+/// PHASE 6H-A11 DIAG — Guard 拒绝原因（**仅观测**；不参与任何判定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardReject {
+    /// 无 canonical adapter / 无 block store。
+    NoStore,
+    /// 存储读取错误（fail-closed）。
+    StorageError,
+    /// 区块尚未本地可用（Guard A1）。
+    MissingBlock,
+    /// Guard A2：父高轮上下文不匹配。
+    HeightContext,
+    /// `block.header.height == 0`（无父高轮）。
+    HeightUnderflow,
+    /// Guard C：绑定证据不可用 / 矛盾（resolver `Err`）。
+    Evidence,
+    /// Guard C：期望 proposer 推导失败（空集 / 非成员 / 非法公钥）。
+    Proposer,
+    /// Guard C：签名验证失败（含零签名）。
+    Signature,
+}
+
+/// PHASE 6H-A11 U1 — **有界** pending proposal 存储（Node-local；**不**持有共识状态）。
+///
+/// 不变量：
+/// - `entries.len() <= `[`MAX_PENDING_PROPOSALS`]（FIFO 淘汰保证）；
+/// - 同一 `block_hash` 至多一条；
+/// - 所有方法**零**共识状态变更（本类型无法访问 `ConsensusState`）。
+#[derive(Debug)]
+pub struct PendingProposalStore {
+    entries: VecDeque<PendingProposal>,
+    admitted: u64,
+    rejected: u64,
+    expired: u64,
+    evicted: u64,
+    /// PHASE 6H-A11 DIAG — 首次入 pending 次数（**仅观测**）。
+    pended: u64,
+    /// PHASE 6H-A11 DIAG — 按 [`GuardReject`] 分类的拒绝次数（**仅观测**）。
+    guard_rejects: [u64; 8],
+}
+
+impl PendingProposalStore {
+    /// 空存储。
+    pub fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            admitted: 0,
+            rejected: 0,
+            expired: 0,
+            evicted: 0,
+            pended: 0,
+            guard_rejects: [0; 8],
+        }
+    }
+
+    /// 当前条目数（≤ [`MAX_PENDING_PROPOSALS`]）。
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 是否为空。
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 是否已存在该 `block_hash`（去重键）。
+    pub fn contains(&self, block_hash: &[u8; 32]) -> bool {
+        self.entries.iter().any(|e| &e.block_hash == block_hash)
+    }
+
+    /// 只读取回条目（U3 recovery 读取证据用；不消费）。
+    pub fn get(&self, block_hash: &[u8; 32]) -> Option<&PendingProposal> {
+        self.entries.iter().find(|e| &e.block_hash == block_hash)
+    }
+
+    /// 插入（去重 + 容量 FIFO 淘汰）；**不**触碰共识状态。
+    pub fn insert(&mut self, entry: PendingProposal) -> PendingInsertOutcome {
+        if self.contains(&entry.block_hash) {
+            return PendingInsertOutcome::Duplicate;
+        }
+        if self.entries.len() >= MAX_PENDING_PROPOSALS {
+            let _ = self.entries.pop_front();
+            self.evicted = self.evicted.saturating_add(1);
+        }
+        self.entries.push_back(entry);
+        PendingInsertOutcome::Inserted
+    }
+
+    /// 消费（移除并返回）指定条目（U3 准入/拒绝后调用）。
+    pub fn remove(&mut self, block_hash: &[u8; 32]) -> Option<PendingProposal> {
+        let idx = self
+            .entries
+            .iter()
+            .position(|e| &e.block_hash == block_hash)?;
+        self.entries.remove(idx)
+    }
+
+    /// 到期 sweep：仅检查**队首起最多 `max_checks` 条**（固定上界 ⇒ 确定性），移除其中
+    /// `now_tick >= expiry_tick` 的条目；返回移除数。**不**改变共识状态。
+    ///
+    /// 注意（MUST）：`expiry_tick` 在插入序上**不保证单调**（窗口随 round 变化；高度推进后
+    /// round 可回落到 0 ⇒ 窗口变小）⇒ **必须**在固定上界内全量检查该窗口，**MUST NOT** 见到
+    /// 首个未到期条目就提前终止。
+    pub fn sweep_expired(&mut self, now_tick: u64, max_checks: usize) -> usize {
+        let bound = max_checks.min(self.entries.len());
+        let mut kept: VecDeque<PendingProposal> =
+            VecDeque::with_capacity(self.entries.len().saturating_sub(bound));
+        let mut removed = 0usize;
+        for _ in 0..bound {
+            match self.entries.pop_front() {
+                Some(e) if now_tick >= e.expiry_tick => removed += 1,
+                Some(e) => kept.push_back(e),
+                None => break,
+            }
+        }
+        // 保留原相对顺序：先放回已检查且未到期的，再追加未检查的尾部。
+        kept.append(&mut self.entries);
+        self.entries = kept;
+        if removed > 0 {
+            self.expired = self.expired.saturating_add(removed as u64);
+        }
+        removed
+    }
+
+    /// PHASE 6H-A11 U3 — 有界证据快照：至多 `max` 条 `(block_hash, arrival_round)`。
+    ///
+    /// 供 recovery checkpoint 在**无借用冲突**下遍历（`remove` 需 `&mut self`）；
+    /// 固定上界 ⇒ 确定性、**无**无界扫描。`arrival_round` 仅作 proposal-bound 证据输入（OD-C2）。
+    pub fn evidence_bounded(&self, max: usize) -> Vec<([u8; 32], u64)> {
+        self.entries
+            .iter()
+            .take(max)
+            .map(|e| (e.block_hash, e.arrival_round))
+            .collect()
+    }
+
+    /// 准入成功次数（U2/U3 起自增；确定性诊断计数）。
+    pub fn admitted_count(&self) -> u64 {
+        self.admitted
+    }
+
+    /// 准入拒绝次数（U2/U3 起自增；确定性诊断计数）。
+    pub fn rejected_count(&self) -> u64 {
+        self.rejected
+    }
+
+    /// 到期淘汰次数。
+    pub fn expired_count(&self) -> u64 {
+        self.expired
+    }
+
+    /// 容量（FIFO）淘汰次数。
+    pub fn evicted_count(&self) -> u64 {
+        self.evicted
+    }
+
+    /// 记录一次**成功准入**（由 U2/U3 调用；本单元仅提供计数槽位）。
+    pub fn note_admitted(&mut self) {
+        self.admitted = self.admitted.saturating_add(1);
+    }
+
+    /// 记录一次**准入拒绝**（由 U2/U3 调用）。
+    pub fn note_rejected(&mut self) {
+        self.rejected = self.rejected.saturating_add(1);
+    }
+
+    /// PHASE 6H-A11 DIAG — 记录一次**首次入 pending**（**仅观测**）。
+    pub fn note_pended(&mut self) {
+        self.pended = self.pended.saturating_add(1);
+    }
+
+    /// PHASE 6H-A11 DIAG — 按原因记一次拒绝（同时计入总数；**仅观测**）。
+    pub fn note_guard_reject(&mut self, reason: GuardReject) {
+        self.rejected = self.rejected.saturating_add(1);
+        let idx = reason as usize;
+        if let Some(slot) = self.guard_rejects.get_mut(idx) {
+            *slot = slot.saturating_add(1);
+        }
+    }
+
+    /// PHASE 6H-A11 DIAG — 首次入 pending 次数（**仅观测**）。
+    pub fn pended_count(&self) -> u64 {
+        self.pended
+    }
+
+    /// PHASE 6H-A11 DIAG — 指定原因的拒绝次数（**仅观测**）。
+    pub fn guard_reject_count(&self, reason: GuardReject) -> u64 {
+        self.guard_rejects
+            .get(reason as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// P1-A.30 **D0** — 全部 8 类拒绝计数（**仅观测**；顺序 = `GuardReject` 判别值：
+    /// `[NoStore, StorageError, MissingBlock, HeightContext, HeightUnderflow, Evidence, Proposer,
+    /// Signature]`）。
+    ///
+    /// 与 [`Self::guard_reject_count`] **同一数据源**（无第二套计数）；数组之和 == [`Self::rejected_count`]。
+    pub fn guard_reject_counts(&self) -> [u64; 8] {
+        let mut out = [0u64; 8];
+        for (idx, slot) in out.iter_mut().enumerate() {
+            *slot = self.guard_rejects.get(idx).copied().unwrap_or(0);
+        }
+        out
+    }
+}
+
+impl Default for PendingProposalStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod pending_proposal_tests {
+    use super::*;
+
+    fn pref(byte: u8) -> ProposalRef {
+        ProposalRef {
+            block_hash: [byte; 32],
+            proposer: ValidatorId::from_consensus_public_key(&[byte; 32]),
+        }
+    }
+
+    fn entry(byte: u8, tick: u64, round: u64) -> PendingProposal {
+        let config = RoundTimeoutConfig::default();
+        PendingProposal {
+            proposal_ref: pref(byte),
+            block_hash: [byte; 32],
+            arrival_height: round.saturating_add(1),
+            arrival_round: round,
+            received_tick: tick,
+            expiry_tick: pending_expiry_tick(&config, tick, round),
+        }
+    }
+
+    #[test]
+    fn u1_insert_contains_get_remove_roundtrip() {
+        let mut store = PendingProposalStore::new();
+        assert!(store.is_empty());
+        assert_eq!(
+            store.insert(entry(0x11, 10, 0)),
+            PendingInsertOutcome::Inserted
+        );
+        assert_eq!(store.len(), 1);
+        assert!(store.contains(&[0x11; 32]));
+        let got = store.get(&[0x11; 32]).expect("entry present");
+        assert_eq!(got.block_hash, [0x11; 32]);
+        assert_eq!(got.arrival_round, 0);
+        assert_eq!(got.arrival_height, 1);
+        assert_eq!(got.received_tick, 10);
+        let removed = store.remove(&[0x11; 32]).expect("removed");
+        assert_eq!(removed.proposal_ref.block_hash, [0x11; 32]);
+        assert!(store.is_empty());
+        assert!(store.remove(&[0x11; 32]).is_none());
+    }
+
+    #[test]
+    fn u1_duplicate_block_hash_is_rejected() {
+        let mut store = PendingProposalStore::new();
+        assert_eq!(
+            store.insert(entry(0x22, 10, 0)),
+            PendingInsertOutcome::Inserted
+        );
+        assert_eq!(
+            store.insert(entry(0x22, 20, 3)),
+            PendingInsertOutcome::Duplicate
+        );
+        assert_eq!(store.len(), 1);
+        // 元数据保持首次值（不被后续重复插入覆盖）。
+        assert_eq!(store.get(&[0x22; 32]).expect("entry").received_tick, 10);
+    }
+
+    #[test]
+    fn u1_capacity_is_64_and_evicts_oldest_fifo() {
+        assert_eq!(MAX_PENDING_PROPOSALS, 64);
+        let mut store = PendingProposalStore::new();
+        for i in 0..65u8 {
+            assert_eq!(
+                store.insert(entry(i, 100, 0)),
+                PendingInsertOutcome::Inserted
+            );
+        }
+        assert_eq!(store.len(), MAX_PENDING_PROPOSALS);
+        assert_eq!(store.evicted_count(), 1);
+        assert!(!store.contains(&[0u8; 32]), "最旧条目应被 FIFO 淘汰");
+        assert!(store.contains(&[64u8; 32]), "最新条目应在");
+    }
+
+    #[test]
+    fn u1_expiry_mapping_is_two_round_windows() {
+        let config = RoundTimeoutConfig::default();
+        // 冻结映射（OD-C3）：round 0 ⇒ +2×10_000；round 1 ⇒ +2×20_000（A3 默认基线单位 = 毫秒）。
+        assert_eq!(pending_expiry_tick(&config, 100, 0), 20_100);
+        assert_eq!(pending_expiry_tick(&config, 100, 1), 40_100);
+    }
+
+    #[test]
+    fn u1_sweep_removes_expired_not_only_head() {
+        // 非单调 expiry（窗口随 round 变化）：A（round 5）晚到期（241_000），B（round 0）先到期（21_000）。
+        let mut store = PendingProposalStore::new();
+        assert_eq!(
+            store.insert(entry(0xA1, 1_000, 5)),
+            PendingInsertOutcome::Inserted
+        );
+        assert_eq!(
+            store.insert(entry(0xB2, 1_000, 0)),
+            PendingInsertOutcome::Inserted
+        );
+        let removed = store.sweep_expired(30_000, PENDING_SWEEP_MAX_PER_STEP);
+        assert_eq!(removed, 1, "只应淘汰已到期条目");
+        assert!(store.contains(&[0xA1; 32]), "未到期条目必须保留");
+        assert!(!store.contains(&[0xB2; 32]), "已到期条目必须淘汰");
+        assert_eq!(store.expired_count(), 1);
+    }
+
+    #[test]
+    fn u1_sweep_respects_fixed_bound() {
+        let mut store = PendingProposalStore::new();
+        for i in 0..3u8 {
+            assert_eq!(
+                store.insert(entry(i, 10, 0)),
+                PendingInsertOutcome::Inserted
+            );
+        }
+        let removed = store.sweep_expired(1_000_000, 1);
+        assert_eq!(removed, 1, "每次 sweep 至多检查/移除 1 条");
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.expired_count(), 1);
+    }
+
+    #[test]
+    fn u1_saturation_never_panics_and_capacity_still_bounds() {
+        let config = RoundTimeoutConfig::default();
+        assert_eq!(pending_expiry_tick(&config, u64::MAX, 0), u64::MAX);
+        let mut store = PendingProposalStore::new();
+        let mut e = entry(0xC3, u64::MAX, 0);
+        assert_eq!(e.expiry_tick, u64::MAX);
+        e.proposal_ref = pref(0xC3);
+        assert_eq!(store.insert(e), PendingInsertOutcome::Inserted);
+        assert_eq!(
+            store.sweep_expired(u64::MAX - 1, PENDING_SWEEP_MAX_PER_STEP),
+            0
+        );
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn u1_diagnostic_counters_are_deterministic_slots() {
+        let mut store = PendingProposalStore::new();
+        assert_eq!(store.admitted_count(), 0);
+        assert_eq!(store.rejected_count(), 0);
+        assert_eq!(store.expired_count(), 0);
+        assert_eq!(store.evicted_count(), 0);
+        store.note_admitted();
+        store.note_rejected();
+        assert_eq!(store.admitted_count(), 1);
+        assert_eq!(store.rejected_count(), 1);
+        assert!(store.is_empty(), "计数不改变容器内容");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // P1-A.8 — Configured peer lifecycle / reconnect backoff（node-local；零新依赖）
@@ -247,11 +700,34 @@ fn resolve_proposer_round_evidence_with_recovery(
 ///   不同步 / 已提案 ⇒ `Ok(None)`，no-op）。
 /// - 返回 `Some(ProposalBuild)`（本地保留 Block，**不持久化 / 不推进 head**）；无 adapter /
 ///   无 actor ⇒ `Ok(None)`。
+///
+/// **SAFETY-REJECT-SKIP（Owner 授权）** — 本地出块签名错误的**唯一**可恢复性判定点。
+///
+/// 语义（MUST）：
+///
+/// - 唯一可恢复情形 = `block_safety` F2/F3/F4 的**常态冲突拒绝**（`ConflictingTarget`）：
+///   本地已为同一 `height` 签过**不同** target（`declared_round` 不是 slot 维度 ⇒ F3）⇒ 安全门
+///   **正确地**拒签 ⇒ 本次提案必须被放弃（既不签名也不广播），但**不得**终止节点。
+///   合法安全拒绝 ≠ 故障：把它当 fatal 会把安全性守卫变成 liveness 事故。
+/// - 其余**全部**变体（journal I/O / 损坏 / 未恢复 / identity 失配 / 链或高失配 / 签名失败 /
+///   自检失败 / 无 safety gate / double-vote / lock / abandon）⇒ **不可恢复**（保持 fatal）。
+///
+/// 本函数是**唯一**判定点：不得在别处 catch `RuntimeError::Validator`、不得按错误文本匹配。
+fn is_recoverable_proposal_refusal(e: &ValidatorActorError) -> bool {
+    matches!(
+        e,
+        ValidatorActorError::BlockSignSafety(BlockSafetyError::ConflictingTarget { .. })
+    )
+}
+
 fn runtime_propose(
     driver: &mut NodeConsensusDriver<DynSigner>,
     block_production: &Option<NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>>,
     timestamp: u64,
+    live: &mut LivenessObservability,
 ) -> Result<Option<ProposalBuild>, RuntimeError> {
+    // PHASE 6H-A30 OD-X7 — 只读观测：调用计数（**不**参与任何判定）。
+    live.prop_calls = live.prop_calls.saturating_add(1);
     // G4（Owner 决策）—— **无 recovery hard guard**：恢复窗口内也照常出块。
     // 恒不 freeze 活性；finality 冲突保护仍由 frozen `check_finality_applicability`
     // （Conflict ⇒ 零状态变更）与既有 lock 语义承担。
@@ -264,12 +740,49 @@ fn runtime_propose(
     let proposal = build_proposal(local_id, driver.consensus(), adapter, timestamp)
         .map_err(RuntimeError::Proposer)?;
     let Some(mut pb) = proposal else {
+        // PHASE 6H-A30 OD-X7 — 跳过原因**只读复算**（OD-X4 = A2；AC-4 残差法）。
+        // 边界（MUST）：不改任何判定 / 不重试 / 不建第二套规则；不确定者一律归残差。
+        {
+            let rs = &driver.consensus().state().round;
+            let (rs_step, rs_has_proposal, rs_height, rs_round) =
+                (rs.step, rs.proposal.is_some(), rs.height, rs.round);
+            let head_height = adapter.head().height;
+            if rs_step != RoundStep::Propose || rs_has_proposal {
+                live.prop_skip_step_guard = live.prop_skip_step_guard.saturating_add(1);
+            } else if rs_height != head_height {
+                live.prop_skip_height_desync = live.prop_skip_height_desync.saturating_add(1);
+            } else {
+                let set_id = driver.consensus().genesis_hash();
+                let elected = select_proposer(
+                    driver.consensus().chain_id(),
+                    rs_height,
+                    rs_round,
+                    &set_id,
+                    driver.consensus().validator_set(),
+                );
+                if matches!(elected, Ok(sel) if sel != local_id) {
+                    live.prop_skip_not_elected = live.prop_skip_not_elected.saturating_add(1);
+                }
+                // 其余（含选择失败 / 未知原因）⇒ **残差**（`prop_skip_fail`），不猜测。
+            }
+        }
         return Ok(None);
     };
     // 出块签名（ValidatorActor 授权；signature ∉ block_hash —— hash 在签名前已定）。
+    //
+    // **SAFETY-REJECT-SKIP**：区分「**常态安全拒绝**」与「真故障」（判定点 =
+    // [`is_recoverable_proposal_refusal`]）。冲突拒绝 ⇒ 放弃**这一次**提案（不签名 / 不写
+    // BlockStore / 不 submit / 不广播）且节点继续运行；**绝不**重试同一冲突 target。其余错误
+    // 保持 fatal（fail-closed、不吞错）。
     if let Some(a) = driver.actor(0) {
-        a.sign_block(&mut pb.block)
-            .map_err(RuntimeError::Validator)?;
+        match a.sign_block(&mut pb.block) {
+            Ok(()) => {}
+            Err(e) if is_recoverable_proposal_refusal(&e) => {
+                live.prop_skip_conflict_target = live.prop_skip_conflict_target.saturating_add(1);
+                return Ok(None);
+            }
+            Err(e) => return Err(RuntimeError::Validator(e)),
+        }
     }
     // D10-C Step 4：本地 produced block 尽早 durable 进 BlockStore（只写 block；不推进 head /
     // state / 不提前 commit）—— 使「finality 后 commit 前 crash」时，
@@ -296,7 +809,49 @@ fn runtime_propose(
     }
     // 提交共识（ProposalRef 64B；只记 hash，不含 Block）。
     let _ = driver.submit_proposal(pb.proposal_ref.clone());
+    // PHASE 6H-A30 OD-X7 — 只读观测：成功构造**并提交**（**不**参与判定）。
+    live.prop_build_ok = live.prop_build_ok.saturating_add(1);
     Ok(Some(pb))
+}
+
+/// PHASE 6H-A30 OD-X7 — **只读**瞬态观测（每 step 调用一次；**不**参与任何判定）。
+///
+/// - `prop_absent_steps`：当前 `(height, round)` 内 `proposal_present == false` 的**连续 step** 数；
+///   `(height, round)` 变化或提案出现 ⇒ 归零（确定性）。
+///   **与 `timer_elapsed`（tick 语义）不同**，不得混用。
+/// - `elected_is_self`：`select_proposer` 与本地 validator id 的**只读**比较；无法判定 ⇒ `false`。
+fn observe_liveness_transient(
+    driver: &NodeConsensusDriver<DynSigner>,
+    live: &mut LivenessObservability,
+) {
+    let (h_now, r_now) = {
+        let s = driver.consensus().state();
+        (s.round.height, s.round.round)
+    };
+    if live.prop_absent_key != (h_now, r_now) {
+        live.prop_absent_key = (h_now, r_now);
+        live.prop_absent_steps = 0;
+    }
+    if driver.consensus().state().round.proposal.is_some() {
+        live.prop_absent_steps = 0;
+    } else {
+        live.prop_absent_steps = live.prop_absent_steps.saturating_add(1);
+    }
+    let set_id = driver.consensus().genesis_hash();
+    let local = driver.actor(0).map(|a| a.validator_id());
+    live.elected_is_self = match (
+        local,
+        select_proposer(
+            driver.consensus().chain_id(),
+            h_now,
+            r_now,
+            &set_id,
+            driver.consensus().validator_set(),
+        ),
+    ) {
+        (Some(lid), Ok(sel)) => sel == lid,
+        _ => false,
+    };
 }
 
 /// D10-A Step 3：本地 consensus 自动推进（enabled 网络主循环每 step 调用；free fn —— 不借 Runtime）。
@@ -364,67 +919,176 @@ fn derived_qc_not_applicable(err: &DriverError) -> bool {
 // 边界（不得越界）：timeout 的**唯一**动作是调用冻结的 `ConsensusNode::round_timeout()`；
 // 它**不**产生 vote / QC / finality / lock / DAG 变更，也**不**广播（非证据、非 certificate）。
 
-/// `RoundTimeoutConfig::timeout_for` 退避循环的迭代上界（见 [`round_timeout_window_ticks`]）。
+/// `RoundTimeoutConfig::timeout_for` 退避循环的迭代上界（见 [`round_timeout_window_ms`]）。
 const ROUND_TIMEOUT_MAX_BACKOFF_STEPS: u64 = 64;
 
-/// 窗口下界（保证 arming 后至少有一个 step 的宽限期；防退化的 0 窗口立即触发）。
-const ROUND_TIMEOUT_MIN_WINDOW_TICKS: u64 = 1;
+/// 毫秒 → 纳秒。
+const NANOS_PER_MS: u64 = 1_000_000;
 
-/// P1-A.6 — `window(round) = min(initial × backoff^round, max)`（冻结 `RoundTimeoutConfig` 语义）。
-///
-/// 数值以 **逻辑 step tick** 解释（node-local 配置，**非**协议常量 —— ADR-0049 §3.5）。
-/// 溢出安全：`timeout_for` 内部为 `saturating_mul(...).min(max)`；这里额外把 round 夹到
-/// [`ROUND_TIMEOUT_MAX_BACKOFF_STEPS`] 以避免退化配置（如 `backoff_factor == 1` 且
-/// `initial < max`）在极大 round 上退化为 O(round) 循环：`backoff ≥ 2` 时 `initial × 2^64`
-/// 必然 saturate 到 cap ⇒ 结果与真实 round **完全一致**；`backoff == 1` 时窗口与迭代次数无关。
-fn round_timeout_window_ticks(config: &RoundTimeoutConfig, round: u64) -> u64 {
-    config
-        .timeout_for(round.min(ROUND_TIMEOUT_MAX_BACKOFF_STEPS))
-        .max(ROUND_TIMEOUT_MIN_WINDOW_TICKS)
+// ===== A3 — 单调时钟 seam（Owner 授权：Testnet 基线 10s / ×2 / 120s）=====
+//
+// 生产 = `std::time::Instant`（**单调**；不受墙钟调整影响）；测试 = 确定性 fake（显式 `advance`，
+// **不** sleep）。计时决策从"step tick 计数"改为"单调已历时 ≥ 窗口"；**事件矩阵不变**
+//（ADR-0049 §3.3/§3.4/§3.4.1：arm / reset / expire / height 前进重置 / RC 交互全部保持）。
+
+/// A3 单调时钟：返回自时钟起点起的单调已历时（**永不回退**；**不**是墙钟时间戳）。
+pub trait MonotonicClock {
+    /// 单调已历时（生产 = `Instant::elapsed`；测试 = fake 计数）。
+    fn elapsed(&self) -> Duration;
 }
 
-/// P1-A.6 — 当前 `(height, round)` 的本地计时器（**只**含位置 + tick 计数）。
+/// 生产单调时钟（`Instant`；与墙钟/时区/NTP 调整无关联）。
+#[derive(Debug)]
+pub struct SystemClock {
+    start: Instant,
+}
+
+impl SystemClock {
+    /// 以 `Instant::now()` 为单调起点。
+    pub fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MonotonicClock for SystemClock {
+    fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+}
+
+/// 测试用**确定性** fake 时钟（无 `sleep` / 无线程 / 与机器负载无关）。
 ///
-/// `elapsed_ticks` = 本计时器（重新）arm 之后**已历经的 step 数**（arming 的那一步记 1）。
-/// 语义：`window_ticks` = 该 `(height, round)` 允许的最大 step 数；`elapsed >= window` ⇒ 到期。
+/// - [`Self::advance_ms`] / [`Self::advance_ns`]：显式前进；
+/// - [`Self::set_ns`]：绝对设定（**允许回拨** —— 用于验证"回拨不得造成误到期 / 不得 panic"）。
+#[derive(Debug, Default)]
+pub struct FakeClock {
+    now_ns: Cell<u64>,
+}
+
+impl FakeClock {
+    /// 从 0 开始。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 前进 `ms` 毫秒（饱和）。
+    pub fn advance_ms(&self, ms: u64) {
+        self.advance_ns(ms.saturating_mul(NANOS_PER_MS));
+    }
+
+    /// 前进 `ns` 纳秒（饱和）。
+    pub fn advance_ns(&self, ns: u64) {
+        self.now_ns.set(self.now_ns.get().saturating_add(ns));
+    }
+
+    /// 绝对设定读数（可回拨；仅测试）。
+    pub fn set_ns(&self, ns: u64) {
+        self.now_ns.set(ns);
+    }
+
+    /// 当前读数（纳秒）。
+    pub fn now_ns(&self) -> u64 {
+        self.now_ns.get()
+    }
+}
+
+impl MonotonicClock for FakeClock {
+    fn elapsed(&self) -> Duration {
+        Duration::from_nanos(self.now_ns.get())
+    }
+}
+
+/// 读取单调时钟（纳秒；饱和到 `u64::MAX` ⇒ 无 panic / 无环绕）。
+fn clock_ns(clock: &dyn MonotonicClock) -> u64 {
+    u64::try_from(clock.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// A3 — 本 round 的单调超时窗口（**毫秒**）：`min(initial × backoff^round, max)`
+///（冻结 `RoundTimeoutConfig` 语义 / 形状；数值为 node-local —— ADR-0049 §3.5）。
 ///
-/// 不保留任何 proposal / block hash / QC / 签名 / 对端材料（hash 仅瞬时存在于本 step 的观测快照，
-/// 见 [`RoundObservation`] —— 不进计时器状态、不跨 step 保留）。
+/// 溢出安全：`timeout_for` 内部 `saturating_mul(...).min(max)`；这里额外把 round 夹到
+/// [`ROUND_TIMEOUT_MAX_BACKOFF_STEPS`]；下界 1 ms（防退化 0 窗口）。
+pub(crate) fn round_timeout_window_ms(config: &RoundTimeoutConfig, round: u64) -> u64 {
+    config
+        .timeout_for(round.min(ROUND_TIMEOUT_MAX_BACKOFF_STEPS))
+        .max(1)
+}
+
+/// A3 — 窗口（**纳秒**，计时器实际使用的单位）。
+pub(crate) fn round_timeout_window_ns(config: &RoundTimeoutConfig, round: u64) -> u64 {
+    round_timeout_window_ms(config, round).saturating_mul(NANOS_PER_MS)
+}
+
+/// **A3 之前的 step-tick 窗口函数（冻结镜像；与 A3 单调超时域分离）**。
+///
+/// 仍以 **step tick** 解释配置数值，仅供 pending-proposal 的 step-tick 到期换算
+///（[`pending_expiry_tick`]；ADR-0076 OD-C3 「2 rounds」语义）使用；**不**再被计时器使用。
+pub(crate) fn round_timeout_window_ticks(config: &RoundTimeoutConfig, round: u64) -> u64 {
+    round_timeout_window_ms(config, round)
+}
+
+/// P1-A.6 / A3 — 当前 `(height, round)` 的本地计时器（**只**含位置 + 单调 deadline 元数据）。
+///
+/// `armed_at_ns` = 本计时器（重新）ARM 时的**单调读数**（纳秒）；`window_ns` = 该
+/// `(height, round)` 允许的最大单调时长（纳秒）；`now - armed_at >= window` ⇒ 到期。
+///
+/// 不保留任何 proposal / block hash / QC / 签名 / 对端材料。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RoundTimer {
-    height: u64,
-    round: u64,
-    elapsed_ticks: u64,
-    window_ticks: u64,
+pub(crate) struct RoundTimer {
+    pub(crate) height: u64,
+    pub(crate) round: u64,
+    /// ARM/RESET 时刻的单调读数（纳秒）。
+    pub(crate) armed_at_ns: u64,
+    /// 本 `(height, round)` 的单调窗口（纳秒）。
+    pub(crate) window_ns: u64,
+}
+
+impl RoundTimer {
+    /// 本计时器已历时（单调；`saturating_sub` ⇒ 时钟回拨**不**造成误到期、不 panic）。
+    pub(crate) fn elapsed_ns(&self, now_ns: u64) -> u64 {
+        now_ns.saturating_sub(self.armed_at_ns)
+    }
 }
 
 /// P1-A.6 — 计时器推进结果（纯计算；便于穷举单测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RoundTimerTick {
-    /// 新 `(height, round)` ⇒ 已 ARM（`elapsed = 1`：arming step 计入本 round；**不**继承上一轮 elapsed）。
+pub(crate) enum RoundTimerTick {
+    /// 新 `(height, round)` ⇒ 已 ARM（`armed_at = now`；**不**继承上一轮 deadline）。
     Armed,
-    /// 计时中（尚未到期）。
+    /// 计时中（单调已历时 < 窗口）。
     Waiting,
-    /// 本 tick 达到窗口 ⇒ 应触发一次本地 round timeout。
+    /// 单调已历时 ≥ 窗口 ⇒ 应触发一次本地 round timeout。
     Expired,
-    /// 当前 round 内观测到 canonical 进展 ⇒ 窗口重开（`elapsed = 1`：本 step 计入新窗口）。
+    /// 当前 round 内观测到 canonical 进展 ⇒ 窗口重开（`armed_at = now`）。
     Reset,
 }
 
-/// P1-A.6 — 计时器推进一步（**纯函数**；无墙钟 / 无随机 / 无 I/O —— 同输入同输出）。
+/// P1-A.6 / A3 — 计时器推进一步（**纯函数**：同输入同输出；无墙钟 / 无随机 / 无 I/O）。
 ///
-/// - **ARM**：`prev` 为空或 `(height, round)` 变化 ⇒ 新计时器（`elapsed = 1`）；ADR-0049 §3.3
-///   「round transition MUST NOT inherit stale deadline」⇒ 绝不继承上一轮 elapsed。
+/// - **ARM**：`prev` 为空或 `(height, round)` 变化 ⇒ 新计时器（`armed_at = now_ns`）；ADR-0049 §3.3
+///   「round transition MUST NOT inherit stale deadline」⇒ 绝不继承上一轮 deadline。
 /// - **RESET**：本 step 在**当前** `(height, round)` 内观测到 canonical 进展 ⇒ 窗口重开
-///   （`elapsed = 1`；不增窗、不改 round）。只有**真实状态变化**能 reset ⇒ invalid / stale /
+///   （`armed_at = now_ns`；不增窗、不改 round）。只有**真实状态变化**能 reset ⇒ invalid / stale /
 ///   duplicate / spam 输入（不改变状态）**不可能** reset（ADR-0049 §3.4 MUST NOT）。
-/// - **EXPIRE**：`elapsed >= window` ⇒ 到期（`window` = 该 round 允许的最大 step 数）。
-fn round_timer_tick(
+/// - **EXPIRE**：`now - armed_at >= window_ns` ⇒ 到期（**单调**判定；与 step 次数无关）。
+///
+/// PHASE 6H-Y：`pub(crate)` **仅**为让 O2 入站 seam 复用本状态机（ARM / 替换语义）。
+#[allow(clippy::too_many_arguments)] // 与仓内既有 `transition` / RC 路径同处置（不相交借用参数）
+pub(crate) fn round_timer_tick(
     prev: Option<RoundTimer>,
     height: u64,
     round: u64,
-    window_ticks: u64,
+    window_ns: u64,
     progressed: bool,
+    now_ns: u64,
 ) -> (RoundTimer, RoundTimerTick) {
     let same_round = prev.is_some_and(|t| t.height == height && t.round == round);
     if !same_round {
@@ -432,20 +1096,19 @@ fn round_timer_tick(
             RoundTimer {
                 height,
                 round,
-                elapsed_ticks: 1,
-                window_ticks,
+                armed_at_ns: now_ns,
+                window_ns,
             },
             RoundTimerTick::Armed,
         );
     }
     let mut timer = prev.expect("same_round ⇒ prev 必为 Some");
     if progressed {
-        timer.elapsed_ticks = 1;
-        timer.window_ticks = window_ticks;
+        timer.armed_at_ns = now_ns;
+        timer.window_ns = window_ns;
         return (timer, RoundTimerTick::Reset);
     }
-    timer.elapsed_ticks = timer.elapsed_ticks.saturating_add(1);
-    let tick = if timer.elapsed_ticks >= timer.window_ticks {
+    let tick = if timer.elapsed_ns(now_ns) >= timer.window_ns {
         RoundTimerTick::Expired
     } else {
         RoundTimerTick::Waiting
@@ -511,13 +1174,420 @@ fn observe_round(node: &ConsensusNode) -> RoundObservation {
 ///    `(height, round)` 重开窗口；`Rejected`（`RoundOverflow`）/ `Ignored` ⇒ 计数 + 重开窗口
 ///    （不 wrap / 不 panic / state 不变 —— 遵循既有 `TransitionResult` 语义）。
 ///
+/// PHASE 6H-Z §11 — 每 step 从 handler 队列取走的入站 RC payload 上界（**node-local drain bound**；
+/// **非**协议参数 —— 协议级限速由 Network 层冻结 D3 limiter 承担：4 msg/s/peer、burst 8）。
+const ROUND_CHANGES_PER_STEP: usize = 8;
+
+/// P1-A.30 **D0** — RC 拒绝原因**分类桶**（**仅观测**：不改变任何拒绝条件 / 判定结果 / 状态）。
+///
+/// 桶边界固定且穷尽（[`Self::Other`] 为兜底）；**不**引入新的拒绝语义，**不**放宽 / 收紧
+/// `verify_certificate` 的任何条件；**不**携带 payload / hash / 签名 / 对端身份。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundChangeRejectKind {
+    /// 解码失败 / 结构 / 长度 / 证据数量 / 升序 / 重复成员（`node` 层 `decode_certificate`
+    /// 失败亦归此桶）—— 即「字节层面不可解释」。
+    Malformed,
+    /// 证书过期（`to_round <= local_round`）。
+    Stale,
+    /// 高度不符（`cert.height != 本地高度`；ADR-0066 §6.2 wrong height）。
+    WrongHeight,
+    /// 证据权重未达 quorum。
+    Quorum,
+    /// 成员 / 身份 / 域 / 签名 / `validator_set_id` 绑定类失败。
+    Identity,
+    /// 其余（含 `RoundOverflow`）；兜底桶 ⇒ 分类穷尽。
+    Other,
+}
+
+impl RoundChangeRejectKind {
+    /// 桶数量（固定；`[u64; COUNT]` 计数槽）。
+    pub const COUNT: usize = 6;
+
+    /// 稳定索引（与 [`RoundChangeDiag::rejects`] 槽位一一对应）。
+    const fn index(self) -> usize {
+        match self {
+            Self::Malformed => 0,
+            Self::Stale => 1,
+            Self::WrongHeight => 2,
+            Self::Quorum => 3,
+            Self::Identity => 4,
+            Self::Other => 5,
+        }
+    }
+
+    /// 冻结 [`RoundChangeError`] ⇒ 桶（**唯一**映射点；穷尽 match ⇒ 新增变体必须显式归类）。
+    const fn of_error(error: RoundChangeError) -> Self {
+        match error {
+            RoundChangeError::TooManyEvidence
+            | RoundChangeError::EmptyEvidence
+            | RoundChangeError::CertificateTooLarge
+            | RoundChangeError::Truncated
+            | RoundChangeError::InvalidLength
+            | RoundChangeError::InvalidEvidenceCount
+            | RoundChangeError::EvidenceNotAscending
+            | RoundChangeError::DuplicateValidator => Self::Malformed,
+            RoundChangeError::StaleCertificate => Self::Stale,
+            RoundChangeError::WrongHeight => Self::WrongHeight,
+            RoundChangeError::InsufficientQuorum => Self::Quorum,
+            RoundChangeError::ValidatorSetMismatch
+            | RoundChangeError::UnknownValidator
+            | RoundChangeError::ValidatorIdentityMismatch
+            | RoundChangeError::InvalidDomain
+            | RoundChangeError::InvalidSignature => Self::Identity,
+            RoundChangeError::RoundOverflow => Self::Other,
+        }
+    }
+}
+
+/// P1-A.30 **D0** — RC 观测计数集合（**仅计数**；不参与任何判定；无 payload / hash / 签名 / 对端材料）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RoundChangeDiag {
+    /// 拒绝原因**分类桶**（索引见 [`RoundChangeRejectKind::index`]）。
+    rejects: [u64; RoundChangeRejectKind::COUNT],
+    /// G-1 暂存证书**重新评估尝试**次数（每 step ≤ 1；仅「暂存区命中当前 `(height, local_round)`」才计）。
+    reeval_attempts: u64,
+    /// 暂存证书重新评估**成功应用**次数（恒 `<=` `reeval_attempts`）。
+    reeval_applied: u64,
+}
+
+impl RoundChangeDiag {
+    /// 记一次拒绝（**唯一**计数入口；与 `round_changes_rejected` 总数同步递增）。
+    fn note_reject(&mut self, kind: RoundChangeRejectKind) {
+        if let Some(slot) = self.rejects.get_mut(kind.index()) {
+            *slot = slot.saturating_add(1);
+        }
+    }
+
+    fn reject_count(&self, kind: RoundChangeRejectKind) -> u64 {
+        self.rejects.get(kind.index()).copied().unwrap_or(0)
+    }
+
+    fn note_reeval_attempt(&mut self) {
+        self.reeval_attempts = self.reeval_attempts.saturating_add(1);
+    }
+
+    fn note_reeval_applied(&mut self) {
+        self.reeval_applied = self.reeval_applied.saturating_add(1);
+    }
+}
+
+/// P1-A.30 **D0** — 本地 round timeout 的**结果分类**（**仅观测**；`round_timeouts` 仍为总数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundTimeoutOutcome {
+    /// 冻结 `round_timeout()` 返回 `Applied`（round 真实 +1）。
+    Applied,
+    /// 返回 `Ignored`。
+    ///
+    /// **当前冻结 transition 对 `RoundTimeout` 不产生 `Ignored`**（`integration.rs`：
+    /// `RoundTimeout` ⇒ `checked_successor` ⇒ 仅 `Applied` / `Rejected{RoundOverflow}`）
+    /// ⇒ 本桶为**防御性分类**（不改判定；仅保证三分支穷尽且可观测）。
+    Ignored,
+    /// 返回 `Rejected`（当前唯一来源 = `u64::MAX` 轮 `RoundOverflow`）。
+    Rejected,
+}
+
+impl RoundTimeoutOutcome {
+    /// 桶数量（固定；`[u64; COUNT]` 计数槽）。
+    pub const COUNT: usize = 3;
+
+    /// 稳定索引。
+    const fn index(self) -> usize {
+        match self {
+            Self::Applied => 0,
+            Self::Ignored => 1,
+            Self::Rejected => 2,
+        }
+    }
+}
+
+/// 记一次 timeout 结果（**唯一**计数入口；saturating、越界零操作）。
+fn note_timeout_outcome(
+    outcomes: &mut [u64; RoundTimeoutOutcome::COUNT],
+    outcome: RoundTimeoutOutcome,
+) {
+    if let Some(slot) = outcomes.get_mut(outcome.index()) {
+        *slot = slot.saturating_add(1);
+    }
+}
+
+/// PHASE 6H-AF §9 — 每 step 从 handler 队列取走的入站 Abandon attestation payload 上界
+/// （**node-local drain bound**；**非**协议参数 —— D3 限速仍 **NOT AUTHORIZED**）。
+const ABANDON_ATTESTATIONS_PER_STEP: usize = 16;
+
+/// PHASE 6H-Z §3.1/§5/§11/§13 — O2 入站 `RoundChangeCertificate` 权威路径
+/// （**唯一**调用点：`NodeRuntime::step`；free fn ⇒ 与 `drive_round_timeout` 同构）。
+///
+/// # 语义边界（Owner D1-1 = D1-B；ADR-0066 §7.1/§11；ADR-0072 §3.4，全部 FROZEN）
+/// - 唯一动作 = 冻结 `verify_certificate` → 节点层适用性前置 →
+///   **既有冻结** round transition（`ConsensusNode::round_timeout()`）→ 既有计时器重开。
+/// - **不**新增 consensus primitive / **不**新增 `ConsensusEvent` / **不**修改 `checked_successor`。
+/// - **不**产生 vote / QC / finality / lock / DAG / `QcRegistry` / `VoteAccumulator` 变更。
+/// - 归因（Owner D1-3 / G-2）：应用成功 ⇒ `round_changes_by_authority += 1`；
+///   **绝不**计入 `round_timeouts`（本地超时语义保持不变）。
+/// - G-1（Owner D1-2）：`from_round > local_round` ⇒ **仅暂存**（bounded `RoundChangeStore`；
+///   不推进 / 不重开计时器）。
+/// - fail-closed：malformed / invalid / stale / overflow / 低 quorum / 高度不符 ⇒ 拒绝 + 计数，
+///   **零** round 变化。
+/// - 无墙钟 / 无随机 / 无持久化（`RoundChangeStore` 为**有界内存**；重启即丢）。
+// `too_many_arguments`：与既有 `transition`（consensus）同处置 —— 参数为**不相交借用**的
+// 显式字段（timer / 三个独立归因计数 / D0 观测集合 / 暂存区），合并为结构体会引入额外的借用手续。
+#[allow(clippy::too_many_arguments)]
+fn drive_round_change_authority(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    config: &RoundTimeoutConfig,
+    now_ns: u64,
+    timer: &mut Option<RoundTimer>,
+    by_authority: &mut u64,
+    rejected: &mut u64,
+    deferred: &mut u64,
+    diag: &mut RoundChangeDiag,
+    store: &mut RoundChangeStore,
+    inbound: Vec<(NodeId, Vec<u8>)>,
+) {
+    for (_sender, payload) in inbound {
+        // decode：结构畸形 ⇒ 拒（零状态变更；不记录 payload）。
+        let Ok(cert) = decode_certificate(&payload) else {
+            *rejected = rejected.saturating_add(1);
+            diag.note_reject(RoundChangeRejectKind::Malformed);
+            continue;
+        };
+        apply_inbound_round_change(
+            driver,
+            config,
+            now_ns,
+            timer,
+            by_authority,
+            rejected,
+            deferred,
+            diag,
+            store,
+            cert,
+        );
+    }
+    // G-1 重新评估（每 step ≤ 1 次；有界）：本地 round 已前进 ⇒ 暂存证书可能变为可应用。
+    reevaluate_stored_round_change(
+        driver,
+        config,
+        now_ns,
+        timer,
+        by_authority,
+        deferred,
+        diag,
+        store,
+    );
+}
+
+/// PHASE 6H-Z — 单张已 decode 证书的权威适用（验证 / 适用性 / 应用 / 暂存 / 拒绝）。
+#[allow(clippy::too_many_arguments)] // 同上（不相交借用；与 `transition` 同处置）
+fn apply_inbound_round_change(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    config: &RoundTimeoutConfig,
+    now_ns: u64,
+    timer: &mut Option<RoundTimer>,
+    by_authority: &mut u64,
+    rejected: &mut u64,
+    deferred: &mut u64,
+    diag: &mut RoundChangeDiag,
+    store: &mut RoundChangeStore,
+    cert: RoundChangeCertificate,
+) {
+    let node = driver.consensus_mut();
+    let local_round = node.state().round.round;
+    let expected_validator_set_id = node.genesis_hash();
+    match apply_verified_round_change(
+        node,
+        &cert,
+        &expected_validator_set_id,
+        local_round,
+        config,
+        *timer,
+        now_ns,
+    ) {
+        RoundChangeApplication::Applied {
+            timer: next_timer, ..
+        } => {
+            *timer = Some(next_timer);
+            *by_authority = by_authority.saturating_add(1);
+        }
+        RoundChangeApplication::Stored { .. } => {
+            // G-1：仅暂存（bounded；幂等）。
+            // D0：`deferred` = 「暂存**新增**」−「重评**应用**」的累计差（gauge）⇒ **仅**
+            // `AdmitOutcome::Admitted` 计 +1：
+            // - `Duplicate`（同一 `(height, from_round)` 重复入站）⇒ **不**计（幂等）；
+            // - store 自身**淘汰**（`evicted_height` / `evicted_certificate`）⇒ 不计入本 gauge
+            //（否则容量满时 `total()` 不变会被误判为"未新增"）；store 真实条目数见
+            // `round_change_store_len()`。
+            if matches!(store.admit(cert), AdmitOutcome::Admitted { .. }) {
+                *deferred = deferred.saturating_add(1);
+            }
+        }
+        RoundChangeApplication::Rejected { error } => {
+            *rejected = rejected.saturating_add(1);
+            // D0：拒绝原因**分类**（唯一映射点；不改变拒绝本身）。
+            diag.note_reject(RoundChangeRejectKind::of_error(error));
+        }
+    }
+}
+
+/// PHASE 6H-Z — G-1 暂存证书的**有界**重新评估（每 step 至多应用 1 张）。
+///
+/// 触发条件 = 暂存区存在「当前 `(height, local_round)`」的证书（即本地 round 已追平其
+/// `from_round`）。仅应用**一张**：避免同 step 内无界级联；后续 step 继续收敛（确定性）。
+///
+/// A3：新增 `now_ns`（单调读数；仅用于重新 arm 新窗口）⇒ 参数 8/7。
+#[allow(clippy::too_many_arguments)] // 同上（不相交借用；与 `transition` / RC 路径同处置）
+fn reevaluate_stored_round_change(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    config: &RoundTimeoutConfig,
+    now_ns: u64,
+    timer: &mut Option<RoundTimer>,
+    by_authority: &mut u64,
+    deferred: &mut u64,
+    diag: &mut RoundChangeDiag,
+    store: &mut RoundChangeStore,
+) {
+    let (height, local_round) = {
+        let state = driver.consensus().state();
+        (state.round.height, state.round.round)
+    };
+    // 暂存区里必须存在恰好匹配当前 (height, local_round) 的证书才尝试（有界：单次 lookup）。
+    let Some(cert) = store.get(height, local_round).cloned() else {
+        return;
+    };
+    // D0："暂存后**已尝试**重新评估"（不含未命中 lookup）—— 每 step ≤ 1 次。
+    diag.note_reeval_attempt();
+    let node = driver.consensus_mut();
+    let expected_validator_set_id = node.genesis_hash();
+    if let RoundChangeApplication::Applied {
+        timer: next_timer, ..
+    } = apply_verified_round_change(
+        node,
+        &cert,
+        &expected_validator_set_id,
+        local_round,
+        config,
+        *timer,
+        now_ns,
+    ) {
+        *timer = Some(next_timer);
+        *by_authority = by_authority.saturating_add(1);
+        *deferred = deferred.saturating_sub(1);
+        diag.note_reeval_applied();
+    }
+}
+
+/// PHASE 6H-AF §8 / PHASE 6H-AH §3 — 本地**真实 EXPIRE** ⇒ A-C 专用签名（每个本地 actor 一条）
+/// ⇒ 池 ⇒（**新增**）返回本次**首次收录**的 `0x0E` wire container 供调用方广播。
+///
+/// 只能经 [`drive_round_timeout`] 输出的 [`LocalExpireObservation`] 调用
+/// ⇒ 无 future-round 签名 / 无 historical back-signing / 无 caller 指定 `(height, from_round)`。
+/// 签名路径 = `ValidatorActor::sign_abandon`（使用**已有** signer；**不**新建 signer / 不新增私钥 /
+/// 不接触 `VoteLedger` / vote journal / block-safety journal / `LockedState`）。
+/// 入池后由 [`RoundChangeAttestationPool::admit`] 的冻结 `verify_evidence` 验签（自签也必验）。
+///
+/// 返回值 = **仅** `PoolOutcome::Recorded`（该 `(height, from_round, validator_id)` 首次收录）对应的
+/// attestation，**按 actor 索引升序**（确定性）；`Duplicate` / `AlreadyAssembled` ⇒ 不返回。
+/// ⇒ 幂等边界由**既有池状态**承担（**不**新增 dedup 结构；无持久化 / 无 journal / 无 safety 语义）。
+fn produce_local_abandon_attestations(
+    driver: &NodeConsensusDriver<DynSigner>,
+    pool: &mut RoundChangeAttestationPool,
+    observation: &LocalExpireObservation,
+    produced: &mut u64,
+) -> Vec<AbandonAttestation> {
+    let chain_id = driver.consensus().chain_id();
+    let mut newly_recorded: Vec<AbandonAttestation> = Vec::new();
+    // fail-closed：池绑定与共识链不符 ⇒ 不签名（也不出站）。
+    if pool.chain_id() != chain_id {
+        return newly_recorded;
+    }
+    let set = driver.consensus().validator_set().clone();
+    for idx in 0..driver.actor_count() {
+        let Some(actor) = driver.actor(idx) else {
+            continue;
+        };
+        let Ok(evidence) = actor.sign_abandon(chain_id, observation) else {
+            // 签名失败 ⇒ 不产出（fail-closed；无副作用）。
+            continue;
+        };
+        let outcome = pool.admit(
+            &set,
+            observation.height(),
+            observation.observed_from_round(),
+            &evidence,
+        );
+        // PHASE 6H-AH §5 幂等：同一 `(height, from_round)` 只出站一次（仅首次收录）。
+        if matches!(outcome, PoolOutcome::Recorded { .. }) {
+            newly_recorded.push(AbandonAttestation {
+                height: observation.height(),
+                from_round: observation.observed_from_round(),
+                validator_id: *evidence.validator_id.as_bytes(),
+                signature: evidence.signature,
+            });
+        }
+        *produced = produced.saturating_add(1);
+    }
+    newly_recorded
+}
+
+/// PHASE 6H-AF §9 — 入站 `0x0E` ⇒ ADR-0074 decode ⇒ 池 `admit`（内含冻结 `verify_evidence`：
+/// membership → identity → 域 `0x10` → hash → `verify_strict`）⇒ 池。
+///
+/// **fail-closed**：长度不符 / decode 失败 / 验签失败 / 非成员 / 身份不符 / 冲突签名 ⇒ 拒绝计数，
+/// **零**状态变更（不推进 round / 不广播 / 不触碰 QC / finality / lock / vote）。
+fn admit_inbound_abandon_attestations(
+    driver: &NodeConsensusDriver<DynSigner>,
+    pool: &mut RoundChangeAttestationPool,
+    rejected: &mut u64,
+    inbound: Vec<(NodeId, Vec<u8>)>,
+) {
+    let chain_id = driver.consensus().chain_id();
+    if pool.chain_id() != chain_id {
+        *rejected = rejected.saturating_add(u64::try_from(inbound.len()).unwrap_or(u64::MAX));
+        return;
+    }
+    let set = driver.consensus().validator_set().clone();
+    for (_sender, payload) in inbound {
+        if payload.len() != ABANDON_ATTESTATION_LEN {
+            *rejected = rejected.saturating_add(1);
+            continue;
+        }
+        let Ok(attestation) = decode_abandon_attestation(&payload) else {
+            *rejected = rejected.saturating_add(1);
+            continue;
+        };
+        // ADR-0074 §6.2：`validator_id` **不**在签名 payload 内 ⇒ 由池内 identity 检查绑定；
+        // `height` / `from_round` 已在签名范围内 ⇒ 跨高度 / 跨 round 重放由验签阻断。
+        let evidence = RoundChangeEvidence {
+            validator_id: ValidatorId::from_bytes(attestation.validator_id),
+            signature: attestation.signature,
+        };
+        match pool.admit(&set, attestation.height, attestation.from_round, &evidence) {
+            PoolOutcome::Rejected(_) => *rejected = rejected.saturating_add(1),
+            PoolOutcome::Recorded { .. }
+            | PoolOutcome::Assembled(_)
+            | PoolOutcome::Duplicate
+            | PoolOutcome::AlreadyAssembled => {}
+        }
+    }
+}
+
 /// `entry` = 本 step 入口的观测快照（用于 `progressed` 判定；仅本 step 内有效）。
+/// PHASE 6H-AF §8：本函数同时**输出**真实 EXPIRE 观测（`expired`）—— 供调用方在
+/// **同一 step** 内走 A-C 签名路径。观测只能来自真实到期计时器状态（见
+/// [`LocalExpireObservation::from_expired_timer`]）；**不**允许调用方自行构造。
+// `too_many_arguments`：与 `drive_round_change_authority` / consensus `transition` 同处置 ——
+// 参数为**不相交借用**的显式字段（D0 观测数组亦为独立字段），合并为结构体会引入额外借用手续。
+#[allow(clippy::too_many_arguments)]
 fn drive_round_timeout(
     driver: &mut NodeConsensusDriver<DynSigner>,
     config: &RoundTimeoutConfig,
+    now_ns: u64,
     timer: &mut Option<RoundTimer>,
     round_timeouts: &mut u64,
+    outcomes: &mut [u64; RoundTimeoutOutcome::COUNT],
+    round_adv_local: &mut u64,
     entry: RoundObservation,
+    expired: &mut Option<LocalExpireObservation>,
 ) {
     // DISARM：必须**已被 finality 确认**（不是单看 `step == Finalized` —— 见谓词 doc）。
     if round_finalized_by_finality(driver.consensus().state()) {
@@ -525,36 +1595,50 @@ fn drive_round_timeout(
         return;
     }
     let observed = observe_round(driver.consensus());
-    let window_ticks = round_timeout_window_ticks(config, observed.round);
+    // A3：窗口为**单调时长**（ms → ns）；到期判定 = `now - armed_at >= window`（与 step 次数无关）。
+    let window_ns = round_timeout_window_ns(config, observed.round);
     let (next, tick) = round_timer_tick(
         *timer,
         observed.height,
         observed.round,
-        window_ticks,
+        window_ns,
         observed != entry,
+        now_ns,
     );
     *timer = Some(next);
     if tick != RoundTimerTick::Expired {
         return;
     }
+    // PHASE 6H-AF §8：先留下**真实 EXPIRE 观测**（`(height, from_round)` 取自到期计时器本身），
+    // 再执行冻结 transition —— 保证 A-C 签名路径只能针对本 step 真实到期的 round。
+    *expired = LocalExpireObservation::from_expired_timer(next, tick, now_ns);
     // EXPIRE ⇒ 冻结的 node-local RoundTimeout（不新增任何共识语义）。
     match driver.consensus_mut().round_timeout() {
         TransitionResult::Applied { .. } => {
             *round_timeouts = round_timeouts.saturating_add(1);
+            note_timeout_outcome(outcomes, RoundTimeoutOutcome::Applied);
+            // PHASE 6H-A30 OD-X7 — 只读观测：**仅**真实推进（`Applied`）计数（**不**参与判定）。
+            *round_adv_local = round_adv_local.saturating_add(1);
+        }
+        // D0：`Ignored` 与 `Rejected` 拆分为**独立观测桶**（判定与 §既有行为完全不变）。
+        TransitionResult::Ignored { .. } => {
+            *round_timeouts = round_timeouts.saturating_add(1);
+            note_timeout_outcome(outcomes, RoundTimeoutOutcome::Ignored);
         }
         // `u64::MAX` 轮：`checked_successor` ⇒ `None` ⇒ `Rejected{RoundOverflow}`（不 wrap、
         // state 与 context 不变）。计该次尝试；不 panic、不视为致命错误。
-        TransitionResult::Rejected { .. } | TransitionResult::Ignored { .. } => {
+        TransitionResult::Rejected { .. } => {
             *round_timeouts = round_timeouts.saturating_add(1);
+            note_timeout_outcome(outcomes, RoundTimeoutOutcome::Rejected);
         }
     }
-    // 立即对新 `(height, round)` 重开窗口（elapsed 不继承；窗口 = 新轮的 `timeout_for`）。
+    // 立即对新 `(height, round)` 重开窗口（不继承 stale deadline；窗口 = 新轮的 `timeout_for`）。
     let after = observe_round(driver.consensus());
     *timer = Some(RoundTimer {
         height: after.height,
         round: after.round,
-        elapsed_ticks: 1,
-        window_ticks: round_timeout_window_ticks(config, after.round),
+        armed_at_ns: now_ns,
+        window_ns: round_timeout_window_ns(config, after.round),
     });
 }
 
@@ -725,6 +1809,533 @@ fn persist_qc_history_if_needed(
     Ok(())
 }
 
+/// PHASE 6H-A11 U2 — 入站 proposal admission 的可变输入（仅借用；避免参数爆炸）。
+struct PendingAdmission<'a> {
+    /// U1 有界 pending 容器（**不**重实现）。
+    store: &'a mut PendingProposalStore,
+    /// round timeout 窗口参数（用于 U1 冻结的 expiry 映射）。
+    config: &'a RoundTimeoutConfig,
+    /// 确定性逻辑 step tick（= `NodeRuntime::inbound_tick`；无墙钟）。
+    tick: u64,
+}
+
+/// PHASE 6H-A11 U2 — 入站 proposal admission 判定（确定性；**不含** recovery）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProposalAdmission {
+    /// Guard A + Guard C 全部通过 ⇒ 交既有 `process_command` → `driver.submit_proposal`。
+    Admitted,
+    /// 区块尚未本地可用 ⇒ 已入 U1 有界 pending（非 progress；NO RESET；恢复归 U3）。
+    Pended,
+    /// Guard A / Guard C 拒绝 ⇒ 丢弃（非 progress；NO RESET）。
+    Rejected,
+}
+
+/// PHASE 6H-A11 U2 — Guard A2 纯判定：当前上下文是否匹配（**父高轮**语义；OD-11）。
+///
+/// `true` ⟺ `block.header.height - 1 == round_height`。
+/// **禁止**把 `block.header.height` 字面作为 proposer selection height（OD-11）。
+fn proposal_height_context_matches(round_height: u64, block_height: u64) -> bool {
+    block_height.checked_sub(1) == Some(round_height)
+}
+
+/// PHASE 6H-A11 U2 — **入站 proposal admission guard**（ADR-0076 PADR-3 / PADR-4）。
+///
+/// 位置：`process_inbound_consensus_command` 内、`process_command` **之前** ⇒ 必然早于
+/// `driver.submit_proposal` → `ConsensusNode::submit_proposal` → `transition(SetProposal)` →
+/// `round.set_proposal`；且**不**改变 `step()` 顶层阶段顺序。
+///
+/// 边界（MUST）：
+/// - 只读判定 + 有界 pending 插入 + 计数；**不**调用任何 consensus transition；
+/// - `ProposalRef.proposer` **不**作为授权来源（PADR-1）；
+/// - `round_now` **只**来自 `resolve_proposer_round_evidence`（OD-17）；**禁止**用
+///   `consensus.state().round.round` 直接作为 `round_now`（后者仅作 pending binding metadata）；
+/// - `height_now = block.header.height - 1`（OD-11）；
+/// - 不复制 future-round / proposer-resolution / canonical admission 规则（OD-C4）。
+///
+/// 注：期望 proposer → VK 的三行粘合与 `block_dispatch::resolve_expected_proposer_vk_at_round`
+/// 同源（同 `select_proposer` + 同 `ValidatorSet`）；该函数当前为模块私有，其可见性调整属
+/// **U4**（本单元不修改 `block_dispatch.rs`）⇒ U4 后改为直接复用。
+fn guard_inbound_proposal(
+    driver: &NodeConsensusDriver<DynSigner>,
+    block_production: &Option<NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>>,
+    admission: &mut PendingAdmission<'_>,
+    proposal_ref: &ProposalRef,
+) -> ProposalAdmission {
+    let block_hash = proposal_ref.block_hash;
+    // ---- Guard A1：本地可用性（BlockStore.contains）----
+    let Some(adapter) = block_production.as_ref() else {
+        // 无 canonical adapter ⇒ 无法判定可用性 / 上下文 ⇒ fail-closed（不入 pending、不猜测）。
+        admission.store.note_guard_reject(GuardReject::NoStore);
+        return ProposalAdmission::Rejected;
+    };
+    let Some(store) = adapter.block_store() else {
+        admission.store.note_guard_reject(GuardReject::NoStore);
+        return ProposalAdmission::Rejected;
+    };
+    match store.contains(&block_hash) {
+        Ok(true) => {}
+        // 尚未本地可用 ⇒ 入 U1 **有界** pending（arrival_round 仅作 binding metadata；OD-C2）。
+        Ok(false) => {
+            let state = driver.consensus().state();
+            let arrival_round = state.round.round;
+            let arrival_height = state.round.height;
+            let entry = PendingProposal {
+                proposal_ref: proposal_ref.clone(),
+                block_hash,
+                arrival_height,
+                arrival_round,
+                received_tick: admission.tick,
+                expiry_tick: pending_expiry_tick(admission.config, admission.tick, arrival_round),
+            };
+            // 幂等：同 `block_hash` 不重复插入 / 不覆盖首次 arrival metadata（U1 容器保证）。
+            let outcome = admission.store.insert(entry);
+            // PHASE 6H-A11 DIAG — 仅观测：区分首次入 pending 与重复命中。
+            if outcome == PendingInsertOutcome::Inserted {
+                admission.store.note_pended();
+            }
+            return ProposalAdmission::Pended;
+        }
+        // 存储错误 ⇒ fail-closed（**不得**当作"暂缺"入 pending）。
+        Err(_) => {
+            admission.store.note_guard_reject(GuardReject::StorageError);
+            return ProposalAdmission::Rejected;
+        }
+    }
+    // ---- Guard A2 + Guard C（**共享判定**；与 U3 recovery checkpoint 同一实现）----
+    //
+    // proposal-bound 证据：`(本 step 当前轮, block_hash)`；绑定键 = `block_hash`
+    //（**不**直接用作 `round_now`；`round_now` 始终为 resolver 输出 — OD-17）。
+    let proposal_evidence = Some((driver.consensus().state().round.round, block_hash));
+    match guard_block_admits_proposal(driver, adapter, block_hash, proposal_evidence) {
+        Ok(()) => {
+            admission.store.note_admitted();
+            ProposalAdmission::Admitted
+        }
+        Err(reason) => {
+            admission.store.note_guard_reject(reason);
+            ProposalAdmission::Rejected
+        }
+    }
+}
+
+/// PHASE 6H-A11 U2/U3 — **Guard A2 + Guard C 共享判定**（无 pending 插入；无副作用）。
+///
+/// 前置：调用方已确认区块本地可用（Guard A1）或该提案已在本节点 pending 集内。
+/// 顺序（MUST）：
+///   ① 取回区块实体 ② Guard A2（`block.header.height - 1 == round.height`；OD-11）
+///   ③ Guard C（`round_now` 仅来自 `resolve_proposer_round_evidence`；OD-17；
+///      expected proposer 仅来自 ADR-0050 `select_proposer`；签名验签经既有 runtime 门面）
+///
+/// `proposal_evidence` = proposal-bound 证据 `(round, block_hash)`
+///（U2 = 当前轮；U3 = pending `arrival_round`）；绑定键校验由 resolver 完成（hash 不匹配 ⇒ 不可用）。
+///
+/// 返回 `Ok(())` = 判定通过；`Err(())` = 拒绝（**单一信号**，非错误载体；与
+/// `resolve_proposer_round_evidence` 同约定）。调用方负责计数 / 移除 pending / 丢弃。
+#[allow(clippy::result_unit_err)]
+fn guard_block_admits_proposal(
+    driver: &NodeConsensusDriver<DynSigner>,
+    adapter: &NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>,
+    block_hash: [u8; 32],
+    proposal_evidence: Option<(u64, [u8; 32])>,
+) -> Result<(), GuardReject> {
+    let Some(store) = adapter.block_store() else {
+        return Err(GuardReject::NoStore);
+    };
+    // ① 区块实体（header + proposer_signature）；读取失败 ⇒ fail-closed。
+    //
+    // PHASE 6H-A11 U5 — **内容寻址读取**：登记经 `put_verified`（proposer-aware `(hash, P)` 多编码）
+    // 写入 ⇒ legacy `get(hash)` 不可见（`contains==true` 但 `get==None` ⇒ 误判 `MissingBlock`）。
+    // 本路径随后**独立**完成 proposer 授权与签名验证（② ③）⇒ 内容型读取不降低安全边界。
+    let Ok(Some(block)) = store.get_content(&block_hash) else {
+        return Err(GuardReject::MissingBlock);
+    };
+    // ② Guard A2：父高轮上下文（含旧 / 未来高度拒绝）。
+    if !proposal_height_context_matches(
+        driver.consensus().state().round.height,
+        block.header.height,
+    ) {
+        return Err(GuardReject::HeightContext);
+    }
+    let Some(height_now) = block.header.height.checked_sub(1) else {
+        return Err(GuardReject::HeightUnderflow);
+    };
+    // ③ Guard C — `round_now` **必须**来自冻结证据解析（OD-17 / PADR-4）。
+    let qc_evidence = last_precommit_round_evidence(driver.consensus());
+    let Ok(round_now) = resolve_proposer_round_evidence(block_hash, proposal_evidence, qc_evidence)
+    else {
+        // 绑定证据矛盾（或不可用）⇒ fail-closed（不静默择一 / 不降级）。
+        return Err(GuardReject::Evidence);
+    };
+    let chain_id = driver.consensus().chain_id();
+    // 期望 proposer（**单一来源**）：复用 `block_dispatch` 的 `(height, round)` 显式版本
+    // （ADR-0076 OD-11：`height_now = block.header.height - 1`）⇒ 不在本模块重复派生规则。
+    let Ok(expected_vk) = resolve_expected_proposer_vk_at(
+        adapter,
+        driver.consensus().validator_set(),
+        height_now,
+        round_now,
+    ) else {
+        return Err(GuardReject::Proposer);
+    };
+    // 区块 proposer 签名验证：复用既有 runtime 门面（**不**新造签名派生规则）。
+    // 零签名 / 错 proposer / 错 chain_id ⇒ 均拒绝（PADR-8）。
+    if nova_runtime::validate_block_signature(&block, &expected_vk, chain_id).is_err() {
+        return Err(GuardReject::Signature);
+    }
+    Ok(())
+}
+
+// ===== PHASE 6H-A30 OD-X8 — 本地提案**有界重播**（in-round refresh）=====
+//
+// 目的（唯一）：修复「本地提案已发出，但某个**合法**接收方此刻仍处于上一轮 ⇒ Guard C 取证轮
+// 与生产轮不匹配 ⇒ 提案被一次性丢弃（`Rejected`，不入 pending）」⇒ 在**零冗余 quorum**
+// （5/7：Q = 全 5 票）下该轮永远无法形成 QC ⇒ 高度停滞。
+//
+// 语义边界（MUST —— 本机制**不**改变任何共识语义）：
+// - 重播的是**逐字节相同**的 `ProposalRef` + wire block（同一签名 / 同一编码 / 同一签名域）；
+// - Guard C 逐字不变 ⇒ 接收方**只有**在自己当前轮 == 生产轮时才会准入（**不**扩大接受范围）；
+// - 投票 / QC / lock / RC / finality / 票轮上下文全部不变（重播走**同一条**既有入站路径）；
+// - 仅**本地生产**路径登记（remote 到达的提案**不**转发 —— relay 仍不在范围内）；
+// - 每个 `(height, round)` 至多 [`MAX_PROPOSAL_REFRESH`] 次、相邻两次至少间隔
+//   [`PROPOSAL_REFRESH_INTERVAL_TICKS`] 个入站 tick（确定性逻辑 step，**无墙钟**）⇒ 有界；
+// - `(height, round)` 变化 / 本轮提案已非本次产出 / 已达上限 ⇒ 停止或清空（无陈旧重播）。
+
+/// 单个 `(height, round)` 内允许的重播次数上限（**有界**；不构成洪泛 / 放大）。
+pub const MAX_PROPOSAL_REFRESH: u32 = 3;
+
+/// 相邻两次重播之间的最小入站 tick 间隔（确定性逻辑 step；**无**墙钟读取）。
+pub const PROPOSAL_REFRESH_INTERVAL_TICKS: u64 = 10;
+
+/// 本地提案重播状态（Node-local；**不含**共识语义；**不**参与任何判定输入）。
+#[derive(Debug, Clone)]
+pub struct ProposalRefresh {
+    /// 产出该提案时的共识高度。
+    pub height: u64,
+    /// 产出该提案时的共识轮。
+    pub round: u64,
+    /// 原提案引用（逐字复用；**不**重算 / **不**重新签名）。
+    pub proposal_ref: ProposalRef,
+    /// 原 wire block（**逐字节相同**；接收方按 `block_hash` 幂等）。
+    pub block_wire: Vec<u8>,
+    /// 已重播次数（`<= `[`MAX_PROPOSAL_REFRESH`]）。
+    pub refreshes: u32,
+    /// 上次重播（或首次登记）时的入站 tick。
+    pub last_tick: u64,
+}
+
+/// 重播决策（纯值；无副作用 ⇒ 可确定性单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshDecision {
+    /// 状态已陈旧（`(height, round)` 变化 / 本轮提案已非本次产出）⇒ 清空。
+    Clear,
+    /// 保持（间隔未到 / 已达上限）⇒ 本 tick 不发送。
+    Hold,
+    /// 本 tick 重播一次（逐字节相同）。
+    Resend,
+}
+
+/// 重播决策（**纯函数**；无副作用 / 无墙钟 / 无 I/O ⇒ 确定性可测）。
+#[allow(clippy::too_many_arguments)]
+pub fn proposal_refresh_decision(
+    bound_height: u64,
+    bound_round: u64,
+    refreshes: u32,
+    last_tick: u64,
+    round_height: u64,
+    round_round: u64,
+    round_holds_our_proposal: bool,
+    tick: u64,
+) -> RefreshDecision {
+    if round_height != bound_height || round_round != bound_round || !round_holds_our_proposal {
+        return RefreshDecision::Clear;
+    }
+    if refreshes >= MAX_PROPOSAL_REFRESH {
+        return RefreshDecision::Hold;
+    }
+    if tick.saturating_sub(last_tick) < PROPOSAL_REFRESH_INTERVAL_TICKS {
+        return RefreshDecision::Hold;
+    }
+    RefreshDecision::Resend
+}
+
+/// 驱动本地提案的**有界**重播（唯一副作用点：命中 `Resend` 时按**同一字节**再入队一次）。
+///
+/// 复用**既有** `Driver::record_local_proposal`（与首次广播同一入口 / 同一 egress / 同一队尾
+/// ⇒ 不新增传输机制、不新增 wire 类型、不改 codec、不改任何 consensus 调用点）。
+fn drive_proposal_refresh(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    refresh: &mut Option<ProposalRefresh>,
+    tick: u64,
+    liveness: &mut LivenessObservability,
+) {
+    let Some(bound) = refresh.as_ref() else {
+        return;
+    };
+    let (bound_height, bound_round, refreshes, last_tick) =
+        (bound.height, bound.round, bound.refreshes, bound.last_tick);
+    let (round_height, round_round, holds) = {
+        let round = &driver.consensus().state().round;
+        let holds = match refresh.as_ref() {
+            Some(state) => round.proposal.as_ref() == Some(&state.proposal_ref),
+            None => false,
+        };
+        (round.height, round.round, holds)
+    };
+    match proposal_refresh_decision(
+        bound_height,
+        bound_round,
+        refreshes,
+        last_tick,
+        round_height,
+        round_round,
+        holds,
+        tick,
+    ) {
+        RefreshDecision::Clear => {
+            *refresh = None;
+        }
+        RefreshDecision::Hold => {}
+        RefreshDecision::Resend => {
+            let Some(state) = refresh.as_mut() else {
+                return;
+            };
+            driver.record_local_proposal(state.proposal_ref.clone(), state.block_wire.clone());
+            state.refreshes = state.refreshes.saturating_add(1);
+            state.last_tick = tick;
+            liveness.egress_prop_refreshed = liveness.egress_prop_refreshed.saturating_add(1);
+        }
+    }
+}
+
+/// PHASE 6H-A30 OD-X8 — 登记本地生产提案的重播状态（**仅**本地生产路径调用）。
+///
+/// `block_wire = None`（编码失败）⇒ **不**登记（保持既有「无半成品」语义；**不**新增错误路径）。
+/// `(bound_height, bound_round)` 取自本节点**当前共识轮**（与产出该提案的轮同一来源）。
+///
+/// 备注：以**free fn + 不相交字段引用**形式提供 —— `step()` 网络段已持 `network_stack`
+/// 可变借用，`&mut self` 方法调用会与之冲突（因此与既有 helper 同一风格）。
+fn register_proposal_refresh(
+    slot: &mut Option<ProposalRefresh>,
+    pb: &ProposalBuild,
+    block_wire: Option<Vec<u8>>,
+    bound_height: u64,
+    bound_round: u64,
+    tick: u64,
+) {
+    let Some(block_wire) = block_wire else {
+        return;
+    };
+    *slot = Some(ProposalRefresh {
+        height: bound_height,
+        round: bound_round,
+        proposal_ref: pb.proposal_ref.clone(),
+        block_wire,
+        refreshes: 0,
+        last_tick: tick,
+    });
+}
+
+/// PHASE 6H-A11 DIAG — 只读诊断计数（**不参与任何判定**；无共识语义）。
+#[derive(Debug, Default)]
+struct A11Diag {
+    recovery_runs: u64,
+    recovery_candidates: u64,
+    recovery_kept_missing_block: u64,
+    recovery_admitted: u64,
+    recovery_rejected: u64,
+    recovery_evidence_conflict: u64,
+    recovery_submit_err: u64,
+    block_inbound_processed: u64,
+    block_canonical_next: u64,
+    block_register_ok: u64,
+    block_conflict_skipped: u64,
+    // PHASE 6H-A30-OD-X7h — 仅观测：入站 block **来源类别**（Gossip / SyncResponse）计数。
+    // 数据源 = 既有 dispatch 判定点（`step()` 内既有 `source`，由既有 match 分支决定）；
+    // bounded + saturating；**不**重新执行 validation、**不**改变 verdict / 控制流 / 返回值。
+    block_src_gossip_total: u64,
+    block_src_gossip_invalid_proposer_signature: u64,
+    block_src_sync_total: u64,
+    block_src_sync_invalid_proposer_signature: u64,
+    // PHASE 6H-A30-OD-X7i — 仅观测：**Gossip** 路径 `InvalidProposerSignature` 来源分类。
+    // A = `resolve_proposer_round_evidence` 冲突（dispatcher 在验签**之前**返回）；
+    // B = `validate_block_signature` 真实验签失败（仅当 A 未发生时可达）。
+    // bounded + saturating；数据来自**同一输入上的只读复算**（不重新验签 / 不新增状态）。
+    block_gossip_invalid_proposer_signature_evidence_conflict: u64,
+    block_gossip_invalid_proposer_signature_signature_failure: u64,
+    // PHASE 6H-A30-ROOTFIX-M3 — 仅观测：**登记阶段**轮派生结果（bounded + saturating）。
+    // 三项均**不参与判定**（判定见 `register_remote_canonical_block`）：
+    // - `block_register_round_conflict`：proposal 与 QC 绑定证据轮冲突 ⇒ 保守 no-op 计数；
+    // - `block_arrival_round_mismatch`：pending arrival 轮 ≠ 登记解析轮（arrival 轮**已不作轮来源**，
+    //   此处仅记录“到达轮偏离生产轮”的频度，**不**导致拒绝）；
+    // - `block_register_label_mismatch`：解析轮 ⇒ 期望 proposer key 与区块签名**不符** ⇒ 保守 no-op
+    //   （防“本地标签错 ⇒ `put_verified` ⇒ `CorruptedState` 致命退出”）。
+    block_register_round_conflict: u64,
+    block_arrival_round_mismatch: u64,
+    block_register_label_mismatch: u64,
+}
+
+/// PHASE 6H-A11 U3 — **pending proposal recovery checkpoint**（ADR-0076 PADR-5.3；OD-C1 = A）。
+///
+/// 触发：`register_remote_canonical_block` **成功返回后**，同 step、同 block inbound stage 内
+/// 立即调用（**不**改变 `step()` 顶层阶段顺序 / **不**新增 pipeline phase）。
+///
+/// 固定顺序（MUST；§3）：
+///   1. 恢复 pending proposal-bound evidence `(arrival_round, block_hash)`（**不**猜 round）
+///   2. `resolve_proposer_round_evidence`（在共享判定内；Ok(r) / Ok(0) / Err ⇒ 拒绝）
+///   3. Guard A（`BlockStore.contains` + `block.header.height - 1 == round.height`）
+///   4. Guard C（expected proposer + signature + chain_id）
+///   5. 全部通过 ⇒ 经**既有唯一** orchestration seam `process_command` → `driver.submit_proposal`
+///      → `process_transition_derived`（与 inbound proposal 路径**逐字同语义**）⇒ 随后 `set_proposal`
+///
+/// 有界：单次 checkpoint 至多处理 [`MAX_PENDING_PROPOSALS`] 条（**无** while 无界扫描 / 无 wall clock）。
+/// 不变量：失败 ⇒ `remove` + `note_rejected`（零共识状态变更 ⇒ `RoundObservation` 不变 ⇒ NO RESET）；
+/// 仅第 5 步成功才产生 progress（允许既有 RESET 逻辑）。
+fn recover_pending_proposals(
+    driver: &mut NodeConsensusDriver<DynSigner>,
+    adapter: &NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>,
+    pending: &mut PendingProposalStore,
+    inbound_consensus_rejected: &mut u64,
+    diag: &mut A11Diag,
+) {
+    // PHASE 6H-A11 DIAG — 仅观测：checkpoint 被调用（即"区块登记成功之后"）。
+    diag.recovery_runs = diag.recovery_runs.saturating_add(1);
+    let Some(store) = adapter.block_store() else {
+        return;
+    };
+    // 有界快照（≤ MAX_PENDING_PROPOSALS）：避免遍历时与 `remove` 的借用冲突。
+    let candidates = pending.evidence_bounded(MAX_PENDING_PROPOSALS);
+    for (block_hash, arrival_round) in candidates {
+        diag.recovery_candidates = diag.recovery_candidates.saturating_add(1);
+        // Step 1/3：区块可用性。尚未可用 ⇒ **保留** pending（由容量 + 到期约束，不无限缓存）。
+        match store.contains(&block_hash) {
+            Ok(true) => {}
+            Ok(false) => {
+                diag.recovery_kept_missing_block =
+                    diag.recovery_kept_missing_block.saturating_add(1);
+                continue;
+            }
+            // 存储错误 ⇒ fail-closed：移除 + 计数（**不得**当作"暂缺"继续保留）。
+            Err(_) => {
+                diag.recovery_rejected = diag.recovery_rejected.saturating_add(1);
+                let _ = pending.remove(&block_hash);
+                pending.note_guard_reject(GuardReject::StorageError);
+                continue;
+            }
+        }
+        // Step 1/2/3/4：proposal-bound 证据 = `(arrival_round, block_hash)`（OD-C2 / OD-C3）。
+        let evidence = Some((arrival_round, block_hash));
+        match guard_block_admits_proposal(driver, adapter, block_hash, evidence) {
+            Ok(()) => {
+                // Step 5：全部通过 ⇒ 经既有唯一准入路径提交（与 inbound 路径同语义）。
+                let Some(entry) = pending.remove(&block_hash) else {
+                    continue;
+                };
+                if process_command(driver, NodeConsensusCommand::Proposal(entry.proposal_ref))
+                    .is_err()
+                {
+                    // 与 inbound 路径同一纪律：peer 提供的内容 **不得**致命；计数并继续。
+                    *inbound_consensus_rejected = (*inbound_consensus_rejected).saturating_add(1);
+                    diag.recovery_submit_err = diag.recovery_submit_err.saturating_add(1);
+                    pending.note_rejected();
+                } else {
+                    diag.recovery_admitted = diag.recovery_admitted.saturating_add(1);
+                    pending.note_admitted();
+                }
+            }
+            Err(reason) => {
+                // 拒绝 ⇒ 移除 + 计数（零共识状态变更）。
+                diag.recovery_rejected = diag.recovery_rejected.saturating_add(1);
+                if reason == GuardReject::Evidence {
+                    diag.recovery_evidence_conflict =
+                        diag.recovery_evidence_conflict.saturating_add(1);
+                }
+                let _ = pending.remove(&block_hash);
+                pending.note_guard_reject(reason);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod proposal_admission_tests {
+    use super::*;
+
+    #[test]
+    fn u2_height_context_is_parent_round_semantics() {
+        // OD-11：`block.header.height - 1 == round.height`（父高轮；无 off-by-one）。
+        assert!(proposal_height_context_matches(3, 4));
+        assert!(
+            !proposal_height_context_matches(4, 4),
+            "以 block.header.height 字面作 selection height 必须失败（OD-11）"
+        );
+        assert!(!proposal_height_context_matches(2, 4));
+    }
+
+    #[test]
+    fn u2_height_context_rejects_zero_and_boundary_heights() {
+        // height 0 区块（genesis / 非 canonical-next）永不被接受；u64 边界不 panic。
+        assert!(!proposal_height_context_matches(0, 0));
+        assert!(!proposal_height_context_matches(u64::MAX, 0));
+        assert!(proposal_height_context_matches(u64::MAX - 1, u64::MAX));
+    }
+
+    /// PHASE 6H-A30 OD-X8 — 重播决策**有界性 / 陈旧清理**（纯函数；确定性）。
+    #[test]
+    fn od_x8_refresh_decision_is_bounded_and_clears_when_stale() {
+        // 同轮 + 本轮提案仍为本次产出 + 间隔未到 ⇒ Hold（不发送）。
+        assert_eq!(
+            proposal_refresh_decision(7, 2, 0, 100, 7, 2, true, 109),
+            RefreshDecision::Hold
+        );
+        // 间隔到达（>= 10 tick）⇒ Resend。
+        assert_eq!(
+            proposal_refresh_decision(7, 2, 0, 100, 7, 2, true, 110),
+            RefreshDecision::Resend
+        );
+        // 高度推进 ⇒ Clear（无陈旧重播）。
+        assert_eq!(
+            proposal_refresh_decision(7, 2, 0, 100, 8, 0, false, 110),
+            RefreshDecision::Clear
+        );
+        // 轮推进 ⇒ Clear。
+        assert_eq!(
+            proposal_refresh_decision(7, 2, 0, 100, 7, 3, false, 110),
+            RefreshDecision::Clear
+        );
+        // 本轮提案已非本次产出（被替换 / 被清空）⇒ Clear。
+        assert_eq!(
+            proposal_refresh_decision(7, 2, 0, 100, 7, 2, false, 110),
+            RefreshDecision::Clear
+        );
+        // 已达上限 ⇒ Hold（不再增加发送；状态保留，由轮/高度变化清空 —— **有界**）。
+        assert_eq!(
+            proposal_refresh_decision(7, 2, MAX_PROPOSAL_REFRESH, 100, 7, 2, true, 10_000),
+            RefreshDecision::Hold
+        );
+        // 上限 -1 ⇒ 仍可发送一次（边界）。
+        assert_eq!(
+            proposal_refresh_decision(7, 2, MAX_PROPOSAL_REFRESH - 1, 100, 7, 2, true, 10_000),
+            RefreshDecision::Resend
+        );
+        // 单调性：timestamp 回退（`tick < last_tick`，saturating）⇒ 不误触发发送。
+        assert_eq!(
+            proposal_refresh_decision(7, 2, 0, 100, 7, 2, true, 5),
+            RefreshDecision::Hold
+        );
+    }
+
+    #[test]
+    fn u2_admission_enum_is_deterministic_and_copy() {
+        // 三态判定是 Copy 的纯值（无内部状态；重放确定）。
+        let a = ProposalAdmission::Admitted;
+        let p = ProposalAdmission::Pended;
+        let r = ProposalAdmission::Rejected;
+        assert_ne!(a, p);
+        assert_ne!(p, r);
+        assert_eq!(a, ProposalAdmission::Admitted);
+    }
+}
+
 /// P1-A.7 — **入站共识命令统一处理入口**（step 网络路径与内部/测试直接调用**同一语义**）。
 ///
 /// 保持既有契约：`DriverError` 原样传出（不吞错 / 不改 canonical 状态）。附加（仅 ADR-0064）：
@@ -738,11 +2349,27 @@ fn persist_qc_history_if_needed(
 fn process_inbound_consensus_command(
     driver: &mut NodeConsensusDriver<DynSigner>,
     block_production: &Option<NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>>,
+    admission: &mut PendingAdmission<'_>,
     ledger: &mut MissingAncestorIntentLedger,
     pending: &mut VecDeque<PendingExternalQc>,
     deferred: &mut u64,
     command: NodeConsensusCommand,
 ) -> Result<(), DriverError> {
+    // PHASE 6H-A11 U2 — 入站 **proposal** admission guard（Guard A / Guard C）。
+    //
+    // MUST 早于 `process_command`（→ `driver.submit_proposal` → `ConsensusNode::submit_proposal`
+    // → `transition(SetProposal)` → `round.set_proposal`）；**不**改变 step() 顶层阶段顺序。
+    // 未准入（Pended / Rejected）⇒ 直接返回：**零** consensus 状态变更（无 progress / NO RESET）。
+    if let NodeConsensusCommand::Proposal(proposal_ref) = &command {
+        match guard_inbound_proposal(driver, block_production, admission, proposal_ref) {
+            // 通过 Guard A + Guard C ⇒ 继续走既有 process_command（唯一准入路径）。
+            ProposalAdmission::Admitted => {}
+            // 区块尚未本地可用 ⇒ 已入 U1 有界 pending（恢复归 U3）；本 step 到此为止。
+            ProposalAdmission::Pended => return Ok(()),
+            // Guard A / Guard C 拒绝 ⇒ 丢弃；本 step 到此为止。
+            ProposalAdmission::Rejected => return Ok(()),
+        }
+    }
     let inbound_qc = match &command {
         NodeConsensusCommand::InboundQc(qc) => Some(qc.clone()),
         _ => None,
@@ -1073,7 +2700,9 @@ fn register_remote_canonical_block(
     driver: &mut NodeConsensusDriver<DynSigner>,
     adapter: &NodeBlockAdapter<PersistentBackend, NoAccountsKeyResolver>,
     wire: &[u8],
+    pending: &PendingProposalStore,
     resolved_round: Option<u64>,
+    diag: &mut A11Diag,
 ) -> Result<(), RuntimeError> {
     let block = nova_runtime::decode_block(wire).map_err(RuntimeError::BlockDecode)?;
     let height = block.header.height;
@@ -1085,26 +2714,47 @@ fn register_remote_canonical_block(
     let block_hash = nova_runtime::block_hash(&block).map_err(RuntimeError::BlockCodec)?;
     let chain_id = driver.consensus().chain_id();
     let genesis_hash = driver.consensus().genesis_hash();
-    // P1-A.18 RC-1 + A3（register ↔ validate parity）：登记 proposer 必须与**绑定证据**给出的轮一致。
+    // PHASE 6H-A30-ROOTFIX-M3（Owner 授权）—— **register ↔ validate parity**：登记所用轮次必须与
+    // validation（`block_dispatch` 两条 dispatcher）**逐字同规则** ⇒ 共用唯一 helper
+    // `block_dispatch::resolve_inbound_block_round`：
+    // - `qc_evidence` = **sync validation 已据以验签通过**的那一轮（`resolved_round`，调用方以同一
+    //   有界 QC 证据切片 + 同一 canonical hash 解析；见 `step()` 的 `SyncBlockResponse` 分支），
+    //   gossip / 本地路径为 `None` ⇒ 回退本地 `last_precommit_qc`；
+    // - `proposal_evidence` = **仅已接受 proposal**（hash 严格相等）；
+    // - **无绑定证据 ⇒ `header.round`**（已签名 / 已被 block hash 承诺）——**不再**回退 round 0。
     //
-    // `resolved_round` = **sync validation 已据以验签通过**的那一轮（调用方以**同一**有界 QC 证据切片
-    // + **同一** canonical hash 解析所得，见 `step()` 的 `SyncBlockResponse` 分支）；gossip / 本地路径为
-    // `None`。它作为**QC 侧绑定证据** `(r, block_hash)` 参与**同一个** `resolve_proposer_round_evidence`：
-    // - `Some(r)` ⇒ 与本地 proposal 证据同权参与；二者冲突 ⇒ `Err` ⇒ 保守 no-op（**不登记**，且**不**以
-    //   `Err` 让节点 fail-closed 退出）；二者均无绑定 ⇒ 仍回退既有 round 0；
-    // - `None` ⇒ 逐字保持既有本地证据链（proposal → last_precommit → round 0）——gossip 行为零变化。
+    // ⚠️ **pending arrival 轮不再作为轮来源**（旧 U4/OD-20 语义）：arrival 轮是“本节点**何时**收到
+    // 该提案”，与“proposer **生产**该块时的轮”可合法不同（例：round 2 的块在本地 round 5 到达）
+    // ⇒ 用它作轮来源会得到**与签名者不符**的 proposer 标签（进而 `put_verified` ⇒ `CorruptedState`
+    // ⇒ 进程致命退出）。现改为：**仅作一致性观测计数**（`block_arrival_round_mismatch`），
+    // 不参与任何判定 —— 持久化的 proposer 标签由下方**登记前签名自验**保证自洽。
     //
-    // ⚠️ 高度语义不变（仍为父高轮 `height - 1`）；`select_proposer` / `BlockStore::put_verified` 语义不变。
+    // ⚠️ 高度语义不变（仍为父高轮 `height - 1`）；`select_proposer` 语义不变。
     let qc_evidence = resolved_round
         .map(|r| (r, block_hash))
         .or_else(|| last_precommit_round_evidence(driver.consensus()));
-    let Ok(round) = resolve_proposer_round_evidence(
+    let proposal_evidence = proposal_round_evidence(
+        driver.consensus().state(),
+        adapter.head().height,
+    )
+    .filter(|(_, h)| *h == block_hash);
+    let header_round = block.header.round;
+    let Ok(round) = resolve_inbound_block_round(
         block_hash,
-        proposal_round_evidence(driver.consensus().state(), adapter.head().height),
+        header_round,
+        proposal_evidence,
         qc_evidence,
     ) else {
+        // 绑定证据冲突 ⇒ 保守 no-op（不登记 / 不写存储 / **不**致命退出）。
+        diag.block_register_round_conflict = diag.block_register_round_conflict.saturating_add(1);
         return Ok(());
     };
+    // arrival 轮仅作**一致性观测**（不参与判定；见上方说明）。
+    if let Some(entry) = pending.get(&block_hash)
+        && entry.arrival_round != round
+    {
+        diag.block_arrival_round_mismatch = diag.block_arrival_round_mismatch.saturating_add(1);
+    }
     let proposer = select_proposer(
         chain_id,
         height.saturating_sub(1),
@@ -1126,6 +2776,14 @@ fn register_remote_canonical_block(
     let Ok(vk) = VerifyingKey::from_bytes(&info.consensus_public_key) else {
         return Ok(());
     };
+    // **登记前签名自验**（Owner 要求 B.4 / B.5）：解析轮 ⇒ 该轮当选 proposer 的 key；
+    // 若签名与该 key 不符 ⇒ 说明**本节点的轮派生**与真实签名者不一致（非存储损坏）⇒
+    // **保守 no-op**（不落盘 / 不登记 / 计数），**绝不**让本地标签错误经 `put_verified` 变成
+    // `CorruptedState` 致命退出。真实存储错误仍由下方 `blockstore_stage` fail-closed 透传。
+    if nova_runtime::validate_block_signature(&block, &vk, chain_id).is_err() {
+        diag.block_register_label_mismatch = diag.block_register_label_mismatch.saturating_add(1);
+        return Ok(());
+    }
     let max_encodings = set.len();
     if let Some(bs) = adapter.block_store() {
         bs.put_verified(&block, proposer.as_bytes(), &vk, chain_id, max_encodings)
@@ -1163,11 +2821,12 @@ fn inbound_accept_and_greet(
     };
     for peer in inbound.accept_bounded() {
         if ns.is_connected(peer) || ns.is_peer_established(peer) {
-            let _ = inbound.drop_peer(peer);
+            // NETDIAG：KEEP-FIRST 丢弃（**仅**区分原因计数；行为与 `drop_peer` 逐字相同）。
+            let _ = inbound.drop_peer_reason(peer, InboundDropReason::GreetKeepFirst);
             continue;
         }
         if ns.connect_peer(peer).is_err() {
-            let _ = inbound.drop_peer(peer);
+            let _ = inbound.drop_peer_reason(peer, InboundDropReason::GreetConnectFailed);
             continue;
         }
         if let Some(auth) = ns.config().peer_auth
@@ -1213,12 +2872,12 @@ fn inbound_reconcile(
         }
         if !ns.is_connected(peer) {
             // frozen 握手失败路径（`close_peer`）⇒ 回收入站连接（不残留 pending）。
-            let _ = inbound.drop_peer(peer);
+            let _ = inbound.drop_peer_reason(peer, InboundDropReason::HandshakeFailed);
             pending.remove(&key);
             continue;
         }
         if tick.saturating_sub(accepted_tick) > INBOUND_PENDING_TIMEOUT_STEPS {
-            let _ = inbound.drop_peer(peer);
+            let _ = inbound.drop_peer_reason(peer, InboundDropReason::PendingTimeout);
             let _ = ns.disconnect_peer(peer);
             pending.remove(&key);
         }
@@ -1247,6 +2906,9 @@ pub enum NodeRuntimeError {
     SafetyJournalMissing,
     /// G5-D.7.2：已声明显式初始化但 safety journal **已存在** ⇒ 拒绝（既有历史保持不变）。
     SafetyJournalAlreadyExists,
+    /// **D-5.3.4**：B2-B signer-owned Block safety journal（`block-safety.journal`）
+    /// create / recover / 校验失败（fail-closed；validator mode 启动失败）。
+    BlockSafety(BlockSafetyError),
     /// ValidatorActor 构造 / 恢复失败（含 identity mismatch）。
     Validator(ValidatorActorError),
     /// configured connection target 校验失败（self / duplicate；dial **前** fail-closed）。
@@ -1432,6 +3094,171 @@ impl ValidatorView<'_> {
     }
 }
 
+/// PHASE 6H-A30 OD-X7 — **只读** liveness 观测快照（供 CLI 独立 `liveness` 行）。
+///
+/// **不参与任何判定**（零共识语义）；全部为 saturating 计数或只读派生。
+/// 不保留 payload / hash / 签名 / 对端身份 / 错误文本。
+/// `prop_skip_fail` 为**残差**（`calls − ok − known_skips`）：**不**推断未知原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LivenessSnapshot {
+    /// 提案构造**调用**总数（含所有跳过路径）。
+    pub prop_calls: u64,
+    /// 成功构造**并提交**提案次数。
+    pub prop_build_ok: u64,
+    /// 因"非当选者"跳过（只读复算）。
+    pub prop_skip_not_elected: u64,
+    /// 因 `rs.height != head.height` 跳过（只读复算）。
+    pub prop_skip_height_desync: u64,
+    /// 因阶段/幂等守卫（`step != Propose` 或已有提案）跳过（只读复算）。
+    pub prop_skip_step_guard: u64,
+    /// **SAFETY-REJECT-SKIP** — 出块签名被 `block_safety` 冲突门正确拒绝（F2/F3/F4
+    /// `ConflictingTarget`）⇒ 该次提案被放弃（不签名 / 不广播），节点继续运行（非 fatal）。
+    pub prop_skip_conflict_target: u64,
+    /// **残差**跳过（含 `build_block` 失败 / 无 adapter / 无 actor / 持久化失败等）。
+    pub prop_skip_fail: u64,
+    /// 入站**成功解码并消费**的提案数。
+    pub inbound_prop_ok: u64,
+    /// 本地提案被登记出站（`record_local_proposal`）次数。
+    pub egress_prop_enqueued: u64,
+    /// PHASE 6H-A30 OD-X8 — 本地提案**有界重播**实际入队次数（逐字节相同的 `ProposalRef`
+    /// + wire block；`<= MAX_PROPOSAL_REFRESH x 本地提案数`）。
+    pub egress_prop_refreshed: u64,
+    /// 单发广播**提案**时 `Established 对端 = 0`（静默丢弃）次数。
+    pub egress_prop_no_peer: u64,
+    /// 本地 pacemaker **实际**推进 round 的次数。
+    pub round_adv_local: u64,
+    /// 因高度推进（`advance_to_height`）导致 round 归零的次数。
+    pub round_adv_height: u64,
+    /// 经 RC 权威推进 round 的次数（= 既有 `round_changes_by_authority`，**仅暴露**）。
+    pub round_adv_rc: u64,
+    /// 当前 `(height, round)` 当选者是否本节点（只读派生；无法判定 ⇒ `false`）。
+    pub elected_is_self: bool,
+    /// 当前 `(height, round)` 内 `proposal_present == false` 的**连续 step** 数（瞬态）。
+    pub prop_absent_steps: u64,
+    /// PHASE 6H-A30 OD-X7b — **入站 proposal admission 生命周期**（直接读取既有真实计数槽位；
+    /// **不**新增增量点、**不**根据结果猜测）：
+    /// `PendingProposalStore::admitted` —— `guard_inbound_proposal` 中 Guard A2 + Guard C
+    /// 全部通过（`note_admitted()`）的次数。
+    pub proposal_admitted: u64,
+    /// `PendingProposalStore::pended` —— Guard A1 `Ok(false)`（区块未本地可用）且
+    /// `insert` 返回 `Inserted`（`note_pended()`）的**首次**入 pending 次数。
+    ///\n    /// 语义：**累计决策结果**，非当前队列长度（队列长度见 `pending_proposals_len()`）。
+    pub proposal_pending: u64,
+    /// `PendingProposalStore::rejected` —— 准入拒绝累计（`note_guard_reject()` 直拒 +
+    /// `note_rejected()` recovery 拒；两者均走真实代码路径）。按原因明细仍在
+    /// `a11_diag_summary()`（本行不重复暴露）。
+    pub proposal_rejected: u64,
+    /// `PendingProposalStore::expired` —— `sweep_expired()` 确定性 tick 到期淘汰次数。
+    pub proposal_expired: u64,
+    /// PHASE 6H-A30 OD-X7d — **只读** egress→ingress 黑洞定位面（直读既有
+    /// `NetworkService::diagnostics()` / `EventLoop::diagnostics()`；无网络时全 0）。
+    /// **不**新增计数器 / **不**新增状态机 / **不**改变 send-receive-queue 控制流。
+    pub net_frames_received: u64,
+    pub net_events_enqueued: u64,
+    pub net_sent: u64,
+    pub net_dropped_invalid: u64,
+    pub net_dropped_overflow: u64,
+    pub net_unauthenticated_drops: u64,
+    pub el_handler_errors: u64,
+    pub el_events_dropped_overflow: u64,
+    /// PHASE 6H-A30 OD-X7e — **recovery / block readiness 面**（直读既有 `A11Diag` 字段；
+    /// **不**新增计数点 / **不**修改 recovery 逻辑 / **不**修改 guard / **不**修改 pending store）。
+    pub recovery_runs: u64,
+    pub recovery_candidates: u64,
+    pub recovery_kept_missing_block: u64,
+    pub recovery_admitted: u64,
+    pub recovery_rejected: u64,
+    pub block_inbound_processed: u64,
+    pub block_canonical_next: u64,
+    pub block_register_ok: u64,
+    /// PHASE 6H-A30 OD-X7f — **`InboundBlockVerdict` 分类面**（只读：对**既有**
+    /// [`NodeRuntime::block_inbound_outcomes`] 窗口（≤ `BLOCK_INBOUND_OUTCOME_CAP` = 128）
+    /// 做分类计数；**不**新增计数器 / **不**新增状态机 / **不**修改任何判定）。
+    ///
+    /// 语义（MUST）：**窗口内**（最近 ≤128 条）分类，**非**累计；六项之和 == 窗口长度。
+    /// `other` 为**残差**（含 `CanonicalNextCandidate` 与其余 `InboundBlockError` 变体）。
+    pub block_verdict_future_missing_ancestor: u64,
+    pub block_verdict_already_known: u64,
+    /// 真实变体为 `Stale`（**无** `Duplicate` 变体；不得虚构）。
+    pub block_verdict_stale: u64,
+    /// 真实变体为 `ConflictingParent`（**无** `UnknownTarget` 变体；不得虚构）。
+    pub block_verdict_conflicting_parent: u64,
+    /// `Err(InboundBlockError::Malformed)`。
+    pub block_verdict_malformed: u64,
+    /// **残差**（窗口长度 − 上述五类）。
+    /// PHASE 6H-A30 OD-X7g 起语义**收紧**：再减去下列 `block_err_*` 十类 ⇒
+    /// 本项 == 窗口内 `Ok(CanonicalNextCandidate)` 数（避免与新键重复计数）。
+    pub block_verdict_other: u64,
+    /// PHASE 6H-A30 OD-X7g — `Err(InboundBlockError)` **细分类**（真实变体 1:1；
+    /// `block_inbound.rs:112-137`；仍为**窗口内**计数，非累计）。
+    /// 不变量：`5 个 Ok 类 + malformed + 上述 10 类 + other` == 窗口长度。
+    pub block_err_oversized: u64,
+    pub block_err_wrong_version: u64,
+    pub block_err_wrong_chain: u64,
+    pub block_err_hash_mismatch: u64,
+    pub block_err_invalid_proposer_signature: u64,
+    pub block_err_transaction_root_mismatch: u64,
+    pub block_err_noncanonical_transaction_ordering: u64,
+    pub block_err_state_root_mismatch: u64,
+    pub block_err_unsupported_validation: u64,
+    pub block_err_storage: u64,
+    /// PHASE 6H-A30-OD-X7h — **入站 block 来源类别**（`GossipBlock` vs `SyncBlockResponse`）
+    /// 的 `InvalidProposerSignature` 归属面。
+    ///
+    /// 语义（MUST）：**累计**（非窗口），bounded + saturating；数据源 = `step()` 内**既有**
+    /// `source`（既有 match 分支已决定）+ 该块**既有** verdict（不重新执行 validation）。
+    /// 一致性关系：`block_src_gossip_invalid_proposer_signature +
+    /// block_src_sync_invalid_proposer_signature` == 累计 `InvalidProposerSignature` 判定数；
+    /// 当判定总数 ≤ `BLOCK_INBOUND_OUTCOME_CAP`（128）时 == 窗口内 `block_err_invalid_proposer_signature`。
+    pub block_src_gossip_total: u64,
+    pub block_src_gossip_invalid_proposer_signature: u64,
+    pub block_src_sync_total: u64,
+    pub block_src_sync_invalid_proposer_signature: u64,
+    /// PHASE 6H-A30-OD-X7i — **Gossip 路径 `InvalidProposerSignature` 来源分类**（累计，非窗口）。
+    ///
+    /// gossip dispatcher 固定顺序：① `resolve_proposer_round_evidence`（证据轮冲突 ⇒ 直接 IPS）
+    /// → ② `validate_block_inbound` ⑦c `validate_block_signature`（验签失败 ⇒ IPS）。
+    /// 因此在**同一输入**上只读复算①即可**精确**归类：① Err ⇒ 本项 +1；① Ok ⇒ 只能是②。
+    /// **不**执行验签 / **不**新增 proposer·consensus·validation state / **不**改变控制流。
+    pub block_gossip_invalid_proposer_signature_evidence_conflict: u64,
+    pub block_gossip_invalid_proposer_signature_signature_failure: u64,
+}
+
+/// PHASE 6H-A30 OD-X7 — 内部累计计数器（**不参与任何判定**；零共识语义）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LivenessObservability {
+    prop_calls: u64,
+    prop_build_ok: u64,
+    prop_skip_not_elected: u64,
+    prop_skip_height_desync: u64,
+    prop_skip_step_guard: u64,
+    /// SAFETY-REJECT-SKIP — 出块签名被 `block_safety` 冲突门正确拒绝而放弃的提案数。
+    prop_skip_conflict_target: u64,
+    inbound_prop_ok: u64,
+    egress_prop_enqueued: u64,
+    /// PHASE 6H-A30 OD-X8 — 本地提案**有界重播**实际入队次数（`<= 3 x 本地提案数`）。
+    egress_prop_refreshed: u64,
+    egress_prop_no_peer: u64,
+    round_adv_local: u64,
+    round_adv_height: u64,
+    // 瞬态（每 step 由 [`observe_liveness_transient`] 重算）
+    elected_is_self: bool,
+    prop_absent_steps: u64,
+    prop_absent_key: (u64, u64),
+}
+
+impl LivenessObservability {
+    /// 残差跳过（`calls − ok − known_skips`；saturating ⇒ 恒 ≥ 0）。
+    fn skip_fail(&self) -> u64 {
+        self.prop_calls
+            .saturating_sub(self.prop_build_ok)
+            .saturating_sub(self.prop_skip_not_elected)
+            .saturating_sub(self.prop_skip_height_desync)
+            .saturating_sub(self.prop_skip_step_guard)
+            .saturating_sub(self.prop_skip_conflict_target)
+    }
+}
+
 /// 生产节点生命周期装配根（STEP 10-16 Phase 1 骨架；STEP 10-18I-C ownership migration；
 /// STEP 10-18I-G Stage C Full Composition）。
 ///
@@ -1504,17 +3331,66 @@ pub struct NodeRuntime {
     /// 非运行错误）：零状态变更（无 lock / 无 outbound / 无 canonical / 无 finality / 无 DAG 修改）。
     /// 仅 `u64` 计数（saturating **不保留** QC payload / target hash / 签名 / 对端身份 / 错误文本）。
     derived_qc_not_applicable: u64,
-    /// P1-A.6 — round timeout 窗口参数（**逻辑 step tick** 单位；默认 `RoundTimeoutConfig::default()`）。
+    /// P1-A.6 / A3 — round timeout 窗口参数（**单调时长：毫秒**；默认 `RoundTimeoutConfig::default()`）。
     ///
     /// node-local 配置面：非协议常量（ADR-0049 §3.5）、非 CLI flag、不进 `NodeConfig`、不持久化。
+    /// A3：单位从"逻辑 step tick"改为**毫秒**（授权 Testnet 基线 10_000 / 120_000 / ×2 ⇒
+    /// 10s→20s→40s→80s→120s→120s…）。
     round_timeout_config: RoundTimeoutConfig,
+    /// A3 — 单调时钟（生产 = [`SystemClock`]；测试经 [`Self::set_clock`] 注入 [`FakeClock`]）。
+    ///
+    /// **不**作为任何共识判定输入；只用于本地计时器到期判断（与墙钟无关联）。
+    clock: Box<dyn MonotonicClock>,
+    /// A3 — 本 step 读取到的单调读数（纳秒；供**只读诊断** accessor 使用，**不**参与判定）。
+    ///
+    /// 目的：`round_timeout_elapsed_ms()` 不得为了读数而额外读时钟（否则会干扰注入式 fake
+    /// 时钟的时间轴）；它报告的永远是**最后一次 `step()`** 的已历时。
+    last_tick_ns: u64,
     /// P1-A.6 — 当前 `(height, round)` 的本地计时器（`None` = 尚未 arm / 已被 finality disarm）。
     /// **只**含位置 + tick 计数（无 payload / 无 hash / 无签名 / 无对端材料）。
     round_timer: Option<RoundTimer>,
     /// P1-A.6 — 本地 round timeout 触发次数（saturating；诊断观测，不携带任何共识材料）。
     round_timeouts: u64,
+    /// PHASE 6H-Z（Owner D1-3 / G-2）— **权威驱动** round 变更次数（独立归因；saturating）。
+    ///
+    /// 仅在「已验证 `RoundChangeCertificate` 且 `from_round == local_round` ⇒ 应用 ⇒ 恰 +1」
+    /// 时递增。**与 [`Self::round_timeouts`] 严格分离**（本地超时 ≠ 外部权威；
+    /// ADR-0072 §3.4 有限附随语义效果；**不**改变 `round_timeouts` 既有语义）。
+    round_changes_by_authority: u64,
+    /// PHASE 6H-Z — 入站 RC 被拒次数（fail-closed 观测；saturating）。
+    round_changes_rejected: u64,
+    /// PHASE 6H-Z — G-1 暂存区「**新增 − 重评应用**」计数（gauge；`Duplicate` 不计、store 淘汰不计）。
+    round_changes_deferred: u64,
+    /// P1-A.30 **D0** — RC 拒绝原因分类 + 暂存重评计数（**仅观测**；不参与任何判定）。
+    round_change_diag: RoundChangeDiag,
+    /// P1-A.30 **D0** — RC 证书广播时**零 Established 对端**（`broadcast()` 返回 `Ok(0)`）的次数。
+    round_change_broadcast_no_peer: u64,
+    /// P1-A.30 **D0** — Abandon attestation 广播时**零 Established 对端**的次数。
+    abandon_broadcast_no_peer: u64,
+    /// P1-A.30 **D0** — 本地 timeout 结果分类 `[applied, ignored, rejected]`。
+    /// `round_timeouts` 仍为**总数**（本数组仅拆分同一批事件，**不**新增计数事件）。
+    round_timeout_outcomes: [u64; RoundTimeoutOutcome::COUNT],
+    /// PHASE 6H-Z — G-1 暂存区（**有界内存**：`DEFAULT_MAX_TRACKED_HEIGHTS` × 64/height；
+    /// 重启即丢、**无持久化**）。**不**参与任何 consensus transition。
+    round_change_store: RoundChangeStore,
+    /// PHASE 6H-AF — O2 attestation 池（**有界内存**；**无持久化**；ADR-0074/0075 生产路径）。
+    /// 绑定 `chain_id` + `genesis_hash`（= `validator_set_id`）。
+    round_change_pool: RoundChangeAttestationPool,
+    /// PHASE 6H-AF — 本地**真实 EXPIRE** 产生的 Abandon attestation 数（saturating 观测）。
+    abandon_attestations_produced: u64,
+    /// PHASE 6H-AF — 入站 attestation 被拒数（malformed / 验签失败 / 非成员 / 身份不符）。
+    abandon_attestations_rejected: u64,
+    /// PHASE 6H-AH — 已**发出**（`NetworkService::broadcast` 已入队）的本地 attestation 数
+    /// （saturating 观测）。仅在池 `admit` 返回 `Recorded`（该 `(height, from_round)` **首次收录**）
+    /// 时 +1 ⇒ 同一 EXPIRE 观测只产生一条 `0x0E` 出站（ADR-0074 §11 幂等语义，无新增去重状态）。
+    abandon_attestations_broadcast: u64,
+    /// PHASE 6H-AF — 池内组装完成并经**既有 `0x0D`** 广播的证书数（saturating 观测）。
+    round_change_certificates_assembled: u64,
     /// D9 Step 7：入站 listener 逻辑 step 计数（每网络 step +1；pending 超时基准；无系统时钟）。
     inbound_tick: u64,
+    /// PHASE 6H-A30 OD-X8 — 本地提案**有界重播**状态（Node-local；无共识语义；见
+    /// [`ProposalRefresh`]）。仅本地生产路径写入；`(height, round)` 变化即清空。
+    proposal_refresh: Option<ProposalRefresh>,
     /// D9 Step 7：入站连接握手 pending（peer 字节键 → 接受时 tick；Established / 失败 / 超时后移除）。
     /// 键用 `[u8; 32]`（`NodeId` 无 `Ord`）⇒ 确定性字典序与 inbound 连接表一致。
     inbound_pending: BTreeMap<[u8; 32], u64>,
@@ -1553,6 +3429,14 @@ pub struct NodeRuntime {
     peer_dial_attempts_total: u64,
     /// P1-A.8 — dial 失败总次数（saturating；只读观测）。
     peer_dial_failures_total: u64,
+    /// PHASE 6H-A11 U1 — **有界** pending proposal 存储（ADR-0076 PADR-5.2；OD-C3）。
+    /// U1 仅提供容器与诊断槽位；**准入 guard / recovery checkpoint 归 U2 / U3** ⇒ 本字段
+    /// 当前不参与任何共识流程（零共识语义变更 / 无 progress / 无 RESET 影响）。
+    pending_proposals: PendingProposalStore,
+    /// PHASE 6H-A11 DIAG — 只读诊断计数（**不参与任何判定**；零共识语义）。
+    a11_diag: A11Diag,
+    /// PHASE 6H-A30 OD-X7 — 只读 liveness 观测（**不参与任何判定**；零共识语义）。
+    liveness: LivenessObservability,
 }
 
 impl NodeRuntime {
@@ -1696,6 +3580,11 @@ impl NodeRuntime {
             (driver, None)
         };
 
+        // PHASE 6H-AF：池绑定链身份（`chain_id` + `genesis_hash` = `validator_set_id`；
+        // 与 D1 的 `expected_validator_set_id` 同源）——构造前捕获，避免依赖 `identity` 后续所有权。
+        let round_change_pool =
+            RoundChangeAttestationPool::new(identity.chain_id, identity.genesis_hash);
+
         // Stage C：网络资产注入 ⇒ NetworkStack（identity → node_id → NetworkService）。
         //   configured peers 校验（self / duplicate）在 dial 前启动时执行（fail-closed）；
         //   NS 注入 TcpDialer（复用 D4 seam；Node 不直调 TcpTransport::dial）。
@@ -1773,9 +3662,27 @@ impl NodeRuntime {
             inbound_consensus_rejected: 0,
             derived_qc_not_applicable: 0,
             round_timeout_config: RoundTimeoutConfig::default(),
+            clock: Box::new(SystemClock::new()),
+            last_tick_ns: 0,
             round_timer: None,
             round_timeouts: 0,
+            round_changes_by_authority: 0,
+            round_changes_rejected: 0,
+            round_changes_deferred: 0,
+            round_change_diag: RoundChangeDiag::default(),
+            round_change_broadcast_no_peer: 0,
+            abandon_broadcast_no_peer: 0,
+            round_timeout_outcomes: [0; RoundTimeoutOutcome::COUNT],
+            round_change_store: RoundChangeStore::new(
+                nova_consensus::round_change::DEFAULT_MAX_TRACKED_HEIGHTS,
+            ),
+            round_change_pool,
+            abandon_attestations_produced: 0,
+            abandon_attestations_rejected: 0,
+            abandon_attestations_broadcast: 0,
+            round_change_certificates_assembled: 0,
             inbound_tick: 0,
+            proposal_refresh: None,
             inbound_pending: BTreeMap::new(),
             sync_respond: SyncRespondDiagnostics::default(),
             qc_history,
@@ -1792,6 +3699,9 @@ impl NodeRuntime {
             peer_lifecycle: BTreeMap::new(),
             peer_dial_attempts_total: 0,
             peer_dial_failures_total: 0,
+            pending_proposals: PendingProposalStore::new(),
+            a11_diag: A11Diag::default(),
+            liveness: LivenessObservability::default(),
         })
     }
 
@@ -1822,25 +3732,68 @@ impl NodeRuntime {
             identity.genesis_hash,
             &validator_id,
         );
-        // G5-D.7.2：「缺失即 fail closed」——不隐式初始化；显式初始化亦不覆盖既有历史。
-        //   (exists, init) = (true, false) ⇒ 绑定既有 journal（恢复由 recover() 严格校验）；
-        //                    (true, true)  ⇒ 拒绝（既有 journal 字节保持不变）；
-        //                    (false, true) ⇒ 显式 create（`create_new(true)`；竞态下 AlreadyExists ⇒ fail closed）；
-        //                    (false, false) ⇒ 启动失败（可诊断；不伪装为 IO failure）。
+        // G5-D.7.2 + P-6 修复（初始化原子性前置）：两枚 journal 的存在性必须在**任何 create 之前**
+        // 一起判定。旧实现先按 vote 分支可能 `create`，之后才在 block 分支拒绝 ⇒
+        // “仅 block 存在 + 显式初始化”会在**失败启动**中新建一枚空 vote journal。
+        //
+        // 判定规则（先判后写；不删除、不补齐、不改写）：
+        //   · 仅一枚存在 + 未声明初始化 ⇒ `SafetyJournalMissing`（**零写入**）；
+        //   · 仅一枚存在 + 已声明初始化 ⇒ `SafetyJournalAlreadyExists`（既有安全状态与
+        //     “全新节点”声明矛盾；同样在**写入之前**拒绝）；
+        //   · 两枚均存在 + 已声明初始化 ⇒ `SafetyJournalAlreadyExists`（既有字节不变）；
+        //   · 两枚均不存在 + 未声明初始化 ⇒ `SafetyJournalMissing`（可诊断；不伪装为 IO failure）；
+        //   · 两枚均不存在 + 已声明初始化 ⇒ **唯一**允许 `create` 的路径。
+        // 原子性边界（不得过度声称）：`exists()` **不提供跨进程原子性**；并发启动仍由
+        // `create_new(true)` 兜底（失败方 fail closed，不会损坏或覆盖既有 journal）。
         let journal_path = config.safety_dir.join("safety.journal");
+        let block_journal_path = config.safety_dir.join("block-safety.journal");
         let journal_exists = journal_path.exists();
-        let store = match (journal_exists, config.validator_safety_init) {
-            (true, false) => ValidatorSafetyStore::at(&journal_path, safety_identity),
-            (true, true) => return Err(NodeRuntimeError::SafetyJournalAlreadyExists),
-            (false, true) => ValidatorSafetyStore::create(&journal_path, safety_identity)
-                .map_err(NodeRuntimeError::Safety)?,
-            (false, false) => return Err(NodeRuntimeError::SafetyJournalMissing),
+        let block_journal_exists = block_journal_path.exists();
+
+        if journal_exists != block_journal_exists {
+            return Err(if config.validator_safety_init {
+                NodeRuntimeError::SafetyJournalAlreadyExists
+            } else {
+                NodeRuntimeError::SafetyJournalMissing
+            });
+        }
+        if journal_exists && config.validator_safety_init {
+            return Err(NodeRuntimeError::SafetyJournalAlreadyExists);
+        }
+        if !journal_exists && !config.validator_safety_init {
+            return Err(NodeRuntimeError::SafetyJournalMissing);
+        }
+
+        let store = if config.validator_safety_init {
+            ValidatorSafetyStore::create(&journal_path, safety_identity)
+                .map_err(NodeRuntimeError::Safety)?
+        } else {
+            ValidatorSafetyStore::at(&journal_path, safety_identity)
         };
 
-        // 8/9. strict recover（restore 内部执行）→ 构造 ValidatorActor。
+        // 7b. **D-5.3.4 B2-B**：signer-owned Block safety journal（与 vote safety journal
+        //     **文件分离**；沿用同一“缺失即 fail closed / 显式初始化不覆写既有历史”纪律）。
+        //     生产出块签名必须经该 journal：`ValidatorActor::sign_block` 无 journal ⇒ 拒绝签名。
+        let block_identity = BlockSafetyIdentity::new(
+            identity.network_id,
+            identity.chain_id,
+            identity.genesis_hash,
+            &validator_id,
+        );
+        let block_safety = if config.validator_safety_init {
+            BlockSafetyJournal::create(&block_journal_path, block_identity)
+                .map_err(NodeRuntimeError::BlockSafety)?
+        } else {
+            let j = BlockSafetyJournal::at(&block_journal_path, block_identity);
+            j.recover().map_err(NodeRuntimeError::BlockSafety)?;
+            j
+        };
+
+        // 8/9. strict recover（restore 内部执行）→ 构造 ValidatorActor（已附加 B2-B safety gate）。
         //      recover / identity mismatch ⇒ Err ⇒ validator mode 启动失败（fail closed）。
         let actor = ValidatorActor::restore(validator_id, signer, identity.chain_id, store)
-            .map_err(NodeRuntimeError::Validator)?;
+            .map_err(NodeRuntimeError::Validator)?
+            .with_block_safety(block_safety);
 
         Ok((actor, journal_path))
     }
@@ -1947,24 +3900,215 @@ impl NodeRuntime {
         self.round_timeouts
     }
 
-    /// P1-A.6：当前计时器已历 step 数（arming step 记 1；`None` = 尚未 arm / 已被 finality disarm）。
-    pub fn round_timeout_elapsed_ticks(&self) -> Option<u64> {
-        self.round_timer.map(|t| t.elapsed_ticks)
+    /// PHASE 6H-Z（Owner D1-3 / G-2）— **权威驱动** round 变更次数（独立归因；观测）。
+    ///
+    /// 仅在「已验证 RC 且 `from_round == local_round` ⇒ 应用 ⇒ 恰 +1」时递增。
+    /// 与 [`Self::round_timeouts`]（**本地**超时）**严格分离**：两者互不包含、互不混淆。
+    pub fn round_changes_by_authority(&self) -> u64 {
+        self.round_changes_by_authority
     }
 
-    /// P1-A.6：当前计时器窗口（tick；`None` = 未 arm）。只读观测（诊断 / 确定测试）。
-    pub fn round_timeout_window_ticks(&self) -> Option<u64> {
-        self.round_timer.map(|t| t.window_ticks)
+    /// PHASE 6H-Z — 入站 RC 被拒次数（malformed / invalid / stale / overflow / 低 quorum / 高度不符）。
+    pub fn round_changes_rejected(&self) -> u64 {
+        self.round_changes_rejected
     }
 
-    /// P1-A.6 — **测试 / 开发 seam**：设置 round timeout 窗口参数（**tick** 单位）。
+    /// PHASE 6H-Z — G-1 暂存（`from_round > local_round`）的「新增 − 重评应用」计数（gauge；
+    /// `Duplicate` 不计；store 淘汰不计 —— 真实条目数见 [`Self::round_change_store_len`]）。
+    pub fn round_changes_deferred(&self) -> u64 {
+        self.round_changes_deferred
+    }
+
+    /// P1-A.30 **D0** — RC 拒绝原因**分类**计数（仅观测；总数仍见 [`Self::round_changes_rejected`]）。
+    pub fn round_change_reject_count(&self, kind: RoundChangeRejectKind) -> u64 {
+        self.round_change_diag.reject_count(kind)
+    }
+
+    /// P1-A.30 **D0** — RC 证书广播时**零 Established 对端**的次数（"已组装但无处可发"的观测）。
+    ///
+    /// **不得**据此推断"证书永久丢失"：本计数仅说明**该次**广播的 `Ok(0)`
+    ///（无 Established 对端）；本流程**未实现**补发 / 重传 / 按需获取。
+    pub fn round_change_broadcast_no_peer(&self) -> u64 {
+        self.round_change_broadcast_no_peer
+    }
+
+    /// P1-A.30 **D0** — Abandon attestation 广播时零 Established 对端的次数（同上语义边界）。
+    pub fn abandon_broadcast_no_peer(&self) -> u64 {
+        self.abandon_broadcast_no_peer
+    }
+
+    /// P1-A.30 **D0** — 暂存证书重新评估 `(attempts, applied)`（仅观测）。
+    pub fn round_change_reeval(&self) -> (u64, u64) {
+        (
+            self.round_change_diag.reeval_attempts,
+            self.round_change_diag.reeval_applied,
+        )
+    }
+
+    /// P1-A.30 **D0** — 本地 timeout 结果分类计数（`applied` / `ignored` / `rejected`）。
+    pub fn round_timeout_outcome(&self, outcome: RoundTimeoutOutcome) -> u64 {
+        self.round_timeout_outcomes
+            .get(outcome.index())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// P1-A.30 **D0′** — 入站**队列溢出丢弃**计数
+    /// `[block_inbound, sync_requests, round_changes, abandon_attestations]`（**仅观测**）。
+    ///
+    /// 数据源 = 既有 [`NodeConsensusHandler`] 计数（唯一递增点 = 各 `collect_*` 的容量分支）；
+    /// 本方法**只读**。无网络栈 ⇒ 全 0（与既有 `liveness_snapshot` 的 `None ⇒ 0` 一致）。
+    /// **不改变**队列容量 / 保留策略 / 广播语义 / 共识行为。
+    pub fn inbound_queue_drops(&self) -> [u64; 4] {
+        self.network_stack.as_ref().map_or([0; 4], |s| {
+            let h = s.el.handler();
+            [
+                h.block_inbound_dropped(),
+                h.sync_requests_dropped(),
+                h.round_changes_dropped(),
+                h.abandon_attestations_dropped(),
+            ]
+        })
+    }
+
+    /// P1-A.30 **D0** — Guard C 准入拒绝**分类**计数（8 类固定序；**仅观测**）。
+    ///
+    /// 数据源 = 既有 `PendingProposalStore`（唯一计数点）；本方法**不**新增计数。
+    /// 用途：区分 A30/A12 运行中 `proposal_rejected` 是否来自 `Signature` / `Proposer` /
+    /// `HeightContext` / `Evidence` / `MissingBlock` 等（过去只能标为 UNKNOWN）。
+    pub fn guard_reject_counts(&self) -> [u64; 8] {
+        self.pending_proposals.guard_reject_counts()
+    }
+
+    /// PHASE 6H-Z — G-1 暂存区当前证书数（有界内存；无持久化）。
+    pub fn round_change_store_len(&self) -> usize {
+        self.round_change_store.total()
+    }
+
+    /// PHASE 6H-AF — 本地真实 EXPIRE 产生的 Abandon attestation 数。
+    pub fn abandon_attestations_produced(&self) -> u64 {
+        self.abandon_attestations_produced
+    }
+
+    /// PHASE 6H-AF — 入站 attestation 被拒数（fail-closed 观测）。
+    pub fn abandon_attestations_rejected(&self) -> u64 {
+        self.abandon_attestations_rejected
+    }
+
+    /// PHASE 6H-AH — 已发出的本地 `0x0E` attestation 数（`broadcast` 已入队数；saturating）。
+    pub fn abandon_attestations_broadcast(&self) -> u64 {
+        self.abandon_attestations_broadcast
+    }
+
+    /// PHASE 6H-AF — 池内组装完成并经既有 `0x0D` 广播的证书数。
+    pub fn round_change_certificates_assembled(&self) -> u64 {
+        self.round_change_certificates_assembled
+    }
+
+    /// PHASE 6H-AF — 池内待广播证书数（有界；无持久化）。
+    pub fn round_change_pending_broadcast(&self) -> usize {
+        self.round_change_pool.pending_broadcast_len()
+    }
+
+    /// A3：当前计时器已历时（**毫秒**；`None` = 尚未 arm / 已被 finality disarm）。
+    ///
+    /// 读数 = **最后一次 `step()` 的**单调读数 − `armed_at`（saturating，毫秒）；本 accessor
+    /// **不**读时钟（不得干扰注入式 fake 时钟的时间轴）。与 `round_timeouts`（触发次数）不同。
+    pub fn round_timeout_elapsed_ms(&self) -> Option<u64> {
+        self.round_timer
+            .map(|t| t.elapsed_ns(self.last_tick_ns) / NANOS_PER_MS)
+    }
+
+    /// A3：当前计时器窗口（**毫秒**；`None` = 未 arm）。只读观测（诊断 / 确定测试）。
+    pub fn round_timeout_window_ms(&self) -> Option<u64> {
+        self.round_timer.map(|t| t.window_ns / NANOS_PER_MS)
+    }
+
+    /// PHASE 6H-A11 U1 — pending proposal 当前条目数（有界：≤ [`MAX_PENDING_PROPOSALS`]）。
+    pub fn pending_proposals_len(&self) -> usize {
+        self.pending_proposals.len()
+    }
+
+    /// PHASE 6H-A11 U1 — pending 准入成功数（U2/U3 起自增；确定性诊断计数）。
+    pub fn pending_proposals_admitted(&self) -> u64 {
+        self.pending_proposals.admitted_count()
+    }
+
+    /// PHASE 6H-A11 U1 — pending 准入拒绝数（U2/U3 起自增）。
+    pub fn pending_proposals_rejected(&self) -> u64 {
+        self.pending_proposals.rejected_count()
+    }
+
+    /// PHASE 6H-A11 U1 — pending 到期淘汰数（确定性 tick）。
+    pub fn pending_proposals_expired(&self) -> u64 {
+        self.pending_proposals.expired_count()
+    }
+
+    /// PHASE 6H-A11 U1 — pending 容量（FIFO）淘汰数。
+    pub fn pending_proposals_evicted(&self) -> u64 {
+        self.pending_proposals.evicted_count()
+    }
+
+    /// PHASE 6H-A11 DIAG — 单行只读诊断汇总（pending / guard 拒绝原因 / recovery / block 入站）。
+    ///
+    /// **仅观测**：不参与任何判定，不影响共识语义；供集成测试打印以定位停滞。
+    pub fn a11_diag_summary(&self) -> String {
+        let s = &self.pending_proposals;
+        let d = &self.a11_diag;
+        format!(
+            "pending(len={}, pended={}, admitted={}, rejected={}, expired={}, evicted={}; \
+             rej[nostore={}, store={}, missing={}, height={}, under={}, evid={}, prop={}, sig={}]) \
+             recovery(runs={}, cand={}, kept_missing={}, admitted={}, rejected={}, evid_conflict={}, submit_err={}) \
+             blocks(proc={}, canonical_next={}, register_ok={}, conflict_skipped={}, skipped={}) \
+             reg(round_conflict={}, arrival_mismatch={}, label_mismatch={})",
+            s.len(),
+            s.pended_count(),
+            s.admitted_count(),
+            s.rejected_count(),
+            s.expired_count(),
+            s.evicted_count(),
+            s.guard_reject_count(GuardReject::NoStore),
+            s.guard_reject_count(GuardReject::StorageError),
+            s.guard_reject_count(GuardReject::MissingBlock),
+            s.guard_reject_count(GuardReject::HeightContext),
+            s.guard_reject_count(GuardReject::HeightUnderflow),
+            s.guard_reject_count(GuardReject::Evidence),
+            s.guard_reject_count(GuardReject::Proposer),
+            s.guard_reject_count(GuardReject::Signature),
+            d.recovery_runs,
+            d.recovery_candidates,
+            d.recovery_kept_missing_block,
+            d.recovery_admitted,
+            d.recovery_rejected,
+            d.recovery_evidence_conflict,
+            d.recovery_submit_err,
+            d.block_inbound_processed,
+            d.block_canonical_next,
+            d.block_register_ok,
+            d.block_conflict_skipped,
+            self.block_inbound_skipped,
+            d.block_register_round_conflict,
+            d.block_arrival_round_mismatch,
+            d.block_register_label_mismatch,
+        )
+    }
+
+    /// P1-A.6 / A3 — **测试 / 开发 seam**：设置 round timeout 窗口参数（**毫秒**，单调时长）。
     ///
     /// - 非生产配置面：无 CLI flag / 不进 `NodeConfig` / 不持久化 / 不改任何共识语义。
     /// - 调用后丢弃当前计时器，下一 `step()` 按新参数重新 arm（确定测试无需等待 / 无 sleep）。
-    /// - 生产默认 = `RoundTimeoutConfig::default()`（1000 / 60_000 / 2）。
+    /// - 生产默认 = `RoundTimeoutConfig::default()`（10_000 / 120_000 / 2，**毫秒**）。
     pub fn set_round_timeout_config(&mut self, config: RoundTimeoutConfig) {
         self.round_timeout_config = config;
         self.round_timer = None;
+    }
+
+    /// A3 测试 seam — 注入**确定性** fake 时钟（生产默认 = [`SystemClock`]）。
+    ///
+    /// 语义边界：只影响本地计时器的"已历时"读数；**不**影响任何共识判定 / 验证 / 广播。
+    /// 注入后计时器**不**被修改（调用方可继续用 [`Self::set_round_timeout_config`] 重置）。
+    pub fn set_clock(&mut self, clock: Box<dyn MonotonicClock>) {
+        self.clock = clock;
     }
 
     /// 当前 outbound sync correlator 中 active（未 resolve / 未 expire）request 数
@@ -2070,6 +4214,15 @@ impl NodeRuntime {
             .and_then(|s| s.inbound.as_ref())
             .map(|i| i.connection_count())
             .unwrap_or(0)
+    }
+
+    /// NETDIAG（**只读**）：本节点当前是否持有该 peer 的**入站**连接。
+    pub fn network_inbound_contains(&self, peer_id: NodeId) -> bool {
+        self.network_stack
+            .as_ref()
+            .and_then(|s| s.inbound.as_ref())
+            .map(|i| i.contains(peer_id))
+            .unwrap_or(false)
     }
 
     /// D9 Step 8A：Production Sync Responder 观测（只读；不含敏感性字段）。
@@ -2709,14 +4862,199 @@ impl NodeRuntime {
         &mut self,
         command: NodeConsensusCommand,
     ) -> Result<(), DriverError> {
+        // PHASE 6H-A30 OD-X7 — 只读观测：入站提案消费计数。
+        // 边界（MUST）：不改变顺序 / guard / 处理结果；**不**触碰 `wiring.rs`。
+        if matches!(&command, NodeConsensusCommand::Proposal(_)) {
+            self.liveness.inbound_prop_ok = self.liveness.inbound_prop_ok.saturating_add(1);
+        }
         process_inbound_consensus_command(
             &mut self.driver,
             &self.block_production,
+            &mut PendingAdmission {
+                store: &mut self.pending_proposals,
+                config: &self.round_timeout_config,
+                tick: self.inbound_tick,
+            },
             &mut self.missing_ancestor_ledger,
             &mut self.pending_external_qc,
             &mut self.inbound_qc_deferred,
             command,
         )
+    }
+
+    /// PHASE 6H-A30 OD-X7 — **只读** liveness 观测快照（供 CLI 独立 `liveness` 行）。
+    ///
+    /// - **不参与任何判定**（零共识语义）；全部为 saturating 计数或只读派生。
+    /// - `prop_skip_fail` 为**残差**（`calls − ok − known_skips`），**不**推断未知原因。
+    /// - `round_adv_rc` 直接暴露**既有** `round_changes_by_authority`（**不**新增计数）。
+    pub fn liveness_snapshot(&self) -> LivenessSnapshot {
+        // PHASE 6H-A30 OD-X7d — 只读快照：既有 `diagnostics()`（`&self`）；無网络 ⇒ `None` ⇒ 0。
+        let net_diag = self.network_stack.as_ref().map(|s| s.ns.diagnostics());
+        let el_diag = self.network_stack.as_ref().map(|s| s.el.diagnostics());
+        // PHASE 6H-A30 OD-X7f — 只读：对**既有** outcomes 窗口分类（无新增计数点 / 无推算）。
+        let mut bv_total = 0u64;
+        let mut bv_future = 0u64;
+        let mut bv_known = 0u64;
+        let mut bv_stale = 0u64;
+        let mut bv_conflict = 0u64;
+        let mut bv_malformed = 0u64;
+        // PHASE 6H-A30 OD-X7g — `Err(InboundBlockError)` 细分（真实变体；零新增计数点）。
+        let mut be_oversized = 0u64;
+        let mut be_wrong_version = 0u64;
+        let mut be_wrong_chain = 0u64;
+        let mut be_hash_mismatch = 0u64;
+        let mut be_invalid_proposer_sig = 0u64;
+        let mut be_tx_root_mismatch = 0u64;
+        let mut be_noncanonical_tx_order = 0u64;
+        let mut be_state_root_mismatch = 0u64;
+        let mut be_unsupported_validation = 0u64;
+        let mut be_storage = 0u64;
+        for outcome in &self.block_inbound_outcomes {
+            bv_total = bv_total.saturating_add(1);
+            match outcome {
+                Ok(InboundBlockVerdict::FutureMissingAncestor { .. }) => {
+                    bv_future = bv_future.saturating_add(1);
+                }
+                Ok(InboundBlockVerdict::AlreadyKnown { .. }) => {
+                    bv_known = bv_known.saturating_add(1);
+                }
+                Ok(InboundBlockVerdict::Stale { .. }) => {
+                    bv_stale = bv_stale.saturating_add(1);
+                }
+                Ok(InboundBlockVerdict::ConflictingParent { .. }) => {
+                    bv_conflict = bv_conflict.saturating_add(1);
+                }
+                Err(InboundBlockError::Malformed) => {
+                    bv_malformed = bv_malformed.saturating_add(1);
+                }
+                Err(InboundBlockError::Oversized { .. }) => {
+                    be_oversized = be_oversized.saturating_add(1);
+                }
+                Err(InboundBlockError::WrongVersion { .. }) => {
+                    be_wrong_version = be_wrong_version.saturating_add(1);
+                }
+                Err(InboundBlockError::WrongChain { .. }) => {
+                    be_wrong_chain = be_wrong_chain.saturating_add(1);
+                }
+                Err(InboundBlockError::HashMismatch { .. }) => {
+                    be_hash_mismatch = be_hash_mismatch.saturating_add(1);
+                }
+                Err(InboundBlockError::InvalidProposerSignature) => {
+                    be_invalid_proposer_sig = be_invalid_proposer_sig.saturating_add(1);
+                }
+                Err(InboundBlockError::TransactionRootMismatch) => {
+                    be_tx_root_mismatch = be_tx_root_mismatch.saturating_add(1);
+                }
+                Err(InboundBlockError::NonCanonicalTransactionOrdering) => {
+                    be_noncanonical_tx_order = be_noncanonical_tx_order.saturating_add(1);
+                }
+                Err(InboundBlockError::StateRootMismatch) => {
+                    be_state_root_mismatch = be_state_root_mismatch.saturating_add(1);
+                }
+                Err(InboundBlockError::UnsupportedValidation(_)) => {
+                    be_unsupported_validation = be_unsupported_validation.saturating_add(1);
+                }
+                Err(InboundBlockError::Storage(_)) => {
+                    be_storage = be_storage.saturating_add(1);
+                }
+                // 仅剩 `CanonicalNextCandidate` ⇒ 归严格残差（== 窗口内 canonical-next 数）。
+                Ok(InboundBlockVerdict::CanonicalNextCandidate { .. }) => {}
+            }
+        }
+        let bv_other = bv_total
+            .saturating_sub(bv_future)
+            .saturating_sub(bv_known)
+            .saturating_sub(bv_stale)
+            .saturating_sub(bv_conflict)
+            .saturating_sub(bv_malformed);
+        // PHASE 6H-A30 OD-X7g — 再减去 10 个 `block_err_*`（上方原式逐字保持不变）⇒
+        // 严格残差 == 窗口内 `Ok(CanonicalNextCandidate)` 数。
+        let bv_other = bv_other
+            .saturating_sub(be_oversized)
+            .saturating_sub(be_wrong_version)
+            .saturating_sub(be_wrong_chain)
+            .saturating_sub(be_hash_mismatch)
+            .saturating_sub(be_invalid_proposer_sig)
+            .saturating_sub(be_tx_root_mismatch)
+            .saturating_sub(be_noncanonical_tx_order)
+            .saturating_sub(be_state_root_mismatch)
+            .saturating_sub(be_unsupported_validation)
+            .saturating_sub(be_storage);
+        LivenessSnapshot {
+            prop_calls: self.liveness.prop_calls,
+            prop_build_ok: self.liveness.prop_build_ok,
+            prop_skip_not_elected: self.liveness.prop_skip_not_elected,
+            prop_skip_height_desync: self.liveness.prop_skip_height_desync,
+            prop_skip_step_guard: self.liveness.prop_skip_step_guard,
+            prop_skip_conflict_target: self.liveness.prop_skip_conflict_target,
+            prop_skip_fail: self.liveness.skip_fail(),
+            inbound_prop_ok: self.liveness.inbound_prop_ok,
+            egress_prop_enqueued: self.liveness.egress_prop_enqueued,
+            egress_prop_refreshed: self.liveness.egress_prop_refreshed,
+            egress_prop_no_peer: self.liveness.egress_prop_no_peer,
+            round_adv_local: self.liveness.round_adv_local,
+            round_adv_height: self.liveness.round_adv_height,
+            round_adv_rc: self.round_changes_by_authority,
+            elected_is_self: self.liveness.elected_is_self,
+            prop_absent_steps: self.liveness.prop_absent_steps,
+            // PHASE 6H-A30 OD-X7b — 直接读取真实计数槽位（无增量点 / 无结果猜测）。
+            proposal_admitted: self.pending_proposals.admitted_count(),
+            proposal_pending: self.pending_proposals.pended_count(),
+            proposal_rejected: self.pending_proposals.rejected_count(),
+            proposal_expired: self.pending_proposals.expired_count(),
+            // PHASE 6H-A30 OD-X7d — 直读既有网络/事件环诊断（无增量点 / 无推算）。
+            net_frames_received: net_diag.map_or(0, |d| d.frames_received),
+            net_events_enqueued: net_diag.map_or(0, |d| d.events_enqueued),
+            net_sent: net_diag.map_or(0, |d| d.sent),
+            net_dropped_invalid: net_diag.map_or(0, |d| d.dropped_invalid),
+            net_dropped_overflow: net_diag.map_or(0, |d| d.dropped_overflow),
+            net_unauthenticated_drops: net_diag.map_or(0, |d| d.unauthenticated_drops),
+            el_handler_errors: el_diag.map_or(0, |d| d.handler_errors),
+            el_events_dropped_overflow: el_diag.map_or(0, |d| d.events_dropped_overflow),
+            // PHASE 6H-A30 OD-X7e — 直读既有 `A11Diag` 字段（无新增计数点 / 无推算）。
+            recovery_runs: self.a11_diag.recovery_runs,
+            recovery_candidates: self.a11_diag.recovery_candidates,
+            recovery_kept_missing_block: self.a11_diag.recovery_kept_missing_block,
+            recovery_admitted: self.a11_diag.recovery_admitted,
+            recovery_rejected: self.a11_diag.recovery_rejected,
+            block_inbound_processed: self.a11_diag.block_inbound_processed,
+            block_canonical_next: self.a11_diag.block_canonical_next,
+            block_register_ok: self.a11_diag.block_register_ok,
+            // PHASE 6H-A30 OD-X7f — 窗口内分类（既有 outcomes；残差法）。
+            block_verdict_future_missing_ancestor: bv_future,
+            block_verdict_already_known: bv_known,
+            block_verdict_stale: bv_stale,
+            block_verdict_conflicting_parent: bv_conflict,
+            block_verdict_malformed: bv_malformed,
+            block_verdict_other: bv_other,
+            // PHASE 6H-A30 OD-X7g — Err 细分（窗口内；与 Ok 五类 + malformed + other 穷尽）。
+            block_err_oversized: be_oversized,
+            block_err_wrong_version: be_wrong_version,
+            block_err_wrong_chain: be_wrong_chain,
+            block_err_hash_mismatch: be_hash_mismatch,
+            block_err_invalid_proposer_signature: be_invalid_proposer_sig,
+            block_err_transaction_root_mismatch: be_tx_root_mismatch,
+            block_err_noncanonical_transaction_ordering: be_noncanonical_tx_order,
+            block_err_state_root_mismatch: be_state_root_mismatch,
+            block_err_unsupported_validation: be_unsupported_validation,
+            block_err_storage: be_storage,
+            // PHASE 6H-A30-OD-X7h — 来源类别累计（直读既有 `A11Diag`；无推算 / 无增量点）。
+            block_src_gossip_total: self.a11_diag.block_src_gossip_total,
+            block_src_gossip_invalid_proposer_signature: self
+                .a11_diag
+                .block_src_gossip_invalid_proposer_signature,
+            block_src_sync_total: self.a11_diag.block_src_sync_total,
+            block_src_sync_invalid_proposer_signature: self
+                .a11_diag
+                .block_src_sync_invalid_proposer_signature,
+            // PHASE 6H-A30-OD-X7i — gossip IPS 来源分类累计（直读既有 `A11Diag`）。
+            block_gossip_invalid_proposer_signature_evidence_conflict: self
+                .a11_diag
+                .block_gossip_invalid_proposer_signature_evidence_conflict,
+            block_gossip_invalid_proposer_signature_signature_failure: self
+                .a11_diag
+                .block_gossip_invalid_proposer_signature_signature_failure,
+        }
     }
 
     /// canonical consensus node handle（只读）—— **delegate** `driver.consensus()`（不复制）。
@@ -2874,10 +5212,13 @@ impl NodeRuntime {
                 &mut self.driver,
                 &self.block_production,
                 self.proposal_timestamp,
+                &mut self.liveness,
             )?;
             if let Some(pb) = proposal {
                 self.last_proposal = Some(pb);
             }
+            // PHASE 6H-A30 OD-X7 — 只读瞬态观测（不相交字段引用；**不**参与判定）。
+            observe_liveness_transient(&self.driver, &mut self.liveness);
             return Ok(());
         }
         // P1-A.6 — round-timeout 决策的**入口观测快照**：仅用于判定「本 step 是否在当前
@@ -2904,11 +5245,21 @@ impl NodeRuntime {
         //  `drive_local_consensus`；`inbound_consensus_rejected` 与 `derived_qc_not_applicable`
         //  是两个独立计数，不互相混合。）
         for command in commands {
+            // PHASE 6H-A30 OD-X7 — 只读观测：入站提案消费计数。
+            // 边界（MUST）：不改变顺序 / guard / 处理结果；**不**触碰 `wiring.rs`。
+            if matches!(&command, NodeConsensusCommand::Proposal(_)) {
+                self.liveness.inbound_prop_ok = self.liveness.inbound_prop_ok.saturating_add(1);
+            }
             // P1-A.4：**入站（peer 提供）** consensus command 的 Driver 拒绝边界（拒绝 + 计数 + 继续）。
             // P1-A.7：同一入口内附加有界 pending / defer 计数 / 恢复 hint（见 free fn doc）。
             if process_inbound_consensus_command(
                 &mut self.driver,
                 &self.block_production,
+                &mut PendingAdmission {
+                    store: &mut self.pending_proposals,
+                    config: &self.round_timeout_config,
+                    tick: self.inbound_tick,
+                },
                 &mut self.missing_ancestor_ledger,
                 &mut self.pending_external_qc,
                 &mut self.inbound_qc_deferred,
@@ -2924,12 +5275,28 @@ impl NodeRuntime {
         // SyncBlockResponse payload → block_inbound validator（只读）→ typed verdict 观测。
         // 不 commit / 不写存储 / 不推进 head（CanonicalNextCandidate 非 finality-authorized）。
         let block_msgs = stack.el.handler_mut().take_block_inbound();
+        // PHASE 6H-Z §11：入站 O2 `RoundChangeCertificate`（bounded 队列；D3 限速在 Network 层
+        // 已完成）—— 本层只搬 payload；decode / 验证 / 适用性 / 应用在
+        // [`drive_round_change_authority`]（委托冻结 `verify_certificate`）。
+        let round_change_msgs = stack
+            .el
+            .handler_mut()
+            .take_round_changes_bounded(ROUND_CHANGES_PER_STEP);
+        // PHASE 6H-AF §9：入站 O2 `ConsensusAbandonAttestation`（`0x0E`；ADR-0075）—— 只搬 payload；
+        // ADR-0074 decode 与冻结验签（`verify_evidence`，经池 `admit`）在下方权威段完成。
+        let abandon_attestation_msgs = stack
+            .el
+            .handler_mut()
+            .take_abandon_attestations_bounded(ABANDON_ATTESTATIONS_PER_STEP);
         // D10-A Step 3：向 D9 proposer validation 提供本地 ValidatorSet（解除生产 None seam 的
         // canonical-next 假阻塞）—— 远端 canonical-next 块经本地 `select_proposer` → expected VK
         // 真实验签；**不 commit / 不推进 head**（block inbound 仍只读观测；远端块自动进入共识 =
         // D10-D 多节点网络 E2E 授权，本 step 不实施）。
         let validator_set = self.driver.consensus().validator_set().clone();
         for msg in block_msgs {
+            // PHASE 6H-A11 DIAG — 仅观测：入站 block 消息处理计数。
+            self.a11_diag.block_inbound_processed =
+                self.a11_diag.block_inbound_processed.saturating_add(1);
             // D8-3-1-A/C：SyncBlockResponse 先做 request_id correlation —— resolve 匹配的 active
             // request（释放 active capacity；request lifecycle 完成）；Unknown / 结构损坏 ⇒ 安全
             // 拒（不 dispatch 未请求数据 / 不 commit / 不改 canonical / 不创建 request / 不 panic）。
@@ -2965,25 +5332,39 @@ impl NodeRuntime {
             // 仅值传递、不新增任何长期状态；生命周期 = 本 step 本次迭代。
             let mut sync_qc_evidences: Vec<(u64, [u8; 32])> = Vec::new();
             let (source, outcomes, wires) = match (&self.block_production, msg) {
-                (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => (
-                    BlockInboundSource::Gossip,
-                    vec![dispatch_gossip_block_round_aware(
-                        adapter,
-                        self.max_block_bytes,
-                        &wire,
-                        &validator_set,
-                        // D9 Step 8A（G1）：注入本地 DAG ⇒ 已落盘但不在 DAG 的块不短路为
-                        // AlreadyKnown，走完 ⑥/⑦ 全验证 ⇒ 可幂等补登记（不 commit / 不推 head）。
-                        Some(self.driver.consensus().dag()),
-                        // P1-A.18 RC-1：**绑定证据**（无证据 ⇒ 回退 round 0；两个来源冲突 ⇒ 拒绝）。
-                        proposal_round_evidence(
+                (Some(adapter), BlockInboundMessage::GossipBlock(wire)) => {
+                    // PHASE 6H-A30-ROOTFIX-M3（Owner 授权）—— gossip 轮证据来源：**仅**已接受 proposal
+                    // （`proposal_round_evidence`：hash 严格相等 + 父高轮 gate 在函数内保证）。
+                    // **不**使用 pending arrival 轮（到达轮 ≠ 生产轮，会把正常 round>0 的块误判）。
+                    // 无绑定证据 ⇒ `evidence = None` ⇒ `dispatch_gossip_block_round_aware` 经
+                    // [`resolve_inbound_block_round`] **回退到 `header.round`**（已签名 / 已被 block hash
+                    // 承诺；M3 取代了旧的隐式 round 0 回退）⇒ round>0 的诚实提案可正常验证 / 登记 /
+                    // 恢复（t7_3 5/7、t7_2 6/7 场景）。
+                    // 结构损坏（无法取得 hash）⇒ `None`（validator 自身以 `Malformed` 拒，既有行为）。
+                    let evidence = match wire_block_hash(&wire) {
+                        Some(h) => proposal_round_evidence(
                             self.driver.consensus().state(),
                             adapter.head().height,
-                        ),
-                        last_precommit_round_evidence(self.driver.consensus()),
-                    )],
-                    vec![Some(wire)],
-                ),
+                        )
+                        .filter(|(_, bh)| *bh == h),
+                        None => None,
+                    };
+                    (
+                        BlockInboundSource::Gossip,
+                        vec![dispatch_gossip_block_round_aware(
+                            adapter,
+                            self.max_block_bytes,
+                            &wire,
+                            &validator_set,
+                            // D9 Step 8A（G1）：注入本地 DAG ⇒ 已落盘但不在 DAG 的块不短路为
+                            // AlreadyKnown，走完 ⑥/⑦ 全验证 ⇒ 可幂等补登记（不 commit / 不推 head）。
+                            Some(self.driver.consensus().dag()),
+                            evidence,
+                            last_precommit_round_evidence(self.driver.consensus()),
+                        )],
+                        vec![Some(wire)],
+                    )
+                }
                 (Some(adapter), BlockInboundMessage::SyncBlockResponse(payload)) => {
                     // P1-A.18 RC-1（Stage 2）：**绑定** QC 证据（**有界**；复用既有
                     // `pending_external_qc`，不新增任何长期状态）。仅当 `qc.target ==` 入站块
@@ -3020,6 +5401,89 @@ impl NodeRuntime {
                 }
             };
             for (idx, outcome) in outcomes.into_iter().enumerate() {
+                // PHASE 6H-A30-OD-X7i — 仅观测：**Gossip** 路径 `InvalidProposerSignature` 来源分类
+                //（A = 绑定证据轮冲突 / B = 真实验签失败）。
+                // 依据：gossip dispatcher 顺序固定 —— 先 `resolve_proposer_round_evidence`
+                //（Err ⇒ 直接 IPS），后 `validate_block_signature`（失败 ⇒ IPS）。
+                // 故在同一输入上**只读复算**证据解析即可精确归类：Err ⇒ A；Ok ⇒ 只能为 B。
+                // 严格只读：不执行验签 / 不新增状态 / 不改变 verdict / 不改变控制流。
+                if source == BlockInboundSource::Gossip
+                    && matches!(&outcome, Err(InboundBlockError::InvalidProposerSignature))
+                {
+                    let origin = match wires.get(idx) {
+                        Some(Some(wire)) => match wire_block_hash(wire) {
+                            Some(h) => {
+                                let qc_evidence =
+                                    last_precommit_round_evidence(self.driver.consensus());
+                                match proposal_round_evidence(
+                                    self.driver.consensus().state(),
+                                    self.block_production
+                                        .as_ref()
+                                        .map_or(0, |a| a.head().height),
+                                )
+                                .filter(|(_, bh)| *bh == h)
+                                {
+                                    // M1 起：无绑定证据 ⇒ 不可能出现 IPS（已归 UnsupportedValidation）
+                                    // ⇒ 若出现则视为与 dispatcher 判定域不一致 ⇒ 归 A（不落入 B）。
+                                    None => Some(true),
+                                    Some(evidence) => Some(
+                                        resolve_proposer_round_evidence(
+                                            h,
+                                            Some(evidence),
+                                            qc_evidence,
+                                        )
+                                        .is_err(),
+                                    ),
+                                }
+                            }
+                            None => None,
+                        },
+                        _ => None,
+                    };
+                    match origin {
+                        Some(true) => {
+                            self.a11_diag
+                                .block_gossip_invalid_proposer_signature_evidence_conflict = self
+                                .a11_diag
+                                .block_gossip_invalid_proposer_signature_evidence_conflict
+                                .saturating_add(1);
+                        }
+                        Some(false) => {
+                            self.a11_diag
+                                .block_gossip_invalid_proposer_signature_signature_failure = self
+                                .a11_diag
+                                .block_gossip_invalid_proposer_signature_signature_failure
+                                .saturating_add(1);
+                        }
+                        None => {}
+                    }
+                }
+                // PHASE 6H-A30-OD-X7h — 仅观测：按**既有**入站来源分类该块 verdict
+                //（`GossipBlock` vs `SyncBlockResponse`；与既有 verdict **同源同序**）。
+                // 严格只读：**不**重新执行 validation、**不**改变 verdict / 控制流 / 返回值；
+                // saturating + bounded；`source` 为既有 `Copy` 值（不影响后续 `observe`）。
+                match source {
+                    BlockInboundSource::Gossip => {
+                        self.a11_diag.block_src_gossip_total =
+                            self.a11_diag.block_src_gossip_total.saturating_add(1);
+                        if matches!(&outcome, Err(InboundBlockError::InvalidProposerSignature)) {
+                            self.a11_diag.block_src_gossip_invalid_proposer_signature = self
+                                .a11_diag
+                                .block_src_gossip_invalid_proposer_signature
+                                .saturating_add(1);
+                        }
+                    }
+                    BlockInboundSource::SyncResponse => {
+                        self.a11_diag.block_src_sync_total =
+                            self.a11_diag.block_src_sync_total.saturating_add(1);
+                        if matches!(&outcome, Err(InboundBlockError::InvalidProposerSignature)) {
+                            self.a11_diag.block_src_sync_invalid_proposer_signature = self
+                                .a11_diag
+                                .block_src_sync_invalid_proposer_signature
+                                .saturating_add(1);
+                        }
+                    }
+                }
                 // observation（bounded outcomes；保留既有语义）
                 if self.block_inbound_outcomes.len() >= BLOCK_INBOUND_OUTCOME_CAP {
                     self.block_inbound_outcomes.pop_front();
@@ -3035,12 +5499,16 @@ impl NodeRuntime {
                         && let Some(Some(wire)) = wires.get(idx)
                         && let Some(adapter) = self.block_production.as_ref()
                     {
-                        // P1-A.18 / A3：registration 必须与 validation 使用**同一**已解析 round。
+                        // PHASE 6H-A11 DIAG — 仅观测：canonical-next 候选计数。
+                        self.a11_diag.block_canonical_next =
+                            self.a11_diag.block_canonical_next.saturating_add(1);
+                        // P1-A.18 / A3 + M3：registration 必须与 validation 使用**同一**轮派生规则。
                         // - sync 分支：用**同一** `sync_qc_evidences` + 同一 canonical hash（verdict 携带，
-                        //   与 validation 逐字同一值）再次解析 ⇒ 同一 round；
-                        // - gossip 分支：切片为空 ⇒ `Ok(None)` ⇒ 逐字保持既有本地证据链
-                        //   （proposal → last_precommit → round 0）；
-                        // - `Err(冲突轮)` ⇒ **保守拒绝该块**（不落盘 / 不登记；**不得**回退 round 0）。
+                        //   与 validation 逐字同一值）解析 ⇒ 同一 round；
+                        // - gossip 分支：切片为空 ⇒ `Ok(None)` ⇒ `register_remote_canonical_block`
+                        //   内部经**同一** `resolve_inbound_block_round`（证据优先 → `header.round`）
+                        //   解析 —— 与 gossip dispatcher **逐字同规则**；
+                        // - `Err(冲突轮)` ⇒ **保守拒绝该块**（不落盘 / 不登记）。
                         match resolve_proposer_round_from_evidences(*block_hash, &sync_qc_evidences)
                         {
                             Ok(resolved_round) => {
@@ -3048,8 +5516,22 @@ impl NodeRuntime {
                                     &mut self.driver,
                                     adapter,
                                     wire,
+                                    &self.pending_proposals,
                                     resolved_round,
+                                    &mut self.a11_diag,
                                 )?;
+                                // PHASE 6H-A11 DIAG — 仅观测：区块登记成功计数。
+                                self.a11_diag.block_register_ok =
+                                    self.a11_diag.block_register_ok.saturating_add(1);
+                                // PHASE 6H-A11 U3 — pending recovery checkpoint：**同 step / 同
+                                // block inbound stage 内**，区块登记成功后立即尝试恢复（OD-C1 = A）。
+                                recover_pending_proposals(
+                                    &mut self.driver,
+                                    adapter,
+                                    &mut self.pending_proposals,
+                                    &mut self.inbound_consensus_rejected,
+                                    &mut self.a11_diag,
+                                );
                             }
                             Err(()) => {
                                 self.block_inbound_skipped =
@@ -3061,6 +5543,12 @@ impl NodeRuntime {
                 self.block_inbound_outcomes.push_back(outcome);
             }
         }
+        // PHASE 6H-A11 U3 — pending **到期 sweep**（每 step **固定**检查上界
+        // [`PENDING_SWEEP_MAX_PER_STEP`]；确定性逻辑 tick；**无** wall clock / **无** 新增 timer /
+        // **无** while 无界扫描）。淘汰仅计数，**不**产生 progress / **不**触发 RESET。
+        let _ = self
+            .pending_proposals
+            .sweep_expired(self.inbound_tick, PENDING_SWEEP_MAX_PER_STEP);
         // ===== P1-A.7 — bounded External Finality Adoption（ADR-0064）=====
         // 顺序固定：入站 commands（verify_qc + acquire_lock + pending）→ block inbound
         //（register_remote_canonical_block）→ **本采纳检查点** → sync 编排 → round timeout →
@@ -3126,13 +5614,96 @@ impl NodeRuntime {
         // `drive_local_consensus`。放在提案生成**之前**，使 round change 后新当选 proposer 能
         // **同一 step** 内走既有提案路径（liveness 在一个 step 内闭合）；其余阶段顺序不变。
         // （free fn + 不相交字段引用：网络段已持 `network_stack` 可变借用。）
+        // ===== PHASE 6H-Z — O2 入站 RoundChangeCertificate 权威路径（唯一检查点）=====
+        // 顺序固定：**RC 权威应用** → round-timeout 检查 → runtime_propose → drive_local_consensus。
+        // 放在 pacemaker **之前**：应用时新 round 的计时器已重开（`elapsed = 1`）⇒ 同一步内
+        // pacemaker 看到的是新 `(height, round)` 的**新鲜**窗口 —— 不可能 double timeout /
+        // double increment / 为错误 height arm timer。
+        // ===== PHASE 6H-A30 OD-X7 — 只读观测：每个 step 读取**一次**单调时钟 =====
+        // A3：本 step 内所有计时决策（RC 重开 / pacemaker 到期）共用**同一个**读数
+        // ⇒ 同一步内不可能出现"两个不同的 now"导致的时序偏差（单步确定性）。
+        let now_ns = clock_ns(self.clock.as_ref());
+        // A3：供只读诊断 accessor 使用的"最后一次 step 读数"（**不**参与判定）。
+        self.last_tick_ns = now_ns;
+        drive_round_change_authority(
+            &mut self.driver,
+            &self.round_timeout_config,
+            now_ns,
+            &mut self.round_timer,
+            &mut self.round_changes_by_authority,
+            &mut self.round_changes_rejected,
+            &mut self.round_changes_deferred,
+            &mut self.round_change_diag,
+            &mut self.round_change_store,
+            round_change_msgs,
+        );
+        // PHASE 6H-AF §8：本 step 的真实 EXPIRE 观测（仅本 step 内有效；`None` = 本 step 未到期）。
+        // 由 `drive_round_timeout` 以**真实到期计时器状态**填充（见 [`LocalExpireObservation`]）。
+        let mut expired_observation: Option<LocalExpireObservation> = None;
         drive_round_timeout(
             &mut self.driver,
             &self.round_timeout_config,
+            now_ns,
             &mut self.round_timer,
             &mut self.round_timeouts,
+            &mut self.round_timeout_outcomes,
+            &mut self.liveness.round_adv_local,
             round_entry,
+            &mut expired_observation,
         );
+        // ===== PHASE 6H-AF — O2 attestation 生产 / 入池 / 证书广播（唯一检查点）=====
+        // 顺序固定：迁移的本地 EXPIRE 观测 ⇒ **A-C 本地签名** ⇒ 池；随后入池入站 `0x0E`；
+        // 最后把池内**已组装**证书经**既有** `0x0D` egress 广播（本 step 末尾既有 flush 发出去）。
+        let newly_recorded = if let Some(observation) = expired_observation.as_ref() {
+            produce_local_abandon_attestations(
+                &self.driver,
+                &mut self.round_change_pool,
+                observation,
+                &mut self.abandon_attestations_produced,
+            )
+        } else {
+            Vec::new()
+        };
+        // ===== PHASE 6H-AH §3 — O2 **个人 attestation 出站**（唯一新增网络边）=====
+        // EXPIRE → sign → pool（`Recorded` 首次收录）⇒ 构造 `OutboundConsensusMessage::AbandonAttestation`
+        // ⇒ **既有** `egress`（ADR-0074 冻结 codec，精确 112B）⇒ **既有** `NetworkService::broadcast`
+        // ⇒ 本 step 末尾**既有** `flush_outbound`（真 TCP）。
+        // 逐字冻结：`0x0E` = 个人 attestation；`0x0D` = 证书（**绝不**把 attestation 塞入 `0x0D`，
+        // 也**绝不**由本地 attestation 直接产生本地证书而绕过**跨节点** attestation 累积）。
+        // 无对端 Established ⇒ `broadcast` 返回 0（尽力而为，**不**重试、**不**新增队列语义）。
+        for attestation in newly_recorded {
+            let message = OutboundConsensusMessage::AbandonAttestation(attestation);
+            let envelope = crate::egress::envelope_for(&message, stack.signer.as_ref())
+                .map_err(RuntimeError::Egress)?;
+            // D0：`Ok(0)` == "本 step 无任何 Established 对端"（既有 `let _ =` 的**忽略错误**
+            // 语义保持不变：`Err` 路径仍不计数、不传播、不重试）。
+            let no_peer = matches!(stack.ns.broadcast(envelope), Ok(0));
+            if no_peer {
+                self.abandon_broadcast_no_peer = self.abandon_broadcast_no_peer.saturating_add(1);
+            }
+            self.abandon_attestations_broadcast =
+                self.abandon_attestations_broadcast.saturating_add(1);
+        }
+        admit_inbound_abandon_attestations(
+            &self.driver,
+            &mut self.round_change_pool,
+            &mut self.abandon_attestations_rejected,
+            abandon_attestation_msgs,
+        );
+        for certificate in self.round_change_pool.take_pending_broadcast() {
+            self.round_change_certificates_assembled =
+                self.round_change_certificates_assembled.saturating_add(1);
+            // 既有 0x0D 路径：不重设计 certificate transport（ADR-0070 codec + ADR-0073 0x0D）。
+            let message = OutboundConsensusMessage::RoundChange(certificate);
+            let envelope = crate::egress::envelope_for(&message, stack.signer.as_ref())
+                .map_err(RuntimeError::Egress)?;
+            // D0："已组装但零 Established 对端" 的**唯一**观测点（同上：`Err` 仍不计数）。
+            let no_peer = matches!(stack.ns.broadcast(envelope), Ok(0));
+            if no_peer {
+                self.round_change_broadcast_no_peer =
+                    self.round_change_broadcast_no_peer.saturating_add(1);
+            }
+        }
         // STEP 10-19-6 OPT-1：node-local proposer orchestration —— 仅本节点为当前 proposer 且
         // 阶段 Propose 且本轮未提案时，经 BlockBuilder 产出真实 Block + ProposalRef 并提交；
         // 否则幂等 no-op。不自动投票（vote 仍走既有路径）。
@@ -3140,6 +5711,7 @@ impl NodeRuntime {
             &mut self.driver,
             &self.block_production,
             self.proposal_timestamp,
+            &mut self.liveness,
         )?;
         if let Some(pb) = &proposal {
             // 本地产出（本地接受的真实 canonical block；runtime_propose 已 submit proposal）→
@@ -3163,10 +5735,43 @@ impl NodeRuntime {
             // 入队仅本 tick（`build_proposal` 幂等守卫 + 每 step drain ⇒ 不重复广播）。
             let block_wire =
                 nova_runtime::encode_block(&pb.block).map_err(RuntimeError::BlockCodec)?;
+            // PHASE 6H-A30 OD-X8 — 登记**有界**重播状态（wire 逐字节复用；见 [`ProposalRefresh`]）。
+            // 仅在**本次**生产成功后登记（失败路径 `?` 在上方 ⇒ 不会登记半成品）。
+            let (bound_height, bound_round) = {
+                let round = &self.driver.consensus().state().round;
+                (round.height, round.round)
+            };
+            register_proposal_refresh(
+                &mut self.proposal_refresh,
+                pb,
+                Some(block_wire.clone()),
+                bound_height,
+                bound_round,
+                self.inbound_tick,
+            );
             self.driver
                 .record_local_proposal(pb.proposal_ref.clone(), block_wire);
+            // PHASE 6H-A30 OD-X7 — 只读观测：提案已登记出站（**不**参与判定）。
+            self.liveness.egress_prop_enqueued =
+                self.liveness.egress_prop_enqueued.saturating_add(1);
             self.last_proposal = Some(pb.clone());
         }
+        // PHASE 6H-A30 OD-X8 — 本地提案**有界重播**（in-round refresh）。
+        //
+        // **不**改任何准入 / 投票 / QC / lock / RC / finality 语义：重播逐字节相同的
+        // `ProposalRef` + wire block，经**同一** egress / **同一**入站路径；接收方只有在
+        // 自己当前轮 == 生产轮时才会准入（Guard C 逐字不变）。
+        //
+        // 触发条件：`(height, round)` 未变 ∧ 本轮提案仍为本次产出 ∧ 间隔 ≥ 10 tick
+        // ∧ 重播次数 < 3。陈旧状态（轮/高度变化、本轮提案被替换）⇒ 立即清空。
+        drive_proposal_refresh(
+            &mut self.driver,
+            &mut self.proposal_refresh,
+            self.inbound_tick,
+            &mut self.liveness,
+        );
+        // PHASE 6H-A30 OD-X7 — 只读瞬态观测（不相交字段引用；**不**参与判定）。
+        observe_liveness_transient(&self.driver, &mut self.liveness);
         // D10-A Step 3：本地 consensus 自动推进（每 step 幂等 —— 本地产出的 canonical
         // proposal 自动执行本地 Prevote/Precommit → QC/finality 由既有 transition 产生）。
         // P1-A.5：派生 QC 的 target 不在本节点 DAG（`UnknownTarget`）⇒ **不适用**（非错误）：
@@ -3221,6 +5826,8 @@ impl NodeRuntime {
             && head_height > self.driver.consensus().state().round.height
         {
             self.driver.consensus_mut().advance_to_height(head_height);
+            // PHASE 6H-A30 OD-X7 — 只读观测：高度推进导致的 round 归零（**不**参与判定）。
+            self.liveness.round_adv_height = self.liveness.round_adv_height.saturating_add(1);
         }
         // D10 Recovery C — 恢复状态清理（**非 gate**）：bridge commit 后 canonical head 已到达
         // 恢复的 finalized reference ⇒ 清空 `restored_finality`（不再充当 bridge 证据）。
@@ -3239,9 +5846,16 @@ impl NodeRuntime {
         // established）按 backpressure drop —— 不 panic、不阻塞共识。
         let outbound = self.driver.take_outbound();
         for msg in outbound {
+            // PHASE 6H-A30 OD-X7 — 只读观测：仅**提案**消息统计"零 Established 对端"。
+            // 语义不变：`Err` 仍忽略（**不**新增 retry / fallback / relay / 错误传播）。
+            let is_proposal = matches!(msg, OutboundConsensusMessage::Proposal(_));
             let envelope = crate::egress::envelope_for(&msg, stack.signer.as_ref())
                 .map_err(RuntimeError::Egress)?;
-            let _ = stack.ns.broadcast(envelope);
+            let broadcasted = stack.ns.broadcast(envelope);
+            if is_proposal && matches!(broadcasted, Ok(0)) {
+                self.liveness.egress_prop_no_peer =
+                    self.liveness.egress_prop_no_peer.saturating_add(1);
+            }
         }
         let _ = stack.ns.flush_outbound();
         Ok(())
@@ -3266,6 +5880,7 @@ impl NodeRuntime {
             handshake_init_sent_for: _,
             validator_journal: _,
             proposal_timestamp: _,
+            proposal_refresh: _,
             last_proposal: _,
             finality_fact_path: _,
             finality_fact_persisted: _,
@@ -3281,8 +5896,23 @@ impl NodeRuntime {
             inbound_consensus_rejected: _,
             derived_qc_not_applicable: _,
             round_timeout_config: _,
+            clock: _,
+            last_tick_ns: _,
             round_timer: _,
             round_timeouts: _,
+            round_changes_by_authority: _,
+            round_changes_rejected: _,
+            round_changes_deferred: _,
+            round_change_diag: _,
+            round_change_broadcast_no_peer: _,
+            abandon_broadcast_no_peer: _,
+            round_timeout_outcomes: _,
+            round_change_store: _,
+            round_change_pool: _,
+            abandon_attestations_produced: _,
+            abandon_attestations_rejected: _,
+            abandon_attestations_broadcast: _,
+            round_change_certificates_assembled: _,
             inbound_tick: _,
             inbound_pending: _,
             sync_respond: _,
@@ -3300,6 +5930,9 @@ impl NodeRuntime {
             peer_lifecycle: _,
             peer_dial_attempts_total: _,
             peer_dial_failures_total: _,
+            pending_proposals: _,
+            a11_diag: _,
+            liveness: _,
         } = self;
 
         if let Some(mut stack) = network_stack {
@@ -3339,6 +5972,14 @@ pub fn derive_validator_id(public_key: &[u8; 32]) -> ValidatorId {
 mod tests {
     use super::*;
     use nova_crypto::identity::validator_id as crypto_validator_id;
+    // PHASE 6H-Z：RC 测试需用**冻结** codec 组帧（不建立第二套 RC 编码）。
+    use nova_consensus::round_change::encode_certificate;
+
+    /// PHASE 6H-Z — RC 权威路径测试常量（devnet 编码空间；非主网参数）。
+    const RC_TEST_CHAIN_ID: u64 = 1001;
+    const RC_TEST_HEIGHT: u64 = 5;
+    const RC_TEST_ROUND: u64 = 3;
+    const RC_TEST_VSID: [u8; 32] = [0xAB; 32];
 
     // -----------------------------------------------------------------------
     // P1-A.8 — peer reconnect backoff（冻结公式 + 溢出安全）
@@ -3436,11 +6077,738 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // PHASE 6H-Z §14-D1 2/5/11/12/16 —— 运行路径：RC 权威应用 / 暂存 / 拒绝 + 独立归因
+    // -----------------------------------------------------------------------
+
+    /// 构造最小的 full-node driver（actors = []；RC 应用不需要 actor）。
+    fn rc_test_driver(n: usize) -> (NodeConsensusDriver<DynSigner>, Vec<KeyPair>, [u8; 32]) {
+        use nova_consensus::dag::Dag;
+        use nova_crypto::address::{
+            ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
+        };
+        use nova_crypto::identity::{
+            EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit,
+        };
+
+        let mut kps: Vec<KeyPair> = Vec::new();
+        let mut vals: Vec<ValidatorInit> = Vec::new();
+        for i in 0..n {
+            let kp = KeyPair::generate().expect("keypair");
+            vals.push(ValidatorInit {
+                account_address: YazimaoAddress::from_payload(YazimaoAddressPayload {
+                    address_version: ADDRESS_VERSION,
+                    address_type: AddressType::UserAccount,
+                    network_id: NetworkId::Mainnet,
+                    key_hash: [0xa0 + i as u8; 32],
+                }),
+                consensus_public_key: kp.verifying_key().to_bytes(),
+                bonded_stake: 100,
+                commission_bps: 0,
+            });
+            kps.push(kp);
+        }
+        vals.sort_by_key(|v| v.consensus_public_key);
+        let genesis = GenesisV1 {
+            network_id: NetworkId::Mainnet,
+            chain_id: RC_TEST_CHAIN_ID,
+            genesis_timestamp: 0,
+            initial_validator_set: vals,
+            initial_accounts: Vec::new(),
+            protocol_parameters: ProtocolParamsV1 {
+                max_tx_bytes: 64 * 1024,
+                max_block_bytes: 8 * 1024 * 1024,
+                max_gas_per_block: 100_000_000_000,
+                max_contract_code_bytes: 0,
+                max_contract_storage_bytes: 0,
+                epoch_length_blocks: 1_000_000,
+                snapshot_interval_blocks: 10_000_000,
+            },
+            economics_parameters: EconomicsParamsV1 {
+                total_supply: 1_000_000_000,
+                min_validator_stake: 100,
+                unbonding_period_seconds: 1_000,
+                fee_burn_bps: 100,
+            },
+        };
+        let set = ValidatorSet::from_genesis(&genesis);
+        let consensus = ConsensusNode::new(
+            RC_TEST_HEIGHT,
+            RC_TEST_ROUND,
+            RC_TEST_CHAIN_ID,
+            set,
+            RC_TEST_VSID,
+            Dag::new(),
+        );
+        (
+            NodeConsensusDriver::<DynSigner>::new(consensus, Vec::new()),
+            kps,
+            RC_TEST_VSID,
+        )
+    }
+
+    fn rc_test_cert(
+        kps: &[KeyPair],
+        vsid: [u8; 32],
+        height: u64,
+        from_round: u64,
+    ) -> RoundChangeCertificate {
+        use nova_consensus::round_change::{RoundChangeEvidence, abandon_message_hash};
+        use nova_crypto::signature::sign_message_hash;
+        let hash = abandon_message_hash(RC_TEST_CHAIN_ID, height, from_round).expect("hash");
+        let mut evidence: Vec<RoundChangeEvidence> = kps
+            .iter()
+            .map(|kp| RoundChangeEvidence {
+                validator_id: ValidatorId::from_consensus_public_key(
+                    &kp.verifying_key().to_bytes(),
+                ),
+                signature: sign_message_hash(kp.signing_key(), &hash).to_bytes(),
+            })
+            .collect();
+        evidence.sort_by_key(|e| e.validator_id);
+        RoundChangeCertificate {
+            validator_set_id: vsid,
+            height,
+            from_round,
+            evidence,
+        }
+    }
+
+    #[test]
+    fn phase6hz_rc_authority_apply_store_reject_with_independent_attribution() {
+        let (mut driver, kps, vsid) = rc_test_driver(3);
+        let config = RoundTimeoutConfig::default();
+        let mut timer: Option<RoundTimer> = None;
+        let mut by_authority = 0u64;
+        let mut rejected = 0u64;
+        let mut deferred = 0u64;
+        let mut diag = RoundChangeDiag::default();
+        let mut store =
+            RoundChangeStore::new(nova_consensus::round_change::DEFAULT_MAX_TRACKED_HEIGHTS);
+
+        // ① 无效入站（畸形字节）⇒ 拒绝 + 计数；round 不变（§14-D1-16）。
+        let round_before = driver.consensus().state().round.round;
+        drive_round_change_authority(
+            &mut driver,
+            &config,
+            0,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            vec![(NodeId::from_bytes([0x01; 32]), vec![0xFF; 3])],
+        );
+        assert_eq!(rejected, 1, "malformed ⇒ 拒绝");
+        assert_eq!(
+            diag.reject_count(RoundChangeRejectKind::Malformed),
+            1,
+            "D0：解码失败 ⇒ Malformed 桶"
+        );
+        assert_eq!(by_authority, 0);
+        assert_eq!(
+            driver.consensus().state().round.round,
+            round_before,
+            "零 round 变化"
+        );
+
+        // ② G-1：future round（from_round > local_round）⇒ **仅暂存**，不推进 / 不重开（§14-D1-2）。
+        let future_round = round_before + 2;
+        let future = rc_test_cert(&kps, vsid, RC_TEST_HEIGHT, future_round);
+        let future_bytes = encode_certificate(&future).expect("encode");
+        drive_round_change_authority(
+            &mut driver,
+            &config,
+            0,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            vec![(NodeId::from_bytes([0x02; 32]), future_bytes)],
+        );
+        assert_eq!(deferred, 1, "future ⇒ 暂存");
+        assert_eq!(by_authority, 0, "暂存不计入权威应用");
+        assert_eq!(store.total(), 1, "证书已暂存（有界内存）");
+        assert_eq!(
+            driver.consensus().state().round.round,
+            round_before,
+            "不推进"
+        );
+        assert!(timer.is_none(), "不重开计时器");
+
+        // ③ 当前 round 的合法证书 ⇒ 恰好 +1 + 计时器重开 + **独立**归因（§14-D1-5/10/11/12）。
+        let current = rc_test_cert(&kps, vsid, RC_TEST_HEIGHT, round_before);
+        let current_bytes = encode_certificate(&current).expect("encode");
+        drive_round_change_authority(
+            &mut driver,
+            &config,
+            0,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            vec![(NodeId::from_bytes([0x03; 32]), current_bytes)],
+        );
+        assert_eq!(by_authority, 1, "权威应用计数 +1");
+        assert_eq!(
+            driver.consensus().state().round.round,
+            round_before + 1,
+            "恰好 +1"
+        );
+        let armed = timer.expect("已重开计时器");
+        assert_eq!(
+            (armed.height, armed.round, armed.armed_at_ns),
+            (RC_TEST_HEIGHT, round_before + 1, 0),
+            "新 round 的新鲜窗口（armed_at = 本 step 单调读数）"
+        );
+        assert_eq!(armed.elapsed_ns(0), 0, "刚 ARM ⇒ 已历时 0");
+        assert_eq!(
+            armed.window_ns,
+            round_timeout_window_ns(&config, round_before + 1)
+        );
+        // 归因分离：本函数**不**接受 `round_timeouts` 参数 ⇒ 本地超时计数**结构上不可能**被 RC 影响。
+        assert_eq!(timer.map(|t| t.elapsed_ns(0)), Some(0));
+        // D0（仅观测）：合法证书不计入任何拒绝桶；暂存 gauge = ② 的 1 张；无重评尝试。
+        assert_eq!(rejected, 1, "本用例仅 ① 为拒绝");
+        assert_eq!(deferred, 1, "仅 ② 的 future 证书暂存");
+        assert_eq!(
+            diag.reeval_attempts, 0,
+            "无命中当前 (height, local_round) 的暂存证书"
+        );
+        assert_eq!(diag.reeval_applied, 0);
+        assert_eq!(diag.reject_count(RoundChangeRejectKind::Stale), 0);
+        assert_eq!(diag.reject_count(RoundChangeRejectKind::Other), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // P1-A.30 D0 — 诊断补全（**仅观测**：分类 / 计数 / 归因；零判定变化）
+    // -----------------------------------------------------------------------
+
+    /// D0 测试专用：把单条 payload 作为"一次入站批"喂给权威路径（`None` = 空批，仅触发重评）。
+    #[allow(clippy::too_many_arguments)]
+    fn rc_feed(
+        driver: &mut NodeConsensusDriver<DynSigner>,
+        timer: &mut Option<RoundTimer>,
+        by_authority: &mut u64,
+        rejected: &mut u64,
+        deferred: &mut u64,
+        diag: &mut RoundChangeDiag,
+        store: &mut RoundChangeStore,
+        payload: Option<&[u8]>,
+    ) {
+        let inbound = payload
+            .map(|p| vec![(NodeId::from_bytes([0x11; 32]), p.to_vec())])
+            .unwrap_or_default();
+        drive_round_change_authority(
+            driver,
+            &RoundTimeoutConfig::default(),
+            0,
+            timer,
+            by_authority,
+            rejected,
+            deferred,
+            diag,
+            store,
+            inbound,
+        );
+    }
+
+    /// D0 测试专用：`kps` 全量 **+ 一个非成员密钥** ⇒ 必落入 `Identity` 桶（与检查次序无关）。
+    fn rc_test_cert_with_foreign_member(
+        kps: &[KeyPair],
+        vsid: [u8; 32],
+        height: u64,
+        from_round: u64,
+    ) -> RoundChangeCertificate {
+        use nova_consensus::round_change::{RoundChangeEvidence, abandon_message_hash};
+        use nova_crypto::signature::sign_message_hash;
+        let foreign = KeyPair::generate().expect("keypair");
+        let hash = abandon_message_hash(RC_TEST_CHAIN_ID, height, from_round).expect("hash");
+        let mut evidence: Vec<RoundChangeEvidence> = kps
+            .iter()
+            .chain(std::iter::once(&foreign))
+            .map(|kp| RoundChangeEvidence {
+                validator_id: ValidatorId::from_consensus_public_key(
+                    &kp.verifying_key().to_bytes(),
+                ),
+                signature: sign_message_hash(kp.signing_key(), &hash).to_bytes(),
+            })
+            .collect();
+        evidence.sort_by_key(|e| e.validator_id);
+        RoundChangeCertificate {
+            validator_set_id: vsid,
+            height,
+            from_round,
+            evidence,
+        }
+    }
+
+    /// P1-A.30 **S5-2**：**同一步**内 `RC 应用` 与 `pacemaker` 的固定顺序 —— 恰一次 +1、无二次超时。
+    ///
+    /// `step()` 冻结顺序 = `drive_round_change_authority` → `drive_round_timeout`；RC 应用后新 round
+    /// 的窗口已重开（`elapsed = 1`）⇒ 同一步 pacemaker 看到 `progressed = true` ⇒ **Reset**（非
+    /// Expired）⇒ 不可能 double timeout / double increment / 为错误 round arm 计时器。
+    #[test]
+    fn p1a30_s5_same_step_rc_apply_and_pacemaker_do_not_double_advance() {
+        let (mut driver, kps, vsid) = rc_test_driver(3);
+        // 窗口 = 1 tick ⇒ 若本 step 无 RC，pacemaker 必然 EXPIRE。
+        let config = RoundTimeoutConfig {
+            initial_timeout: 1,
+            max_timeout: 2,
+            backoff_factor: 1,
+        };
+        let mut timer: Option<RoundTimer> = None;
+        let mut by_authority = 0u64;
+        let mut rejected = 0u64;
+        let mut deferred = 0u64;
+        let mut diag = RoundChangeDiag::default();
+        let mut store =
+            RoundChangeStore::new(nova_consensus::round_change::DEFAULT_MAX_TRACKED_HEIGHTS);
+        let mut round_timeouts = 0u64;
+        let mut outcomes = [0u64; RoundTimeoutOutcome::COUNT];
+        let mut round_adv_local = 0u64;
+        let mut expired: Option<LocalExpireObservation> = None;
+
+        // step 0（ARM）：RC 批为空；入口观测 == 当前观测 ⇒ 不计到期。
+        let entry0 = observe_round(driver.consensus());
+        drive_round_change_authority(
+            &mut driver,
+            &config,
+            0,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            Vec::new(),
+        );
+        drive_round_timeout(
+            &mut driver,
+            &config,
+            0,
+            &mut timer,
+            &mut round_timeouts,
+            &mut outcomes,
+            &mut round_adv_local,
+            entry0,
+            &mut expired,
+        );
+        assert_eq!(round_timeouts, 0, "arming step 未到期");
+        assert_eq!(by_authority, 0);
+
+        // step 1：**同一步**内先应用当前 round 证书，再跑 pacemaker（入场快照 = 应用前）。
+        //
+        // A3：单调读数取到**已越过窗口**（1ms 窗口 ⇒ now = 1ms）⇒ 若无 RC 重开，本 step 必然 EXPIRED；
+        // RC 在同一读数重开（armed_at = now）⇒ 已历时 0 ⇒ 仍 Waiting（不 double advance）。
+        let now_ns: u64 = 1_000_000;
+        let entry1 = observe_round(driver.consensus());
+        assert_eq!(entry1.round, RC_TEST_ROUND);
+        let cert = encode_certificate(&rc_test_cert(&kps, vsid, RC_TEST_HEIGHT, RC_TEST_ROUND))
+            .expect("enc");
+        drive_round_change_authority(
+            &mut driver,
+            &config,
+            now_ns,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            vec![(NodeId::from_bytes([0x21; 32]), cert)],
+        );
+        assert_eq!(by_authority, 1, "RC 权威应用恰一次");
+        assert_eq!(rejected, 0);
+        drive_round_timeout(
+            &mut driver,
+            &config,
+            now_ns,
+            &mut timer,
+            &mut round_timeouts,
+            &mut outcomes,
+            &mut round_adv_local,
+            entry1,
+            &mut expired,
+        );
+        // 断言：恰一次 +1；本地超时**未被**触发（归因分离）；计时器为新 round 的新鲜窗口。
+        assert_eq!(
+            driver.consensus().state().round.round,
+            RC_TEST_ROUND + 1,
+            "恰 +1（无 double increment）"
+        );
+        assert_eq!(round_timeouts, 0, "RC 应用后同一步不得产生本地 EXPIRED");
+        assert_eq!(round_adv_local, 0);
+        assert_eq!(outcomes[RoundTimeoutOutcome::Applied.index()], 0);
+        assert!(expired.is_none(), "无真实 EXPIRE 观测");
+        let t = timer.expect("已重开计时器");
+        assert_eq!(
+            (t.height, t.round, t.armed_at_ns, t.window_ns),
+            (RC_TEST_HEIGHT, RC_TEST_ROUND + 1, now_ns, 1_000_000)
+        );
+    }
+
+    /// D0-5：`deferred` gauge = **仅** `Admitted` 计 +1（幂等 + **淘汰**均不干扰）。
+    #[test]
+    fn p1a30_d0_deferred_gauge_counts_admitted_only() {
+        let (mut driver, kps, vsid) = rc_test_driver(3);
+        let mut timer: Option<RoundTimer> = None;
+        let mut by_authority = 0u64;
+        let mut rejected = 0u64;
+        let mut deferred = 0u64;
+        let mut diag = RoundChangeDiag::default();
+        // 极小容量：`max_per_height = 1` ⇒ 第 2 张必然触发 store 自身 FIFO 淘汰。
+        let mut store = RoundChangeStore::with_caps(1, 1);
+
+        // ① future round（from_round = local + 1）⇒ 暂存 +1。
+        let c1 = encode_certificate(&rc_test_cert(&kps, vsid, RC_TEST_HEIGHT, RC_TEST_ROUND + 1))
+            .expect("enc");
+        rc_feed(
+            &mut driver,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            Some(&c1),
+        );
+        assert_eq!(deferred, 1);
+
+        // ② 同一 key 重复入站 ⇒ `Duplicate` ⇒ **不**增（幂等）。
+        rc_feed(
+            &mut driver,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            Some(&c1),
+        );
+        assert_eq!(deferred, 1, "Duplicate 不得重复计数");
+        assert_eq!(store.total(), 1);
+
+        // ③ 第三个 future round ⇒ `Admitted` **且伴随淘汰**（total 不变）⇒ 仍必须 +1。
+        let c2 = encode_certificate(&rc_test_cert(&kps, vsid, RC_TEST_HEIGHT, RC_TEST_ROUND + 2))
+            .expect("enc");
+        rc_feed(
+            &mut driver,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            Some(&c2),
+        );
+        assert_eq!(store.total(), 1, "容量 1 ⇒ 淘汰后 total 不变");
+        assert_eq!(deferred, 2, "Admitted 必计（不得被淘汰掩盖）");
+        assert_eq!(rejected, 0);
+        assert_eq!(driver.consensus().state().round.round, RC_TEST_ROUND);
+    }
+
+    /// D0-4：Guard C 拒绝**分类**计数直通（唯一来源 = 既有 `PendingProposalStore`；无第二套计数）。
+    #[test]
+    fn p1a30_d0_guard_reject_counts_are_exposed() {
+        let mut store = PendingProposalStore::new();
+        store.note_guard_reject(GuardReject::Signature);
+        store.note_guard_reject(GuardReject::Signature);
+        store.note_guard_reject(GuardReject::Evidence);
+        store.note_guard_reject(GuardReject::HeightContext);
+        let counts = store.guard_reject_counts();
+        assert_eq!(counts.len(), 8, "8 类固定序");
+        assert_eq!(counts[GuardReject::Signature as usize], 2);
+        assert_eq!(counts[GuardReject::Evidence as usize], 1);
+        assert_eq!(counts[GuardReject::HeightContext as usize], 1);
+        assert_eq!(counts.iter().sum::<u64>(), 4, "分类之和 == 拒绝总数");
+        assert_eq!(store.rejected_count(), 4);
+        // 与既有单类访问器**一致**（同一数据源；不新增计数点）。
+        assert_eq!(store.guard_reject_count(GuardReject::Signature), 2);
+        assert_eq!(counts[GuardReject::NoStore as usize], 0);
+    }
+
+    /// D0-1：拒绝原因**分类**穷尽、互斥，且分类之和 == `round_changes_rejected` 总数。
+    #[test]
+    fn p1a30_d0_reject_reasons_are_classified() {
+        let (mut driver, kps, vsid) = rc_test_driver(3);
+        let mut timer: Option<RoundTimer> = None;
+        let mut by_authority = 0u64;
+        let mut rejected = 0u64;
+        let mut deferred = 0u64;
+        let mut diag = RoundChangeDiag::default();
+        let mut store =
+            RoundChangeStore::new(nova_consensus::round_change::DEFAULT_MAX_TRACKED_HEIGHTS);
+        assert_eq!(RoundChangeRejectKind::COUNT, 6, "桶数量固定");
+
+        // ① 解码失败 ⇒ Malformed
+        rc_feed(
+            &mut driver,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            Some(&[0xFF; 3]),
+        );
+        assert_eq!(diag.reject_count(RoundChangeRejectKind::Malformed), 1);
+
+        // ② stale（`from_round = 2` ⇒ `to_round = 3 <= local 3`）
+        let stale = encode_certificate(&rc_test_cert(&kps, vsid, RC_TEST_HEIGHT, 2)).expect("enc");
+        rc_feed(
+            &mut driver,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            Some(&stale),
+        );
+        assert_eq!(diag.reject_count(RoundChangeRejectKind::Stale), 1);
+
+        // ③ 高度不符（`verify_certificate` 通过 ⇒ 由高度适用性拒绝）
+        let wrong_height =
+            encode_certificate(&rc_test_cert(&kps, vsid, RC_TEST_HEIGHT + 1, RC_TEST_ROUND))
+                .expect("enc");
+        rc_feed(
+            &mut driver,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            Some(&wrong_height),
+        );
+        assert_eq!(diag.reject_count(RoundChangeRejectKind::WrongHeight), 1);
+
+        // ④ 权重不足（1/3，100 < quorum 200）
+        let low_quorum = encode_certificate(&rc_test_cert(
+            &kps[..1],
+            vsid,
+            RC_TEST_HEIGHT,
+            RC_TEST_ROUND,
+        ))
+        .expect("enc");
+        rc_feed(
+            &mut driver,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            Some(&low_quorum),
+        );
+        assert_eq!(diag.reject_count(RoundChangeRejectKind::Quorum), 1);
+
+        // ⑤ 非成员证据（3 成员 + 1 外来密钥）
+        let foreign = encode_certificate(&rc_test_cert_with_foreign_member(
+            &kps,
+            vsid,
+            RC_TEST_HEIGHT,
+            RC_TEST_ROUND,
+        ))
+        .expect("enc");
+        rc_feed(
+            &mut driver,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            Some(&foreign),
+        );
+        assert_eq!(diag.reject_count(RoundChangeRejectKind::Identity), 1);
+
+        // 分类穷尽（Other = 兜底，本用例为 0）+ 总数一致 + 零状态变化。
+        let buckets = [
+            RoundChangeRejectKind::Malformed,
+            RoundChangeRejectKind::Stale,
+            RoundChangeRejectKind::WrongHeight,
+            RoundChangeRejectKind::Quorum,
+            RoundChangeRejectKind::Identity,
+            RoundChangeRejectKind::Other,
+        ];
+        let sum: u64 = buckets.iter().map(|k| diag.reject_count(*k)).sum();
+        assert_eq!(sum, rejected, "桶之和 == 拒绝总数（穷尽 / 互斥）");
+        assert_eq!(rejected, 5);
+        assert_eq!(diag.reject_count(RoundChangeRejectKind::Other), 0);
+        assert_eq!(by_authority, 0, "零权威应用");
+        assert_eq!(deferred, 0, "零暂存");
+        assert_eq!(
+            driver.consensus().state().round.round,
+            RC_TEST_ROUND,
+            "零 round 变化"
+        );
+        assert!(timer.is_none(), "未重开计时器");
+    }
+
+    /// D0-2：暂存 gauge **不重复计数**；重评 attempts / applied 精确且 `applied <= attempts`。
+    #[test]
+    fn p1a30_d0_deferred_gauge_and_reeval_are_exact() {
+        let (mut driver, kps, vsid) = rc_test_driver(3);
+        let mut timer: Option<RoundTimer> = None;
+        let mut by_authority = 0u64;
+        let mut rejected = 0u64;
+        let mut deferred = 0u64;
+        let mut diag = RoundChangeDiag::default();
+        let mut store =
+            RoundChangeStore::new(nova_consensus::round_change::DEFAULT_MAX_TRACKED_HEIGHTS);
+
+        // ① future round（local 3 ⇒ from_round 4）⇒ 暂存；重复入站**不得**重复计数。
+        let next_round =
+            encode_certificate(&rc_test_cert(&kps, vsid, RC_TEST_HEIGHT, RC_TEST_ROUND + 1))
+                .expect("enc");
+        for _ in 0..2 {
+            rc_feed(
+                &mut driver,
+                &mut timer,
+                &mut by_authority,
+                &mut rejected,
+                &mut deferred,
+                &mut diag,
+                &mut store,
+                Some(&next_round),
+            );
+        }
+        assert_eq!(
+            deferred, 1,
+            "gauge：同一 (height, from_round) 重复入站只计 1"
+        );
+        assert_eq!(rejected, 0);
+        assert_eq!(
+            diag.reeval_attempts, 0,
+            "未命中当前 (height, local_round) ⇒ 不计尝试"
+        );
+        assert_eq!(diag.reeval_applied, 0);
+        assert_eq!(store.total(), 1, "暂存区 1 条（幂等 admit）");
+
+        // ② 本地真实超时推进：round 3 ⇒ 4（既有冻结转移；此处仅为构造重评前提）。
+        assert!(matches!(
+            driver.consensus_mut().round_timeout(),
+            TransitionResult::Applied { .. }
+        ));
+        assert_eq!(driver.consensus().state().round.round, RC_TEST_ROUND + 1);
+
+        // ③ 空入站批 ⇒ 仅重评：恰好 1 次尝试 + 1 次应用（每 step ≤ 1）。
+        rc_feed(
+            &mut driver,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            None,
+        );
+        assert_eq!(diag.reeval_attempts, 1);
+        assert_eq!(diag.reeval_applied, 1);
+        assert_eq!(by_authority, 1, "重评应用计入独立归因");
+        assert_eq!(deferred, 0, "应用后 gauge 归零");
+        assert_eq!(rejected, 0);
+        assert_eq!(
+            driver.consensus().state().round.round,
+            RC_TEST_ROUND + 2,
+            "恰好 +1"
+        );
+        assert!(timer.is_some(), "重评应用后计时器已重开");
+
+        // ④ 再跑一次：暂存已空 ⇒ 不计尝试（有界 / 不空转计数）。
+        rc_feed(
+            &mut driver,
+            &mut timer,
+            &mut by_authority,
+            &mut rejected,
+            &mut deferred,
+            &mut diag,
+            &mut store,
+            None,
+        );
+        assert_eq!(diag.reeval_attempts, 1, "无匹配证书 ⇒ 尝试数不变");
+        assert_eq!(by_authority, 1);
+    }
+
+    /// D0-3：本地 timeout 结果分类（`applied` / `ignored` / `rejected`）与 `round_timeouts` 总数一致。
+    #[test]
+    fn p1a30_d0_round_timeout_outcomes_are_counted() {
+        let (mut driver, _kps, _vsid) = rc_test_driver(3);
+        // 窗口固定 1ms（`min(initial × backoff^round, max)` = 1）⇒ 越过后必然到期。
+        let config = RoundTimeoutConfig {
+            initial_timeout: 1,
+            max_timeout: 2,
+            backoff_factor: 1,
+        };
+        assert_eq!(round_timeout_window_ms(&config, RC_TEST_ROUND), 1);
+        assert_eq!(round_timeout_window_ns(&config, RC_TEST_ROUND), 1_000_000);
+        assert_eq!(RoundTimeoutOutcome::COUNT, 3);
+
+        let mut timer: Option<RoundTimer> = None;
+        let mut round_timeouts = 0u64;
+        let mut outcomes = [0u64; RoundTimeoutOutcome::COUNT];
+        let mut round_adv_local = 0u64;
+        let mut expired: Option<LocalExpireObservation> = None;
+
+        // step 1：ARM（armed_at = 本读数）—— arming step 不计到期。
+        let entry = observe_round(driver.consensus());
+        drive_round_timeout(
+            &mut driver,
+            &config,
+            0,
+            &mut timer,
+            &mut round_timeouts,
+            &mut outcomes,
+            &mut round_adv_local,
+            entry,
+            &mut expired,
+        );
+        assert_eq!(round_timeouts, 0);
+        assert!(expired.is_none());
+        assert_eq!(round_adv_local, 0);
+
+        // step 2：单调读数越过窗口 ⇒ 到期 ⇒ `Applied`（round +1）+ 观测填充。
+        let entry = observe_round(driver.consensus());
+        drive_round_timeout(
+            &mut driver,
+            &config,
+            1_000_000,
+            &mut timer,
+            &mut round_timeouts,
+            &mut outcomes,
+            &mut round_adv_local,
+            entry,
+            &mut expired,
+        );
+        assert_eq!(round_timeouts, 1, "总数计数不变（既有字段）");
+        assert_eq!(outcomes[RoundTimeoutOutcome::Applied.index()], 1);
+        assert_eq!(outcomes[RoundTimeoutOutcome::Ignored.index()], 0);
+        assert_eq!(outcomes[RoundTimeoutOutcome::Rejected.index()], 0);
+        assert_eq!(round_adv_local, 1);
+        assert!(expired.is_some(), "真实 EXPIRE 观测已填充");
+
+        // 分类器级：`Ignored` / `Rejected` 分支的**唯一**计数入口（当前冻结 transition：
+        // `RoundTimeout` ⇒ `checked_successor` ⇒ 仅 `Applied` / `Rejected{RoundOverflow}`；
+        // 故二者不通过本用例的运行路径触发，仅在此钉住映射与槽位）。
+        note_timeout_outcome(&mut outcomes, RoundTimeoutOutcome::Ignored);
+        note_timeout_outcome(&mut outcomes, RoundTimeoutOutcome::Rejected);
+        assert_eq!(outcomes[RoundTimeoutOutcome::Ignored.index()], 1);
+        assert_eq!(outcomes[RoundTimeoutOutcome::Rejected.index()], 1);
+        assert_eq!(outcomes[RoundTimeoutOutcome::Applied.index()], 1);
+    }
+
+    // -----------------------------------------------------------------------
     // P1-A.6 T1（单元）：纯计时状态机 / 窗口算术 / DISARM 判据
     // （集成层时序与可观测行为见 `tests/d10_p1_a6_round_timeout_liveness.rs`）
     // -----------------------------------------------------------------------
 
-    /// 窗口算术 = 冻结 `min(initial × backoff^round, max)`；含 cap / 退化配置 / 极大 round 有界。
+    /// 窗口算术 = 冻结 `min(initial × backoff^round, max)`（**毫秒**）；含 cap / 退化 / 极大 round。
     #[test]
     fn p1a6_window_follows_backoff_and_cap() {
         let cfg = RoundTimeoutConfig {
@@ -3448,88 +6816,242 @@ mod tests {
             max_timeout: 25,
             backoff_factor: 2,
         };
-        assert_eq!(round_timeout_window_ticks(&cfg, 0), 10);
-        assert_eq!(round_timeout_window_ticks(&cfg, 1), 20);
-        assert_eq!(round_timeout_window_ticks(&cfg, 2), 25, "40 ⇒ cap 25");
-        assert_eq!(round_timeout_window_ticks(&cfg, 3), 25, "cap 后恒定");
+        assert_eq!(round_timeout_window_ms(&cfg, 0), 10);
+        assert_eq!(round_timeout_window_ms(&cfg, 1), 20);
+        assert_eq!(round_timeout_window_ms(&cfg, 2), 25, "40 ⇒ cap 25");
+        assert_eq!(round_timeout_window_ms(&cfg, 3), 25, "cap 后恒定");
         assert_eq!(
-            round_timeout_window_ticks(&cfg, u64::MAX),
+            round_timeout_window_ms(&cfg, u64::MAX),
             25,
-            "极大 round 有界（不 O(round)；结果 = cap）"
+            "极大 round 有界（不 O(round)）"
+        );
+        assert_eq!(
+            round_timeout_window_ns(&cfg, 2),
+            25_000_000,
+            "ns = ms × 1e6"
         );
 
-        // 生产默认（tick 单位；node config 非协议常量）：1000 / 60_000 / 2。
-        let default_cfg = RoundTimeoutConfig::default();
-        assert_eq!(round_timeout_window_ticks(&default_cfg, 0), 1_000);
-        assert_eq!(round_timeout_window_ticks(&default_cfg, 1), 2_000);
-        assert_eq!(round_timeout_window_ticks(&default_cfg, 6), 60_000);
-        assert_eq!(round_timeout_window_ticks(&default_cfg, u64::MAX), 60_000);
+        // **A3 授权基线（Testnet）**：10s / ×2 / 120s ⇒ 10 · 20 · 40 · 80 · 120 · 120 …
+        let base = RoundTimeoutConfig::default();
+        assert_eq!(base.initial_timeout, 10_000);
+        assert_eq!(base.max_timeout, 120_000);
+        assert_eq!(base.backoff_factor, 2);
+        let seq: Vec<u64> = (0..8)
+            .map(|r| round_timeout_window_ms(&base, r) / 1_000)
+            .collect();
+        assert_eq!(
+            seq,
+            vec![10, 20, 40, 80, 120, 120, 120, 120],
+            "授权超时序列（秒）"
+        );
+        assert_eq!(
+            round_timeout_window_ns(&base, 0),
+            10_000_000_000,
+            "round 0 = 10s"
+        );
+        assert_eq!(
+            round_timeout_window_ns(&base, 1),
+            20_000_000_000,
+            "round 1 = 20s"
+        );
 
-        // 退化配置：0 窗口 ⇒ 下界 1；backoff == 1 ⇒ 不增长（且不退化循环）。
+        // 退化配置：0 窗口 ⇒ 下界 1ms；backoff == 1 ⇒ 不增长（且不退化循环）。
         let zero = RoundTimeoutConfig {
             initial_timeout: 0,
-            max_timeout: 60_000,
+            max_timeout: 120_000,
             backoff_factor: 2,
         };
-        assert_eq!(round_timeout_window_ticks(&zero, 0), 1);
+        assert_eq!(round_timeout_window_ms(&zero, 0), 1);
         let flat = RoundTimeoutConfig {
             initial_timeout: 5,
-            max_timeout: 60_000,
+            max_timeout: 120_000,
             backoff_factor: 1,
         };
-        assert_eq!(round_timeout_window_ticks(&flat, u64::MAX), 5);
+        assert_eq!(round_timeout_window_ms(&flat, u64::MAX), 5);
     }
 
-    /// ARM / 未到期 / 恰好到期 / 不继承 elapsed / RESET / 确定性。
+    /// A3 — **单调 deadline** 状态机：ARM / 未到期 / 恰好到期 / 不继承 deadline / RESET / 确定性。
     #[test]
     fn p1a6_timer_arms_waits_expires_and_resets() {
-        // ARM：新 (height, round) ⇒ elapsed = 1（arming step 计入）；不继承任何历史。
-        let (armed, tick) = round_timer_tick(None, 0, 0, 3, false);
+        let w: u64 = 3_000_000; // 3ms（ns）
+        // ARM：新 (height, round) ⇒ armed_at = 本读数；已历时 0；不继承任何历史。
+        let (armed, tick) = round_timer_tick(None, 0, 0, w, false, 0);
         assert_eq!(tick, RoundTimerTick::Armed);
-        assert_eq!(armed.elapsed_ticks, 1);
-        assert_eq!((armed.height, armed.round, armed.window_ticks), (0, 0, 3));
+        assert_eq!((armed.height, armed.round, armed.window_ns), (0, 0, w));
+        assert_eq!(armed.elapsed_ns(0), 0);
 
-        // 未到期 → 恰好到期（window = 3 ⇒ elapsed 1、2 为 Waiting；3 为 Expired）。
-        let (waiting, tick) = round_timer_tick(Some(armed), 0, 0, 3, false);
+        // 未到期（窗口 − 1ns）⇒ Waiting。
+        let (waiting, tick) = round_timer_tick(Some(armed), 0, 0, w, false, w - 1);
         assert_eq!(tick, RoundTimerTick::Waiting);
-        assert_eq!(waiting.elapsed_ticks, 2);
-        let (expired, tick) = round_timer_tick(Some(waiting), 0, 0, 3, false);
-        assert_eq!(tick, RoundTimerTick::Expired, "恰好到达 window ⇒ 到期");
-        assert_eq!(expired.elapsed_ticks, 3);
+        assert_eq!(waiting.elapsed_ns(w - 1), w - 1);
+        // 恰好到期（边界 `>=`）。
+        let (expired, tick) = round_timer_tick(Some(armed), 0, 0, w, false, w);
+        assert_eq!(tick, RoundTimerTick::Expired, "恰好到达窗口 ⇒ 到期");
 
-        // 新 round ⇒ 全新窗口（不继承 elapsed = 3）；窗口按新 round 传入。
-        let (next_round, tick) = round_timer_tick(Some(expired), 0, 1, 6, false);
+        // 新 round ⇒ 全新 deadline（`armed_at` 归到当前读数；不继承旧已历时）＋新窗口。
+        let (next_round, tick) = round_timer_tick(Some(expired), 0, 1, 6_000_000, false, w);
         assert_eq!(tick, RoundTimerTick::Armed);
-        assert_eq!(next_round.elapsed_ticks, 1, "round 变更后 elapsed 不继承");
-        assert_eq!(next_round.window_ticks, 6);
+        assert_eq!(next_round.armed_at_ns, w);
+        assert_eq!(next_round.elapsed_ns(w), 0, "round 变更后已历时归零");
+        assert_eq!(next_round.window_ns, 6_000_000);
 
         // height 变更 ⇒ 同样 fresh（丢弃旧高度计时）。
-        let (next_height, tick) = round_timer_tick(Some(next_round), 1, 0, 3, false);
+        let (next_height, tick) = round_timer_tick(Some(next_round), 1, 0, w, false, w + 5);
         assert_eq!(tick, RoundTimerTick::Armed);
         assert_eq!((next_height.height, next_height.round), (1, 0));
-        assert_eq!(next_height.elapsed_ticks, 1);
+        assert_eq!(next_height.elapsed_ns(w + 5), 0);
 
-        // RESET：同 round 内进展 ⇒ 窗口重开（elapsed 回 1；不增窗、不改 round）。
-        let (reset, tick) = round_timer_tick(Some(expired), 0, 0, 3, true);
+        // RESET：同 round 内进展 ⇒ 窗口重开（armed_at = now；不增窗、不改 round）。
+        let (reset, tick) = round_timer_tick(Some(expired), 0, 0, w, true, 2 * w);
         assert_eq!(tick, RoundTimerTick::Reset);
-        assert_eq!(reset.elapsed_ticks, 1);
+        assert_eq!(reset.armed_at_ns, 2 * w);
+        assert_eq!(reset.elapsed_ns(2 * w), 0);
         assert_eq!((reset.height, reset.round), (0, 0));
-        // 重开后需再满一个窗口 ⇒ 下一 tick 不得到期。
-        let (_, tick) = round_timer_tick(Some(reset), 0, 0, 3, false);
+        // 重开后需再满一个窗口 ⇒ 同一读数不得到期。
+        let (_, tick) = round_timer_tick(Some(reset), 0, 0, w, false, 2 * w);
         assert_eq!(tick, RoundTimerTick::Waiting);
 
         // 确定性 / 无墙钟：同一序列重复执行 ⇒ 结果逐项相同。
         let run = || {
             let mut seen = Vec::new();
             let mut current = None;
-            for progressed in [false, false, false, true, false, false, false] {
-                let (timer, tick) = round_timer_tick(current, 2, 7, 3, progressed);
-                seen.push((timer.elapsed_ticks, tick));
+            for (now, progressed) in [
+                (0u64, false),
+                (1_000_000, false),
+                (2_000_000, false),
+                (3_000_000, true),
+                (4_000_000, false),
+            ] {
+                let (timer, tick) = round_timer_tick(current, 2, 7, w, progressed, now);
+                seen.push((timer.armed_at_ns, tick));
                 current = Some(timer);
             }
             seen
         };
         assert_eq!(run(), run(), "同输入同输出（无外部时钟 / 无随机）");
+    }
+
+    /// **A3 必测项**：注入式 fake 时钟的边界与健壮性
+    ///（重复读数 / 回拨 / 长停顿 / 伪造 EXPIRE 观测）。
+    #[test]
+    fn a3_monotonic_clock_boundaries_and_robustness() {
+        let clock = FakeClock::new();
+        assert_eq!(clock.now_ns(), 0);
+        clock.advance_ms(10_000);
+        assert_eq!(
+            clock.now_ns(),
+            10_000_000_000,
+            "fake 时钟显式推进（无 sleep）"
+        );
+
+        let w = round_timeout_window_ns(&RoundTimeoutConfig::default(), 0);
+        assert_eq!(w, 10_000_000_000, "round 0 窗口 = 10s");
+
+        // ① ARM；推进 9.999s ⇒ 未到期；再推进 1ms ⇒ **恰好**到期。
+        let now = clock_ns(&clock);
+        let (armed, tick) = round_timer_tick(None, 5, 0, w, false, now);
+        assert_eq!(tick, RoundTimerTick::Armed);
+        clock.advance_ms(9_999);
+        let (_, tick) = round_timer_tick(Some(armed), 5, 0, w, false, clock_ns(&clock));
+        assert_eq!(tick, RoundTimerTick::Waiting, "未到期");
+        clock.advance_ms(1);
+        let (expired, tick) = round_timer_tick(Some(armed), 5, 0, w, false, clock_ns(&clock));
+        assert_eq!(tick, RoundTimerTick::Expired, "恰好 10s ⇒ 到期");
+        assert!(
+            LocalExpireObservation::from_expired_timer(expired, tick, clock_ns(&clock)).is_some()
+        );
+
+        // ② 重复读数**不**产生第二次到期事件：到期后 round 由冻结 transition +1，并在**同一读数**
+        //   重开（仿真 `drive_round_timeout` 的立即重开）⇒ 同一读数下不再 Expired。
+        let now = clock_ns(&clock);
+        let (rearmed, _) = round_timer_tick(None, 5, 1, w, false, now);
+        let (_, tick) = round_timer_tick(Some(rearmed), 5, 1, w, false, now);
+        assert_eq!(
+            tick,
+            RoundTimerTick::Waiting,
+            "同一读数不得二次到期（无 double advance）"
+        );
+
+        // ③ 读数**回拨**（墙钟回退）⇒ 不 panic、不误到期：`elapsed_ns` 饱和到 0。
+        let back = now.saturating_sub(60_000_000_000);
+        clock.set_ns(back);
+        let (_, tick) = round_timer_tick(Some(rearmed), 5, 1, w, false, clock_ns(&clock));
+        assert_eq!(tick, RoundTimerTick::Waiting, "读数回退不得造成误到期");
+        assert_eq!(rearmed.elapsed_ns(back), 0, "饱和，无环绕");
+
+        // ④ 长停顿（极大读数）⇒ 恰好一次到期，且无算术溢出。
+        let (_, tick) = round_timer_tick(Some(rearmed), 5, 1, w, false, u64::MAX);
+        assert_eq!(tick, RoundTimerTick::Expired, "长停顿 ⇒ 到期（一次事件）");
+        assert_eq!(
+            rearmed.elapsed_ns(u64::MAX),
+            u64::MAX - rearmed.armed_at_ns,
+            "无溢出"
+        );
+        assert!(rearmed.elapsed_ns(u64::MAX) >= w);
+
+        // ⑤ 刚 ARM 的计时器不可用于构造 EXPIRE 观测（即使伪造 `Expired` 也被双重守卫拒绝）。
+        let (fresh, _) = round_timer_tick(None, 9, 0, w, false, now);
+        assert!(
+            LocalExpireObservation::from_expired_timer(fresh, RoundTimerTick::Expired, now)
+                .is_none(),
+            "已历时 = 0 ⇒ 伪造 Expired 亦被拒"
+        );
+    }
+
+    /// **SAFETY-REJECT-SKIP** — 可恢复性分类表（**唯一**判定点；纯函数、无 I/O、无时序）。
+    ///
+    /// 不变量：**只有** `block_safety` F2/F3/F4 的常态冲突拒绝（同 height 不同 target）可恢复；
+    /// 其余（I/O / 损坏 / 未恢复 / identity / 链高失配 / 签名失败 / 自检 / 无 safety gate /
+    /// double-vote / lock / abandon）**一律保持 fatal**。
+    #[test]
+    fn safety_reject_skip_classification_is_exact() {
+        use crate::block_safety::BlockSafetyError as B;
+        use crate::safety_store::ValidatorSafetyError as S;
+        use crate::validator::ValidatorActorError as V;
+
+        assert!(
+            is_recoverable_proposal_refusal(&V::BlockSignSafety(B::ConflictingTarget {
+                existing_target: [0x11; 32],
+                requested_target: [0x22; 32],
+            })),
+            "同 height 不同 target 的常态冲突拒绝 ⇒ 可恢复（放弃本次提案，不终止节点）"
+        );
+
+        let must_stay_fatal = [
+            V::BlockSignSafety(B::Io),
+            V::BlockSignSafety(B::UnknownMagic),
+            V::BlockSignSafety(B::UnknownVersion),
+            V::BlockSignSafety(B::CorruptHeader),
+            V::BlockSignSafety(B::IdentityMismatch),
+            V::BlockSignSafety(B::CorruptRecord),
+            V::BlockSignSafety(B::ChecksumMismatch),
+            V::BlockSignSafety(B::TruncatedRecord),
+            V::BlockSignSafety(B::MissingReservation),
+            V::BlockSignSafety(B::AlreadyExists),
+            V::BlockSignSafety(B::NotRecovered),
+            V::BlockSignSafety(B::RequestIdentityMismatch),
+            V::BlockSignSafety(B::SignerIdentityMismatch),
+            V::BlockSignSafety(B::ProposerIdentityMismatch),
+            V::BlockSignSafety(B::ChainIdMismatch),
+            V::BlockSignSafety(B::DeclaredHeightMismatch),
+            V::BlockSignSafety(B::PayloadInvalid),
+            V::BlockSignSafety(B::TargetReconstruction),
+            V::BlockSignSafety(B::SigningFailed),
+            V::BlockSignSafety(B::SignatureInvalid),
+            V::BlockSafetyUnavailable,
+            V::IdentityMismatch,
+            V::BlockSigning,
+            V::Safety(S::Io),
+            V::Safety(S::IdentityMismatch),
+            V::Safety(S::ConflictingRecord),
+            V::AbandonSigning,
+        ];
+        for e in must_stay_fatal {
+            assert!(
+                !is_recoverable_proposal_refusal(&e),
+                "必须保持 fatal（不得 blanket-catch）：{e:?}"
+            );
+        }
     }
 
     /// DISARM 判据：**必须** `step == Finalized` **且** proposal 存在 **且**

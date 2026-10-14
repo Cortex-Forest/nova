@@ -18,12 +18,16 @@ use nova_consensus::dag::Dag;
 use nova_consensus::finality::{FinalityError, QuorumCertificate, acquire_lock};
 use nova_consensus::integration::ConsensusEvent;
 use nova_consensus::round::LockedState;
+// PHASE 6H-AF A-C：Abandon Attestation 签名路径的既有冻结类型（**不**新增类型定义）。
+use nova_consensus::round_change::RoundChangeEvidence;
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_consensus::vote::{ValidatorVote, VoteType, canonical_vote_payload};
 use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
 use nova_runtime::Block;
 
-use crate::block_builder::attach_proposer_signature;
+use crate::block_builder::{BlockBuilderError, attach_proposer_signature};
+use crate::block_safety::{BlockSafetyError, BlockSafetyJournal};
+use crate::round_change_pool::LocalExpireObservation;
 use crate::safety_store::{ValidatorSafetyError, ValidatorSafetyStore};
 use crate::signer::SigningCapability;
 use crate::vote_ledger::{VoteKey, VoteLedger, VoteLedgerError, VotePrepare, VoteRecord};
@@ -46,8 +50,17 @@ pub enum ValidatorActorError {
     /// 本地 lock transition 失败（`acquire_lock`；如非 Precommit QC —— lock 不变）。
     Lock(FinalityError),
     /// 出块（proposer）签名 seam 失败（`block_builder::attach_proposer_signature`；
-    /// STEP 10-19-6 OPT-1）。
+    /// STEP 10-19-6 OPT-1；承载**非** B2-B safety 原因的底层失败）。
     BlockSigning,
+    /// **B2-B safety gate 拒绝 / 失败**（D-5.3.4）：F2/F3/F4 冲突、identity 不符、journal
+    /// 未恢复 / 损坏 / 冲突、target 重建失败、签名自检失败等（原因原样保留，不吞错）。
+    BlockSignSafety(BlockSafetyError),
+    /// **B2-B safety gate 未附加**（D-5.3.4）：actor 无 block safety journal ⇒ **拒绝签名**
+    /// （**绝不**回退到直接 `signer.sign(..)`）。
+    BlockSafetyUnavailable,
+    /// **Abandon Attestation 签名失败**（PHASE 6H-AF A-C）：域构造或签名原语失败。
+    /// **不**表示任何 vote / lock / journal 相关失败 —— Abandon 与这些路径**完全隔离**。
+    AbandonSigning,
 }
 
 /// 本地投票授权决策。
@@ -160,9 +173,14 @@ pub struct ValidatorActor<S: SigningCapability> {
     context: LocalVoteContext,
     signer: S,
     chain_id: u64,
-    /// Optional durable safety journal（STEP 10-15T）。`None` = 纯内存 actor（既有测试 /
+    /// Optional durable **vote** safety journal（STEP 10-15T）。`None` = 纯内存 actor（既有测试 /
     /// 临时路径）；`Some` = restart-safe（persist-before-sign + fail-closed 恢复）。
     store: Option<ValidatorSafetyStore>,
+    /// Optional **B2-B signer-owned Block signing safety** journal（D-5.3.4 生产集成）。
+    ///
+    /// `None` = **不允许出块签名**（[`ValidatorActorError::BlockSafetyUnavailable`]）；
+    /// `Some` = 生产路径：出块签名必须经 `BlockSafetyJournal::authorize_and_sign`。
+    block_safety: Option<BlockSafetyJournal>,
 }
 
 impl<S: SigningCapability> ValidatorActor<S> {
@@ -182,6 +200,7 @@ impl<S: SigningCapability> ValidatorActor<S> {
             signer,
             chain_id,
             store: None,
+            block_safety: None,
         })
     }
 
@@ -214,7 +233,20 @@ impl<S: SigningCapability> ValidatorActor<S> {
             signer,
             chain_id,
             store: Some(store),
+            block_safety: None,
         })
+    }
+
+    /// 附加 **B2-B signer-owned Block signing safety** journal（D-5.3.4 生产 wiring）。
+    ///
+    /// - 未附加 ⇒ [`Self::sign_block`] 返回 [`ValidatorActorError::BlockSafetyUnavailable`]
+    ///   （fail-closed；**无**直签回退）。
+    /// - 附加后，出块签名经 `BlockSafetyJournal::authorize_and_sign`：namespace / chain_id /
+    ///   declared height / exact target / F1-B / F2 / F3 / F4 全部由 safety gate 判定。
+    /// - 本方法**不**校验 journal 身份；身份不符在签名时由 safety gate 拒绝（fail-closed）。
+    pub fn with_block_safety(mut self, journal: BlockSafetyJournal) -> Self {
+        self.block_safety = Some(journal);
+        self
     }
 
     pub fn validator_id(&self) -> ValidatorId {
@@ -222,15 +254,50 @@ impl<S: SigningCapability> ValidatorActor<S> {
     }
 
     /// 用本地 signer 对 `block` 的 canonical header 签名（STEP 10-19-6 OPT-1：Proposer→Block
-    /// 签名 seam）。委托 `block_builder::attach_proposer_signature`（payload = canonical_header；
-    /// DomainId::Block + chain_id，ADR-0042）；`signature ∉ block_hash`（不改 hash）。
+    /// 签名 seam；**D-5.3.4 起强制经 B2-B safety gate**）。
     ///
-    /// - `&self` 只读：block 签名不改 VoteLedger / LockedState / Safety journal（出块幂等，
-    ///   非 vote，无 Double-Vote 约束）。
+    /// - 委托 `block_builder::attach_proposer_signature(block, &safety, &signer)`：payload =
+    ///   canonical_header；exact target = `SigningMessageHash`（由 safety gate 内的冻结 canonical
+    ///   构造产生，`DomainId::Block` + `chain_id`）；`signature ∉ block_hash`（不改 hash）。
+    /// - **无 B2-B safety gate ⇒ 拒绝签名**（[`ValidatorActorError::BlockSafetyUnavailable`]）；
+    ///   **绝不**回退到直接调用 signer（无 bypass）。
+    /// - `&self` 只读：block 签名不改 VoteLedger / LockedState / vote Safety journal（出块幂等，
+    ///   非 vote，无 Double-Vote 约束）；block 级冲突防护由 B2-B safety gate 承担（F1/F2/F3/F4）。
     /// - 不暴露私钥：`signer` 私有，仅授权「sign block」（不签任意字节；外部不能取得 signer）。
     pub fn sign_block(&self, block: &mut Block) -> Result<(), ValidatorActorError> {
-        attach_proposer_signature(block, &self.signer)
-            .map_err(|_| ValidatorActorError::BlockSigning)
+        let Some(safety) = self.block_safety.as_ref() else {
+            return Err(ValidatorActorError::BlockSafetyUnavailable);
+        };
+        attach_proposer_signature(block, safety, &self.signer).map_err(|e| match e {
+            BlockBuilderError::BlockSafety(s) => ValidatorActorError::BlockSignSafety(s),
+            _ => ValidatorActorError::BlockSigning,
+        })
+    }
+
+    /// **A-C（PHASE 6H-AF；Owner 授权）** — 专用 **Abandon Attestation** 签名路径。
+    ///
+    /// # 边界（MUST）
+    /// - 使用**本 actor 已有** signer（**不**新建第二份 signer / **不**新增私钥材料 /
+    ///   **不**改 `KeyProvider` 的一次性 provisioning 语义 / **不**把 signer 移到 `NodeRuntime`）。
+    /// - **不接受任意 hash**：语句由本方法内部按冻结 S1 从 `Abandon(chain_id, height, from_round)`
+    ///   构造（`AlgorithmId::Ed25519 = 0x01` · `DomainId::RoundChangeCertificate = 0x10`；
+    ///   ADR-0066 RC-4/RC-5 · ADR-0070 §5 · ADR-0074）⇒ 结构上**不能**签 vote / block / 任意字节。
+    /// - **只能由真实本地 EXPIRE 触发**：`observation` 只能由
+    ///   [`crate::round_change_pool::LocalExpireObservation::from_expired_timer`] 构造
+    ///   （要求 `RoundTimerTick::Expired` **且** `elapsed_ticks >= window_ticks`）
+    ///   ⇒ 无 future-round 签名 / 无 historical back-signing / 无 caller 指定 `(height, from_round)`。
+    /// - **不**触碰 `VoteLedger` / vote safety journal / block-safety journal / `LockedState`
+    ///   （Abandon ≠ vote；ADR-0066 §9.2-12 / §10.1）。
+    ///
+    /// `pub(crate)`：入参 `LocalExpireObservation` 为 crate 内部类型 ⇒ 本签名入口**不**向外暴露
+    /// （纵深防御：外部无法取得对任意 `(height, from_round)` 的 Abandon 签名）。
+    pub(crate) fn sign_abandon(
+        &self,
+        chain_id: u64,
+        observation: &LocalExpireObservation,
+    ) -> Result<RoundChangeEvidence, ValidatorActorError> {
+        crate::round_change_pool::produce_local_abandon(&self.signer, chain_id, observation)
+            .map_err(|_| ValidatorActorError::AbandonSigning)
     }
 
     pub fn locked_state(&self) -> &LockedState {

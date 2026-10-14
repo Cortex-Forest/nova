@@ -28,6 +28,7 @@
 
 use nova_consensus::finality::QuorumCertificate;
 use nova_consensus::round::ProposalRef;
+use nova_consensus::round_change::RoundChangeCertificate;
 use nova_consensus::vote::ValidatorVote;
 
 /// Driver 产出的、需要广播给网络对端的 consensus outbound **语义**消息。
@@ -49,6 +50,19 @@ pub enum OutboundConsensusMessage {
     /// 本地生产的 canonical block **wire**（= `nova_runtime::encode_block` 输出；与 inbound
     /// `GossipBlock` payload / `MessageType::GossipBlock` 同一格式 —— **不新建第二套序列化**）。
     GossipBlock(Vec<u8>),
+    /// O2 **已组装** 的 `RoundChangeCertificate`（PHASE 6H-Z D2-4；ADR-0066 / ADR-0070 / ADR-0073）。
+    ///
+    /// - 唯一生产者 = 节点层有界 attestation 池（`round_change_pool`）；只能在**达到**
+    ///   `ceil(2T/3)` 权重时产出（ADR-0066 RC-3）。
+    /// - 编码 = **冻结** ADR-0070 codec（`encode_certificate`）；wire = `0x0D`（ADR-0073 FROZEN）。
+    /// - **不是** QC / 不是 finality proof / 不是 lock override（ADR-0066 RC-6 / §7.2）。
+    RoundChange(RoundChangeCertificate),
+    /// O2 individual **Abandon Attestation**（PHASE 6H-AF；ADR-0074 container / ADR-0075 `0x0E`）。
+    ///
+    /// - 唯一生产者 = 本地真实 EXPIRE 后的 `ValidatorActor` 专用签名路径（A-C）。
+    /// - 编码 = **冻结** ADR-0074 codec（精确 112B）；wire = `0x0E`（ADR-0075 FROZEN）。
+    /// - **不是** vote / **不是** QC / **不是** RoundChangeCertificate（ADR-0074 §15）。
+    AbandonAttestation(nova_network::abandon_attestation::AbandonAttestation),
 }
 
 /// 出站 egress seam：把 Driver 产出的 consensus semantic output 接出（**抽象 seam**；

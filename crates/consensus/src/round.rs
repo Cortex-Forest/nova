@@ -226,18 +226,27 @@ impl LockedState {
 }
 
 /// Round timeout 配置（B-3；**本地事件，非共识输入**）。
+///
+/// **A3（Owner 授权，Testnet 基线）**：数值单位 = **毫秒**（单调时长），默认
+/// `(initial 10_000 ms = 10s, max 120_000 ms = 120s, backoff ×2)` ⇒ 序列
+/// 10s · 20s · 40s · 80s · 120s · 120s …（cap 先行）。
+/// 数值**非**共识常量（ADR-0049 §3.5「exact timeout numeric values = OPEN」）；
+/// `timeout_for` 的**形状**（`min(initial × backoff^round, max)`）保持不变。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoundTimeoutConfig {
+    /// 初始（round 0）超时窗口（**毫秒**）。
     pub initial_timeout: u64,
+    /// 窗口上限（**毫秒**）。
     pub max_timeout: u64,
+    /// 退避倍数（每 round 乘一次，饱和后 cap）。
     pub backoff_factor: u64,
 }
 
 impl Default for RoundTimeoutConfig {
     fn default() -> Self {
         Self {
-            initial_timeout: 1000,
-            max_timeout: 60_000,
+            initial_timeout: 10_000,
+            max_timeout: 120_000,
             backoff_factor: 2,
         }
     }

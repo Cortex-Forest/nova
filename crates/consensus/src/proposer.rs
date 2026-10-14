@@ -7,9 +7,12 @@
 //! - seed 输入（Micro-Fix #2，57B 定宽）：
 //!   ```text
 //!   ProposerSeedInput =
-//!       ProposerDomain(1B, = 0x07) ‖ chain_id(8B LE) ‖ height(8B LE) ‖ round(8B LE)
+//!       ProposerHashDomain(1B, = 0x07) ‖ chain_id(8B LE) ‖ height(8B LE) ‖ round(8B LE)
 //!       ‖ validator_set_id(32B)
 //!   ```
+//!   **命名空间修复（ADR-0068）**：首字节为**哈希域**（[`nova_crypto::hash_domain::HashDomain::Proposer`]，
+//!   `= 0x07`），**不是**签名域。它与 [`nova_crypto::domain::DomainId`] **不是同一命名空间**，
+//!   两者无任何隐式转换。取值 `0x07` 与历史实现逐字节一致 ⇒ **`ProposerSeedInput` 不变**。
 //! - `x = LE_u128(H(seed)[0..16]) mod total_weight`；选 **first validator where cumulative > x**。
 //! - V0.1：`validator_set_reference = validator_set_id = genesis_hash`（ADR-0038 F-11）。
 //! - 边界：`total_weight == 0` ⇒ 错误（无 proposer，不 fallback）；duplicate ValidatorId / 权重溢出 ⇒ 错误。
@@ -24,8 +27,8 @@
 
 use crate::error::ConsensusError;
 use crate::validator::{ValidatorId, ValidatorSet};
-use nova_crypto::domain::DomainId;
 use nova_crypto::hash::protocol_hash;
+use nova_crypto::hash_domain::HashDomain;
 
 /// ProposerSeedInput 定长总长度（ADR-0050 §20）：1 + 8 + 8 + 8 + 32 = 57。
 pub const PROPOSER_SEED_INPUT_LEN: usize = 57;
@@ -40,7 +43,7 @@ pub fn proposer_seed_input(
     validator_set_id: &[u8; 32],
 ) -> [u8; PROPOSER_SEED_INPUT_LEN] {
     let mut out = [0u8; PROPOSER_SEED_INPUT_LEN];
-    out[0] = DomainId::Proposer.as_u8();
+    out[0] = HashDomain::Proposer.as_u8();
     out[1..9].copy_from_slice(&chain_id.to_le_bytes());
     out[9..17].copy_from_slice(&height.to_le_bytes());
     out[17..25].copy_from_slice(&round.to_le_bytes());
@@ -203,13 +206,51 @@ mod tests {
         let input = proposer_seed_input(chain_id, height, round, &vsid);
         assert_eq!(
             input[0],
-            DomainId::Proposer.as_u8(),
-            "byte 0 = ProposerDomain(0x07)"
+            HashDomain::Proposer.as_u8(),
+            "byte 0 = ProposerHashDomain(0x07)（ADR-0068；非签名域）"
         );
         assert_eq!(&input[1..9], &chain_id.to_le_bytes(), "chain_id 8B LE");
         assert_eq!(&input[9..17], &height.to_le_bytes(), "height 8B LE");
         assert_eq!(&input[17..25], &round.to_le_bytes(), "round 8B LE");
         assert_eq!(&input[25..57], &vsid[..], "validator_set_id 32B");
+    }
+
+    // ---- PHASE 6G-A §7：C-1 兼容性回归（旧语义前缀 vs 新 HashDomain 前缀）----
+    //
+    // 目的：证明 ADR-0068 的命名空间迁移**逐字节不改变** `ProposerSeedInput`。
+    // 做法：在测试内**手工重建**「旧语义」的 57B 输入（首字节字面量 0x07——即历史
+    // `DomainId::Proposer` 的字节值），与当前 `proposer_seed_input` 输出逐字节比较。
+    // 本测试**不**依赖保留的旧命名空间代码（旧 `DomainId::Proposer` 已按 ADR-0067 移除）。
+    #[test]
+    fn hash_domain_migration_preserves_seed_input_bytes() {
+        let chain_id = 0x0102_0304_0506_0708u64;
+        let height = 0x1112_1314_1516_1718u64;
+        let round = 0x2122_2324_2526_2728u64;
+        let vsid = [0x33u8; 32];
+
+        // 旧语义构造（historically: DomainId::Proposer.as_u8() == 0x07）
+        let mut legacy = [0u8; PROPOSER_SEED_INPUT_LEN];
+        legacy[0] = 0x07;
+        legacy[1..9].copy_from_slice(&chain_id.to_le_bytes());
+        legacy[9..17].copy_from_slice(&height.to_le_bytes());
+        legacy[17..25].copy_from_slice(&round.to_le_bytes());
+        legacy[25..57].copy_from_slice(&vsid);
+
+        let now = proposer_seed_input(chain_id, height, round, &vsid);
+
+        assert_eq!(PROPOSER_SEED_INPUT_LEN, 57, "长度必须仍为 57");
+        assert_eq!(now[0], 0x07, "首字节必须仍为 0x07");
+        assert_eq!(
+            now[0],
+            HashDomain::Proposer.as_u8(),
+            "首字节来源 = HashDomain::Proposer"
+        );
+        assert_eq!(now, legacy, "ProposerSeedInput 必须逐字节不变（C-1）");
+        assert_eq!(
+            proposer_seed(chain_id, height, round, &vsid),
+            protocol_hash(&legacy),
+            "ProposerSeed 必须不变（C-1）"
+        );
     }
 
     // ---- Test 3-7: seed determinism / separation ----
@@ -352,8 +393,12 @@ mod tests {
         let b = select_proposer(1, 5, 2, &set_id(), &set).unwrap();
         assert_eq!(a, b);
         // proposer_seed 与 witness_seed（W-3：H(prev_finality_ref‖height)）不同源：seed 输入第一个字节为
-        // ProposerDomain(0x07)，非 Witness 域。
+        // ProposerHashDomain(0x07)（哈希域，ADR-0068），非 Witness 域。
         assert_eq!(proposer_seed_input(1, 5, 2, &set_id())[0], 0x07);
+        assert_eq!(
+            proposer_seed_input(1, 5, 2, &set_id())[0],
+            HashDomain::Proposer.as_u8()
+        );
     }
 
     // ---- 确定性测试向量（ADR-0050 §33；常量由独立 SHA-256 计算固化）----

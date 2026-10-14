@@ -22,6 +22,8 @@
 
 use crate::message::{MessageEnvelope, MessageType, NetworkError, decode, encode, verify_message};
 use crate::node_id::NodeId;
+// PHASE 6H-AK（Owner 授权 D3）：O2 专属 per-peer 入站限流（独立 buckets；DROP only）。
+use crate::round_change_limit::{RateLimitDecision, RoundChangeRateLimiter};
 use crate::session::{
     PeerAuthConfig, PeerSessionState, ReplayCache, ReplayKey, handshake_payload_decode,
     validate_handshake_context,
@@ -86,6 +88,12 @@ pub struct NetworkDiagnostics {
     pub replay_drops: u64,
     /// 未认证（非 Established session）消息丢弃数。
     pub unauthenticated_drops: u64,
+    /// PHASE 6H-AK（D3）—— 因 **per-peer 配额**（0x0D `ConsensusRoundChange`）而 DROP 的入站证书数。
+    /// 语义独立于 `dropped_invalid` / `dropped_overflow`（**不**混用）。
+    pub round_change_rate_limited: u64,
+    /// PHASE 6H-AK（D3）—— 因 **per-peer 配额**（0x0E `ConsensusAbandonAttestation`）而 DROP 的
+    /// 入站 attestation 数。与 0x0D **独立 bucket**（不共享额度）。
+    pub abandon_attestation_rate_limited: u64,
 }
 
 /// NetworkService 错误（node-local 网络域；fail-safe：不 panic、不改共识）。
@@ -220,17 +228,63 @@ impl PeerManager {
 /// 入站网络事件（分类结果；payload **opaque** —— NetworkService 不解析共识语义）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkEvent {
-    Handshake { sender: NodeId, payload: Vec<u8> },
-    Ping { sender: NodeId, payload: Vec<u8> },
-    Pong { sender: NodeId, payload: Vec<u8> },
-    GossipTransaction { sender: NodeId, payload: Vec<u8> },
-    GossipBlock { sender: NodeId, payload: Vec<u8> },
-    SyncBlockRequest { sender: NodeId, payload: Vec<u8> },
-    SyncBlockResponse { sender: NodeId, payload: Vec<u8> },
-    Status { sender: NodeId, payload: Vec<u8> },
-    ConsensusVote { sender: NodeId, payload: Vec<u8> },
-    ConsensusProposal { sender: NodeId, payload: Vec<u8> },
-    ConsensusQc { sender: NodeId, payload: Vec<u8> },
+    Handshake {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    Ping {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    Pong {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    GossipTransaction {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    GossipBlock {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    SyncBlockRequest {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    SyncBlockResponse {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    Status {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    ConsensusVote {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    ConsensusProposal {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    ConsensusQc {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    /// O2 round-change 证书（PHASE 6H-Y；wire = `ConsensusRoundChange = 0x0D`，ADR-0073 FROZEN）。
+    /// payload opaque；本层**不**解析其语义（不得进入 QC / finality / lock 路径）。
+    ConsensusRoundChange {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
+    /// O2 individual Abandon Attestation（PHASE 6H-AF；wire = `ConsensusAbandonAttestation = 0x0E`，
+    /// ADR-0075 FROZEN；payload = ADR-0074 的 112B container，opaque）。
+    /// 本层**不**解析其语义（不得进入 QC / finality / lock / vote 路径）。
+    ConsensusAbandonAttestation {
+        sender: NodeId,
+        payload: Vec<u8>,
+    },
 }
 
 impl NetworkEvent {
@@ -246,7 +300,9 @@ impl NetworkEvent {
             | Self::Status { sender, .. }
             | Self::ConsensusVote { sender, .. }
             | Self::ConsensusProposal { sender, .. }
-            | Self::ConsensusQc { sender, .. } => *sender,
+            | Self::ConsensusQc { sender, .. }
+            | Self::ConsensusRoundChange { sender, .. }
+            | Self::ConsensusAbandonAttestation { sender, .. } => *sender,
         }
     }
 
@@ -262,7 +318,9 @@ impl NetworkEvent {
             | Self::Status { payload, .. }
             | Self::ConsensusVote { payload, .. }
             | Self::ConsensusProposal { payload, .. }
-            | Self::ConsensusQc { payload, .. } => payload,
+            | Self::ConsensusQc { payload, .. }
+            | Self::ConsensusRoundChange { payload, .. }
+            | Self::ConsensusAbandonAttestation { payload, .. } => payload,
         }
     }
 
@@ -280,6 +338,8 @@ impl NetworkEvent {
             Self::ConsensusVote { .. } => MessageType::ConsensusVote,
             Self::ConsensusProposal { .. } => MessageType::ConsensusProposal,
             Self::ConsensusQc { .. } => MessageType::ConsensusQc,
+            Self::ConsensusRoundChange { .. } => MessageType::ConsensusRoundChange,
+            Self::ConsensusAbandonAttestation { .. } => MessageType::ConsensusAbandonAttestation,
         }
     }
 }
@@ -364,6 +424,10 @@ pub struct NetworkService<T: Transport> {
     global_handshake_attempts: u32,
     /// bounded replay cache（握手去重；FIFO 驱逐）。
     replay: ReplayCache,
+    /// PHASE 6H-AK（D3）—— `0x0D ConsensusRoundChange` 的 **per-peer** 入站限流（独立 bucket）。
+    round_change_limiter: RoundChangeRateLimiter,
+    /// PHASE 6H-AK（D3）—— `0x0E ConsensusAbandonAttestation` 的 **per-peer** 入站限流（独立 bucket）。
+    abandon_attestation_limiter: RoundChangeRateLimiter,
     /// 本端网络身份锚（dial 首包 local / 未来 sender 校验）。
     self_id: NodeId,
     /// 可选 outbound dialer（NetworkService 拥有 connection lifecycle；None = 无 dial 能力）。
@@ -392,6 +456,10 @@ impl<T: Transport> NetworkService<T> {
             handshake_attempts: HashMap::new(),
             global_handshake_attempts: 0,
             replay: ReplayCache::new(replay_capacity),
+            // PHASE 6H-AK（D3）：两个 **独立** limiter 实例；数值由 `RoundChangeRateLimiter::new()`
+            // 固定为 Owner policy（0x0D 与 0x0E 各自 4/s + burst 8）。**不**使用 `with_caps`。
+            round_change_limiter: RoundChangeRateLimiter::new(),
+            abandon_attestation_limiter: RoundChangeRateLimiter::new(),
             self_id,
             dialer: None,
         }
@@ -709,6 +777,33 @@ impl<T: Transport> NetworkService<T> {
         }
         // 5. classify → NetworkEvent（payload opaque；不解析共识语义）。
         let event = classify(&envelope);
+        // 5b. PHASE 6H-AK（Owner 授权 D3）：O2 专属 **per-peer 入站限流**（唯一新增 gate）。
+        //
+        // 位置约定（Owner）：**分类之后、入队之前** —— DROP ⇒ **不产生 `NetworkEvent`**
+        // ⇒ 永不到达 wiring / runtime / consensus（零共识面）。
+        // - 键 = `envelope.sender`（已在步骤 2 与 `raw_sender` 绑定并完成信封验签，不可伪造）。
+        // - 两个**独立** bucket：0x0D 与 0x0E 互不借用额度（Owner policy）。
+        // - DROP 为**完整动作**：不 BAN、不断开（不调用 `close_peer`）、不改任何 peer/session 状态。
+        // - 既有 envelope 验签 / sender 绑定 / payload 大小校验（步骤 1-4）**在此之前且不变**。
+        match envelope.message_type {
+            MessageType::ConsensusRoundChange
+                if self.round_change_limiter.check(envelope.sender.as_bytes())
+                    == RateLimitDecision::Drop =>
+            {
+                self.diagnostics.round_change_rate_limited += 1;
+                return false;
+            }
+            MessageType::ConsensusAbandonAttestation
+                if self
+                    .abandon_attestation_limiter
+                    .check(envelope.sender.as_bytes())
+                    == RateLimitDecision::Drop =>
+            {
+                self.diagnostics.abandon_attestation_rate_limited += 1;
+                return false;
+            }
+            _ => {}
+        }
         // 6. bounded inbound；满 ⇒ drop + overflow 计数（consensus/gossip/sync/block 一致策略）。
         match self.inbound.push_back(event) {
             Ok(()) => {
@@ -817,6 +912,10 @@ impl<T: Transport> NetworkService<T> {
         self.handshake_attempts.clear();
         self.global_handshake_attempts = 0;
         self.replay = ReplayCache::new(0);
+        // PHASE 6H-AK（D3）：两个 limiter 与 session/replay/handshake 同等对待 —— **无跨生命周期
+        // 状态**（不持久化；restart 后 token 重新从 burst 开始）。
+        self.round_change_limiter = RoundChangeRateLimiter::new();
+        self.abandon_attestation_limiter = RoundChangeRateLimiter::new();
     }
 
     fn ensure_running(&self) -> Result<(), NetworkServiceError> {
@@ -886,6 +985,10 @@ fn classify(envelope: &MessageEnvelope) -> NetworkEvent {
         MessageType::ConsensusVote => NetworkEvent::ConsensusVote { sender, payload },
         MessageType::ConsensusProposal => NetworkEvent::ConsensusProposal { sender, payload },
         MessageType::ConsensusQc => NetworkEvent::ConsensusQc { sender, payload },
+        MessageType::ConsensusRoundChange => NetworkEvent::ConsensusRoundChange { sender, payload },
+        MessageType::ConsensusAbandonAttestation => {
+            NetworkEvent::ConsensusAbandonAttestation { sender, payload }
+        }
     }
 }
 

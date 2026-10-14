@@ -51,6 +51,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use nova_consensus::round::RoundStep;
 use nova_consensus::validator::{ValidatorId, ValidatorSet};
 use nova_crypto::address::NetworkId;
 use nova_crypto::domain::SigningMessageHash;
@@ -64,7 +65,9 @@ use nova_network::transport::{ConnectionTarget, Transport};
 use nova_node::bootstrap::NodeConfig;
 use nova_node::key_provider::{KeyProvider, KeyProviderConfig, KeyProviderError};
 use nova_node::network_identity::{NetworkSigner, NetworkSigningError};
-use nova_node::runtime::{NodeRuntime, NodeRuntimeError, RuntimeError};
+use nova_node::runtime::{
+    NodeRuntime, NodeRuntimeError, RoundChangeRejectKind, RoundTimeoutOutcome, RuntimeError,
+};
 use nova_node::signer::{SigningCapability, SigningError};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -897,6 +900,174 @@ struct RunSummary {
     peer_dial_attempts_total: u64,
     /// P1-A.9（P1-3）—— A.8 dial 失败总数（saturating；恒定观测）。
     peer_dial_failures_total: u64,
+    /// PHASE 6H-AH — O2 观测（全部为 runtime **既有**只读 accessor；不新增语义）。
+    /// 本地真实 EXPIRE 产生的 Abandon attestation 数。
+    abandon_produced: u64,
+    /// 已**发出**（`broadcast` 已入队）的本地 `0x0E` attestation 数。
+    abandon_broadcast: u64,
+    /// 入站 `0x0E` attestation 被拒数。
+    abandon_rejected: u64,
+    /// 池内组装完成并经**既有 `0x0D`** 广播的证书数。
+    rc_certs: u64,
+    /// 经**证书**（D1 authority）应用的 round change 数。
+    rc_authority: u64,
+    /// 入站 `0x0D` 证书被拒数。
+    rc_rejected: u64,
+    /// P1-A.30 **D0** — RC 拒绝原因分类 `[malformed, stale, wrong_height, quorum, identity, other]`
+    /// （既有 `rc_rejected` 总数**不变**；本字段仅**拆分**同一批事件）。
+    rc_reject_buckets: [u64; 6],
+    /// P1-A.30 **D0** — RC 证书广播 `Ok(0)`（零 Established 对端）次数。
+    rc_bcast_no_peer: u64,
+    /// P1-A.30 **D0** — Abandon attestation 广播 `Ok(0)`（零 Established 对端）次数。
+    abandon_bcast_no_peer: u64,
+    /// P1-A.30 **D0** — 暂存证书重评尝试次数（每 step ≤ 1）。
+    rc_reeval_attempts: u64,
+    /// P1-A.30 **D0** — 暂存证书重评**成功应用**次数（恒 ≤ `rc_reeval_attempts`）。
+    rc_reeval_applied: u64,
+    /// P1-A.30 **D0** — 本地 timeout 结果分类 `[applied, ignored, rejected]`
+    /// （总数见 `round_timeouts`；本字段仅**拆分**同一批事件）。
+    timeout_outcomes: [u64; 3],
+    /// P1-A.30 **D0** — Guard C 拒绝分类计数（8 类固定序；数据源 = 既有 PendingProposalStore）。
+    guard_rej: [u64; 8],
+    /// P1-A.30 **D0′** — 入站队列溢出丢弃
+    /// `[block_inbound, sync_requests, round_changes, abandon_attestations]`（既有 handler 计数）。
+    wire_drops: [u64; 4],
+    /// ── PHASE 6H-AQ — pacemaker / round **只读观测**（纯诊断；零语义 / 零状态机影响）──
+    /// 本地 round timeout **已触发次数**（含被冻结 `checked_successor` 拒绝的尝试）。
+    /// `0` = 从未到达 `Expired`（既有只读 accessor；不新增语义）。
+    round_timeouts: u64,
+    /// 当前计时器已历 step 数（`None` = 尚未 arm / **已被 finality DISARM**）。
+    timer_elapsed: Option<u64>,
+    /// 当前计时器窗口（tick；`None` = 未 arm）。
+    timer_window: Option<u64>,
+    /// `consensus.round.step` 名称（Propose / Prevote / Precommit / Finalized）。
+    round_step: &'static str,
+    /// `consensus.round.proposal.is_some()`（DISARM 谓词输入之一）。
+    proposal_present: bool,
+    /// `consensus.finality.finalized_reference.is_some()`（DISARM 谓词输入之一）。
+    finalized_ref_present: bool,
+    /// ── PHASE 6H-A30 OD-X7 — liveness **只读**观测（OUTPUT_MODE=B：**独立** `liveness` 行）──
+    /// 提案构造调用总数 / 成功提交数（既有 `status` 行**逐字不变**）。
+    prop_calls: u64,
+    /// 成功构造**并提交**提案次数。
+    prop_build_ok: u64,
+    /// 因"非当选者"跳过次数（只读复算）。
+    prop_skip_not_elected: u64,
+    /// 因 `rs.height != head.height` 跳过次数（只读复算）。
+    prop_skip_height_desync: u64,
+    /// 因阶段 / 幂等守卫跳过次数（只读复算）。
+    prop_skip_step_guard: u64,
+    /// SAFETY-REJECT-SKIP — 出块签名被 `block_safety` 冲突门正确拒绝而放弃的提案数（非 fatal）。
+    prop_skip_conflict_target: u64,
+    /// **残差**跳过次数（`calls − ok − known_skips`；**不**推断未知原因）。
+    prop_skip_fail: u64,
+    /// 入站提案消费数 / 本地产出入站登记数 / "零 Established 对端"丢弃数。
+    inbound_prop_ok: u64,
+    /// 本地提案被登记出站（`record_local_proposal`）次数。
+    egress_prop_enqueued: u64,
+    /// 单发广播**提案**时 `Established 对端 = 0`（静默丢弃）次数。
+    egress_prop_no_peer: u64,
+    /// PHASE 6H-A30 OD-X8 — 本地提案**有界重播**实际入队次数（直读 snapshot；**仅观测**，
+    /// 不参与任何判定；`<= MAX_PROPOSAL_REFRESH x 本地提案数`）。
+    egress_prop_refreshed: u64,
+    /// round 前进来源分解：本地 pacemaker / 高度推进 / RC 权威（后者=既有 accessor）。
+    round_adv_local: u64,
+    /// 因高度推进（`advance_to_height`）导致 round 归零的次数。
+    round_adv_height: u64,
+    /// 经 RC 权威推进 round 的次数（= 既有 `round_changes_by_authority`，**仅暴露**）。
+    round_adv_rc: u64,
+    /// 瞬态：当前 `(height, round)` 当选者是否本节点（只读派生；无法判定 ⇒ `false`）。
+    elected_is_self: bool,
+    /// 瞬态：当前 `(height, round)` 内无提案的**连续 step** 数。
+    prop_absent_steps: u64,
+    /// ── PHASE 6H-A30 OD-X7b — 入站 proposal admission 生命周期（只读；既有真实计数）──
+    /// Guard A2+C 通过（`note_admitted()`）累计。
+    proposal_admitted: u64,
+    /// 首次入 pending（`note_pended()`）累计（决策结果，非队列长度）。
+    proposal_pending: u64,
+    /// 准入拒绝累计（直拒 + recovery 拒）。
+    proposal_rejected: u64,
+    /// 到期淘汰（`sweep_expired()`）累计。
+    proposal_expired: u64,
+    /// ── PHASE 6H-A30 OD-X7d — 网络/事件环 **只读**诊断（直读既有 `diagnostics()`）──
+    /// 已从 transport 读取的帧数 / 已入队 inbound 的有效事件数。
+    net_frames_received: u64,
+    net_events_enqueued: u64,
+    /// 已成功发出的出站消息数。
+    net_sent: u64,
+    /// 因 invalid envelope/sender/超限丢帧数（注：**含**出站 send 失败，语义混合）。
+    net_dropped_invalid: u64,
+    /// NS inbound 队列满丢事件数。
+    net_dropped_overflow: u64,
+    /// 非 Established session 丢弃数。
+    net_unauthenticated_drops: u64,
+    /// handler 返回 Err 次数（wire decode 失败等）。
+    el_handler_errors: u64,
+    /// EventLoop 队列满丢事件数。
+    el_events_dropped_overflow: u64,
+    /// ── PHASE 6H-A30 OD-X7e — recovery / block readiness（直读既有 `A11Diag`）──
+    /// pending recovery checkpoint 被调用次数 / 候选数 / 因区块未就绪保留数 / 接纳数 / 拒绝数。
+    recovery_runs: u64,
+    recovery_candidates: u64,
+    recovery_kept_missing_block: u64,
+    recovery_admitted: u64,
+    recovery_rejected: u64,
+    /// block inbound 处理数 / canonical-next 候选数 / 登记成功数。
+    block_inbound_processed: u64,
+    block_canonical_next: u64,
+    block_register_ok: u64,
+    /// ── PHASE 6H-A30 OD-X7f — `InboundBlockVerdict` 窗口内分类（只读；非累计）──
+    /// 六项之和 == 既有 outcomes 窗口长度（bounded ≤128）。
+    block_verdict_future_missing_ancestor: u64,
+    block_verdict_already_known: u64,
+    /// 真实变体 `Stale`（无 `Duplicate`）。
+    block_verdict_stale: u64,
+    /// 真实变体 `ConflictingParent`（无 `UnknownTarget`）。
+    block_verdict_conflicting_parent: u64,
+    block_verdict_malformed: u64,
+    /// 残差（含 `CanonicalNextCandidate` 与其余 `InboundBlockError`）。
+    /// PHASE 6H-A30 OD-X7g 起：`block_err_*` 已单独列出 ⇒ 本项 == 窗口内 CanonicalNextCandidate 数。
+    block_verdict_other: u64,
+    /// ── PHASE 6H-A30 OD-X7g — `Err(InboundBlockError)` 细分类（窗口内；真实变体 1:1）──
+    /// 不变量：5 个 Ok 类 + malformed + 下列 10 类 + other == 既有 outcomes 窗口长度。
+    block_err_oversized: u64,
+    block_err_wrong_version: u64,
+    block_err_wrong_chain: u64,
+    block_err_hash_mismatch: u64,
+    block_err_invalid_proposer_signature: u64,
+    block_err_transaction_root_mismatch: u64,
+    block_err_noncanonical_transaction_ordering: u64,
+    block_err_state_root_mismatch: u64,
+    block_err_unsupported_validation: u64,
+    block_err_storage: u64,
+    /// ── PHASE 6H-A30-OD-X7h — 入站 block **来源类别**归属（累计；非窗口）──
+    /// 数据源 = `step()` 内既有 dispatch `source`（既有 match 分支）+ 该块既有 verdict。
+    /// 一致性：gossip/sync 两项之和 == 累计 `InvalidProposerSignature` 数（≤128 判定时
+    /// == 窗口内 `block_err_invalid_proposer_signature`）。
+    block_src_gossip_total: u64,
+    block_src_gossip_invalid_proposer_signature: u64,
+    block_src_sync_total: u64,
+    block_src_sync_invalid_proposer_signature: u64,
+    /// ── PHASE 6H-A30-OD-X7i — Gossip IPS 来源分类（累计；A 证据冲突 / B 验签失败）──
+    /// 不变量：A + B == 累计 gossip 路径 `InvalidProposerSignature` 数
+    /// （wire hash 可解析时精确；归 A = dispatcher 在验签之前返回的 IPS）。
+    block_gossip_invalid_proposer_signature_evidence_conflict: u64,
+    block_gossip_invalid_proposer_signature_signature_failure: u64,
+}
+
+/// PHASE 6H-AQ — `RoundStep` 名称（只读观测；无状态机影响）。
+fn round_step_name(step: RoundStep) -> &'static str {
+    match step {
+        RoundStep::Propose => "Propose",
+        RoundStep::Prevote => "Prevote",
+        RoundStep::Precommit => "Precommit",
+        RoundStep::Finalized => "Finalized",
+    }
+}
+
+/// PHASE 6H-AQ — `Option<u64>` 渲染（与既有 `finalized_height=none` 约定一致）。
+fn opt_u64(v: Option<u64>) -> String {
+    v.map_or_else(|| "none".to_string(), |x| x.to_string())
 }
 
 /// 采样当前 runtime 只读观测（不触碰秘密材料；全部用**既有** public accessor）。
@@ -912,6 +1083,23 @@ fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
         .map_or(0, |d| d.accepted);
     let consensus_height = runtime.driver().consensus().state().round.height;
     let round = runtime.driver().consensus().state().round.round;
+    // PHASE 6H-AQ — 只读观测（既有 accessor + 既有 `pub` consensus 字段；不改状态机）。
+    let state = runtime.driver().consensus().state();
+    let round_step = round_step_name(state.round.step);
+    let proposal_present = state.round.proposal.is_some();
+    let finalized_ref_present = state.finality.finalized_reference.is_some();
+    // PHASE 6H-A30 OD-X7 — 只读 liveness 快照（既有 accessor；不改状态机）。
+    let live = runtime.liveness_snapshot();
+    // P1-A.30 D0 — 只读诊断（拒绝原因分类 / 广播无对端 / 暂存重评 / 超时结果分类）。
+    let rc_reeval = runtime.round_change_reeval();
+    let rc_reject_buckets = [
+        runtime.round_change_reject_count(RoundChangeRejectKind::Malformed),
+        runtime.round_change_reject_count(RoundChangeRejectKind::Stale),
+        runtime.round_change_reject_count(RoundChangeRejectKind::WrongHeight),
+        runtime.round_change_reject_count(RoundChangeRejectKind::Quorum),
+        runtime.round_change_reject_count(RoundChangeRejectKind::Identity),
+        runtime.round_change_reject_count(RoundChangeRejectKind::Other),
+    ];
     RunSummary {
         steps,
         run_steps: cli.run_steps,
@@ -930,22 +1118,281 @@ fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
         validator_enabled: runtime.validator_enabled(),
         peer_dial_attempts_total: runtime.peer_dial_attempts_total(),
         peer_dial_failures_total: runtime.peer_dial_failures_total(),
+        abandon_produced: runtime.abandon_attestations_produced(),
+        abandon_broadcast: runtime.abandon_attestations_broadcast(),
+        abandon_rejected: runtime.abandon_attestations_rejected(),
+        rc_certs: runtime.round_change_certificates_assembled(),
+        rc_authority: runtime.round_changes_by_authority(),
+        rc_rejected: runtime.round_changes_rejected(),
+        rc_reject_buckets,
+        rc_bcast_no_peer: runtime.round_change_broadcast_no_peer(),
+        abandon_bcast_no_peer: runtime.abandon_broadcast_no_peer(),
+        rc_reeval_attempts: rc_reeval.0,
+        rc_reeval_applied: rc_reeval.1,
+        timeout_outcomes: [
+            runtime.round_timeout_outcome(RoundTimeoutOutcome::Applied),
+            runtime.round_timeout_outcome(RoundTimeoutOutcome::Ignored),
+            runtime.round_timeout_outcome(RoundTimeoutOutcome::Rejected),
+        ],
+        guard_rej: runtime.guard_reject_counts(),
+        wire_drops: runtime.inbound_queue_drops(),
+        round_timeouts: runtime.round_timeouts(),
+        timer_elapsed: runtime.round_timeout_elapsed_ms(),
+        timer_window: runtime.round_timeout_window_ms(),
+        round_step,
+        proposal_present,
+        finalized_ref_present,
+        prop_calls: live.prop_calls,
+        prop_build_ok: live.prop_build_ok,
+        prop_skip_not_elected: live.prop_skip_not_elected,
+        prop_skip_height_desync: live.prop_skip_height_desync,
+        prop_skip_step_guard: live.prop_skip_step_guard,
+        prop_skip_conflict_target: live.prop_skip_conflict_target,
+        prop_skip_fail: live.prop_skip_fail,
+        inbound_prop_ok: live.inbound_prop_ok,
+        egress_prop_enqueued: live.egress_prop_enqueued,
+        egress_prop_no_peer: live.egress_prop_no_peer,
+        // PHASE 6H-A30 OD-X8 — 直读 snapshot 计数（无新增增量点 / 无行为变更）。
+        egress_prop_refreshed: live.egress_prop_refreshed,
+        round_adv_local: live.round_adv_local,
+        round_adv_height: live.round_adv_height,
+        round_adv_rc: live.round_adv_rc,
+        elected_is_self: live.elected_is_self,
+        prop_absent_steps: live.prop_absent_steps,
+        // PHASE 6H-A30 OD-X7b — 真实计数直读（无增量点 / 无结果猜测）。
+        proposal_admitted: live.proposal_admitted,
+        proposal_pending: live.proposal_pending,
+        proposal_rejected: live.proposal_rejected,
+        proposal_expired: live.proposal_expired,
+        // PHASE 6H-A30 OD-X7d — 只读网络/事件环诊断直读（无推算）。
+        net_frames_received: live.net_frames_received,
+        net_events_enqueued: live.net_events_enqueued,
+        net_sent: live.net_sent,
+        net_dropped_invalid: live.net_dropped_invalid,
+        net_dropped_overflow: live.net_dropped_overflow,
+        net_unauthenticated_drops: live.net_unauthenticated_drops,
+        el_handler_errors: live.el_handler_errors,
+        el_events_dropped_overflow: live.el_events_dropped_overflow,
+        // PHASE 6H-A30 OD-X7e — 只读 recovery/block 直读（无推算）。
+        recovery_runs: live.recovery_runs,
+        recovery_candidates: live.recovery_candidates,
+        recovery_kept_missing_block: live.recovery_kept_missing_block,
+        recovery_admitted: live.recovery_admitted,
+        recovery_rejected: live.recovery_rejected,
+        block_inbound_processed: live.block_inbound_processed,
+        block_canonical_next: live.block_canonical_next,
+        block_register_ok: live.block_register_ok,
+        // PHASE 6H-A30 OD-X7f — 既有 outcomes 窗口分类（无推算）。
+        block_verdict_future_missing_ancestor: live.block_verdict_future_missing_ancestor,
+        block_verdict_already_known: live.block_verdict_already_known,
+        block_verdict_stale: live.block_verdict_stale,
+        block_verdict_conflicting_parent: live.block_verdict_conflicting_parent,
+        block_verdict_malformed: live.block_verdict_malformed,
+        block_verdict_other: live.block_verdict_other,
+        // PHASE 6H-A30 OD-X7g — Err 细分直读（窗口内；无推算）。
+        block_err_oversized: live.block_err_oversized,
+        block_err_wrong_version: live.block_err_wrong_version,
+        block_err_wrong_chain: live.block_err_wrong_chain,
+        block_err_hash_mismatch: live.block_err_hash_mismatch,
+        block_err_invalid_proposer_signature: live.block_err_invalid_proposer_signature,
+        block_err_transaction_root_mismatch: live.block_err_transaction_root_mismatch,
+        block_err_noncanonical_transaction_ordering: live
+            .block_err_noncanonical_transaction_ordering,
+        block_err_state_root_mismatch: live.block_err_state_root_mismatch,
+        block_err_unsupported_validation: live.block_err_unsupported_validation,
+        block_err_storage: live.block_err_storage,
+        // PHASE 6H-A30-OD-X7h — 来源类别累计直读（无推算）。
+        block_src_gossip_total: live.block_src_gossip_total,
+        block_src_gossip_invalid_proposer_signature: live
+            .block_src_gossip_invalid_proposer_signature,
+        block_src_sync_total: live.block_src_sync_total,
+        block_src_sync_invalid_proposer_signature: live.block_src_sync_invalid_proposer_signature,
+        // PHASE 6H-A30-OD-X7i — gossip IPS 来源分类直读（无推算）。
+        block_gossip_invalid_proposer_signature_evidence_conflict: live
+            .block_gossip_invalid_proposer_signature_evidence_conflict,
+        block_gossip_invalid_proposer_signature_signature_failure: live
+            .block_gossip_invalid_proposer_signature_signature_failure,
     }
+}
+
+/// PHASE 6H-A30 OD-X7 — **独立** `liveness` 行（OUTPUT_MODE=B）。
+///
+/// - 既有 `status` 行**逐字不变**（本行纯 append；不影响 `status_write_failed`）。
+/// - 只读观测；字段顺序固定、无时间戳、无随机值、不读取外部服务。
+fn liveness_line(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> String {
+    let s = summarize(runtime, cli, steps);
+    format!(
+        "{PROGRAM}: liveness steps={} prop_calls={} prop_build_ok={} \
+         prop_skip_not_elected={} prop_skip_height_desync={} prop_skip_step_guard={} \
+         prop_skip_conflict_target={} \
+         prop_skip_fail={} inbound_prop_ok={} egress_prop_enqueued={} egress_prop_no_peer={} \
+         egress_prop_refreshed={} \
+         round_adv_local={} round_adv_height={} round_adv_rc={} elected_is_self={} \
+         prop_absent_steps={} proposal_admitted={} proposal_pending={} \
+         proposal_rejected={} proposal_expired={} net_frames_received={} \
+         net_events_enqueued={} net_sent={} net_dropped_invalid={} net_dropped_overflow={} \
+         net_unauthenticated_drops={} el_handler_errors={} el_events_dropped_overflow={} \
+         recovery_runs={} recovery_candidates={} recovery_kept_missing_block={} \
+         recovery_admitted={} recovery_rejected={} block_inbound_processed={} \
+         block_canonical_next={} block_register_ok={} \
+         block_verdict_future_missing_ancestor={} block_verdict_already_known={} \
+         block_verdict_stale={} block_verdict_conflicting_parent={} \
+         block_verdict_malformed={} block_verdict_other={} block_err_oversized={} \
+         block_err_wrong_version={} block_err_wrong_chain={} block_err_hash_mismatch={} \
+         block_err_invalid_proposer_signature={} block_err_transaction_root_mismatch={} \
+         block_err_noncanonical_transaction_ordering={} block_err_state_root_mismatch={} \
+         block_err_unsupported_validation={} block_err_storage={} \
+         block_src_gossip_total={} block_src_gossip_invalid_proposer_signature={} \
+         block_src_sync_total={} block_src_sync_invalid_proposer_signature={} \
+         block_gossip_invalid_proposer_signature_evidence_conflict={} \
+         block_gossip_invalid_proposer_signature_signature_failure={}\n",
+        s.steps,
+        s.prop_calls,
+        s.prop_build_ok,
+        s.prop_skip_not_elected,
+        s.prop_skip_height_desync,
+        s.prop_skip_step_guard,
+        s.prop_skip_conflict_target,
+        s.prop_skip_fail,
+        s.inbound_prop_ok,
+        s.egress_prop_enqueued,
+        s.egress_prop_no_peer,
+        s.egress_prop_refreshed,
+        s.round_adv_local,
+        s.round_adv_height,
+        s.round_adv_rc,
+        s.elected_is_self,
+        s.prop_absent_steps,
+        s.proposal_admitted,
+        s.proposal_pending,
+        s.proposal_rejected,
+        s.proposal_expired,
+        s.net_frames_received,
+        s.net_events_enqueued,
+        s.net_sent,
+        s.net_dropped_invalid,
+        s.net_dropped_overflow,
+        s.net_unauthenticated_drops,
+        s.el_handler_errors,
+        s.el_events_dropped_overflow,
+        s.recovery_runs,
+        s.recovery_candidates,
+        s.recovery_kept_missing_block,
+        s.recovery_admitted,
+        s.recovery_rejected,
+        s.block_inbound_processed,
+        s.block_canonical_next,
+        s.block_register_ok,
+        s.block_verdict_future_missing_ancestor,
+        s.block_verdict_already_known,
+        s.block_verdict_stale,
+        s.block_verdict_conflicting_parent,
+        s.block_verdict_malformed,
+        s.block_verdict_other,
+        s.block_err_oversized,
+        s.block_err_wrong_version,
+        s.block_err_wrong_chain,
+        s.block_err_hash_mismatch,
+        s.block_err_invalid_proposer_signature,
+        s.block_err_transaction_root_mismatch,
+        s.block_err_noncanonical_transaction_ordering,
+        s.block_err_state_root_mismatch,
+        s.block_err_unsupported_validation,
+        s.block_err_storage,
+        s.block_src_gossip_total,
+        s.block_src_gossip_invalid_proposer_signature,
+        s.block_src_sync_total,
+        s.block_src_sync_invalid_proposer_signature,
+        s.block_gossip_invalid_proposer_signature_evidence_conflict,
+        s.block_gossip_invalid_proposer_signature_signature_failure,
+    )
 }
 
 /// P1-A.9（P1-3）—— 单行 periodic status（确定性；仅非敏感观测值）。
 ///
 /// 字段顺序固定、无时间戳、无随机值、不读取外部服务。
+/// P1-A.30 **D0** — 紧凑诊断串（`a/b/c`；确定性、零外部输入、无时间戳 / 无随机 / 无分配副作用）。
+///
+/// 仅用于把**固定长度**的诊断分类数组打成单字段，避免字符型描述扩充状态行长度。
+fn slash_join(values: &[u64]) -> String {
+    values
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<String>>()
+        .join("/")
+}
+
 fn status_line(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> String {
     let s = summarize(runtime, cli, steps);
     let finalized = s
         .finalized_height
         .map_or_else(|| "none".to_string(), |h| h.to_string());
+    // ---- NETDIAG（**仅诊断**；Owner 授权；零行为变更 / 不改连接选择与重试策略）----
+    // 入站诊断（既有 `InboundDiagnostics`；此前仅退出摘要行输出部分字段）。
+    let inbound = runtime.network_inbound_diagnostics();
+    let ib = inbound.map_or([0u64; 7], |d| {
+        [
+            d.accepted,
+            d.duplicate_drops,
+            d.overflow_drops,
+            d.header_drops,
+            d.accept_error_drops,
+            d.closed_drops,
+            d.connections as u64,
+        ]
+    });
+    let idr = inbound.map_or([0u64; 4], |d| {
+        [
+            d.greet_keepfirst_drops,
+            d.greet_connect_failed_drops,
+            d.handshake_failed_drops,
+            d.pending_timeout_drops,
+        ]
+    });
+    // per-peer 状态（配置顺序；确定性）：`E`=established / `C`=connected / `-`=均无；`i`=持有入站连接。
+    let peer_state = cli
+        .peers
+        .iter()
+        .map(|t| {
+            let sess = if runtime.network_peer_established(t.peer_id) {
+                'E'
+            } else if runtime.network_peer_connected(t.peer_id) {
+                'C'
+            } else {
+                '-'
+            };
+            let inb = if runtime.network_inbound_contains(t.peer_id) {
+                'i'
+            } else {
+                '.'
+            };
+            format!("{sess}{inb}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let peer_fail = cli
+        .peers
+        .iter()
+        .map(|t| {
+            runtime
+                .peer_lifecycle(t.peer_id)
+                .map_or(0, |s| s.failure_count)
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
         "{PROGRAM}: status steps={} head_height={} finalized_height={} consensus_height={} \
          round={} configured_peers={} established_peers={} inbound_connections={} \
          sync_pending={} block_inbound_skipped={} pending_external_qc={} qc_served={} \
-         validator_enabled={}\n",
+         validator_enabled={} abandon_produced={} abandon_broadcast={} abandon_rejected={} \
+         rc_certs={} rc_authority={} rc_rejected={} \
+         rc_rej={} rc_bcast_nopeer={} abandon_bcast_nopeer={} rc_reeval={}/{} timeout_split={} \
+         guard_rej={} wire_drops={} \
+         round_timeouts={} timer_elapsed={} timer_window={} round_step={} \
+         proposal_present={} finalized_ref_present={} \
+         inbound={}/{}/{}/{}/{}/{}/{} inbound_drops={}/{}/{}/{} \
+         peer_state=[{}] peer_fail=[{}]\n",
         s.steps,
         s.head_height,
         finalized,
@@ -959,6 +1406,40 @@ fn status_line(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> String {
         s.pending_external_qc,
         s.qc_served,
         s.validator_enabled,
+        s.abandon_produced,
+        s.abandon_broadcast,
+        s.abandon_rejected,
+        s.rc_certs,
+        s.rc_authority,
+        s.rc_rejected,
+        slash_join(&s.rc_reject_buckets),
+        s.rc_bcast_no_peer,
+        s.abandon_bcast_no_peer,
+        s.rc_reeval_attempts,
+        s.rc_reeval_applied,
+        slash_join(&s.timeout_outcomes),
+        slash_join(&s.guard_rej),
+        slash_join(&s.wire_drops),
+        s.round_timeouts,
+        opt_u64(s.timer_elapsed),
+        opt_u64(s.timer_window),
+        s.round_step,
+        s.proposal_present,
+        s.finalized_ref_present,
+        // NETDIAG（仅诊断）
+        ib[0],
+        ib[1],
+        ib[2],
+        ib[3],
+        ib[4],
+        ib[5],
+        ib[6],
+        idr[0],
+        idr[1],
+        idr[2],
+        idr[3],
+        peer_state,
+        peer_fail,
     )
 }
 
@@ -971,7 +1452,12 @@ fn summary_line(s: &RunSummary) -> String {
         "{PROGRAM}: stopped after {}/{} steps; head_height={} finalized_height={} \
          consensus_height={} round={} configured_peers={}/{} inbound_connections={} \
          inbound_accepted={} sync_pending={} peer_dial_attempts={} peer_dial_failures={} \
-         validator_enabled={}; runtime shut down\n",
+         validator_enabled={} abandon_produced={} abandon_broadcast={} abandon_rejected={} \
+         rc_certs={} rc_authority={} rc_rejected={} \
+         rc_rej={} rc_bcast_nopeer={} abandon_bcast_nopeer={} rc_reeval={}/{} timeout_split={} \
+         guard_rej={} wire_drops={} \
+         round_timeouts={} timer_elapsed={} timer_window={} round_step={} \
+         proposal_present={} finalized_ref_present={}; runtime shut down\n",
         s.steps,
         if s.run_steps == 0 {
             "unlimited".to_string()
@@ -990,6 +1476,26 @@ fn summary_line(s: &RunSummary) -> String {
         s.peer_dial_attempts_total,
         s.peer_dial_failures_total,
         s.validator_enabled,
+        s.abandon_produced,
+        s.abandon_broadcast,
+        s.abandon_rejected,
+        s.rc_certs,
+        s.rc_authority,
+        s.rc_rejected,
+        slash_join(&s.rc_reject_buckets),
+        s.rc_bcast_no_peer,
+        s.abandon_bcast_no_peer,
+        s.rc_reeval_attempts,
+        s.rc_reeval_applied,
+        slash_join(&s.timeout_outcomes),
+        slash_join(&s.guard_rej),
+        slash_join(&s.wire_drops),
+        s.round_timeouts,
+        opt_u64(s.timer_elapsed),
+        opt_u64(s.timer_window),
+        s.round_step,
+        s.proposal_present,
+        s.finalized_ref_present,
     )
 }
 
@@ -1031,13 +1537,18 @@ fn run_fault_kind(e: &RuntimeError) -> &'static str {
 /// **P1-A.17 F-1 诊断（Owner 授权；仅错误格式化）** —— 语义逐项不变：
 /// - 控制流不变（`runtime.step()` 返回 `Err` ⇒ 仍 fail-closed 立即停止，不继续下一轮）；
 /// - 退出码不变（仍为非 0）；
-/// - 除 `BlockCommit` 外，**所有**变体载荷文本逐字不变（仍取 `run_fault_kind` 的稳定类别名）；
-/// - 只多出 inner error 的 `Display`（typed / 确定性；`NodeBlockApplicationError` →
-///   `block application pipeline: <decode|validation|execution|storage>: …`），
-///   不引入 `RuntimeError` 的 `Debug` 文本 / 不含 session/nonce 类运行期材料。
+/// - 除 `BlockCommit` / `Validator` 外，**所有**变体载荷文本逐字不变（仍取 `run_fault_kind` 的稳定类别名）；
+/// - 只多出 inner error 的 typed 文本（`NodeBlockApplicationError` →
+///   `block application pipeline: <decode|validation|execution|storage>: …`；
+///   `ValidatorActorError` → 具体变体 + 对应 target hash / 高度轮次 / safety 类别），
+///   不引入 `RuntimeError` 的 `Debug` 文本 / 不含 session/nonce 类运行期材料；
+///   **不**包含任何私钥 / 密钥材料 / 凭证（target 为公开 block hash；safety 错误为枚举类别）。
 fn run_fault_message(e: &RuntimeError) -> String {
     match e {
         RuntimeError::BlockCommit(inner) => format!("BlockCommit: {inner}"),
+        // SAFETY-REJECT-SKIP 配套诊断（仅文本）：保留**具体**的 validator 错误变体，
+        // 使「合法安全拒绝」与「journal 损坏 / identity 失配 / 签名失败」在日志上可区分。
+        RuntimeError::Validator(inner) => format!("Validator: {inner:?}"),
         other => run_fault_kind(other).to_string(),
     }
 }
@@ -1125,6 +1636,11 @@ fn run_node_loop(runtime: &mut NodeRuntime, cli: &Cli) -> RunLoopOutcome {
         if should_emit_status(steps) && write_stdout(&status_line(runtime, cli, steps)).is_err() {
             status_write_failed = true;
         }
+        // PHASE 6H-A30 OD-X7（OUTPUT_MODE=B）：**独立** liveness 行（best-effort）。
+        // 写失败**不**影响既有 `status_write_failed` 语义 / 不中断运行（append-only 观测量）。
+        if should_emit_status(steps) {
+            let _ = write_stdout(&liveness_line(runtime, cli, steps));
+        }
         // B1：仅**有限预算**在 steps 达到 N 时退出；`0`（continuous）不因预算退出。
         if cli.run_steps != 0 && steps >= cli.run_steps {
             break;
@@ -1160,6 +1676,26 @@ fn main() -> Result<(), StartupError> {
             write_stdout(&line)
         }
         Action::Run(cli) => {
+            // P-6 mount guard（Owner 授权）：在**任何**状态创建之前，拒绝把容器可写层普通目录
+            // 当作持久化 `--storage-dir` / `--safety-dir`（判据 = 内核挂载表；容器内不可判定 ⇒ fail-closed）。
+            // 非容器化开发/CI 环境无法判定挂载 ⇒ 只打印一行提示并继续（生产 = 容器 ⇒ 强制执行）。
+            // 错误载荷复用既有 `Run(String)`（typed/确定性、不含秘密），避免改动 `StartupError` 派生与 Display。
+            // 只要 CLI 提供了 `--safety-dir`（validator 模式的必需项）就**必须**同样受保护：
+            // 未挂载的 safety 目录会让 journal 落在易失层（重启即丢失 ⇒ double-vote 风险面）。
+            let safety_target = cli.safety_dir.as_deref();
+            let guard_outcome = nova_node::mount_guard::enforce_persistent_dirs_with(
+                &cli.storage_dir,
+                safety_target,
+                &nova_node::mount_guard::ProcSelfMountinfoInspector,
+                nova_node::mount_guard::in_container_default(),
+            )
+            .map_err(|e| StartupError::Run(format!("MountGuard: {e}")))?;
+            if guard_outcome == nova_node::mount_guard::GuardOutcome::SkippedNotContainer {
+                eprintln!(
+                    "{PROGRAM}: mount guard skipped (not running in a container); \
+                     persistent-volume persistence is NOT verified in this environment"
+                );
+            }
             let (_identity, set) = preflight(&cli).map_err(StartupError::Preflight)?;
             let (mut runtime, report) = assemble_and_verify_runtime(&cli, &set)?;
             // 启动行（CLI 契约输出；非日志）—— 进入循环前写出 ⇒ 绑定地址 / 预算立即可观测。
@@ -2328,6 +2864,45 @@ mod tests {
             "循环必须有界终止（实测 {elapsed:?}）"
         );
         runtime.shutdown().expect("shutdown ok");
+    }
+
+    // OD-X8 — liveness 行暴露 `egress_prop_refreshed`（**字段暴露/格式化**测试；
+    // **不**证明重播已发生：新装配 runtime 尚未发生任何 replay ⇒ 期望值为 0，
+    // 实际重播次数必须从运行日志读取）。
+    #[test]
+    fn od_x8_liveness_line_exposes_refresh_counter() {
+        let env = TempEnv::new("odx8");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &["--run-steps".to_string(), "1".to_string()],
+        );
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let (mut runtime, _report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+
+        // 定向驱动（**不是** soak）：跑有限步，取**真实**运行读数（值本身不参与断言强度）。
+        for _ in 0..12 {
+            let _ = runtime.step();
+        }
+
+        let line = liveness_line(&runtime, &cli, STATUS_INTERVAL_STEPS);
+        let counter = runtime.liveness_snapshot().egress_prop_refreshed;
+        let expected = format!("egress_prop_refreshed={counter}");
+        // 观测值直接打印（`--nocapture` 可见）；**不**断言其大于零。
+        println!("OD-X8 observed egress_prop_refreshed={counter}");
+        assert!(line.contains(&expected), "liveness 行缺少刷新计数: {line}");
+        // 兼容性：既有相邻字段仍逐字存在（未重命名 / 未移除）。
+        assert!(line.contains("egress_prop_enqueued="), "既有字段缺失: {line}");
+        assert!(line.contains("egress_prop_no_peer="), "既有字段缺失: {line}");
+        assert!(line.contains("round_adv_local="), "既有字段缺失: {line}");
+        // 确定性（无墙钟 / 无随机 / 无 I/O）。
+        assert_eq!(
+            line,
+            liveness_line(&runtime, &cli, STATUS_INTERVAL_STEPS),
+            "liveness 行必须确定性"
+        );
     }
 
     // T48（P1-A.9 / P1-3）— status 固定 interval：非每 step、非零、默认预算下无日志洪水

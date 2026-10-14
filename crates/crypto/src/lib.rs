@@ -24,6 +24,7 @@
 pub mod address;
 pub mod domain;
 pub mod hash;
+pub mod hash_domain;
 pub mod identity;
 pub mod key;
 pub mod signature;

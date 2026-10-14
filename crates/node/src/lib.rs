@@ -62,6 +62,22 @@ pub mod outbound;
 /// `MessageEnvelope`（canonical）+ `NetworkSigner` 签名 → NetworkService。
 pub mod egress;
 
+/// O2 Round-Change **Inbound Authority Seam**（PHASE 6H-Y；ADR-0066 / ADR-0070 / ADR-0072 /
+/// ADR-0049 §3.3，全部 FROZEN）：入站 `RoundChangeCertificate` → 委托冻结的
+/// `verify_certificate` → **唯一**结果 = 本地 round `+1`，并按既有 node-local 计时器状态机
+/// **重开**新 round 的窗口（`elapsed = 1`，**不**继承 stale deadline）。
+/// **绝不**产生 vote / QC / finality / lock 变更；**不**持有 `VoteAccumulator` /
+/// `QcRegistry` / `RoundEvidence` / `LockedState`，**不**调用 `assemble_qc` / `verify_qc` / `admit`。
+pub mod round_change_inbound;
+
+/// O2 Local Abandon attestation + **bounded** attestation accumulation（PHASE 6H-Z；
+/// ADR-0066 RC-1/RC-4/RC-5/§8/§10.1，FROZEN）：真实本地 EXPIRE 观测 → S1 `Abandon` 签名
+/// （`DomainId::RoundChangeCertificate = 0x10`）→ 有界池（去重 / 逐条冻结验签 / 权重累计）
+/// → 达 `ceil(2T/3)` 时组装 `RoundChangeCertificate`。
+/// **绝不**经 `ValidatorActor::sign_vote`、**不**写 vote / block-safety journal、
+/// **不**形成 QC / **不**进 `QcRegistry` / `VoteAccumulator` / **不**触发 finality / **不**触碰 lock。
+pub mod round_change_pool;
+
 /// Node-local BlockBuilder（STEP 10-19-5 / ADR-0061）：candidate transactions → ADR-0061 canonical
 /// ordering → execution（runtime 只读组合 `execute_and_compute_state_root`）→ post-state root →
 /// transaction root → BlockV1 assembly → block_hash。纯确定性：timestamp / height / parent_hash /
@@ -149,6 +165,20 @@ pub mod qc_history;
 /// durable journal（VoteIntent / VoteSigned / LockedState + identity header）。Option B —— 与
 /// canonical `PersistentBackend` state WAL 分离；不持久化私钥。
 pub mod safety_store;
+
+/// Signer-owned Block signing safety journal（D-5.2 / D-5.3 B2-B；Owner 授权 D-5.3.3）：
+/// 独立 fail-closed 的 `block-safety.journal`（BlockSigningIntent / BlockSigned + identity header）。
+/// Safety Namespace = (network_id, chain_id, genesis_hash, validator_id)；Block Safety Slot =
+/// Namespace + height；exact target = `SigningMessageHash`；`F1-B` 语义等价幂等 / `F2` 冲突拒绝 /
+/// `F3`·`F4` 不构成新 slot；`round`·`proposer` 不进入 signed bytes；无 pruning；
+/// 不改变 Block encoding / block_hash / consensus / genesis。
+pub mod block_safety;
+
+/// P-6 mount guard（Owner 授权）：拒绝把**容器可写层普通目录**当作持久化 `--storage-dir` /
+/// `--safety-dir`。判据 = Linux 内核挂载表 `/proc/self/mountinfo`；容器内不可判定 ⇒ fail-closed；
+/// 非容器化开发/CI 环境无法判定 ⇒ 返回显式 `SkippedNotContainer`（调用方须提示，非安全保证）。
+/// 仅只读：不创建目录、不打开文件 ⇒ 失败路径**零写入**。
+pub mod mount_guard;
 
 /// NodeRuntime 生命周期装配（STEP 10-16 Phase 1）：Config → Genesis → ChainIdentity → chain
 /// storage →（validator mode）KeyProvider → derive ValidatorId → SafetyStore → recover →
