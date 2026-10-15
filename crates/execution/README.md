@@ -1,11 +1,14 @@
 # nova-execution
 
-YAZIMAO WASM 执行层（**PHASE 1 占位**）。
+YAZIMAO 执行层（PHASE 3；state transition 与 block 执行**纯计算已实现**；WASM 未实现）。
 
 ## 状态
 
-- `NOT IMPLEMENTED`（无任何执行逻辑）。
-- 技术选型：Wasmtime 或经评审等价方案（ADR-0010），待 PHASE 12。
+- `state_transition`：**已实现**（STEP 7G；`apply_transaction`，ADR-0023）。
+- `block`：**已实现**（STEP 8D；`execute_block` / `validate_block` 纯计算，ADR-0029）。
+- `NOT IMPLEMENTED`：WASM / 合约执行（技术选型 Wasmtime 或经评审等价方案，待 PHASE 12 ADR）。
+- **不实现**（属其它 crate 职责）：storage / trie / state root（`nova-storage`）、完整 Block 编码与提交
+  （`nova-runtime`）。
 
 ## 纪律
 

@@ -1,4 +1,4 @@
-# Nova Chain 协议文档
+# YAZIMAO 协议文档
 
 ## 状态
 
@@ -14,7 +14,8 @@
     组装 / RoundTimeout / Vote / Proposal 端到端可验证；`ADR-0041` ProposalRef serialization FROZEN）。
     QC ingestion / A11：**DEFERRED**（独立后续 Track）。
 - RPC：`NOT IMPLEMENTED`（等各自 Phase）。
-- 完整 Block 格式 / block_hash：**PHASE 7 DEFERRED**。
+- 完整 Block 格式 / `block_hash`：ADR-0042（Block Format V1）**已 FROZEN**；设计见
+  `block-lifecycle-design-v1.md`，实现状态见根 README §3（本索引不重复维护实现状态表）。
 
 ## 已冻结协议规范
 
@@ -32,7 +33,7 @@
 ## 未来协议规范（每项须先成规范再实现）
 
 - Transaction Spec（字段/编码/签名范围/hash 范围）→ 已实现（STEP 7）。
-- Block Spec（Block Hash 生成方式）→ **PHASE 7 DEFERRED**（完整 Block 格式未定义）。
+- Block Spec（Block Hash 生成方式）→ 已冻结（ADR-0042 Block Format V1）。
 - Network Protocol Spec（Message ID/Version/Encoding/Max Size/Timeout）→ 部分实现（STEP 9）+ STEP 11 集成中。
 - RPC API Contract（API Contract First）→ 未实现。
 - Consensus Specification → 已冻结（`consensus-spec-v1.md`）。

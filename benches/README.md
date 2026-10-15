@@ -2,8 +2,8 @@
 
 ## 状态
 
-- PHASE 1 — Project Foundation。
-- benchmark 入口已预留；**本阶段不声称任何 TPS 数据**（Master Prompt §64）。
+- 本目录为 benchmark 入口（当前仅本文件）；**现有 benchmark 实际位于 `crates/crypto/benches/`**（hash_bench）。
+- **不声称任何 TPS 数据**（Master Prompt §64）。
 
 ## 未来目标（禁止只跑单机 TPS）
 

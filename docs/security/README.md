@@ -2,12 +2,15 @@
 
 ## 状态
 
-- PHASE 1 — Project Foundation。
-- 本阶段无业务逻辑，安全重点在工程基线与供应链。
+- PHASE 2 — Implementation & Integration In Progress：协议（crypto / genesis / consensus）、节点运行时、
+  网络运行时基础设施已实现（见根 README §3）。
+- 安全重点不限于工程基线与供应链；已实现模块的 Threat Modeling / Security Review 仍为 `待落实`（见下）。
 
-## 已落实（PHASE 1）
+## 已落实
 
-- 零第三方运行时依赖（无供应链攻击面）。
+- 第三方依赖（含仅 dev / bench 用途者）统一经 `[workspace.dependencies]` 登记、`Cargo.lock` 提交锁定
+  （可复现、防依赖投毒）；每次新增依赖须走下方依赖审查流程。
+- 依赖清单**尚未**经过完整的供应链安全审计；本文件不构成任何安全保证。
 - 无硬编码密钥/助记词/token；`.gitignore` 兜底（`*.pem`/`*.key`/`*.mnemonic`/`secrets/` 等）。
 - CI 权限最小化：`contents: read`；无自托管 runner。
 - `unsafe_code = "forbid"`（workspace 级）。

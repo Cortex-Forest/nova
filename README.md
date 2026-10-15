@@ -18,7 +18,7 @@ YAZIMAO 是一条面向 **AI、数字创作、数字娱乐和开放应用生态*
 
 ## 1. 简介
 
-YAZIMAO 采用分层架构：
+YAZIMAO 采用分层架构（**目标架构**；各层**当前**实现状态以 §3 为准，未实现项在 §3 中标注 `NOT IMPLEMENTED` / `PLANNED`）：
 
 ```
 Application Layer
@@ -31,9 +31,9 @@ State Transition
   ↓
 Consensus（PoS + DAG 传播 + BFT 最终性）
   ↓
-P2P Network（rust-libp2p）
+P2P Network（当前实现：自研 TCP transport；libp2p 未采用）
   ↓
-Storage（RocksDB + 状态树）
+Storage（StateStore / SMT + 自研 PersistentBackend；未引入外部数据库依赖）
 ```
 
 ## 2. 当前版本
@@ -81,11 +81,16 @@ YAZIMAO/                    # 公开品牌 YAZIMAO；内部开发代号 Nova（c
 │   ├── node/             # nova-node：运行时 / 集成层（NodeRuntime/driver/validator safety/bootstrap/restart recovery/block/follower sync 等；integration hardening）
 │   ├── rpc/              # nova-rpc（占位）
 │   ├── storage/          # nova-storage：StateStore/SMT + PersistentBackend + chain head + block store（持久化 / 崩溃一致性已实现）
+│   ├── genesis-builder/  # nova-genesis-builder：Owner `genesis.json` → canonical `genesis.bin` + `genesis_hash`（生产工具库，不被节点依赖）
+│   ├── runtime/          # nova-runtime：跨层 Block Lifecycle 组合（decode / validate / execute / commit）
 │   └── wallet/           # nova-wallet（占位）
-├── tests/                # 跨 crate 集成测试入口
-├── benches/              # benchmark 入口
-├── fuzz/                 # fuzz 基础设施
-├── docs/                 # 架构 / ADR / 安全 / 测试 / 运维 / 协议
+├── tests/                # 跨 crate 测试基础设施：`tests/vectors/`（nova-test-vectors 协议向量 + loader）
+├── benches/              # benchmark 入口（当前仅 README；现有 benchmark 见 `crates/crypto/benches/`）
+├── fuzz/                 # fuzz 基础设施（独立 crate，需 nightly）
+├── docs/                 # 架构 / ADR / 协议 / 测试 / 运维 / 安全 / Genesis / Testnet / 设计与审计
+├── deploy/               # 部署配置（Akash SDL）
+├── genesis-image/        # Genesis 容器镜像产物（Containerfile / genesis.bin）
+├── simulation/           # 经济模型模拟与实验结果
 ├── scripts/              # 开发运维脚本
 └── .github/workflows/    # CI
 ```
@@ -104,9 +109,25 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
+测试文档入口见 [docs/testing/](docs/testing/)。其中 **O2 Round Change 真实多进程 TCP 集成测试**的现行断言契约、
+最近验证结果与**明确的证明范围限制**见
+[docs/testing/o2-round-change-real-tcp-tests.md](docs/testing/o2-round-change-real-tcp-tests.md)。
+
+> **注意**：目标集成测试通过 ≠ 共识协议整体安全性已证明，也 ≠ Devnet / Testnet / Mainnet 具备发布条件
+> （发布状态仍为 `NOT RELEASED`，见 §3）。
+
+其他测试入口：
+
+- 长时间多进程测试（真实二进制，`--test-threads=1`）：见 `.github/workflows/ci.yml` 的 `long-tests` job
+- 协议测试向量：`cargo test -p nova-test-vectors`（`tests/vectors/`）
+- fuzz（独立 crate，需 nightly）：见 [fuzz/README.md](fuzz/README.md)
+- 测试文档与已知失败项：[docs/testing/](docs/testing/)（已知失败项见 O2 专项文档 §5）
+- 部署 / Testnet 演练：[docs/testnet/testnet-runbook-v1.md](docs/testnet/testnet-runbook-v1.md)
+
 ## 7. Development
 
-- **Rust**: stable toolchain，Edition 2024
+- **Rust**: stable toolchain，Edition 2024；工具链由 `rust-toolchain.toml` 锁定 `channel = "1.96.1"`
+  （workspace `rust-version = 1.96`、`resolver = "3"`）
 - **依赖方向**: `Application → Services → Protocol → Infrastructure`（单向无环，见 ADR-0001）
 - **错误处理**: 统一 `Result<T, E>`；生产代码禁止 `unwrap/expect/panic`
 - **依赖管理**: 公共依赖统一经 `[workspace.dependencies]`；`Cargo.lock` 必须提交锁定

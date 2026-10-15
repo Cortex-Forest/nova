@@ -2,8 +2,8 @@
 
 ## 状态
 
-- PHASE 1 — Project Foundation。
-- 脚本目录预留；当前无脚本。
+- `bench_percentiles.ps1`：对 benchmark 原始样本计算 p50 / p95 / p99（用法见 `crates/crypto/benches/README.md`）。
+- `check_akash_sdl.py`：Akash SDL 检查脚本（部署配置见 `deploy/akash/`）。
 
 ## 未来目标
 

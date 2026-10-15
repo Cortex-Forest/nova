@@ -2,8 +2,9 @@
 
 ## 状态
 
-- PHASE 1 — Project Foundation。
-- 暂无运行中的节点；本目录为运维知识预留。
+- PHASE 2 — Implementation & Integration In Progress。
+- **当前无运行中的公共网络**（Devnet / Testnet / Mainnet 均未发布，见根 README §3）。
+- 本目录含日志规范；部署与演练文档位于 `docs/testnet/`。
 
 ## 待落实（后续 Phase）
 
