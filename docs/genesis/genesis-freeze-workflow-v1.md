@@ -94,6 +94,13 @@ cargo run -p nova-genesis-builder --bin yazimao-genesis -- \
 | 3.4 | 核对 `reorder` 映射（若 `*_reordered = true`，逐条确认映射符合预期，而非掩盖错填） | 映射表 |
 | 3.5 | 核对 `canonical_len` 与公式 `1 + 8 + 8 + 4 + 85N + 4 + 51M + 40 + 42` | 数值记录 |
 | 3.6 | 记录 hash（小写 hex 全 64 位），用于分发与公告 | `genesis_hash.txt` |
+| 3.7 | 执行**冻结记录机器校验**（R11 新增）：`python scripts/check_genesis_freeze.py --record freeze-record.json` | 输出 `FREEZE_RECORD_OK`，**exit 0** |
+
+> **3.7 说明**：本工具本身不具备"批准"语义——能否定 `build` 出 `genesis.bin` 是数据工具的职责，
+> "谁批准了"是链外事实。故此门禁做成**独立脚本**而非 `yazimao-genesis` 的必填 flag，
+> 以免破坏既有 CLI 契约。它 **fail-closed**：字段缺失/空值/占位值/格式不符/复核人与生成者同一人
+> ⇒ **exit 1**。其自身有效性用 `python scripts/check_genesis_freeze.py --selftest`（16 用例）验证，
+> 且必须验证"空模板（`--template`）被拒绝"。
 
 > **独立性要求**：3.1 必须使用只读 `verify` 路径；**不得**通过重新生成来"验证"（同路径不构成独立验证）。
 
