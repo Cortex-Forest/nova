@@ -83,6 +83,8 @@ const OBSERVER_RUN_STEPS: &str = "1200";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// D1 观测窗口（仅等待确定性即将发生的事件）。
 const D1_WINDOW: Duration = Duration::from_secs(180);
+/// P4 有界收敛窗口：等待 A/B 的**已采样** durable head 追平观察者（见阶段 6 说明）。
+const P4_CONVERGENCE: Duration = Duration::from_secs(120);
 
 /// 与 6H-AH 相同的确定性身份（3 验证者 genesis；round-0 proposer 缺席 ⇒ 确定性停滞）。
 const VAL_SEED: [[u8; 32]; 3] = [[0x31; 32], [0x32; 32], [0x33; 32]];
@@ -331,7 +333,36 @@ struct Stats {
     rc_certs: u64,
     rc_authority: u64,
     rc_rejected: u64,
+    /// `rc_rej=` 六个拒绝分类桶（**严格**解析；缺失/畸形 ⇒ 无样本）。
+    rc_rej: [u64; 6],
     established_peers: u64,
+}
+
+/// `rc_rej=` 桶索引（与 `runtime.rs` 的 `RoundChangeRejectKind::index()` 一一对应）。
+const RC_REJ_MALFORMED: usize = 0;
+const RC_REJ_STALE: usize = 1;
+const RC_REJ_WRONG_HEIGHT: usize = 2;
+const RC_REJ_QUORUM: usize = 3;
+const RC_REJ_IDENTITY: usize = 4;
+const RC_REJ_OTHER: usize = 5;
+
+/// 解析 `key=a/b/c/d/e/f`（**严格**：字段缺失或任一分量不可解析 ⇒ `None`；绝不默认零）。
+fn buckets6(line: &str, key: &str) -> Option<[u64; 6]> {
+    let start = line.find(key)? + key.len();
+    let rest = line.get(start..)?;
+    let raw: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '/')
+        .collect();
+    let mut out = [0u64; 6];
+    let mut it = raw.split('/');
+    for slot in out.iter_mut() {
+        *slot = it.next()?.parse().ok()?;
+    }
+    if it.next().is_some() {
+        return None;
+    }
+    Some(out)
 }
 
 fn field(line: &str, key: &str) -> Option<u64> {
@@ -373,6 +404,7 @@ fn parse_line(line: &str) -> Option<Stats> {
         rc_certs: field(line, "rc_certs=").unwrap_or(0),
         rc_authority: field(line, "rc_authority=").unwrap_or(0),
         rc_rejected: field(line, "rc_rejected=").unwrap_or(0),
+        rc_rej: buckets6(line, "rc_rej=")?,
         established_peers: field(line, "established_peers=").unwrap_or(0),
     })
 }
@@ -570,6 +602,18 @@ fn o2_d1_applied_observed_on_real_observer_process() {
         D1_WINDOW,
     );
 
+    // ---- 阶段 6：P4 有界收敛（在采集/终止之前）----
+    // 等待 A/B 的**已采样** durable head 追平/超过 O 的 durable head（见 P4 处说明）。
+    let p4_converged = poll_until(
+        || {
+            let a_head = last_stats(&a.stdout()).map_or(0, |s| s.head);
+            let b_head = last_stats(&b.stdout()).map_or(0, |s| s.head);
+            let o_head = last_stats(&o.stdout()).map_or(0, |s| s.head);
+            a_head.max(b_head) >= o_head
+        },
+        P4_CONVERGENCE,
+    );
+
     // ---- 证据采集（terminate 之前）----
     let a_stats = last_stats(&a.stdout());
     let b_stats = last_stats(&b.stdout());
@@ -621,11 +665,45 @@ fn o2_d1_applied_observed_on_real_observer_process() {
         "observer 必须观测到 D1 Applied（rc_authority >= 1）\n{}",
         diag()
     );
-    // (5) 唯一证书副本被 Applied ⇒ 无 stale/wrong-height 拒绝。
+    // (5) 拒绝**分类契约**（取代旧的 `rc_rejected == 0`）。
+    //
+    // 旧断言把「observer 恰好只收到一份 `0x0D`」这一**拓扑/观测假设**写成了协议契约；同提交的
+    // `o2_round_change_real_tcp_e2e.rs` 已明确容忍「本地计时器先行前进 ⇒ 证书按冻结语义被判 stale」。
+    // 源码依据（`crates/consensus/src/round_change.rs::verify_certificate`）：
+    //   ⑪ `to_round <= local_round ⇒ StaleCertificate`；② `cert.height != local height ⇒ WrongHeight`。
+    // 二者在 ADR-0066 下都是**合法**拒绝；observer 自身 pacemaker 会独立推进 (height, round)
+    // （`runtime.rs::drive_round_timeout` 对所有节点生效），故重复/迟到副本可合法落入这两类。
+    //
+    // 但**只放行这两类**，并强制分类完备：任何 Malformed / Quorum / Identity / Other（或未分类）
+    // 拒绝仍使测试失败 ⇒ 「不允许非法消息或未授权证书通过」这一安全保证**未被削弱**。
+    assert_eq!(
+        o_stats.rc_rej[RC_REJ_MALFORMED],
+        0,
+        "observer 不得出现 Malformed 拒绝\n{}",
+        diag()
+    );
+    assert_eq!(
+        o_stats.rc_rej[RC_REJ_QUORUM],
+        0,
+        "observer 不得出现 Quorum 拒绝\n{}",
+        diag()
+    );
+    assert_eq!(
+        o_stats.rc_rej[RC_REJ_IDENTITY],
+        0,
+        "observer 不得出现 Identity 拒绝\n{}",
+        diag()
+    );
+    assert_eq!(
+        o_stats.rc_rej[RC_REJ_OTHER],
+        0,
+        "observer 不得出现 Other 拒绝\n{}",
+        diag()
+    );
     assert_eq!(
         o_stats.rc_rejected,
-        0,
-        "observer 不应出现被拒证书（唯一副本必须 Applied）\n{}",
+        o_stats.rc_rej[RC_REJ_STALE] + o_stats.rc_rej[RC_REJ_WRONG_HEIGHT],
+        "拒绝只能是合法 Stale/WrongHeight，且必须分类完备（rc_rejected == Stale + WrongHeight）\n{}",
         diag()
     );
     // (6) 验证者侧确实走完了 O2 生产路径（真实 EXPIRE ⇒ `0x0E` ⇒ quorum 2W ⇒ `0x0D`）。
@@ -655,8 +733,10 @@ fn o2_d1_applied_observed_on_real_observer_process() {
     //   本段改为性质断言（并保留真正的非法检测）：
     //   P1 单调：`height` 永不回退；同高度内 `round` 永不回退；
     //   P2 归因：`rc_authority` 首次 ≥ 1 的样本必须与前一态**不同**（Applied 必改变 round/height）；
-    //   P3 唯一：整轮运行 `rc_authority` **恰为 1**（单张证书、无重复应用）；
-    //   P4 上限：observer 高度不得超过 A/B 已提供的 durable head（+1 采样容差）⇒ 无"凭空推进"；
+    //   P3 归因（修订）：`rc_authority` 累计**单调**，且**每次增加**都必须伴随本地 (height, round)
+    //            变化 —— **取消**旧「恰为 1」的唯一性假设（多张不同证书可合法应用，见 P3 处说明）；
+    //   P4 覆盖（修订）：observer durable head 必须（在**有界收敛**窗口内）被 A/B 的已采样
+    //            durable head 覆盖（容差 0）⇒ 观察者不是链推进的来源；**不**再跨时刻比较 +1 容差；
     //   P5 目标/终局：A/B 必须跨过 round-0 停滞（`head >= 1`）；`finalized <= head`；两者都已 finality。
     let idx = o_samples
         .iter()
@@ -671,10 +751,14 @@ fn o2_d1_applied_observed_on_real_observer_process() {
         "authority 首次递增点前的样本必须为 0\n{}",
         diag()
     );
-    assert_eq!(
-        cur.rc_authority,
-        1,
-        "authority 首次观测必须恰为 1（单张证书、无重复计数）\n{}",
+    // 取代旧断言 `cur.rc_authority == 1`（":739-742"）：
+    // status 每 **100 step** 才打印一次（`crates/node/src/bin/yazimao-node.rs:86`），因此"首个非零
+    // 样本恰为 1"是**采样粒度假设** —— 一个采样窗内可合法地发生**多次**应用（⇒ 首个非零样本可为 2）。
+    // 真正可证明的性质是"非零即已发生真实应用"（`rc_authority` 仅在 `Applied` 分支自增）与"每次
+    // 增加都伴随状态变化"（见下方 P3 归因循环）；此处**不**对上界作未经证明的假设。
+    assert!(
+        cur.rc_authority >= 1,
+        "authority 首次非零样本必须 >= 1\n{}",
         diag()
     );
     // P2：Applied 必定改变本地 round/height（同 `(height, round)` 而 authority 增加 = 非法）。
@@ -687,13 +771,41 @@ fn o2_d1_applied_observed_on_real_observer_process() {
         cur.round,
         diag()
     );
-    // P3：整轮**恰一次**应用（单张证书、无重复 / 无二次应用；比旧断言更强）。
-    assert_eq!(
-        o_stats.rc_authority,
-        1,
-        "整轮 observer 仅允许一次 RC 应用\n{}",
-        diag()
-    );
+    // P3（修订）：**逐样本归因**取代旧的 `assert_eq!(o_stats.rc_authority, 1)`。
+    //
+    // 旧前提「整轮仅一张证书」**不是**协议性质：证书按**每个** `(height, from_round)` 上 2W 见证
+    // 重合而独立产生（`crates/consensus/src/round_change.rs::verify_certificate` ⑤⑥⑨），而 A/B 在本
+    // 场景会**多次**到期（实测 `abandon_produced` = 3/4）⇒ 同一轮运行内**可合法地应用多张不同证书**
+    // （实测 `rc_authority == 2`，且 `rc_rej` 仅 `Stale`）。
+    //
+    // 「同一证书不得重复应用」在冻结语义下**结构性成立**：首次应用后 `local_round == to_round`
+    // ⇒ 任何副本必然在 ⑪ `to_round <= local_round` 处被判 `Stale`（**零副作用**）。该性质由
+    // (4)（≥ 1 次真实应用）、(5)（拒绝仅限 Stale/WrongHeight）与本循环（每次增加都伴随状态变化）
+    // 共同覆盖 —— **无需**、也**不应**用总计数上界来表达（该上界不可从协议推出）。
+    for w in o_samples.windows(2) {
+        let (p, c) = (w[0], w[1]);
+        assert!(
+            c.rc_authority >= p.rc_authority,
+            "authority 累计计数不得回退 {}→{}\n{}",
+            p.rc_authority,
+            c.rc_authority,
+            diag()
+        );
+        if c.rc_authority > p.rc_authority {
+            assert!(
+                c.height != p.height || c.round != p.round,
+                "authority 增加必须伴随本地 (height, round) 变化\
+                 （prev h={} r={} a={} → cur h={} r={} a={}）\n{}",
+                p.height,
+                p.round,
+                p.rc_authority,
+                c.height,
+                c.round,
+                c.rc_authority,
+                diag()
+            );
+        }
+    }
     // P1：单调性（真正的非法状态检测；不要求逐窗 +1）。
     for w in o_samples.windows(2) {
         let (p, c) = (w[0], w[1]);
@@ -718,15 +830,26 @@ fn o2_d1_applied_observed_on_real_observer_process() {
             );
         }
     }
-    // P4：observer 不得超出 A/B 已提供的 durable head（+1 采样容差）。
+    // P4（修订）：容差为 **0** 的 durable-head 覆盖（配合上方阶段 6 的有界收敛等待）。
+    //
+    // 旧断言 `o.head <= max(a.head, b.head) + 1` 直接比较**不同时刻**的采样：status 每 100 step 打印
+    // 一次（`yazimao-node.rs:86`），而 `head_height` 是 **durable** head（`block_production().head()`,
+    // `yazimao-node.rs:1075`）⇒ 本测试在 O 首次 `applied` 后立即采集/终止，A/B 的**最后一条采样**
+    // 可能落后其真实 durable head 若干高度 ⇒ 旧断言存在**采样竞态**，其失败**不能**证明协议违规。
+    //
+    // 新契约（保持安全意图）：仅在 A/B 的已采样 durable head **有界收敛**至 ≥ O 的 durable head 之后，
+    // 再做**容差 0** 的比较 ⇒ 证明"观察者的 durable head 已被验证者提供的高度覆盖"（观察者不是
+    // 链推进的来源）。窗口耗尽仍未覆盖 ⇒ 失败并输出完整诊断（可能是真实异常，需独立调查）。
+    // **不**扩大容差、**不**无条件放宽：仍要求 `ab_max >= o.head`。
     let ab_head_max = a_stats
         .map_or(0, |s| s.head)
         .max(b_stats.map_or(0, |s| s.head));
     assert!(
-        o_stats.head <= ab_head_max + 1,
-        "observer head 超出 A/B 已提供 head（o={} ab_max={}）\n{}",
+        p4_converged && ab_head_max >= o_stats.head,
+        "observer durable head 未被 A/B 覆盖（有界收敛失败：o={} ab_max={} converged={}）\n{}",
         o_stats.head,
         ab_head_max,
+        p4_converged,
         diag()
     );
     // P5：目标 + 终局一致性（2/3 quorum ⇒ A/B 必须共同推进；finalized 不得超过自身 head）。

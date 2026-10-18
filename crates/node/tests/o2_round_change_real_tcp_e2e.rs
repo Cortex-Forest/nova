@@ -309,6 +309,27 @@ struct O2Stats {
     rc_certs: u64,
     rc_authority: u64,
     rc_rejected: u64,
+    /// `timeout_split=` = [Applied, Ignored, Rejected]（**单调累计**；严格解析）。
+    timeout_split: [u64; 3],
+}
+
+/// 解析 `key=a/b/c`（**严格**：字段缺失或任一分量不可解析 ⇒ `None`；绝不默认零）。
+fn buckets3(line: &str, key: &str) -> Option<[u64; 3]> {
+    let start = line.find(key)? + key.len();
+    let rest = line.get(start..)?;
+    let raw: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '/')
+        .collect();
+    let mut out = [0u64; 3];
+    let mut it = raw.split('/');
+    for slot in out.iter_mut() {
+        *slot = it.next()?.parse().ok()?;
+    }
+    if it.next().is_some() {
+        return None;
+    }
+    Some(out)
 }
 
 /// 从 `key=` 取十进制值（缺失 ⇒ 0；仅供**观测**，严格性由调用方按需判 None）。
@@ -344,6 +365,7 @@ fn parse_stats(out: &str) -> Option<O2Stats> {
         rc_certs: field(&line, "rc_certs=").unwrap_or(0),
         rc_authority: field(&line, "rc_authority=").unwrap_or(0),
         rc_rejected: field(&line, "rc_rejected=").unwrap_or(0),
+        timeout_split: buckets3(&line, "timeout_split=")?,
     })
 }
 
@@ -463,11 +485,21 @@ fn o2_abandon_attestation_reaches_peer_over_real_tcp() {
     );
 
     // ---- 观测窗口：等待**确定性** O2 事件（round-0 停滞 ⇒ 双端 EXPIRE ⇒ `0x0E` 交换 ⇒ quorum ⇒ `0x0D`）----
+    //
+    // ⚠️ 等待条件**必须**包含「对端 `0x0D` 已被处理」（`rc_authority + rc_rejected >= 1`）：
+    // 断言 (5) 要求对端 `0x0D` 到达并处理，而等待条件原先只覆盖
+    // `rc_certs / abandon_broadcast / abandon_produced` ⇒ **断言 (5) 与其先决条件之间存在竞态**
+    // （实测 run2：三条件已全部成立，但 `rc_authority == 0 && rc_rejected == 0` ⇒ 断言 (5) 在
+    // 事件到达前即被判定为失败）。补入该条件**只**把被断言的先决条件纳入等待，仍受 `O2_WINDOW`
+    // 有界约束 —— **不**新增重试、**不**延长时间窗、**不**削弱断言 (5) 本身。
     let converged = poll_until(
         || {
             children.iter_mut().all(|c| {
                 parse_stats(&c.stdout()).is_some_and(|s| {
-                    s.rc_certs >= 1 && s.abandon_broadcast >= 1 && s.abandon_produced >= 1
+                    s.rc_certs >= 1
+                        && s.abandon_broadcast >= 1
+                        && s.abandon_produced >= 1
+                        && s.rc_authority + s.rc_rejected >= 1
                 })
             })
         },
@@ -496,6 +528,7 @@ fn o2_abandon_attestation_reaches_peer_over_real_tcp() {
                         rc_certs: field(l, "rc_certs=").unwrap_or(0),
                         rc_authority: field(l, "rc_authority=").unwrap_or(0),
                         rc_rejected: field(l, "rc_rejected=").unwrap_or(0),
+                        timeout_split: buckets3(l, "timeout_split=")?,
                     })
                 })
                 .collect()
@@ -557,11 +590,22 @@ fn o2_abandon_attestation_reaches_peer_over_real_tcp() {
             "节点 {idx}: 合法双端 `0x0E` 不应被拒（abandon_rejected == 0）；stats={s:?}\n{}",
             diag()
         );
-        // (7) round 确实前进过（停滞被打破）。
-        let max_round = samples[idx].iter().map(|s| s.round).max().unwrap_or(0);
+        // (7) 停滞解除（round 曾前进）—— 以**单调累计**计数取代旧的瞬时采样断言 `max_round >= 1`。
+        //
+        // 旧断言对每 100 step 的 status 采样取 `round` 最大值；而 status 的 `round` 是**当前**值，
+        // 且**高度推进即归零** ⇒ 采样会系统性漏掉瞬态（实测：`timeout_split=1/0/0` 已发生 Applied，
+        // 而全部采样 `round` 仍为 0）⇒ 旧断言属**观测粒度假失败**。
+        //
+        // `timeout_split` = 本节点 round-timeout 结果 [Applied, Ignored, Rejected]，为**单调累计**，
+        // 仅由 `drive_round_timeout`（`crates/node/src/runtime.rs`）在**真实到期且冻结转移 Applied**
+        // 时递增 ⇒ `timeout_split[0] >= 1` 证明**该节点自己的 round 真实前进过**。
+        //
+        // **诚实边界**：本断言**只**证明本地 pacemaker 的 round 前进；**不代表**对端 attestation 到达、
+        // 证书组装或状态应用 —— 那些性质由 (2)(3)(4)(5)(6) 独立承担，未被本改动触及。
+        // `samples`（含逐样本 `round`）保留在失败诊断信息中。
         assert!(
-            max_round >= 1,
-            "节点 {idx}: round 必须前进（max_round >= 1）；samples={:?}\n{}",
+            s.timeout_split[0] >= 1,
+            "节点 {idx}: 本地 round 必须真实前进过（timeout_split[0] >= 1）；stats={s:?} samples={:?}\n{}",
             samples[idx],
             diag()
         );
