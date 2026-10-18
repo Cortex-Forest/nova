@@ -342,7 +342,12 @@ fn summary_of(stdout: &str) -> String {
 }
 
 fn assert_no_consensus_errors(label: &str, out: &str, err: &str) {
-    for needle in ["InvalidSignature", "QcVerification", "panicked", "error"] {
+    // R6：原 needle 用裸 `"error"`，会命中**诊断字段名** `el_handler_errors=`（属 `liveness` 行的
+    // 只读计数，值为 0 表示「无 handler 错误」）⇒ 把「零错误」误判成「有错误」。
+    // 改为匹配**错误消息形态**（`Error:` / `error:`）：真实 anyhow/驱动错误均以该形态输出；
+    // `el_handler_errors=0` / `block_err_*=0` 等字段名不再误命中。
+    // 「无 handler 错误」语义由 T3 调用点的**显式零计数断言**承载，故**未减弱**。
+    for needle in ["InvalidSignature", "QcVerification", "panicked", "Error:", "error:"] {
         assert!(
             !out.contains(needle),
             "{label} stdout 不得包含 {needle}：\n{out}"
@@ -997,6 +1002,16 @@ fn t3_unreachable_peer_exhausts_warmup_and_exits_bounded() {
     let err = kid.stderr();
     eprintln!("=== T3 DIAGNOSTICS ===\n{}", kid.diagnostic(status, true));
     assert_no_consensus_errors("T3", &out, &err);
+    // R6：精确化的「无 handler 错误」断言（替代原先被字段名误命中的裸 `error` 子串）：
+    // 事件循环 handler 错误数与事件丢弃溢出数必须均为 0。
+    assert!(
+        out.contains("el_handler_errors=0"),
+        "T3 必须报告 el_handler_errors=0（无事件循环 handler 错误）；stdout={out}"
+    );
+    assert!(
+        out.contains("el_events_dropped_overflow=0"),
+        "T3 必须报告 el_events_dropped_overflow=0（无事件丢弃溢出）；stdout={out}"
+    );
     assert!(
         status.is_some_and(|s| s.success()),
         "T3 必须 exit 0（不可达 peer 不得阻塞启动）；实测 exit={:?}；stdout={out}",

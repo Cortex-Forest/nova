@@ -383,13 +383,24 @@ fn p1a3_dual_process_bounded_long_run() {
     ] {
         assert!(!out.contains("panicked"), "{name} 出现 panic；{diag}");
     }
+    // R6：**仅**容忍已知的 Mount Guard 环境提示（非容器环境必然打印；两进程仍 exit 0 成功运行）。
+    // 其余任何 stderr 输出仍然失败 —— 这不是「忽略所有 stderr」。
+    let without_known_env_notice = |s: &str| {
+        const PREFIX: &str = "yazimao-node: mount guard skipped (not running in a container)";
+        s.lines()
+            .filter(|l| !l.starts_with(PREFIX))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let a_stderr_rest = without_known_env_notice(&a_stderr);
+    let b_stderr_rest = without_known_env_notice(&b_stderr);
     assert!(
-        a_stderr.trim().is_empty(),
-        "A stderr 必须为空（无日志 / 无错误）；{diag}"
+        a_stderr_rest.trim().is_empty(),
+        "A stderr 仅允许已知 Mount Guard 环境提示，不得有其他输出；剩余={a_stderr_rest:?}；{diag}"
     );
     assert!(
-        b_stderr.trim().is_empty(),
-        "B stderr 必须为空（无日志 / 无错误）；{diag}"
+        b_stderr_rest.trim().is_empty(),
+        "B stderr 仅允许已知 Mount Guard 环境提示，不得有其他输出；剩余={b_stderr_rest:?}；{diag}"
     );
 
     // ---------- 12. 临时 storage 可正常释放（无遗留句柄 / 锁）----------
