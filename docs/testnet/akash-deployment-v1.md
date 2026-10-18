@@ -27,10 +27,14 @@
 
 ## 2. 硬件与端口规划（SDL 已表达）
 
-| 工作负载 | 数量 | CPU | RAM | 持久化 | 内部监听 | 公开端口 |
+| 工作负载 | 数量 | CPU | RAM | 持久化卷 | 内部监听 | 公开端口 |
 |---|---|---|---|---|---|---|
-| Seed（仅 bootstrap） | 1 | 2 | 4 GiB | 60 GiB（`/storage`） | `0.0.0.0:17770` | 17770/tcp |
-| Validator 1–7 | 7 | 2 | 4 GiB | 55 GiB（`/storage`）+ 5 GiB（`/safety`）= 60 GiB | `0.0.0.0:17771`…`17777` | 17771–17777/tcp |
+| Seed（仅 bootstrap） | 1 | 2 | 4 GiB | **60 GiB**（`data` → `/storage`） | `0.0.0.0:17770` | 17770/tcp |
+| Validator 1–7 | 7 | 2 | 4 GiB | **60 GiB**（`data` 55 GiB → `/storage` + `safety` 5 GiB → `/safety`） | `0.0.0.0:17771`…`17777` | 17771–17777/tcp |
+
+> 另加 **1 GiB 无名临时 root 卷**（官方语法的必需条目，**不**计入持久化容量）。
+> 故每工作负载：**持久化 60 GiB / 总磁盘额度 61 GiB**。需求来源 = `docs/genesis/testnet-parameters-v1.md` §1
+> “≥ 60 GiB 持久化”。
 
 - **GPU OFF / TEE OFF**：SDL **不**请求 `gpu`/`tee` 段（= 关闭）。
 - **端口依据**：代码**无**默认端口常量，`--listen` 省略即不监听（`crates/node/src/bin/yazimao-node.rs`）。
@@ -371,6 +375,8 @@ exec /usr/local/bin/yazimao-node \
 - 本 SDL 现状：仅 `- name: data / size: 60Gi`（Seed）与 `- name: data 55Gi` + `- name: safety 5Gi`（Validator），**无 root 卷条目、无 `attributes.persistent`**。
 - **后果**：即使卷被正确挂载，也**不保证跨重启保留** ⇒ `safety.journal`/`block-safety.journal` 与 chain 数据可能丢失 ⇒ **P-6 的“重启使用既有 journal”前提不成立**（无 flag ⇒ 拒启；有 flag ⇒ 在 §13.4 的缺陷下会留下空历史）。
 - **最小变更建议（本轮未实施）**：`- size: 1Gi`（临时 root）+ `data: 54Gi / persistent: true` + `safety: 5Gi / persistent: true`（合计 60 GiB/节点）。
+  > ⚠️ 以上为 **2026-10-14 修复前**的历史记录（`54Gi` 是当时的建议值，后已证明持久量不足）。
+  > **当前实际值见 §14.1**：Seed `data 60Gi`；Validator `data 55Gi` + `safety 5Gi`（持久 60 GiB / 总 61 GiB）。
 - **未实施原因**：修改 SDL 运行结构超出本任务授权（§1），且**无官方校验器**可用 ⇒ 只记录证据与最小变更建议，待 Owner 授权。
 - SDL 头部已加 **P-9** 注释记录同一事实。
 - ✅ **本轮已修复（2026-10-14）**：临时 root 卷 + 命名持久卷 `attributes.persistent: true` 已写入 SDL；
@@ -435,17 +441,20 @@ exec /usr/local/bin/yazimao-node \
 
 ## 14. Remediation（2026-10-14）：SDL 持久化修复 + safety 初始化原子性修复
 
-### 14.1 SDL 存储布局（本轮修复，P-9 已落地）
+### 14.1 SDL 存储布局（2026-10-14 落地；2026-10-18 **R4 容量更正**）
 
-| 工作负载 | 临时 root（ephemeral） | data（persistent） | safety（persistent） | 总存储 | 持久合计 |
+| 工作负载 | 临时 root（ephemeral） | data（persistent） | safety（persistent） | **持久化容量** | 总磁盘额度 |
 |---|---|---|---|---|---|
-| Seed ×1 | 1 GiB | 59 GiB | — | **60 GiB** | 59 GiB |
-| Validator ×7 | 1 GiB | 54 GiB | 5 GiB | **60 GiB** | 59 GiB |
+| Seed ×1 | 1 GiB | **60 GiB** | — | **60 GiB** | 61 GiB |
+| Validator ×7 | 1 GiB | **55 GiB** | 5 GiB | **60 GiB** | 61 GiB |
 
 - 临时 root 卷 = 官方语法要求的“至少一个仅 `size` 的临时卷条目”；命名卷均显式 `attributes: { persistent: true }`（官方：“Survives restarts”）。
 - **未改变**：1 Seed + 7 Validator 拓扑、Seed bootstrap-only、静态 peer、端口（17770 / 17771–17777）、`chain_id`/`network_id`、镜像与启动命令、验证者数量与身份隔离。
-- **容量口径歧义（待官方校验）**：每工作负载**总存储**仍为 60 GiB（原预算不变），其中**持久部分 59 GiB**。若 Owner 本意为“持久卷本身 ≥ 60 GiB”，应改为 `data 55Gi`（Seed）与 `data 55Gi + safety 5Gi`（Validator）⇒ 每工作负载 61 GiB（总预算 +1 GiB/负载）。**本轮未擅自采用**。
-- 本地结构校验：`LOCAL_STRUCTURAL_VALIDATION = PASS`（见 §14.4）；**官方 SDL 校验 = NOT PERFORMED**（无 `akash`/`provider-services`；未安装任何软件）。
+- **容量口径（R4 已锁定，不再悬而未决）**：“持久化”只计 `attributes.persistent: true` 的**命名卷**；无名临时 root 卷**不**计入。依据 = `docs/genesis/testnet-parameters-v1.md` §1 的“≥ 60 GiB 持久化”。
+  - 旧状态（2026-10-14 – 2026-10-18）：Seed `data 59Gi`、Validator `data 54Gi + safety 5Gi` ⇒ 持久仅 **59 GiB**，**低于**需求 1 GiB。
+  - R4 更正：Seed `data 60Gi`；Validator `data 55Gi` + `safety 5Gi` ⇒ 持久 **60 GiB** / 总 **61 GiB**（预算 +1 GiB/工作负载，全集群 +8 GiB）。
+  - 校验器已同步：`scripts/check_akash_sdl.py` 现在直接断言**持久化容量 ≥ 60 GiB**（并对总量与持久量分开展示），不再把 `总==60 / 持久==59` 固化成通过目标。
+- 本地结构校验：`LOCAL_STRUCTURAL_VALIDATION = PASS`（`checks_passed=211 checks_failed=0`，见 §14.4）；**官方 SDL 校验 = NOT PERFORMED**（无 `akash`/`provider-services`；未安装任何软件）。
 
 ### 14.2 safety 初始化原子性（本轮修复）
 
@@ -515,6 +524,10 @@ exec /usr/local/bin/yazimao-node \
   |---|---|---|---|---|---|
   | id=1（seed） | **1** | 1 GiB | 59 GiB | — | `class=beta1`, `persistent=true` |
   | id=2（validator） | **7** | 1 GiB | 54 GiB | 5 GiB | `class=beta1`, `persistent=true` |
+  > ⚠️ 上表是 **2026-10-14 官方库实测时点**的 SDL 内容（持久 59 GiB）。
+  > **2026-10-18 R4** 已将 Seed `data` 改为 `60Gi`、Validator `data` 改为 `55Gi`（持久 60 GiB / 总 61 GiB）。
+  > 该次更正**尚未**再用官方库复测（本环境无 `akash`/`provider-services`，见 §14.1）——不得把上表当作
+  > **当前** SDL 的校验结果。
 - **卷隔离结论 = PASS（官方证据，三条独立）**：
   1. 官方文档 `learn/core-concepts/persistent-storage` → **Limitations → Not Shared Between Services**：
      *“Each service gets its own storage volume. Services cannot share persistent storage.”*；
@@ -665,7 +678,7 @@ stat -c '%d %i %n' /storage /safety
 | Akash 更新/回滚/自动重启语义 | **UNVERIFIED** | 官方答复或真机验证 |
 | P-3 seed 投递机制 | **BLOCKED**（Owner 决策） | Owner 批准托管方案 |
 | P-1/P-2 镜像与 genesis | **BLOCKED**（Owner 交付） | 发布含正式 genesis 的镜像 digest + 冻结 `genesis_hash` |
-| 容量口径（“持久 ≥ 60 GiB”？） | **Owner 决策** | 若确需，改 `data 55Gi`（+1 GiB/负载） |
+| 容量口径（“持久 ≥ 60 GiB”？） | **已解决（2026-10-18 R4）** | 按需求文档改为“持久 60 / 总 61 GiB”，SDL + 校验器 + 本文件已同步 |
 | 存储类 `beta1` vs `beta3` | **Owner 决策** | 影响费用与 Provider 匹配范围 |
 | 定价 `denom`（`uakt` vs `uact`） | **Owner 决策** | 官方文档表明 escrow 使用 ACT（`uact`）；本 SDL 仍为 `uakt`，**未擅自更改** |
 

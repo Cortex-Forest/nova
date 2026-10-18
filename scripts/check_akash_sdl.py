@@ -23,7 +23,10 @@ What it checks:
   6. mount wiring: CLI `--storage-dir` / `--safety-dir` must equal the
      `params.storage.<name>.mount` values, because the node's mount guard refuses
      to start unless those exact paths are mount points
-  7. storage accounting is reported explicitly (never silently re-interpreted)
+  7. storage accounting is reported explicitly (never silently re-interpreted),
+     and **persistent capacity** (named volumes with attributes.persistent: true)
+     must be >= MIN_PERSISTENT_GIB per workload. The ephemeral root volume does
+     NOT count towards "persistent" -- the two numbers are always reported apart.
   8. the file must cite the official volume-isolation evidence (docs URL), so the
      isolation conclusion cannot silently disappear from the SDL header
 
@@ -54,6 +57,13 @@ ISOLATION_EVIDENCE_URL = "https://akash.network/docs/learn/core-concepts/persist
 VALIDATOR_SERVICES = ["validator-%d" % i for i in range(1, 8)]
 SEED_SERVICE = "seed"
 EXPECTED_PORTS = [17770 + i for i in range(8)]
+
+# Approved capacity policy (source of truth:
+# docs/genesis/testnet-parameters-v1.md -- "2 CPU / 4 GiB RAM / >= 60 GiB 持久化").
+# "持久化" counts ONLY named volumes carrying attributes.persistent: true.
+# The unnamed ephemeral root volume is sized separately and never counts.
+MIN_PERSISTENT_GIB = 60
+EPHEMERAL_ROOT_GIB = 1
 
 
 class Checker:
@@ -130,6 +140,58 @@ def argv_value(cmd: list[str], flag: str) -> str | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Selftest mutations: exercise the REAL CLI on mutated copies of the shipped SDL.
+# Mutations are written to a temp file and deleted immediately; the repository copy
+# is never touched.
+# ---------------------------------------------------------------------------
+
+
+def _run_checker_text(text: str) -> tuple[int, str]:
+    """Run this checker (real CLI path) on a temporary file containing `text`."""
+    import subprocess
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".yaml", prefix="sdl-selftest-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), path],
+            capture_output=True,
+            text=True,
+        )
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _replace_volume_size(text: str, volume: str, occurrence: int, size: str) -> str:
+    """Replace the `size:` of the Nth (1-based) `- name: <volume>` entry."""
+    pattern = re.compile(r"(- name: %s\n\s+size: )(\d+Gi)" % re.escape(volume))
+    hits = [0]
+
+    def sub(m: "re.Match[str]") -> str:
+        hits[0] += 1
+        return m.group(1) + (size if hits[0] == occurrence else m.group(2))
+
+    out = pattern.sub(sub, text)
+    if hits[0] < occurrence:
+        raise AssertionError(
+            "selftest fixture: %d occurrence(s) of volume %r, wanted >= %d"
+            % (hits[0], volume, occurrence)
+        )
+    return out
+
+
+def _replace_first_root_size(text: str, size: str) -> str:
+    """Replace the size of the first unnamed (ephemeral root) storage entry."""
+    return re.sub(r"(- size: )(\d+Gi)", lambda m: m.group(1) + size, text, count=1)
+
+
 def selftest() -> int:
     """Verify the checker's own detectors -- a check that cannot fail proves nothing."""
     failures = 0
@@ -156,6 +218,36 @@ def selftest() -> int:
     expect(argv_value(["--listen"], "--listen") is None, "argv_value tolerates a trailing flag")
     # size parser
     expect(size_to_gib("1Gi") == 1 and size_to_gib("59Gi") == 59, "size_to_gib parses Gi")
+
+    # ---- persistent-capacity boundary cases (the policy must be able to fail) ----
+    # A check that can never fail proves nothing, so every variant below is run
+    # through the real CLI on a temp file and the exit code + message are asserted.
+    base_code, base_out = _run_checker_text(raw)
+    expect(base_code == 0, "shipped SDL accepted (persistent capacity compliant)")
+    expect("checks_failed=0" in base_out, "shipped SDL reports zero failed checks")
+    expect("FAIL:" not in base_out, "shipped SDL reports no FAIL lines")
+
+    code, out = _run_checker_text(_replace_volume_size(raw, "data", 1, "59Gi"))
+    expect(code == 1 and "seed persistent storage >= 60Gi (got 59)" in out,
+           "seed persistent 59Gi is rejected")
+
+    code, out = _run_checker_text(_replace_volume_size(raw, "data", 2, "54Gi"))
+    expect(code == 1 and "validator-1 persistent storage >= 60Gi (got 59)" in out,
+           "validator persistent 59Gi is rejected")
+
+    # total disk quota sufficient (61 GiB) but persistent volume still short: MUST fail
+    short_persistent = _replace_first_root_size(
+        _replace_volume_size(raw, "data", 1, "59Gi"), "2Gi"
+    )
+    code, out = _run_checker_text(short_persistent)
+    expect(code == 1 and "seed persistent storage >= 60Gi (got 59)" in out,
+           "sufficient total disk with insufficient persistent volume is rejected")
+
+    # exactly-60 boundary must pass on its own (independent of the shipped values)
+    at_boundary = _replace_volume_size(_replace_volume_size(raw, "data", 1, "60Gi"), "data", 2, "55Gi")
+    code, out = _run_checker_text(at_boundary)
+    expect(code == 0, "persistent capacity exactly 60Gi for both workloads passes")
+
     print("SELFTEST_%s" % ("OK" if not failures else "FAIL"))
     return 1 if failures else 0
 
@@ -284,17 +376,28 @@ def main() -> int:
         c.note("%s: total=%sGi persistent=%sGi" % (prof_name, total, persistent))
 
     # explicit accounting for the approved capacity policy (no silent reinterpretation)
+    #
+    # 口径（锁定）："持久化" = 命名卷（attributes.persistent: true）之和；
+    # 无名临时 root 卷**不**计入。两个数字分开展示，绝不用一个数字兼表两个概念。
     seed_total = sum(size_to_gib(e.get("size")) for e in seed_declared)
+    seed_root = sum(size_to_gib(e.get("size")) for e in seed_declared if "name" not in e)
     seed_persistent_gib = sum(size_to_gib(e.get("size")) for e in seed_persistent)
-    c.chk(seed_total == 60, "seed total storage == 60Gi (got %s)" % seed_total)
-    c.chk(seed_persistent_gib == 59, "seed persistent storage == 59Gi (got %s)" % seed_persistent_gib)
+    c.chk(seed_root == EPHEMERAL_ROOT_GIB,
+          "seed ephemeral root == %dGi (got %s)" % (EPHEMERAL_ROOT_GIB, seed_root))
+    c.chk(seed_persistent_gib >= MIN_PERSISTENT_GIB,
+          "seed persistent storage >= %dGi (got %s)" % (MIN_PERSISTENT_GIB, seed_persistent_gib))
+    c.note("seed: persistent=%sGi total=%sGi" % (seed_persistent_gib, seed_total))
     for name in VALIDATOR_SERVICES:
         prof_name = ((deployment.get(name) or {}).get("akash") or {}).get("profile")
         storage = (profiles.get(prof_name) or {}).get("resources", {}).get("storage") or []
+        root = sum(size_to_gib(e.get("size")) for e in storage if "name" not in e)
         total = sum(size_to_gib(e.get("size")) for e in storage)
         persistent = sum(size_to_gib(e.get("size")) for e in storage if "name" in e)
-        c.chk(total == 60, "%s total storage == 60Gi (got %s)" % (name, total))
-        c.chk(persistent == 59, "%s persistent storage == 59Gi (got %s)" % (name, persistent))
+        c.chk(root == EPHEMERAL_ROOT_GIB,
+              "%s ephemeral root == %dGi (got %s)" % (name, EPHEMERAL_ROOT_GIB, root))
+        c.chk(persistent >= MIN_PERSISTENT_GIB,
+              "%s persistent storage >= %dGi (got %s)" % (name, MIN_PERSISTENT_GIB, persistent))
+        c.note("%s: persistent=%sGi total=%sGi" % (name, persistent, total))
 
     # ---- 6. pricing for every compute profile actually used ----------------
     for prof_name in profiles:

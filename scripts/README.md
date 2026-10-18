@@ -3,7 +3,9 @@
 ## 状态
 
 - `bench_percentiles.ps1`：对 benchmark 原始样本计算 p50 / p95 / p99（用法见 `crates/crypto/benches/README.md`）。
-- `check_akash_sdl.py`：Akash SDL 检查脚本（部署配置见 `deploy/akash/`）。
+- `check_akash_sdl.py`：Akash SDL **仓库内静态检查**（部署配置见 `deploy/akash/`）。
+  仅校验 SDL 结构与持久卷容量等静态约束，`--selftest` 覆盖其自身判定；
+  **不代表**官方 SDL validator 校验通过，**不代表** provider / 挂载 / 网络连通性已验证，也**不代表**已部署。
 
 ## 未来目标
 

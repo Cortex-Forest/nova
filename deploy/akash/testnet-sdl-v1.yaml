@@ -51,11 +51,16 @@
 #   P-8 **【已实测】** 占位符未替换前不可启动：`--genesis-hash REPLACE_...`
 #       ⇒ `Error: Cli(InvalidGenesisHash)`，退出码 1；`--peer` 的 `REPLACE_*@…` 同理
 #       （格式必须为 `<64 hex>@<ip:port>`）。
-#   P-9 **【已修复 · 2026-10-14】** 存储条目已按 Akash 官方语法改写：临时 root 卷（仅 `size`，1 Gi）、
-#       命名持久卷 `data` / `safety` 均带 `attributes: { persistent: true }`（官方 “Survives restarts”）。
-#       每工作负载：Seed = 1 + 59 = 60 GiB（持久 59）；Validator = 1 + 54 + 5 = 60 GiB（持久 59）。
-#       遗留（非 P-9）：容量口径歧义（“持久≥ 60 GiB”？）与官方工具链校验未执行 ⇒ 见部署文档 §14.1。
+#   P-9 **【已修复 · 2026-10-14；2026-10-18 R4 容量更正】** 存储条目已按 Akash 官方语法改写：临时 root 卷
+#       （仅 `size`，1 Gi）、命名持久卷 `data` / `safety` 均带 `attributes: { persistent: true }`
+#       （官方 “Survives restarts”）。
+#       **持久化容量口径（R4 锁定，不再是歧义）**：只有 `attributes.persistent: true` 的命名卷计入
+#       “持久化”；临时 root 卷（无名、仅 size）**不**计入。需求来源 = `docs/genesis/testnet-parameters-v1.md`
+#       §1 “每工作负载资源：2 CPU · 4 GiB RAM · **≥ 60 GiB 持久化** · GPU OFF · TEE OFF”。
+#         · Seed      ：data 60 GiB（持久 60）+ root 1 GiB（临时）      ⇒ 持久 60 / 总 61 GiB
+#         · Validator ：data 55 GiB + safety 5 GiB（持久 60）+ root 1 GiB ⇒ 持久 60 / 总 61 GiB
 #       证据：Akash 官方 “SDL Syntax Reference”（Profiles → compute → storage）。
+#       官方工具链校验仍未执行（本地无 akash/provider-services CLI）⇒ 见部署文档 §14.1。
 #   P-10 **【已核实 · 无需结构变更】** 卷隔离：见上方“依据”中的官方语义引用 ⇒ “7 个独立 service +
 #       `count: 1`”已保证每 Validator 独立持久卷（Proof：官方文档 “Not Shared Between Services”）。
 #       若未来采取“每 Validator 独立 compute profile + 卷名唯一”的**防御性加固**（资源预算不变，但文件
@@ -513,7 +518,7 @@ profiles:
         storage:
           - size: 1Gi                        # 临时 root 卷（官方要求：至少一个临时卷条目）
           - name: data
-            size: 59Gi                       # 持久化 chain 数据（Survives restarts）
+            size: 60Gi                       # 持久化 chain 数据（Survives restarts）—— 持久化容量 60 GiB
             attributes:
               persistent: true
               class: beta1                     # P-12：官方 schema 要求的显式 class（= 官方文档默认 beta1，不改变成本）
@@ -526,7 +531,7 @@ profiles:
         storage:
           - size: 1Gi                        # 临时 root 卷（官方要求）
           - name: data
-            size: 54Gi                       # 持久化 chain 数据
+            size: 55Gi                       # 持久化 chain 数据
             attributes:
               persistent: true
               class: beta1                     # P-12：官方 schema 要求的显式 class（默认值，不改变成本）
@@ -535,7 +540,7 @@ profiles:
             attributes:
               persistent: true
               class: beta1                     # P-12：官方 schema 要求的显式 class（默认值，不改变成本）
-              # data(54) + safety(5) + root(1) = 60 GiB / 节点
+              # 持久化容量 = data(55) + safety(5) = 60 GiB；总磁盘额度 = 60 + root(1) = 61 GiB
   placement:
     akash:
       pricing:
