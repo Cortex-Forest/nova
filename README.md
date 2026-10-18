@@ -89,7 +89,7 @@ YAZIMAO/                    # 公开品牌 YAZIMAO；内部开发代号 Nova（c
 ├── fuzz/                 # fuzz 基础设施（独立 crate，需 nightly）
 ├── docs/                 # 架构 / ADR / 协议 / 测试 / 运维 / 安全 / Genesis / Testnet / 设计与审计
 ├── deploy/               # 部署配置（Akash SDL）
-├── genesis-image/        # Genesis 容器镜像产物（Containerfile / genesis.bin）
+├── genesis-image/        # Genesis 容器镜像产物（Containerfile / genesis.bin）；当前 genesis.bin 为 Devnet fixture（network_id=0x03 / chain_id=3004），正式 Testnet Genesis：BLOCKED（缺权威输入与批准/冻结产物）
 ├── simulation/           # 经济模型模拟与实验结果
 ├── scripts/              # 开发运维脚本
 └── .github/workflows/    # CI
