@@ -240,11 +240,22 @@ fn actor_of(kp: KeyPair, id: ValidatorId) -> ValidatorActor<SoftwareSigner> {
 
 /// D-5.3.4：为测试 actor 附加 B2-B signer-owned Block safety journal（与 actor 身份匹配）。
 fn block_safety_for(id: ValidatorId) -> BlockSafetyJournal {
+    // R6：`SystemTime` 在本机粒度粗（实测 20 万次读数仅 14.7 万个不同值，最小正间隔 100ns）
+    // ⇒ 并行测试线程可能取到**相同** nanos ⇒ 临时目录撞名；若两线程均通过 `path.exists()`
+    // 预检，`create_new(true)` 的失败方会被映射为 `BlockSafetyError::Io`（`block_safety.rs:375-378`）
+    // ⇒ `.unwrap()` panic。故追加进程内原子序号，使唯一性不依赖时钟。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("nova_int_d9s6_bs_{}_{}", std::process::id(), unique));
+    let dir = std::env::temp_dir().join(format!(
+        "nova_int_d9s6_bs_{}_{}_{}",
+        std::process::id(),
+        unique,
+        seq
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     BlockSafetyJournal::create(
         &dir.join("block-safety.journal"),
