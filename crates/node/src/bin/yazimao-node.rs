@@ -894,6 +894,24 @@ struct RunSummary {
     pending_external_qc: usize,
     /// P1-A.12-DIAG（**仅观测**）—— 已附发历史 QC 数（sync responder 服务能力）。
     qc_served: u64,
+    /// **R11 诊断**（仅观测）—— 成功写入 qc_history 的高度数（既有只读 accessor
+    /// `qc_history_written()`；区分「QC 未持久化」与「已持久化」）。
+    qc_history_written: u64,
+    /// **R11 诊断**（仅观测）—— qc_history 写入失败次数（既有只读 accessor
+    /// `qc_history_write_failed()`；失败不计锚 ⇒ 下一 step 重试）。
+    qc_history_write_failed: u64,
+    /// **R11 诊断**（仅观测）—— QC 附发被跳过次数（既有只读 accessor `qc_serve_skipped()`；
+    /// 区分「未命中」与「命中但附发失败」）。
+    qc_serve_skipped: u64,
+    /// **R11 诊断**（仅观测）—— 外部 finality 成功采纳次数（既有只读 accessor
+    /// `external_finality_adopted()`）。
+    external_finality_adopted: u64,
+    /// **R11 诊断**（仅观测）—— 外部 QC 未被采纳次数（既有只读 accessor
+    /// `external_finality_rejected()`；前置检查失败 / 幂等 / 过时 / 冲突 / frozen 拒绝）。
+    external_finality_rejected: u64,
+    /// **R11 诊断**（仅观测）—— 入站 QC 因 target ∉ 本地 DAG 被有界暂存次数（既有只读
+    /// accessor `inbound_qc_deferred()`；区分「未到达」与「到达但无法应用」）。
+    inbound_qc_deferred: u64,
     /// P1-A.9（P1-3）—— 本进程是否 validator 形态（proposal/vote/finality 推进）。
     validator_enabled: bool,
     /// P1-A.9（P1-3）—— A.8 dial 尝试总数（saturating；恒定观测）。
@@ -946,6 +964,17 @@ struct RunSummary {
     proposal_present: bool,
     /// `consensus.finality.finalized_reference.is_some()`（DISARM 谓词输入之一）。
     finalized_ref_present: bool,
+    /// **权威** finalization 引用本身（P3 授权诊断）。
+    ///
+    /// 与 `finalized_ref_present` **同源**：二者都直接读
+    /// `driver().consensus().state().finality.finalized_reference`（`FinalityState`，
+    /// 仅在 `verify_qc` 通过的 PrecommitQC 触发 `Advance` 时置位为 `Some(qc.target)`）。
+    /// 本字段是**逐字节**拷贝，`None` = finality 尚未成立。
+    ///
+    /// **不得**由 `head_height` / `consensus_height` / `finalized_height`（QC tip）/ `round`
+    /// 推导；渲染为 64 位小写 hex（`none` = 缺失）。跨节点逐字节比较即可判定
+    /// 是否同一最终化对象。
+    finalized_ref: Option<[u8; 32]>,
     /// ── PHASE 6H-A30 OD-X7 — liveness **只读**观测（OUTPUT_MODE=B：**独立** `liveness` 行）──
     /// 提案构造调用总数 / 成功提交数（既有 `status` 行**逐字不变**）。
     prop_calls: u64,
@@ -1070,6 +1099,14 @@ fn opt_u64(v: Option<u64>) -> String {
     v.map_or_else(|| "none".to_string(), |x| x.to_string())
 }
 
+/// P3 — `Option<[u8; 32]>` 渲染：`Some(h)` ⇒ **64 位小写 hex**（复用 [`hex32`]）；`None` ⇒ `none`。
+///
+/// 编码**确定性**：小写、无 `0x` 前缀、定长 64 ⇒ 跨节点/跨运行逐字节可比。
+/// **不**伪造默认哈希：`None` 一律渲染为 `none`。
+fn opt_hash32(v: Option<[u8; 32]>) -> String {
+    v.map_or_else(|| "none".to_string(), |h| hex32(&h))
+}
+
 /// 采样当前 runtime 只读观测（不触碰秘密材料；全部用**既有** public accessor）。
 fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
     let head_height = runtime.block_production().map_or(0, |a| a.head().height);
@@ -1087,7 +1124,10 @@ fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
     let state = runtime.driver().consensus().state();
     let round_step = round_step_name(state.round.step);
     let proposal_present = state.round.proposal.is_some();
-    let finalized_ref_present = state.finality.finalized_reference.is_some();
+    // P3 授权诊断：`finalized_ref` 与 `finalized_ref_present` **同一次读取**（同一 live 状态），
+    // 保证布尔与哈希永不互相矛盾（不缓存、不重读、不推导）。
+    let finalized_ref = state.finality.finalized_reference;
+    let finalized_ref_present = finalized_ref.is_some();
     // PHASE 6H-A30 OD-X7 — 只读 liveness 快照（既有 accessor；不改状态机）。
     let live = runtime.liveness_snapshot();
     // P1-A.30 D0 — 只读诊断（拒绝原因分类 / 广播无对端 / 暂存重评 / 超时结果分类）。
@@ -1115,6 +1155,12 @@ fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
         block_inbound_skipped: runtime.block_inbound_skipped(),
         pending_external_qc: runtime.pending_external_qc_len(),
         qc_served: runtime.qc_served(),
+        qc_history_written: runtime.qc_history_written(),
+        qc_history_write_failed: runtime.qc_history_write_failed(),
+        qc_serve_skipped: runtime.qc_serve_skipped(),
+        external_finality_adopted: runtime.external_finality_adopted(),
+        external_finality_rejected: runtime.external_finality_rejected(),
+        inbound_qc_deferred: runtime.inbound_qc_deferred(),
         validator_enabled: runtime.validator_enabled(),
         peer_dial_attempts_total: runtime.peer_dial_attempts_total(),
         peer_dial_failures_total: runtime.peer_dial_failures_total(),
@@ -1142,6 +1188,7 @@ fn summarize(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> RunSummary {
         round_step,
         proposal_present,
         finalized_ref_present,
+        finalized_ref,
         prop_calls: live.prop_calls,
         prop_build_ok: live.prop_build_ok,
         prop_skip_not_elected: live.prop_skip_not_elected,
@@ -1385,12 +1432,14 @@ fn status_line(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> String {
         "{PROGRAM}: status steps={} head_height={} finalized_height={} consensus_height={} \
          round={} configured_peers={} established_peers={} inbound_connections={} \
          sync_pending={} block_inbound_skipped={} pending_external_qc={} qc_served={} \
+         qc_history_written={} qc_history_write_failed={} qc_serve_skipped={} \
+         ext_qc_adopted={} ext_qc_rejected={} inbound_qc_deferred={} \
          validator_enabled={} abandon_produced={} abandon_broadcast={} abandon_rejected={} \
          rc_certs={} rc_authority={} rc_rejected={} \
          rc_rej={} rc_bcast_nopeer={} abandon_bcast_nopeer={} rc_reeval={}/{} timeout_split={} \
          guard_rej={} wire_drops={} \
          round_timeouts={} timer_elapsed={} timer_window={} round_step={} \
-         proposal_present={} finalized_ref_present={} \
+         proposal_present={} finalized_ref_present={} finalized_ref={} \
          inbound={}/{}/{}/{}/{}/{}/{} inbound_drops={}/{}/{}/{} \
          peer_state=[{}] peer_fail=[{}]\n",
         s.steps,
@@ -1405,6 +1454,12 @@ fn status_line(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> String {
         s.block_inbound_skipped,
         s.pending_external_qc,
         s.qc_served,
+        s.qc_history_written,
+        s.qc_history_write_failed,
+        s.qc_serve_skipped,
+        s.external_finality_adopted,
+        s.external_finality_rejected,
+        s.inbound_qc_deferred,
         s.validator_enabled,
         s.abandon_produced,
         s.abandon_broadcast,
@@ -1426,6 +1481,7 @@ fn status_line(runtime: &NodeRuntime, cli: &Cli, steps: u64) -> String {
         s.round_step,
         s.proposal_present,
         s.finalized_ref_present,
+        opt_hash32(s.finalized_ref),
         // NETDIAG（仅诊断）
         ib[0],
         ib[1],
@@ -1457,7 +1513,7 @@ fn summary_line(s: &RunSummary) -> String {
          rc_rej={} rc_bcast_nopeer={} abandon_bcast_nopeer={} rc_reeval={}/{} timeout_split={} \
          guard_rej={} wire_drops={} \
          round_timeouts={} timer_elapsed={} timer_window={} round_step={} \
-         proposal_present={} finalized_ref_present={}; runtime shut down\n",
+         proposal_present={} finalized_ref_present={} finalized_ref={}; runtime shut down\n",
         s.steps,
         if s.run_steps == 0 {
             "unlimited".to_string()
@@ -1496,6 +1552,7 @@ fn summary_line(s: &RunSummary) -> String {
         s.round_step,
         s.proposal_present,
         s.finalized_ref_present,
+        opt_hash32(s.finalized_ref),
     )
 }
 
@@ -3031,6 +3088,169 @@ mod tests {
         ] {
             assert!(line.contains(key), "摘要缺少新增字段 {key}: {line}");
         }
+        runtime.shutdown().expect("shutdown ok");
+    }
+
+    // T51（P3）— `finalized_ref` 编码：`Some(32B)` ⇒ **恰 64 位小写 hex**，逐字节往返一致。
+    //
+    // 该断言固定三件事：① 定长（不截断）；② 小写（确定性、跨节点可比）；
+    // ③ 逐字节忠实（不交换字节、不改变字节序）。解码器为**测试局部**实现，
+    // 与被测编码器不共享代码 ⇒ 不是同义反复。
+    #[test]
+    fn t51_finalized_ref_encoding_is_exact_64_lowercase_hex() {
+        // 每字节互不相同 ⇒ 可检出截断 / 错位 / 字节序错误。
+        let mut bytes = [0u8; 32];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let s = opt_hash32(Some(bytes));
+        assert_eq!(s.len(), 64, "必须是定长 64 位 hex: {s}");
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "必须全部为小写 hex: {s}"
+        );
+        let mut back = [0u8; 32];
+        for (i, slot) in back.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("合法 hex");
+        }
+        assert_eq!(back, bytes, "编码不得截断或改写任何字节");
+        // `None` 一律 `none`（禁止伪造默认哈希 / 全零默认值）。
+        assert_eq!(opt_hash32(None), "none");
+    }
+
+    // T52（P3）— `status` 行与退出摘要必须**暴露** `finalized_ref=`，且与权威状态、与
+    // `finalized_ref_present` **三方自洽**；既有字段不得被破坏。
+    //
+    // 新装配的 runtime 尚未 finality ⇒ 本测试覆盖 **E2（缺失 ⇒ `none`）** 的端到端路径：
+    // 输出必须是显式 `finalized_ref=none`，而不是省略字段或补零哈希。
+    #[test]
+    fn t52_status_and_summary_lines_expose_consistent_finalized_ref() {
+        let env = TempEnv::new("t52");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &["--run-steps".to_string(), "1".to_string()],
+        );
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let (runtime, _report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+
+        let summary = summarize(&runtime, &cli, STATUS_INTERVAL_STEPS);
+        // ① 必须**逐字节**等于权威 live 状态（不得缓存 / 推导 / 重读）。
+        assert_eq!(
+            summary.finalized_ref,
+            runtime
+                .driver()
+                .consensus()
+                .state()
+                .finality
+                .finalized_reference,
+            "RunSummary.finalized_ref 必须逐字节等于 FinalityState.finalized_reference"
+        );
+        // ② 布尔与哈希必须同源自洽。
+        assert_eq!(
+            summary.finalized_ref.is_some(),
+            summary.finalized_ref_present,
+            "finalized_ref 与 finalized_ref_present 必须自洽"
+        );
+
+        let expected = format!("finalized_ref={}", opt_hash32(summary.finalized_ref));
+        let line = status_line(&runtime, &cli, STATUS_INTERVAL_STEPS);
+        assert!(
+            line.contains(&expected),
+            "status 行必须包含 {expected}: {line}"
+        );
+        // ③ 字段必须**恰好出现一次**（防止重复 token 造成解析歧义）。
+        assert_eq!(
+            line.split_whitespace()
+                .filter(|t| t.starts_with("finalized_ref="))
+                .count(),
+            1,
+            "status 行中 finalized_ref= 必须恰出现一次: {line}"
+        );
+        // ④ 既有布尔字段不得被移除或改写（回归保护）。
+        assert!(
+            line.contains(&format!(
+                "finalized_ref_present={}",
+                summary.finalized_ref_present
+            )),
+            "既有 finalized_ref_present 字段必须保留: {line}"
+        );
+
+        let sline = summary_line(&summary);
+        assert!(
+            sline.contains(&expected),
+            "退出摘要必须包含 {expected}: {sline}"
+        );
+        assert_eq!(
+            sline
+                .split_whitespace()
+                .filter(|t| t.starts_with("finalized_ref="))
+                .count(),
+            1,
+            "退出摘要中 finalized_ref= 必须恰出现一次: {sline}"
+        );
+
+        runtime.shutdown().expect("shutdown ok");
+    }
+
+    // T53（R11）—— 状态行必须导出 QC-history 写入计数与 QC 附发跳过计数，且与 runtime 既有
+    // 只读 accessor **逐值一致**；每个字段恰出现一次（防重复 token 造成解析歧义）。
+    //
+    // 目的（P4 可观测性）：在真实运行中区分「QC 通过验证但未持久化」与「已持久化」，
+    // 以及「未命中」与「命中但附发失败」——这正是 H8/H11 之前无法判定的观测缺口。
+    // 本测试仅断言**既有只读 accessor** 被正确暴露，不验证也不改变任何共识行为。
+    #[test]
+    fn t53_status_exposes_qc_history_and_serve_skip_counters() {
+        let env = TempEnv::new("t53");
+        let genesis_hash = write_valid_genesis(&env, vk_bytes(TEST_SEED_VAL));
+        env.write_seed("net.seed", TEST_SEED_NET);
+        let cli = assembly_cli(
+            &env,
+            genesis_hash,
+            &["--run-steps".to_string(), "1".to_string()],
+        );
+        let (_identity, set) = preflight(&cli).expect("preflight ok");
+        let (runtime, _report) = assemble_and_verify_runtime(&cli, &set).expect("assembly ok");
+
+        let line = status_line(&runtime, &cli, STATUS_INTERVAL_STEPS);
+        let observed = [
+            ("qc_history_written=", runtime.qc_history_written()),
+            ("qc_history_write_failed=", runtime.qc_history_write_failed()),
+            ("qc_serve_skipped=", runtime.qc_serve_skipped()),
+            ("ext_qc_adopted=", runtime.external_finality_adopted()),
+            ("ext_qc_rejected=", runtime.external_finality_rejected()),
+            ("inbound_qc_deferred=", runtime.inbound_qc_deferred()),
+        ];
+        for (token, value) in observed {
+            let want = format!("{token}{value}");
+            assert!(line.contains(&want), "status 行必须包含 {want}: {line}");
+            assert_eq!(
+                line.split_whitespace()
+                    .filter(|t| t.starts_with(token))
+                    .count(),
+                1,
+                "status 行中 {token} 必须恰出现一次: {line}"
+            );
+        }
+        // 新建 runtime 尚未产生任何持久化失败 ⇒ 失败计数必须为 0（不伪造写入成功）。
+        assert_eq!(
+            runtime.qc_history_write_failed(),
+            0,
+            "新 runtime 不得报告 QC-history 写入失败"
+        );
+        // 既有字段不得被覆盖。
+        assert!(
+            line.contains("qc_served="),
+            "既有 qc_served 字段必须保留: {line}"
+        );
+        assert!(
+            line.contains("validator_enabled="),
+            "既有 validator_enabled 字段必须保留: {line}"
+        );
+
         runtime.shutdown().expect("shutdown ok");
     }
 }
