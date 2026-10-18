@@ -19,10 +19,11 @@ use nova_crypto::identity::{
     AccountInit, EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit,
     canonical_genesis_bytes, compute_genesis_hash,
 };
-use nova_crypto::domain::SigningMessageHash;
+use nova_crypto::domain::{AlgorithmId, DomainId, SigningMessageHash, build_signed_bytes, hash_signing_message};
 use nova_crypto::key::KeyPair;
 use nova_crypto::signature::{Signature, SigningKey, VerifyingKey, sign_message_hash};
 
+use nova_node::block_adapter::NoAccountsKeyResolver;
 use nova_node::bootstrap::NodeConfig;
 use nova_node::key_provider::{KeyProvider, KeyProviderError, SoftwareKeyProvider};
 use nova_node::runtime::{NodeRuntime, NodeRuntimeError, derive_validator_id};
@@ -32,6 +33,10 @@ use nova_node::signer::{SigningCapability, SigningError};
 use nova_node::validator::LocalVoteRequest;
 use nova_node::vote_ledger::VoteKey;
 use nova_node::wiring::NodeConsensusCommand;
+use nova_runtime::{
+    BLOCK_VERSION, Block, BlockBody, BlockHeader, block_hash, compute_transaction_root,
+    encode_block_header,
+};
 
 const CHAIN_ID: u64 = 1001;
 
@@ -159,6 +164,44 @@ fn ev_target(ev: &ConsensusEvent) -> [u8; 32] {
     match ev {
         ConsensusEvent::Vote { vote, .. } => vote.target_block_hash,
         other => panic!("必须为 ConsensusEvent::Vote，got {other:?}"),
+    }
+}
+
+// ---------- 测试专用 block fixture（R5） ----------
+
+/// 构造一个**真实 Ed25519 签名**的「仅落盘、不登记 DAG」区块（R5 夹具修复）。
+///
+/// 必须在 `KeyPair` 被 `SoftwareKeyProvider::from_keypair` 取走**之前**调用
+///（`KeyPair` 与 `SigningKey` 均**故意不可 Clone**）。`state_root` 取自同一 config 的
+/// canonical store（`bootstrap::start` 只读，与 `d10_p1_a22::write_crash_state` 同款用法）。
+///
+/// 签名域与生产逐字节一致（`DomainId::Block` + `chain_id` + `canonical_header`）。
+fn signed_store_only_block(config: &NodeConfig, kp: &KeyPair, genesis_hash: [u8; 32]) -> Block {
+    let adapter = nova_node::bootstrap::start(NoAccountsKeyResolver, config)
+        .expect("canonical adapter（只读 state_root）");
+    let state_root = *adapter.store().state_root().as_bytes();
+    drop(adapter);
+    let body = BlockBody { txs: Vec::new() };
+    let header = BlockHeader {
+        version: BLOCK_VERSION,
+        chain_id: CHAIN_ID,
+        height: 1, // Guard A2：`header.height - 1 == round.height`（本测试恒为高度 0）
+        round: 0,
+        parent_hash: genesis_hash,
+        finality_reference: None,
+        transaction_root: compute_transaction_root(&body),
+        state_root,
+        validator_set_hash: genesis_hash,
+        timestamp: 0,
+    };
+    let payload = encode_block_header(&header);
+    let signed = build_signed_bytes(AlgorithmId::Ed25519, DomainId::Block, CHAIN_ID, &payload)
+        .expect("签名域编码");
+    Block {
+        header,
+        body,
+        proposer_signature: sign_message_hash(kp.signing_key(), &hash_signing_message(&signed))
+            .to_bytes(),
     }
 }
 
@@ -293,6 +336,21 @@ fn rt_28_validator_id_mismatch_startup_fails() {
     let sid_a = SafetyIdentity::new(NetworkId::Mainnet, CHAIN_ID, env.genesis_hash, &id_a);
     let journal = env.safety_dir.join("safety.journal");
     ValidatorSafetyStore::create(&journal, sid_a).unwrap();
+    // R5：现行 `build_validator`（P-6 原子性前置）要求两枚 journal 的存​在性一致
+    // （`runtime.rs:3746-3765`）。旧测试只建 vote journal ⇒ 命中 `journal_exists !=
+    // block_journal_exists` 分支，在 identity 校验**之前**返回 `SafetyJournalMissing`，
+    // 掩盖了本用例真正要验证的 validator_id mismatch。
+    //
+    // 这里把 block safety journal 建成 **key B** 的身份：`build_validator` 的校验顺序是
+    // 「block journal recover ⇒ BlockSafety(IdentityMismatch)」**先于** `ValidatorActor::restore`
+    // 对 vote safety store 的身份校验。若两枚都建成 A，本用例会先撞上 block 侧的错误，
+    // 从而验证不到「**vote** store 身份不符」这条路径。建成 B 后 block 侧通过，
+    // 断言（`NodeRuntimeError::Validator(_)`）保持不变、测试目的不变。
+    let id_b = derive_validator_id(&kp_b.verifying_key().to_bytes());
+    let block_identity =
+        BlockSafetyIdentity::new(NetworkId::Mainnet, CHAIN_ID, env.genesis_hash, &id_b);
+    BlockSafetyJournal::create(&env.safety_dir.join("block-safety.journal"), block_identity)
+        .expect("预置 block safety journal（生产 create API）");
     // G5-D.7.2：既有 journal ⇒ 不得声明显式初始化（init + exists ⇒ 启动拒绝，
     // 会掩盖本用例要验证的 identity mismatch 语义）。
     let mut config = config;
@@ -321,12 +379,26 @@ fn rt_29_runtime_processes_consensus_command() {
     let pk = kp.verifying_key().to_bytes();
     let env = Env::new(&genesis_for(pk));
     let config = env.config(true, env.genesis_hash);
+    // R5：`KeyPair` / `SigningKey` 故意不可 Clone ⇒ 签名必须在 provider 取走 `kp` **之前**。
+    let store_only = signed_store_only_block(&config, &kp, env.genesis_hash);
     let provider = SoftwareKeyProvider::from_keypair(kp);
 
     let mut runtime = NodeRuntime::start(&config, Some(&provider)).expect("validator 启动成功");
     let proposer = derive_validator_id(&pk);
+    // R5：Guard A1 要求 `block_hash` 本地可用；旧夹具的 `[0xAA;32]` 不在 store ⇒ 入 U1 pending
+    // ⇒ `process_command` 不被调用 ⇒ 提案永不安装（历史失败成因）。现经生产 `put_verified`
+    // 落盘真实签名区块（**不** `register_block` ⇒ target ∉ DAG）。
+    let vk = VerifyingKey::from_bytes(&pk).expect("validator verifying key");
+    let target = block_hash(&store_only).expect("block hash");
+    runtime
+        .block_production()
+        .expect("canonical adapter")
+        .block_store()
+        .expect("block store")
+        .put_verified(&store_only, proposer.as_bytes(), &vk, CHAIN_ID, 1)
+        .expect("put_verified（真实签名验证先于落盘）");
     let pr = ProposalRef {
-        block_hash: [0xAA; 32],
+        block_hash: target,
         proposer,
     };
 

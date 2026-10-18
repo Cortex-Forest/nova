@@ -19,6 +19,8 @@ use nova_crypto::identity::{
     canonical_genesis_bytes, compute_genesis_hash,
 };
 use nova_crypto::key::KeyPair;
+use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
+use nova_crypto::signature::sign_message_hash;
 use nova_network::message::{MessageEnvelope, MessageType, encode, sign_message};
 use nova_network::node_id::NodeId;
 use nova_network::security::SessionNonce;
@@ -29,9 +31,12 @@ use nova_storage::persistent::PersistentBackend;
 use nova_node::bootstrap::NodeConfig;
 use nova_node::network_identity::SoftwareNetworkIdentity;
 use nova_node::runtime::{NodeRuntime, derive_validator_id};
+use nova_runtime::{
+    BLOCK_VERSION, Block, BlockBody, BlockHeader, block_hash, compute_transaction_root,
+    encode_block_header,
+};
 
 const CHAIN_ID: u64 = 1001;
-const TARGET: [u8; 32] = [0xAA; 32];
 
 // ---------- fixtures（与 runtime_tests 同套路；此处独立复制以免跨文件依赖） ----------
 
@@ -183,6 +188,59 @@ fn sign_envelope(
     envelope
 }
 
+// ---------- 测试专用 block fixture（R5） ----------
+
+/// 构造并落盘一个**真实 Ed25519 签名**的「仅落盘、不登记 DAG」区块，返回其 `block_hash`。
+///
+/// # 为何需要（R5 夹具修复）
+/// `guard_inbound_proposal` 的 **Guard A1** 以 `BlockStore.contains(block_hash)` 判定入站 proposal
+/// 的本地可用性；旧夹具注入的 `TARGET = [0xAA;32]` 不在 store 也不在 DAG ⇒ 入 U1 pending
+/// ⇒ `process_command` 不被调用 ⇒ 提案永不安装（C-2 历史失败成因）。
+///
+/// # 为何不是绕过
+/// 签名域与生产逐字节一致（`DomainId::Block` + `chain_id` + `canonical_header`），写入走生产
+/// `BlockStore::put_verified`（**先验签、后落盘**）；`RuntimeBlockInput` 仍完整经过
+/// Guard A1 → A2 → C 的真实校验。唯一刻意之处是**不**调用 `register_block`
+/// ⇒ `dag.contains == false`（保持 C-2 原本验证的「target ∉ DAG」场景）。
+fn persist_store_only_block(rt: &NodeRuntime, kp: &KeyPair, genesis_hash: [u8; 32]) -> [u8; 32] {
+    let body = BlockBody { txs: Vec::new() };
+    let header = BlockHeader {
+        version: BLOCK_VERSION,
+        chain_id: CHAIN_ID,
+        height: 1, // Guard A2：`header.height - 1 == round.height`（本测试恒为高度 0）
+        round: 0,
+        parent_hash: genesis_hash,
+        finality_reference: None,
+        transaction_root: compute_transaction_root(&body),
+        state_root: *rt
+            .block_production()
+            .expect("canonical adapter（P1-A.24：validator 与 full-node 均装配）")
+            .store()
+            .state_root()
+            .as_bytes(),
+        validator_set_hash: genesis_hash,
+        timestamp: 0,
+    };
+    let payload = encode_block_header(&header);
+    let signed = build_signed_bytes(AlgorithmId::Ed25519, DomainId::Block, CHAIN_ID, &payload)
+        .expect("签名域编码");
+    let block = Block {
+        header,
+        body,
+        proposer_signature: sign_message_hash(kp.signing_key(), &hash_signing_message(&signed))
+            .to_bytes(),
+    };
+    let hash = block_hash(&block).expect("block hash");
+    let proposer = derive_validator_id(&kp.verifying_key().to_bytes());
+    rt.block_production()
+        .expect("canonical adapter")
+        .block_store()
+        .expect("block store")
+        .put_verified(&block, proposer.as_bytes(), kp.verifying_key(), CHAIN_ID, 1)
+        .expect("put_verified（真实签名验证先于落盘）");
+    hash
+}
+
 // ---------- C-1 : Network Injection ----------
 
 /// C-1：`start_with_network` ⇒ NetworkStack `Some`；`NetworkService.self_id ==
@@ -246,9 +304,28 @@ fn c2_runtime_step_drives_network_to_driver() {
         .expect("inject handshake");
     runtime.step().expect("step handshake Ok");
 
+    // R5：Guard A1 以 `BlockStore.contains` 判定本地可用性。旧夹具注入 store 中不存在的
+    // `TARGET` ⇒ 提案入 U1 pending ⇒ `process_command` 不被调用 ⇒ 提案永不安装。
+    // 现落盘一个**真实签名**的 store-only 区块，保持「target ∉ DAG」不变。
+    let target = persist_store_only_block(&runtime, &validator_kp, env.genesis_hash);
+    assert!(
+        runtime
+            .block_production()
+            .expect("canonical adapter")
+            .block_store()
+            .expect("block store")
+            .contains(&target)
+            .expect("contains"),
+        "前提：区块已本地可用（Guard A1）"
+    );
+    assert!(
+        !runtime.consensus().dag().contains(&target),
+        "前提：不登记 DAG ⇒ target ∉ DAG"
+    );
+
     // 合法 proposal（proposer = genesis validator —— set 成员）。
     let pr = ProposalRef {
-        block_hash: TARGET,
+        block_hash: target,
         proposer: derive_validator_id(&validator_pk),
     };
     let env_frame = sign_envelope(

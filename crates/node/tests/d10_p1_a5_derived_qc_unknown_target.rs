@@ -53,6 +53,8 @@ use nova_crypto::identity::{
     canonical_genesis_bytes, compute_genesis_hash,
 };
 use nova_crypto::key::KeyPair;
+use nova_crypto::domain::{AlgorithmId, DomainId, build_signed_bytes, hash_signing_message};
+use nova_crypto::signature::{VerifyingKey, sign_message_hash};
 use nova_network::message::{MessageEnvelope, MessageType, decode, encode, sign_message};
 use nova_network::node_id::NodeId;
 use nova_network::security::SessionNonce;
@@ -61,7 +63,11 @@ use nova_network::transport::{MemoryTransport, TcpTransport, Transport};
 use nova_node::bootstrap::NodeConfig;
 use nova_node::key_provider::{KeyProvider, SoftwareKeyProvider};
 use nova_node::network_identity::SoftwareNetworkIdentity;
-use nova_node::runtime::NodeRuntime;
+use nova_node::runtime::{NodeRuntime, derive_validator_id};
+use nova_runtime::{
+    BLOCK_VERSION, Block, BlockBody, BlockHeader, block_hash, compute_transaction_root,
+    encode_block_header,
+};
 
 use nova_consensus::vote::{ValidatorVote, VoteType, canonical_vote_payload};
 
@@ -290,16 +296,21 @@ fn establish(
 /// accept 侧 ⇒ peer `connected` + Established ⇒ `broadcast` 可达对端 ⇒ outbound 可被对端观测）。
 ///
 /// 注入 transport 仅为满足 `start_with_network` 签名（陌生 non-validator 对端，本测试不使用）。
-/// 返回 `(runtime, 本端 NodeId, listener 地址)`。
+/// 返回 `(runtime, 本端 NodeId, listener 地址, store-only target hash)`。
 fn start_validator_listening(
     env: &Env,
     validator_kp: KeyPair,
-) -> (NodeRuntime, NodeId, SocketAddr) {
+) -> (NodeRuntime, NodeId, SocketAddr, [u8; 32]) {
     let net_a = KeyPair::generate().expect("net keypair A");
     let a_id = node_id_of(&net_a);
     let (tx_a, _tx_stranger) = MemoryTransport::pair(a_id, NodeId::from_bytes([0x99; 32]));
-    let provider = SoftwareKeyProvider::from_keypair(validator_kp);
     let cfg = env.config(true, Some("127.0.0.1:0".parse().expect("listen addr")));
+    // R5：`KeyPair` / `SigningKey` 故意不可 Clone ⇒ 签名必须在 provider 取走 `validator_kp` **之前**。
+    let store_only = signed_store_only_block(&cfg, &validator_kp, env.genesis_hash);
+    let proposer = derive_validator_id(&validator_kp.verifying_key().to_bytes());
+    let vk = VerifyingKey::from_bytes(&validator_kp.verifying_key().to_bytes())
+        .expect("validator verifying key");
+    let provider = SoftwareKeyProvider::from_keypair(validator_kp);
     let rt = NodeRuntime::start_with_network(
         &cfg,
         Some(&provider as &dyn KeyProvider),
@@ -308,7 +319,58 @@ fn start_validator_listening(
     )
     .expect("start_with_network（validator + 真实 listener）");
     let addr = rt.network_listen_addr().expect("必须绑定真实 listener");
-    (rt, a_id, addr)
+    // R5：以生产 `put_verified` 落盘真实签名区块（**不** register_block ⇒ target ∉ DAG）。
+    // 动机：Guard A1 以 `BlockStore.contains` 判定入站 proposal 的本地可用性；旧夹具使用的
+    // `TARGET` 不在 store ⇒ 入 U1 pending ⇒ `process_command` 不被调用 ⇒ 提案永不安装。
+    let target = block_hash(&store_only).expect("block hash");
+    rt.block_production()
+        .expect("canonical adapter（P1-A.24：validator 与 full-node 均装配）")
+        .block_store()
+        .expect("block store")
+        .put_verified(&store_only, proposer.as_bytes(), &vk, CHAIN_ID, 1)
+        .expect("put_verified（真实签名验证先于落盘）");
+    (rt, a_id, addr, target)
+}
+
+/// 构造一个**真实 Ed25519 签名**的「仅落盘、不登记 DAG」区块（R5 夹具修复）。
+///
+/// 签名域与生产逐字节一致（`DomainId::Block` + `chain_id` + `canonical_header`）；`state_root`
+/// 取自同一 config 的 canonical store（`bootstrap::start` 只读，与 `d10_p1_a22::write_crash_state`
+/// 同款用法）——它必须在 `NodeRuntime` 启动**之前**取得，因为 `KeyPair` 随后会被 provider 取走。
+fn signed_store_only_block(
+    config: &NodeConfig,
+    kp: &KeyPair,
+    genesis_hash: [u8; 32],
+) -> Block {
+    let adapter = nova_node::bootstrap::start(
+        nova_node::block_adapter::NoAccountsKeyResolver,
+        config,
+    )
+    .expect("canonical adapter（只读 state_root）");
+    let state_root = *adapter.store().state_root().as_bytes();
+    drop(adapter);
+    let body = BlockBody { txs: Vec::new() };
+    let header = BlockHeader {
+        version: BLOCK_VERSION,
+        chain_id: CHAIN_ID,
+        height: 1, // Guard A2：`header.height - 1 == round.height`（本测试恒为高度 0）
+        round: 0,
+        parent_hash: genesis_hash,
+        finality_reference: None,
+        transaction_root: compute_transaction_root(&body),
+        state_root,
+        validator_set_hash: genesis_hash,
+        timestamp: 0,
+    };
+    let payload = encode_block_header(&header);
+    let signed = build_signed_bytes(AlgorithmId::Ed25519, DomainId::Block, CHAIN_ID, &payload)
+        .expect("签名域编码");
+    Block {
+        header,
+        body,
+        proposer_signature: sign_message_hash(kp.signing_key(), &hash_signing_message(&signed))
+            .to_bytes(),
+    }
 }
 
 /// 从真实 TCP 对端读取并统计 consensus 帧（有界：iterations + idle rounds + 1ms 轮询；无无限等待）。
@@ -351,7 +413,13 @@ fn p1a5_derived_qc_unknown_target_is_not_fatal() {
     let validator_kp = KeyPair::generate().expect("validator keypair");
     let genesis = genesis_for(validator_kp.verifying_key().to_bytes());
     let env = Env::new(&genesis, "t1");
-    let (mut rt, a_id, listen_addr) = start_validator_listening(&env, validator_kp);
+    let (mut rt, a_id, listen_addr, store_only_target) =
+        start_validator_listening(&env, validator_kp);
+    // R5：Guard A1 以 `BlockStore.contains` 判定本地可用性；旧夹具的 `TARGET = [0xAA;32]` 不在
+    // store ⇒ 提案入 U1 pending ⇒ `process_command` 不被调用 ⇒ 提案永不安装（历史失败成因）。
+    // 现改用刚刚经生产 `put_verified` 落盘的真实签名区块哈希（**不** register_block
+    // ⇒ 仍满足本测试依赖的「target ∉ DAG」且无 lock）。
+    let target = store_only_target;
     let net_b = KeyPair::generate().expect("net keypair B");
     let b_id = node_id_of(&net_b);
 
@@ -363,8 +431,8 @@ fn p1a5_derived_qc_unknown_target_is_not_fatal() {
     assert_eq!(round.step, RoundStep::Propose, "前提：初始 step = Propose");
     assert!(round.proposal.is_none(), "前提：初始无 proposal");
     assert!(
-        !rt.consensus().dag().contains(&TARGET),
-        "前提：TARGET 必须不在本地 DAG"
+        !rt.consensus().dag().contains(&target),
+        "前提：target 必须不在本地 DAG"
     );
     let locked_before = *rt
         .validator()
@@ -391,7 +459,7 @@ fn p1a5_derived_qc_unknown_target_is_not_fatal() {
     let expected = select_proposer(CHAIN_ID, round.height, round.round, &env.genesis_hash, &set)
         .expect("单验证者集合必然可推导 proposer");
     let proposal = ProposalRef {
-        block_hash: TARGET,
+        block_hash: target,
         proposer: expected,
     };
 
@@ -442,8 +510,8 @@ fn p1a5_derived_qc_unknown_target_is_not_fatal() {
         let s = rt.consensus().state();
         assert_eq!(
             s.round.proposal.as_ref().map(|p| p.block_hash),
-            Some(TARGET),
-            "proposal 已应用（target = TARGET）"
+            Some(target),
+            "proposal 已应用（target = 注入的 store-only block_hash）"
         );
         assert_eq!(
             s.round.step,
@@ -452,8 +520,8 @@ fn p1a5_derived_qc_unknown_target_is_not_fatal() {
         );
     }
     assert!(
-        !rt.consensus().dag().contains(&TARGET),
-        "proposal 不得使 TARGET 进入 DAG（未 register_block）"
+        !rt.consensus().dag().contains(&target),
+        "proposal 不得使 target 进入 DAG（未 register_block）"
     );
 
     // 该 QC 生效前的快照（用于「QC 零副作用」断言）。
@@ -508,7 +576,7 @@ fn p1a5_derived_qc_unknown_target_is_not_fatal() {
         "head 不得推进（无 canonical commit）"
     );
     assert!(
-        !rt.consensus().dag().contains(&TARGET),
+        !rt.consensus().dag().contains(&target),
         "不得把 QC target 错误插入 DAG"
     );
     assert_eq!(
