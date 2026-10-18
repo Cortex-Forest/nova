@@ -1773,6 +1773,9 @@ fn adopt_pending_external_finality(
 /// 物理发送在本 step 末；本函数在该之前）。
 ///
 /// - 只写与当前 `finalized_reference` **一致**的 PrecommitQC（`qc.target == x`）；
+/// - 候选必须**逐个**比对（R8）：不能只取第一个非空候选，否则一个**过期的**外部采纳 QC
+///   （`last_adopted_qc`，其 target 早已不是当前 finalized 块）会永久遮蔽本地派生 QC，
+///   使该高度及之后**所有**高度的 QC-history 写入被静默跳过（`tip` 冻结）；
 /// - 同一 reference 已写 ⇒ no-op（in-memory 锚 + store 自身幂等双重）；
 /// - 失败 ⇒ `Err`（**不**设锚 ⇒ 下一 step 重试）；**调用方**（runtime）将其计为观测失败。
 ///
@@ -1783,7 +1786,7 @@ fn adopt_pending_external_finality(
 fn persist_qc_history_if_needed(
     history: &mut Option<QcHistory>,
     finalized: Option<[u8; 32]>,
-    qc: Option<&QuorumCertificate>,
+    candidates: [Option<&QuorumCertificate>; 2],
     persisted: &mut Option<[u8; 32]>,
     written: &mut u64,
 ) -> Result<(), QcHistoryError> {
@@ -1796,12 +1799,11 @@ fn persist_qc_history_if_needed(
     if *persisted == Some(x) {
         return Ok(());
     }
-    let Some(qc) = qc else {
+    // R8：候选**逐个**比对 `target == x`（顺序 = 优先级）。
+    // 只取第一个非空候选会让过期的 `last_adopted_qc` 永久遮蔽本地派生 QC。
+    let Some(qc) = candidates.into_iter().flatten().find(|qc| qc.target == x) else {
         return Ok(());
     };
-    if qc.target != x {
-        return Ok(());
-    }
     let height = qc.context.height.saturating_add(1);
     history.put(height, qc)?;
     *written = written.saturating_add(1);
@@ -5790,13 +5792,16 @@ impl NodeRuntime {
         // ===== P1-A.7 — durable per-height PrecommitQC history（ADR-0064）=====
         // 与 fact 同点（**persist-before-broadcast**：egress 物理发送在本 step 末）。
         // QC 来源：采纳的外部 QC（`last_adopted_qc`）优先，否则既有本地派生 QC（同一 transition）。
+        // R8：两个候选**都**交给写入函数，由它以 `target == finalized_reference` 逐个筛选 ——
+        // 单取第一个非空候选会让过期的 `last_adopted_qc` 永久遮蔽本地 QC（tip 冻结）。
         // 失败：计观测 + 不设锚（下一 step 重试）；**不** halting consensus（纯服务能力）。
         if persist_qc_history_if_needed(
             &mut self.qc_history,
             self.driver.consensus().state().finality.finalized_reference,
-            self.last_adopted_qc
-                .as_ref()
-                .or_else(|| self.driver.consensus().last_precommit_qc()),
+            [
+                self.last_adopted_qc.as_ref(),
+                self.driver.consensus().last_precommit_qc(),
+            ],
             &mut self.qc_history_persisted,
             &mut self.qc_history_written,
         )
@@ -7102,5 +7107,141 @@ mod tests {
             !round_finalized_by_finality(&state(RoundStep::Finalized, Some(x), Some([0x22u8; 32]))),
             "finality 与 proposal 不匹配 ⇒ 不 disarm"
         );
+    }
+}
+
+/// **R8 回归测试** —— QC-history 写入的**候选选择**语义。
+///
+/// 缺陷（R8 修复前）：调用点用 `last_adopted_qc.as_ref().or_else(|| …last_precommit_qc())`
+/// 只传**一个**候选，写入函数再判 `qc.target != x ⇒ return Ok(())`。
+/// 一旦曾采纳过外部 QC，`last_adopted_qc` 会**永久**停留在那个 target 上（全仓无清除点），
+/// 于是 `finalized_reference` 前进后 `qc.target != x` 恒成立、`or_else` 分支**永不被求值**
+/// ⇒ 该高度及之后所有高度的 QC-history 写入被**静默跳过**（`tip` 冻结），
+/// 使本节点无法再向追赶中的对端提供 QC（`serve_qc` 只能服务 `≤ tip` 的高度）。
+///
+/// 本模块锁定修复后的语义：**逐个**比对 `target == x`，过期候选不得遮蔽匹配候选。
+#[cfg(test)]
+mod r8_qc_history_candidate_selection {
+    use super::*;
+
+    use nova_consensus::finality::QcContext;
+    use nova_consensus::vote::VoteType;
+    use nova_crypto::address::NetworkId;
+
+    fn qc(target: [u8; 32], height: u64) -> QuorumCertificate {
+        QuorumCertificate {
+            context: QcContext {
+                chain_id: 1,
+                height,
+                round: 0,
+                vote_type: VoteType::Precommit,
+            },
+            target,
+            validator_set_id: [0u8; 32],
+            evidence: Vec::new(),
+        }
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("nova_r8_qcsel_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("tmp dir");
+        d
+    }
+
+    fn open(dir: &std::path::Path) -> Option<QcHistory> {
+        Some(QcHistory::open(dir, NetworkId::Mainnet, 1, [0u8; 32]))
+    }
+
+    /// 过期 primary + 匹配 fallback ⇒ **必须成功写入**（修复前此断言失败）。
+    #[test]
+    fn stale_primary_must_not_shadow_matching_fallback() {
+        let dir = tmp_dir("shadow");
+        let mut history = open(&dir);
+        let mut persisted: Option<[u8; 32]> = None;
+        let mut written = 0u64;
+
+        let stale = qc([0x11; 32], 9);
+        let matching = qc([0x22; 32], 10);
+        let finalized = [0x22u8; 32];
+
+        persist_qc_history_if_needed(
+            &mut history,
+            Some(finalized),
+            [Some(&stale), Some(&matching)],
+            &mut persisted,
+            &mut written,
+        )
+        .expect("QC-history write must succeed when a candidate matches");
+
+        assert_eq!(
+            written, 1,
+            "匹配的 fallback QC 必须被写入：过期 primary 不得遮蔽它"
+        );
+        assert_eq!(persisted, Some(finalized), "写入成功后必须设锚");
+        assert_eq!(
+            history.as_ref().and_then(|h| h.tip_height()),
+            Some(11),
+            "QC-history tip 必须前进到该 QC 的高度+1（= 块高）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两个候选都不匹配 ⇒ 不写入、不设锚（保持下一 step 可重试）。
+    #[test]
+    fn no_matching_candidate_is_a_resumable_no_op() {
+        let dir = tmp_dir("nomatch");
+        let mut history = open(&dir);
+        let mut persisted: Option<[u8; 32]> = None;
+        let mut written = 0u64;
+
+        let a = qc([0x11; 32], 9);
+        let b = qc([0x22; 32], 10);
+
+        persist_qc_history_if_needed(
+            &mut history,
+            Some([0x33u8; 32]),
+            [Some(&a), Some(&b)],
+            &mut persisted,
+            &mut written,
+        )
+        .expect("no-op must not error");
+
+        assert_eq!(written, 0);
+        assert_eq!(persisted, None, "未写入 ⇒ 不得设锚");
+        assert_eq!(history.as_ref().and_then(|h| h.tip_height()), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 匹配的 primary 优先（既有优先级不变）。
+    #[test]
+    fn matching_primary_wins_over_fallback() {
+        let dir = tmp_dir("primary");
+        let mut history = open(&dir);
+        let mut persisted: Option<[u8; 32]> = None;
+        let mut written = 0u64;
+
+        let primary = qc([0x44; 32], 5);
+        let fallback = qc([0x55; 32], 6);
+
+        persist_qc_history_if_needed(
+            &mut history,
+            Some([0x44u8; 32]),
+            [Some(&primary), Some(&fallback)],
+            &mut persisted,
+            &mut written,
+        )
+        .expect("write ok");
+
+        assert_eq!(written, 1);
+        assert_eq!(
+            history.as_ref().and_then(|h| h.tip_height()),
+            Some(6),
+            "应使用匹配的 primary（高度 5 ⇒ tip 6）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
