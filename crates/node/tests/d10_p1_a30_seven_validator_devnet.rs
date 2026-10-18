@@ -33,10 +33,16 @@
 //!   前进** 作为 7/6/5-of-7 的 finality 判据，并**显式标注为代理指标**；
 //!   4/7 以「无 head 前进 ∧ 无 durable QC tip ∧ 无 QC 服务」三条同时成立作为 no-finality 判据。
 //!
-//! # PACEMAKER WINDOW（PHASE 3 修正）
+//! # PACEMAKER WINDOW（PHASE 3 修正；PHASE 6H-A3 后**单位已变更**）
 //!
-//! 生产默认 `RoundTimeoutConfig = (initial 1000 tick, max 60_000, ×2)`；offline proposer ⇒
-//! round 0→1 需 ~1000 tick、1→2 再 ~2000 tick。旧窗口（300s）**不足**。
+//! **A3 之后的当前生产默认** = `RoundTimeoutConfig::default()` = `(initial 10_000 ms,
+//! max 120_000 ms, ×2)`（毫秒；`crates/consensus/src/round.rs` L245–L252；唯一构造点
+//! `runtime.rs` L3664）。round 0 窗口 **10 s**、cap **120 s**。
+//!
+//! **历史（A3 之前）**：单位为「逻辑 step tick」，默认 `(1000 / 60_000 / ×2)`；本文件早期
+//! 版本的注释与窗口推导均基于该 tick 语义。两条历史记录**不得**再用于当前墙钟推算：
+//! 「round 0..3 = 1000+2000+4000+8000 = 15000 ticks」与「cap 60_000 ticks ≈ 2.5–3.3 h」在
+//! 当前实现下分别对应 **10+20+40+80 = 150 s** 与 **cap = 120 s**。
 //! 本文件在 T7-1 的 **S0 阶段先实测 step rate**，再据此设定窗口（覆盖 ≥2 个 timeout cycle）。
 //!
 //! 说明：
@@ -94,8 +100,14 @@ const WINDOW_7: Duration = Duration::from_secs(240);
 /// status 每 100 step 才输出一行，而各节点 step 吞吐相差近 2×，采样时刻不同会让
 /// 同一条单一链上的两个节点看起来相差 ~21 个高度。lag 仅作证据记录。
 const WINDOW_CONVERGE: Duration = Duration::from_secs(600);
-/// **PHASE 5 E1 — 受控实验窗口**：覆盖 round 0..3（1000+2000+4000+8000 = 15000 ticks）。
-/// 可用环境变量 `A30_WINDOW_E1`（秒）覆盖；默认 3000。
+/// **PHASE 5 E1 — 受控实验窗口**（秒）。
+///
+/// A3 之后 round 窗口为**墙钟毫秒**：round 0..3 = `10_000+20_000+40_000+80_000` =
+/// **150_000 ms = 150 s**，cap = **120 s**（`configured_window_ms`）。默认 3000 s 覆盖 ≥2 个
+/// 完整 timeout cycle 且留足收敛余量；可用环境变量 `A30_WINDOW_E1`（秒）覆盖。
+///
+/// **实验纪律**：本参数**必须**在每个产物中被显式记录（含取默认值的情形），否则该次运行
+/// 的窗口预算不可知（历史上多次运行缺失该记录）。
 const WINDOW_E1_DEFAULT_SECS: u64 = 3000;
 
 /// 读取 E1 窗口（env 覆盖；**test-only 窗口配置**，不改任何实现）。
@@ -425,7 +437,27 @@ struct Stats {
     /// production head（finality-commit 代理）。
     head: u64,
     /// **durable QC-history tip**（服务能力指标；**≠ consensus finality**）。
+    ///
+    /// 字段来源（`bin/yazimao-node.rs` L1111）：`finalized_height = runtime.qc_history_tip_height()`。
+    /// ⇒ CLI 的 `finalized_height` **不是** consensus finality（见文件头「METRIC DISCIPLINE」）。
     qc_tip: Option<u64>,
+    /// **权威**：`state().finality.finalized_reference.is_some()`（consensus finality 是否成立）。
+    ///
+    /// 数据源 = CLI status 行的 `finalized_ref_present=`；该字段由 `bin` 直接读
+    /// `driver().consensus().state().finality.finalized_reference`（`FinalityState`，
+    /// 仅在 `verify_qc` 通过的 PrecommitQC 触发 `Advance` 时置位）。
+    ///
+    /// **与 `qc_tip` 严格区分**：`qc_tip` 是 durable QC-history tip（只在该 finality 引用的
+    /// QC 被持久化时才前进 ⇒ 可能滞后 / 缺失）；`finalized_ref_present` 是 finality 状态本身。
+    finalized_ref_present: bool,
+    /// **权威** finalization 引用本身（`finalized_ref=<64hex|none>`，P3 授权诊断）。
+    ///
+    /// `Some(h)` = finality 已在区块 `h` 成立（值 = PrecommitQC 的 `qc.target`，32B 区块哈希）；
+    /// `None` = **显式** `none`（finality 尚未成立）。
+    ///
+    /// fail-closed 纪律：字段**缺失** / 重复 / 非 64 位 hex / 与 `finalized_ref_present`
+    /// 自相矛盾 ⇒ **整行** `None`。因此本结构存在即证明该值是**观测值**，而非「未观测」被当作 `none`。
+    finalized_ref: Option<[u8; 32]>,
     /// consensus context 高度（round.height）。
     consensus: u64,
     /// BFT round（> 0 ⇒ pacemaker timeout 已发生）。
@@ -433,6 +465,251 @@ struct Stats {
     /// QC 服务能力（对其他节点 served QC 数）。
     qc_served: u64,
     established: usize,
+    /// **权威**：节点自报的本地 round-timeout **事件**计数（累计；含 Applied/Ignored/Rejected 三类）。
+    ///
+    /// 语义区分（不得混淆）：`round_timeouts` 计**尝试**；仅 `round_adv_local` 计**真实推进**。
+    round_timeouts: u64,
+    /// 当前已 ARM 计时器的窗口（**毫秒**）；`None` = 未 arm / 已被 finality disarm。
+    timer_window: Option<u64>,
+}
+
+/// PHASE 6H-ONEPASS — **liveness 行**（`OUTPUT_MODE=B`）的节点自报权威计数。
+///
+/// 数据源 = 真实子进程 stdout 中的 `yazimao-node: liveness …`（字段顺序固定；见
+/// `bin/yazimao-node.rs` L1216 起的 [`liveness_line`]）。
+///
+/// 本结构存在的**唯一原因**：把原先只能由 harness **推断**的量（round 推进来源、
+/// timeout 是否真的发生、proposer 跳过原因）替换为**节点自报**的量 ⇒ 使
+/// 「round 推进是否由本地 timeout 驱动」「当选 proposer 是否在线」可由证据直接判定，
+/// 而不再依赖采样推断。**只读观测**：不改变任何共识语义，也不改变任何判据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Liveness {
+    steps: u64,
+    prop_calls: u64,
+    prop_build_ok: u64,
+    prop_skip_not_elected: u64,
+    prop_skip_step_guard: u64,
+    prop_skip_fail: u64,
+    inbound_prop_ok: u64,
+    egress_prop_enqueued: u64,
+    /// 本地 pacemaker timeout **真实推进** round 的次数（`Applied`）。
+    round_adv_local: u64,
+    /// 高度前进次数（**非** timeout；round 重置为 0 的那类推进）。
+    round_adv_height: u64,
+    /// **RC（round change）驱动**的 round 推进次数。
+    round_adv_rc: u64,
+    elected_is_self: bool,
+    prop_absent_steps: u64,
+    proposal_admitted: u64,
+    proposal_pending: u64,
+    proposal_rejected: u64,
+    proposal_expired: u64,
+    recovery_runs: u64,
+    net_frames_received: u64,
+    net_sent: u64,
+}
+
+/// 解析节点 stdout 中**最后一行** `liveness …`（要求尾部关键字段完整，避免撕裂行）。
+///
+/// 缺失**任何**必需字段 ⇒ `None`（**绝不**静默补 0；与 [`last_liveness_refreshed`] 同纪律）。
+fn last_liveness(out: &str) -> Option<Liveness> {
+    let line = out
+        .lines()
+        .rev()
+        .find(|l| l.contains("liveness steps=") && l.contains("round_adv_rc="))?;
+    let field = |k: &str| -> Option<&str> {
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix(k))
+    };
+    let num = |k: &str| -> Option<u64> { field(k)?.parse().ok() };
+    let boolean = |k: &str| -> Option<bool> { field(k)?.parse().ok() };
+    Some(Liveness {
+        steps: num("steps=")?,
+        prop_calls: num("prop_calls=")?,
+        prop_build_ok: num("prop_build_ok=")?,
+        prop_skip_not_elected: num("prop_skip_not_elected=")?,
+        prop_skip_step_guard: num("prop_skip_step_guard=")?,
+        prop_skip_fail: num("prop_skip_fail=")?,
+        inbound_prop_ok: num("inbound_prop_ok=")?,
+        egress_prop_enqueued: num("egress_prop_enqueued=")?,
+        round_adv_local: num("round_adv_local=")?,
+        round_adv_height: num("round_adv_height=")?,
+        round_adv_rc: num("round_adv_rc=")?,
+        elected_is_self: boolean("elected_is_self=")?,
+        prop_absent_steps: num("prop_absent_steps=")?,
+        proposal_admitted: num("proposal_admitted=")?,
+        proposal_pending: num("proposal_pending=")?,
+        proposal_rejected: num("proposal_rejected=")?,
+        proposal_expired: num("proposal_expired=")?,
+        recovery_runs: num("recovery_runs=")?,
+        net_frames_received: num("net_frames_received=")?,
+        net_sent: num("net_sent=")?,
+    })
+}
+
+/// **纯函数**：权威计数的逐节点聚合（便于穷举单测；无进程 / 无 I/O）。
+///
+/// 返回 `(nodes, liveness_parsed, round_timeouts, round_adv_local, round_adv_height,
+/// round_adv_rc, prop_build_ok, prop_absent_steps)`。
+///
+/// 纪律：`round_timeouts` 仅在对应节点的 `liveness`/`status` **均解析成功**时计入 ——
+/// 缺失一律 **不**补 0（避免把「未观测」伪装成「0 次超时」）。
+#[allow(clippy::type_complexity)]
+fn auth_totals(
+    stats: &[Option<Stats>],
+    live: &[Option<Liveness>],
+) -> (usize, usize, u64, u64, u64, u64, u64, u64) {
+    let mut parsed = 0usize;
+    let (mut to, mut al, mut ah, mut ar, mut bok, mut abs) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    for (i, l) in live.iter().enumerate() {
+        let (Some(l), Some(st)) = (l, stats.get(i).copied().flatten()) else {
+            continue;
+        };
+        parsed += 1;
+        to += st.round_timeouts;
+        al += l.round_adv_local;
+        ah += l.round_adv_height;
+        ar += l.round_adv_rc;
+        bok += l.prop_build_ok;
+        abs += l.prop_absent_steps;
+    }
+    (live.len(), parsed, to, al, ah, ar, bok, abs)
+}
+
+/// PHASE 6H-ONEPASS — **权威**逐节点计数摘要 + 推进来源守恒关系。
+///
+/// 输出每节点的自报计数（缺失 ⇒ `MISSING`），并给出**推进来源守恒**关系：
+/// ```text
+/// Σ round_adv_local + Σ round_adv_rc + Σ round_adv_height  ≟  观测到的 round/height 迁移总数
+/// ```
+/// 该关系是区分 **H4（RC 传播/应用）** 与 **H1（timeout 预算）** 的关键：若推进几乎全部
+/// 来自 `round_adv_rc`，则停滞与本地 timeout 预算无关；若 `round_adv_local` 远大于实际
+/// round 变化，则存在「timeout 触发但不推进」的路径（`Ignored`/`Rejected`）。
+fn authoritative_summary(kids: &[ChildGuard]) -> String {
+    let outs: Vec<String> = kids.iter().map(|c| c.stdout()).collect();
+    let stats: Vec<Option<Stats>> = outs.iter().map(|o| last_status(o)).collect();
+    let live: Vec<Option<Liveness>> = outs.iter().map(|o| last_liveness(o)).collect();
+    let mut out = Vec::new();
+    for (i, c) in kids.iter().enumerate() {
+        let st = stats.get(i).copied().flatten();
+        let lv = live.get(i).copied().flatten();
+        let g = |f: fn(&Liveness) -> String| -> String {
+            lv.map_or("MISSING".to_string(), |l| f(&l))
+        };
+        out.push(format!(
+            "{} status[round_timeouts={} timer_window={:?} finality={} ref={}] liveness[round_adv_local={} \
+             round_adv_height={} round_adv_rc={} elected_is_self={} prop_build_ok={} \
+             prop_skip_not_elected={} prop_skip_step_guard={} prop_skip_fail={} \
+             prop_absent_steps={} proposal(admitted={} pending={} rejected={} expired={}) \
+             recovery_runs={} net(sent={} recv={})]",
+            c.label,
+            st.map_or("MISSING".to_string(), |s| s.round_timeouts.to_string()),
+            st.and_then(|s| s.timer_window),
+            st.map_or("MISSING".to_string(), |s| s.finalized_ref_present.to_string()),
+            st.map_or("MISSING".to_string(), |s| {
+                s.finalized_ref
+                    .map_or_else(|| "none".to_string(), |h| hex32_hex(&h))
+            }),
+            g(|l| l.round_adv_local.to_string()),
+            g(|l| l.round_adv_height.to_string()),
+            g(|l| l.round_adv_rc.to_string()),
+            g(|l| l.elected_is_self.to_string()),
+            g(|l| l.prop_build_ok.to_string()),
+            g(|l| l.prop_skip_not_elected.to_string()),
+            g(|l| l.prop_skip_step_guard.to_string()),
+            g(|l| l.prop_skip_fail.to_string()),
+            g(|l| l.prop_absent_steps.to_string()),
+            g(|l| l.proposal_admitted.to_string()),
+            g(|l| l.proposal_pending.to_string()),
+            g(|l| l.proposal_rejected.to_string()),
+            g(|l| l.proposal_expired.to_string()),
+            g(|l| l.recovery_runs.to_string()),
+            g(|l| l.net_sent.to_string()),
+            g(|l| l.net_frames_received.to_string()),
+        ));
+    }
+    let (nodes, parsed, to, al, ah, ar, bok, abs) = auth_totals(&stats, &live);
+    out.push(format!(
+        "AUTH_TOTALS nodes={nodes} liveness_parsed={parsed} round_timeouts={to} \
+         round_adv_local={al} round_adv_height={ah} round_adv_rc={ar} \
+         prop_build_ok={bok} prop_absent_steps={abs}"
+    ));
+    out.join("\n")
+}
+
+/// 32B → 小写 hex（与 `bin` 的 `hex32` **同编码**；仅用于证据打印，**不**参与判据）。
+fn hex32_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// **纯函数** — 解析 `finalized_ref=` 的单个取值。
+///
+/// - `Some(None)` = 显式 `none`（finality 尚未成立）
+/// - `Some(Some(h))` = 64 位 hex，逐字节解出
+/// - `None` = 非法（长度 ≠ 64 / 非十六进制 / 空串）—— **绝不**猜测
+///
+/// 大小写均接受（消费端宽容），但**生产端**恒输出小写（见 `bin` 的 `opt_hash32`）。
+/// 全零哈希是合法值，**不**得被误判为缺失。
+fn parse_finalized_ref_token(v: &str) -> Option<Option<[u8; 32]>> {
+    if v == "none" {
+        return Some(None);
+    }
+    let raw = v.as_bytes();
+    if raw.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = (raw[2 * i] as char).to_digit(16)?;
+        let lo = (raw[2 * i + 1] as char).to_digit(16)?;
+        *slot = ((hi as u8) << 4) | (lo as u8);
+    }
+    Some(Some(out))
+}
+
+/// 从整行中**严格**提取 `finalized_ref=`：必须**恰好出现一次**。
+///
+/// 重复 / 冲突（≥ 2 次）⇒ `None`（fail-closed；**不**取首个、**不**取末个）。
+/// 注：`strip_prefix` 是**精确前缀**匹配 ⇒ `finalized_ref_present=true` 不会被误命中。
+fn extract_finalized_ref(line: &str) -> Option<Option<[u8; 32]>> {
+    let mut vals = line
+        .split_whitespace()
+        .filter_map(|tok| tok.strip_prefix("finalized_ref="));
+    let first = vals.next()?;
+    if vals.next().is_some() {
+        return None;
+    }
+    parse_finalized_ref_token(first)
+}
+
+/// **纯函数** — 按 finality 高度（`head`，finality-commit 代理）分组，**仅组内**比较
+/// finalization 引用。返回 `(group_count, mismatched_heads)`。
+///
+/// **为何必须分组**（P4 实测 `P4-BASE-01`）：`status` 每 100 step 才输出一行，各节点
+/// step 吞吐不同 ⇒ 同一时刻各节点的 `last_status` 可能停在**不同的 finality 高度**。
+/// 此时「不同节点报告不同引用」是**正常**的（各自 finalize 了各自高度的区块），
+/// **不是** 对象分歧。P3 的跳 head 直接比较会产生**伪失败**（已在 P4 复现）。
+///
+/// **仍然非空洞**：若**同一 head** 下的两个节点报告不同引用 ⇒ 真正的 finality 对象分歧。
+///
+/// 边界：`head` 或 `ref` 缺失的条目**不参与**比较（由调用方先行做完整性断言）。
+fn finality_identity_check(heads: &[Option<u64>], refs: &[Option<[u8; 32]>]) -> (usize, Vec<u64>) {
+    let mut groups: std::collections::BTreeMap<u64, Vec<Option<[u8; 32]>>> =
+        std::collections::BTreeMap::new();
+    for (i, h) in heads.iter().enumerate() {
+        let (Some(h), Some(r)) = (h, refs.get(i).copied().flatten()) else {
+            continue;
+        };
+        groups.entry(*h).or_default().push(Some(r));
+    }
+    let mut mismatched: Vec<u64> = Vec::new();
+    for (h, rs) in &groups {
+        let first = rs[0];
+        if rs.iter().any(|r| *r != first) {
+            mismatched.push(*h);
+        }
+    }
+    (groups.len(), mismatched)
 }
 
 /// 解析最后一行**完整** `status …`（要求尾部字段完整，避免撕裂行）。
@@ -444,19 +721,46 @@ fn last_status(out: &str) -> Option<Stats> {
     let field =
         |k: &str| -> Option<&str> { line.split_whitespace().find_map(|tok| tok.strip_prefix(k)) };
     let num = |k: &str| -> Option<u64> { field(k)?.parse().ok() };
+    // CLI 的 `finalized_height` 实际为 `runtime.qc_history_tip_height()`（bin L1111）⇒ 映射到
+    // `qc_tip`（durable QC-history tip），**不**是 consensus finality。该映射为**有意**行为，
+    // 由 `t7_7_status_and_liveness_field_domains` 回归测试固定，防止未来被误读为真实 finality。
     let qc_tip = match field("finalized_height=") {
         Some("none") => None,
         Some(v) => Some(v.parse().ok()?),
         None => return None,
     };
+    // `timer_window` 在未 arm 时打印为 `-` / `none` ⇒ 必须区分「未 arm」与「0」，不得静默补 0。
+    let timer_window = match field("timer_window=") {
+        Some("-") | Some("none") => None,
+        Some(v) => Some(v.parse().ok()?),
+        None => return None,
+    };
+    // `finalized_ref_present` 是**权威** finality 布尔值（不是代理）⇒ 缺失或非法一律 fail-closed：
+    // 绝不把「未观测」默认为 `false`（否则会把 finality 观测失败伪装成「无 finality」）。
+    let finalized_ref_present = match field("finalized_ref_present=") {
+        Some("true") => true,
+        Some("false") => false,
+        _ => return None,
+    };
+    // P3 — `finalized_ref` 是**权威** finalization 引用本身。
+    // 缺失 / 重复 / 非法 ⇒ 整行 `None`（**绝不**把「未观测」伪装成 `none`）；
+    // 且必须与 `finalized_ref_present` **一致**（生产端同一次读取，理论不可能矛盾）。
+    let finalized_ref = extract_finalized_ref(line)?;
+    if finalized_ref.is_some() != finalized_ref_present {
+        return None;
+    }
     Some(Stats {
         steps: num("steps=")?,
         head: num("head_height=")?,
         qc_tip,
+        finalized_ref_present,
+        finalized_ref,
         consensus: num("consensus_height=")?,
         round: num("round=")?,
         qc_served: num("qc_served=")?,
         established: num("established_peers=")? as usize,
+        round_timeouts: num("round_timeouts=")?,
+        timer_window,
     })
 }
 
@@ -785,6 +1089,107 @@ where
     }
 }
 
+/// **P4-A2** — 带**进程存活**与 **fatal 标记**检测的 polling 结果。
+///
+/// 只有 `reached == true` **且** `dead`/`fatal` 均为空，才表示「判据在存活前提下达成」。
+#[derive(Debug, Default)]
+struct LivePoll {
+    /// 判据是否在窗口内达成（**不含**存活/fatal 结论）。
+    reached: bool,
+    /// 判据达成前意外退出的验证者标签。
+    dead: Vec<&'static str>,
+    /// 检测到的 fatal 标记（标签 + 命中的模式）。
+    fatal: Vec<(&'static str, String)>,
+}
+
+/// **P4-A2** — 与 [`poll_traced`] **判据等价**，但每轮额外检查子进程存活、并周期扫描 fatal 标记。
+///
+/// 设计目的（OD-P4-1 A2 授权）：关闭「节点达成目标后崩溃，测试仍 PASS」的假阴性通道。
+/// `t7_3` 场景中**没有**任何测试侧主动停机，因此任何子进程退出都是**意外退出**，一律失败。
+///
+/// 代价控制：`try_wait` 每轮（20 ms）执行，开销极低；`fatal_marker` 是全量字符串扫描，
+/// 因此按 **1 s** 节流，而不是每轮执行。
+fn poll_traced_live<F, S>(
+    label: &str,
+    kids: &mut [ChildGuard],
+    mut f: F,
+    mut snap: S,
+    window: Duration,
+) -> LivePoll
+where
+    F: FnMut(&[ChildGuard]) -> bool,
+    S: FnMut(&[ChildGuard]) -> String,
+{
+    let t0 = Instant::now();
+    let deadline = t0 + window;
+    let mut next_snap = t0;
+    let mut next_fatal = t0;
+    loop {
+        // ① 存活检查（每轮）：任一子进程已退出 ⇒ 立即失败，不得再用其陈旧 status 判 PASS。
+        let mut dead: Vec<&'static str> = Vec::new();
+        for k in kids.iter_mut() {
+            if !k.is_running() {
+                dead.push(k.label);
+            }
+        }
+        if !dead.is_empty() {
+            return LivePoll {
+                reached: false,
+                dead,
+                fatal: Vec::new(),
+            };
+        }
+        // ② fatal 标记（1 s 节流）。
+        let now = Instant::now();
+        if now >= next_fatal {
+            let mut hit: Vec<(&'static str, String)> = Vec::new();
+            for k in kids.iter() {
+                if let Some(m) = fatal_marker(&k.stdout(), &k.stderr()) {
+                    hit.push((k.label, m));
+                }
+            }
+            if !hit.is_empty() {
+                return LivePoll {
+                    reached: false,
+                    dead: Vec::new(),
+                    fatal: hit,
+                };
+            }
+            next_fatal = now + Duration::from_secs(1);
+        }
+        // ③ 判据（与 [`poll_traced`] 完全一致）。
+        if f(kids) {
+            return LivePoll {
+                reached: true,
+                dead: Vec::new(),
+                fatal: Vec::new(),
+            };
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return LivePoll::default();
+        }
+        if now >= next_snap {
+            eprintln!("TRACE {label} t={:?} {}", t0.elapsed(), snap(kids));
+            next_snap = now + Duration::from_secs(30);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// **P4-A2** — 停机并**验证停机确实生效**（故障注入的激活证据）。
+///
+/// 返回 `Err` 表示注入**未生效**。调用方必须据此 FAIL，而**不是**继续观察 ——
+/// 否则「注入失败」会被误读成「注入后无活性变化」，二者语义完全不同。
+fn stop_validator_and_verify(kid: &mut ChildGuard) -> Result<ExitStatus, String> {
+    let label = kid.label;
+    let status = kid.terminate();
+    if kid.is_running() {
+        return Err(format!("{label}: terminate 后仍在运行"));
+    }
+    status.ok_or_else(|| format!("{label}: terminate 未返回退出状态"))
+}
+
 // ---------------------------------------------------------------------------
 // PHASE 5 — E1…E5 观测器（**test-only**；不触碰任何 production 语义）
 // ---------------------------------------------------------------------------
@@ -810,9 +1215,20 @@ fn configured_window_ms(round: u64) -> u64 {
 /// PHASE 5 观测器：把 CLI status 采样**离线**派生成 E1–E5 所需指标。
 ///
 /// 派生规则（全部只读，不与生产进程交互）：
-/// - **timeout 计数**：同一 `consensus_height` 下观测到 `round: r → r'`（`r' > r`）⇒ 对 `r..r'`
-///   各记一次。`RoundTimeout` 是 round 前进的**唯一**原因（新高度会把 round 重置为 0）。
-///   受 status cadence（每 100 step 一行）限制 ⇒ 该计数是**下界**（可能连跳）。
+/// - **timeout 计数（推断；非权威）**：同一 `consensus_height` 下观测到 `round: r → r'`（`r' > r`）
+///   ⇒ 对 `r..r'` 各记一次。
+///
+///   ⚠️ **两条已知局限（PHASE 6H-ONEPASS 更正）**，引用本字段时**必须**同时引用它们：
+///   1. **前提不成立**：round 前进的原因**不唯一** —— 除本地 pacemaker timeout 外，
+///      **RC（round change）** 亦可推进 round（节点自报 `round_adv_rc`）。早期版本声称
+///      「`RoundTimeout` 是 round 前进的**唯一**原因」是**错误**的。
+///   2. **首次推进系统性丢失**：首个采样点常为 `NO_STATUS`（进程尚未输出 status），
+///      而 round 0→1 通常发生在此之前 ⇒ 该迁移**不可观测** ⇒ 恒少计（历史上出现
+///      `timeouts_by_round[0] = 0` 而节点已在 round ≥1 的情形，即为本局限所致）。
+///
+///   ⇒ 本计数是**下界**且**混淆来源**。判定「timeout 是否真的发生、是否真的推进」
+///   **必须**使用 [`authoritative_summary`] 的节点自报 `round_timeouts` /
+///   `round_adv_local` / `round_adv_height` / `round_adv_rc`。
 /// - **round 墙钟窗口**：记录进入每个 `(height, round)` 的时刻，离开时得出观测墙钟时长；
 ///   与 [`configured_window_ms`] 对照 ⇒ E5 的 `implied_ms_rate`（1 计时单位的墙钟厚度）。
 /// - **round 发散**：同一采样中，处于同一 `consensus_height` 的节点出现 >1 种 `round`。
@@ -1337,20 +1753,42 @@ fn t7_3_five_of_seven_finality() {
     // PHASE 5 E1 — 5/7：接入 [`Tracer`] + E1 窗口（默认 3000s，覆盖 round 0..3 = 15000 ticks）。
     // 判据**不变**（仅 `poll_until` → 等价判据的 `poll_traced` + 证据增强）。
     let mut tr3 = Tracer::new(&fx.genesis, fx.gh, 5);
-    let ok = poll_traced(
+    // P4-A2 加固：判据**不变**，但每轮检查进程存活 + 周期扫描 fatal 标记。
+    // 本场景**无**测试侧主动停机 ⇒ 任何子进程退出都是意外退出，一律不得判 PASS。
+    let poll = poll_traced_live(
         "T7-3-A",
-        || {
-            kids.iter().all(|c| {
+        &mut kids,
+        |ks| {
+            ks.iter().all(|c| {
                 last_status(&c.stdout())
                     .is_some_and(|s| advanced_to(&s, 5) && s.established >= 4)
             })
         },
-        || tr3.observe(&stats_of(&kids), Instant::now()),
+        |ks| tr3.observe(&stats_of(ks), Instant::now()),
         window_e1(),
     );
+    let ok = poll.reached;
     let final_stats = stats_of(&kids);
     eprintln!("T7-3 E1/E4 SUMMARY (recovered={ok}):\n{}", tr3.summary());
+    // PHASE 6H-ONEPASS：**断言之前**输出节点自报的权威计数 ⇒ PASS 与 FAIL 两条路径下的
+    // 证据等价（FAIL 路径此前只能依赖 `forensic()` 的 stdout 尾部，且会被截断）。
+    // 只读观测：不改变判据、不改变计时、不改变任何共识语义。
+    eprintln!("T7-3 AUTH SUMMARY (recovered={ok}):\n{}", authoritative_summary(&kids));
     eprintln!("T7-3 final={final_stats:?}");
+    // P4-A2 ① — 进程存活：判据达成**之前**有验证者退出 ⇒ 立即失败（不得用陈旧 status 判 PASS）。
+    assert!(
+        poll.dead.is_empty(),
+        "T7-3：PROCESS_LIVENESS — 验证者在判据达成前意外退出 dead={:?}（final={final_stats:?}）\n{}",
+        poll.dead,
+        forensic("T7-3-process-dead", &kids.iter().collect::<Vec<_>>())
+    );
+    // P4-A2 ② — fatal 标记：轮询期间出现即失败（优先于进展判据）。
+    assert!(
+        poll.fatal.is_empty(),
+        "T7-3：FATAL_MARKER — 轮询期间出现 fatal {:?}（final={final_stats:?}）\n{}",
+        poll.fatal,
+        forensic("T7-3-fatal-poll", &kids.iter().collect::<Vec<_>>())
+    );
     assert!(
         ok,
         "T7-3：5/7 未在 {:?} 内达成 finality 代理判据（head≥5 ∧ consensus≥5）（final={final_stats:?}）\n{}",
@@ -1365,6 +1803,81 @@ fn t7_3_five_of_seven_finality() {
         .iter()
         .map(|s| s.and_then(|x| x.qc_tip))
         .collect();
+    // ── P3 — **最终化对象标识**跨节点比较（本轮新增观测；不改既有判据 / 计时 / 进程管理）──
+    //
+    // 判据强度：仅「5/5 finalized_ref_present=true」**不足以**证明 finality 一致性
+    //（不同节点可能对不同区块 finality）。必须比较 32B 引用本身。
+    let refs: Vec<Option<[u8; 32]>> = final_stats
+        .iter()
+        .map(|s| s.and_then(|x| x.finalized_ref))
+        .collect();
+    let refs_hex: Vec<String> = refs
+        .iter()
+        .map(|r| r.map_or_else(|| "MISSING".to_string(), |h| hex32_hex(&h)))
+        .collect();
+    // （P4）对象标识的分组打印见下方 ② 之后。
+    // ① 每个节点都必须有**可解析**的引用 ⇒ 否则观测不完整（不得当作 PASS）。
+    let incomplete: Vec<usize> = (0..refs.len()).filter(|i| refs[*i].is_none()).collect();
+    assert!(
+        incomplete.is_empty(),
+        "T7-3：FINALITY_OBJECT_IDENTITY_INCOMPLETE — 节点索引 {incomplete:?} 无可解析 finalized_ref \
+         （refs={refs_hex:?}）\n{}",
+        forensic("T7-3-object-incomplete", &kids.iter().collect::<Vec<_>>())
+    );
+    // ② **按 head 分组**后组内比较 ⇒ 跨 head 的不同引用是正常的异步推进，不是分歧。
+    //    （P4 修正：P3 的跨 head 直接比较在 `P4-BASE-01` 中产生了伪失败。）
+    let heads: Vec<Option<u64>> = final_stats
+        .iter()
+        .map(|s| s.as_ref().map(|x| x.head))
+        .collect();
+    let (groups, mismatched_heads) = finality_identity_check(&heads, &refs);
+    let group_desc: Vec<String> = {
+        let mut m: std::collections::BTreeMap<u64, Vec<usize>> = std::collections::BTreeMap::new();
+        for (i, h) in heads.iter().enumerate() {
+            if let Some(h) = h {
+                m.entry(*h).or_default().push(i);
+            }
+        }
+        m.iter().map(|(h, v)| format!("head={h}:{v:?}")).collect()
+    };
+    eprintln!(
+        "T7-3 FINALITY_OBJECT groups=[{}] refs={refs_hex:?}",
+        group_desc.join(" ")
+    );
+    assert!(
+        mismatched_heads.is_empty(),
+        "T7-3：FINALITY_OBJECT_IDENTITY_MISMATCH — 同一 head 下引用分歧 heads={mismatched_heads:?} \
+         （refs={refs_hex:?}）\n{}",
+        forensic("T7-3-object-mismatch", &kids.iter().collect::<Vec<_>>())
+    );
+    eprintln!(
+        "T7-3 FINALITY_OBJECT_IDENTITY_CONSISTENT groups={groups} nodes={} heads={heads:?}",
+        refs.len()
+    );
+    // P4-A2 ③ — **最终接受点复核**：不依赖轮询期间的结论，重新检查存活与 fatal。
+    // 目的：节点在达成目标后、宣布 PASS 前退出，也必须失败（见 OD-P4-1 A2 §A/§B）。
+    let mut dead_at_accept: Vec<&'static str> = Vec::new();
+    for c in kids.iter_mut() {
+        if !c.is_running() {
+            dead_at_accept.push(c.label);
+        }
+    }
+    assert!(
+        dead_at_accept.is_empty(),
+        "T7-3：PROCESS_LIVENESS — 节点 {:?} 在最终接受点已退出（判据虽已达成，但不得 PASS）\n{}",
+        dead_at_accept,
+        forensic("T7-3-dead-at-acceptance", &kids.iter().collect::<Vec<_>>())
+    );
+    let fatal_at_accept: Vec<(&'static str, String)> = kids
+        .iter()
+        .filter_map(|c| fatal_marker(&c.stdout(), &c.stderr()).map(|m| (c.label, m)))
+        .collect();
+    assert!(
+        fatal_at_accept.is_empty(),
+        "T7-3：FATAL_MARKER — 节点 {:?} 在最终接受点出现 fatal\n{}",
+        fatal_at_accept,
+        forensic("T7-3-fatal-acceptance", &kids.iter().collect::<Vec<_>>())
+    );
     eprintln!("T7-3 PASS: rounds={rounds:?} qc_tips={qctips:?} final={final_stats:?}");
     // PHASE 6H-A30 OD-X8 — **真实**运行时可观测性摘要（只读；不改断言 / 计时 / 进程管理）。
     observability_dump(&kids);
@@ -1413,27 +1926,42 @@ fn t7_4_four_of_seven_no_finality() {
         WINDOW_NOFINAL,
     );
     let final_stats = stats_of(&kids);
+    // PHASE 6H-ONEPASS：**断言之前**输出权威计数（4/7 是「无 finality 属预期」的路径，
+    // 其价值在于记录真实 round 推进来源；只读观测，不改判据）。
+    eprintln!("T7-4 AUTH SUMMARY:\n{}", authoritative_summary(&kids));
     for (i, c) in kids.iter().enumerate() {
-        let s = final_stats[i].unwrap_or(Stats {
-            steps: 0,
-            head: 0,
-            qc_tip: None,
-            consensus: 0,
-            round: 0,
-            qc_served: 0,
-            established: 0,
+        // fail-closed：节点状态缺失**不得**退化为全零默认值（否则 no-finality 判据会「空过」）。
+        // 该分支必须与本循环其它断言一样携带取证输出，便于事后复核「为何读不到状态」。
+        let s = final_stats[i].unwrap_or_else(|| {
+            panic!(
+                "T7-4：{} 状态缺失（status 行不可解析或从未产出），不能把「未观测」当作 \
+                 no-finality 证据；需显式失败\n{}",
+                c.label,
+                forensic("T7-4-unparsed", &kids.iter().collect::<Vec<_>>()),
+            )
         });
-        // no-finality 判据（三条件同时成立；不得仅凭 head=0）：
+        // no-finality 判据（五条件同时成立；不得仅凭 head=0）：
         //   ① 无 head 前进（finality-commit 代理从未触发）
         //   ② 无 consensus finality 证据（durable QC tip 从未 ≥1）
         //   ③ 无 QC 服务能力（qc_served == 0）
+        //   ④ **权威** finality 状态未置位（`state().finality.finalized_reference` 为 None）
+        //   ⑤ **P3** 权威 finalization 引用本身为**显式** none（不是「未观测」）
+        // ④ 是本轮新增：使用节点自报的**权威**布尔值，而非仅依赖 QC-tip 代理。只增不减。
+        // ⑤ 是 P3 新增：布尔为 false 时引用必须同时为 none（解析端已强制自洽）。
         assert!(
-            s.head == 0 && s.qc_tip.is_none() && s.qc_served == 0,
-            "T7-4：4/7 竟然产生了 finality 迹象（{} head={} qc_tip={:?} qc_served={} consensus={} round={}）——违反 2/3 quorum 门限\n{}",
+            s.head == 0
+                && s.qc_tip.is_none()
+                && s.qc_served == 0
+                && !s.finalized_ref_present
+                && s.finalized_ref.is_none(),
+            "T7-4：4/7 竟然产生了 finality 迹象（{} head={} qc_tip={:?} qc_served={} \
+             finalized_ref_present={} finalized_ref={:?} consensus={} round={}）——违反 2/3 quorum 门限\n{}",
             c.label,
             s.head,
             s.qc_tip,
             s.qc_served,
+            s.finalized_ref_present,
+            s.finalized_ref,
             s.consensus,
             s.round,
             forensic("T7-4-violation", &kids.iter().collect::<Vec<_>>())
@@ -1586,14 +2114,318 @@ fn t7_5_seven_validator_restart_catchup() {
 }
 
 // ---------------------------------------------------------------------------
+// T7-8 — 7/7 ⇒ **停 V5 + V6** ⇒ 5/7（恰达 quorum）继续 ⇒ 重启两者 ⇒ 重连 + catch-up
+//
+// P4-A2 授权（OD-P4-1 A2）：确定性 test-only 故障注入 + 恢复。
+// 复用 `t7_5` 的机制（里程碑触发 / `ChildGuard` 进程管理 / `node_args` 同身份重启），
+// **不修改** `t7_5` 的语义；额外要求「注入确实生效」与「最终接受点存活」被**显式证明**。
+// ---------------------------------------------------------------------------
+#[test]
+fn t7_8_seven_to_five_fault_injection_and_recovery() {
+    // quorum 口径：5/7 = 5 × 200_000 = 1_000_000 ≥ 933_334 ⇒ 停滞即缺陷；
+    // 4/7 = 800_000 < quorum ⇒ 停滞属正确行为（本用例不进入 4/7）。
+    eprintln!(
+        "T7-8: quorum={} ; 5/7 weight={} (>= quorum: {})",
+        expected_quorum(),
+        STAKE * 5,
+        STAKE * 5 >= expected_quorum()
+    );
+    assert!(
+        STAKE * 5 >= expected_quorum(),
+        "T7-8：前提不成立 —— 5/7 必须仍达 quorum，否则本用例「应当推进」的期望无效"
+    );
+
+    let fx = setup("t78");
+    let mut kids = spawn_first(&fx, N);
+
+    assert!(
+        wait_ready(&kids, STARTUP_TIMEOUT),
+        "T7-8：7 进程未进入 run loop\n{}",
+        forensic("T7-8-startup", &kids.iter().collect::<Vec<_>>())
+    );
+
+    // ── 阶段 A：健康基线（全部 7 节点推进且彼此已连接）──
+    let base = poll_traced_live(
+        "T7-8-A",
+        &mut kids,
+        |ks| {
+            ks.iter().all(|c| {
+                last_status(&c.stdout())
+                    .is_some_and(|s| advanced_to(&s, 5) && s.established >= N - 1)
+            })
+        },
+        |ks| snapshot_line(&stats_of(ks)),
+        WINDOW_7,
+    );
+    assert!(
+        base.dead.is_empty(),
+        "T7-8：基线阶段有进程退出 {:?}\n{}",
+        base.dead,
+        forensic("T7-8-base-dead", &kids.iter().collect::<Vec<_>>())
+    );
+    assert!(
+        base.fatal.is_empty(),
+        "T7-8：基线阶段出现 fatal {:?}\n{}",
+        base.fatal,
+        forensic("T7-8-base-fatal", &kids.iter().collect::<Vec<_>>())
+    );
+    assert!(
+        base.reached,
+        "T7-8：基线未在 {WINDOW_7:?} 内达成（7/7 未全部 advanced_to(5) ∧ established≥{}）\n{}",
+        N - 1,
+        forensic("T7-8-baseline", &kids.iter().collect::<Vec<_>>())
+    );
+
+    let before = stats_of(&kids);
+    let base_heads: Vec<u64> = before
+        .iter()
+        .take(5)
+        .map(|s| s.map_or(0, |x| x.head))
+        .collect();
+    eprintln!("T7-8 BASELINE: {before:?}");
+
+    // ── 阶段 B：注入 —— 停 V5 + V6（7 → 5 在线）──
+    let st5 = stop_validator_and_verify(&mut kids[5]);
+    if let Err(e) = &st5 {
+        panic!(
+            "T7-8：INJECTION FAILED (V5) — {e}\n{}",
+            forensic("T7-8-inject-fail", &kids.iter().collect::<Vec<_>>())
+        );
+    }
+    let st6 = stop_validator_and_verify(&mut kids[6]);
+    if let Err(e) = &st6 {
+        panic!(
+            "T7-8：INJECTION FAILED (V6) — {e}\n{}",
+            forensic("T7-8-inject-fail", &kids.iter().collect::<Vec<_>>())
+        );
+    }
+
+    // 注入后的**独立**观测：两个被停的必须已退出，其余 5 个必须仍存活。
+    let mut alive_after_stop: Vec<&'static str> = Vec::new();
+    for c in kids[..5].iter_mut() {
+        if c.is_running() {
+            alive_after_stop.push(c.label);
+        }
+    }
+    let mut still_running: Vec<&'static str> = Vec::new();
+    for c in kids[5..].iter_mut() {
+        if c.is_running() {
+            still_running.push(c.label);
+        }
+    }
+    assert!(
+        still_running.is_empty(),
+        "T7-8：INJECTION NOT EFFECTIVE — 被停节点仍在运行 {:?}",
+        still_running
+    );
+    assert_eq!(
+        alive_after_stop.len(),
+        5,
+        "T7-8：INJECTION — 期望恰好 5 个节点存活，实际 {:?}",
+        alive_after_stop
+    );
+    eprintln!(
+        "T7-8 INJECTION ACTIVATED: alive={alive_after_stop:?} stopped=[V5={:?} V6={:?}]",
+        st5.as_ref().ok(),
+        st6.as_ref().ok()
+    );
+
+    // ── 阶段 C：5/7（仍 ≥ quorum）必须继续推进 —— 本用例的**正向**期望 ──
+    let progressed = poll_traced_live(
+        "T7-8-B",
+        &mut kids[..5],
+        |ks| {
+            ks.iter()
+                .enumerate()
+                .all(|(i, c)| last_status(&c.stdout()).is_some_and(|s| s.head >= base_heads[i] + 2))
+        },
+        |ks| snapshot_line(&stats_of(ks)),
+        WINDOW_QUORUM,
+    );
+    let after_stop = stats_of(&kids[..5]);
+    assert!(
+        progressed.dead.is_empty(),
+        "T7-8：5/7 阶段有节点退出 {:?}\n{}",
+        progressed.dead,
+        forensic("T7-8-five-dead", &kids[..5].iter().collect::<Vec<_>>())
+    );
+    assert!(
+        progressed.fatal.is_empty(),
+        "T7-8：5/7 阶段出现 fatal {:?}\n{}",
+        progressed.fatal,
+        forensic("T7-8-five-fatal", &kids[..5].iter().collect::<Vec<_>>())
+    );
+    assert!(
+        progressed.reached,
+        "T7-8：QUORUM-SUFFICIENT STALL — 停 V5/V6 后 5/7（1_000_000 ≥ quorum {}）未在 {WINDOW_QUORUM:?} 内继续推进（base={base_heads:?} after={after_stop:?}）\n{}",
+        expected_quorum(),
+        forensic("T7-8-stall", &kids[..5].iter().collect::<Vec<_>>())
+    );
+    eprintln!("T7-8 5/7 PROGRESSED: after_stop={after_stop:?}");
+
+    // ── 阶段 D：恢复 —— 同身份/同目录重启 V5/V6（既有 `node_args`）──
+    let v5_args = node_args(
+        &fx.env,
+        N,
+        5,
+        &fx.ids,
+        &fx.ports,
+        &fx.genesis_path,
+        &fx.hash_hex,
+    );
+    let v6_args = node_args(
+        &fx.env,
+        N,
+        6,
+        &fx.ids,
+        &fx.ports,
+        &fx.genesis_path,
+        &fx.hash_hex,
+    );
+    assert!(
+        v5_args.iter().all(|a| a != "--init-validator-safety"),
+        "T7-8：重启 V5 **不得**携带 --init-validator-safety（既有 journal ⇒ 恢复路径）"
+    );
+    assert!(
+        v6_args.iter().all(|a| a != "--init-validator-safety"),
+        "T7-8：重启 V6 **不得**携带 --init-validator-safety（既有 journal ⇒ 恢复路径）"
+    );
+    let mut restarted: Vec<ChildGuard> = vec![
+        ChildGuard::spawn("V5r", &v5_args),
+        ChildGuard::spawn("V6r", &v6_args),
+    ];
+
+    // ── 阶段 E：重连（两个重启进程各自至少 established ≥ 1）──
+    let reconnected = poll_traced_live(
+        "T7-8-C",
+        &mut restarted,
+        |ks| {
+            ks.iter()
+                .all(|c| last_status(&c.stdout()).is_some_and(|s| s.established >= 1))
+        },
+        |ks| snapshot_line(&stats_of(ks)),
+        WINDOW_RESTART,
+    );
+    let restart_stats = stats_of(&restarted);
+    assert!(
+        reconnected.dead.is_empty(),
+        "T7-8：RECOVERY FAILED — 重启进程退出 {:?}\n{}",
+        reconnected.dead,
+        forensic("T7-8-recover-dead", &restarted.iter().collect::<Vec<_>>())
+    );
+    assert!(
+        reconnected.fatal.is_empty(),
+        "T7-8：RECOVERY FAILED — 重启进程出现 fatal {:?}\n{}",
+        reconnected.fatal,
+        forensic("T7-8-recover-fatal", &restarted.iter().collect::<Vec<_>>())
+    );
+    assert!(
+        reconnected.reached,
+        "T7-8：RECOVERY FAILED — V5/V6 未在 {WINDOW_RESTART:?} 内重连（{restart_stats:?}）\n{}",
+        forensic("T7-8-reconnect", &restarted.iter().collect::<Vec<_>>())
+    );
+    eprintln!("T7-8 RECOVERY RECONNECTED: {restart_stats:?}");
+
+    // ── 阶段 F：catch-up（与 `t7_5` 同口径：head ≥ 5 且不落后其他节点超过 1）──
+    let caught = poll_traced_live(
+        "T7-8-D",
+        &mut restarted,
+        |ks| {
+            let others_min = kids[..5]
+                .iter()
+                .filter_map(|c| last_status(&c.stdout()))
+                .map(|s| s.head)
+                .min()
+                .unwrap_or(u64::MAX);
+            ks.iter().all(|c| {
+                last_status(&c.stdout()).is_some_and(|s| s.head >= 5 && s.head + 1 >= others_min)
+            })
+        },
+        |ks| snapshot_line(&stats_of(ks)),
+        WINDOW_RESTART,
+    );
+    let final_restarted = stats_of(&restarted);
+    assert!(
+        caught.dead.is_empty(),
+        "T7-8：CATCH-UP FAILED — 重启进程退出 {:?}\n{}",
+        caught.dead,
+        forensic("T7-8-catchup-dead", &restarted.iter().collect::<Vec<_>>())
+    );
+    assert!(
+        caught.fatal.is_empty(),
+        "T7-8：CATCH-UP FAILED — 重启进程出现 fatal {:?}\n{}",
+        caught.fatal,
+        forensic("T7-8-catchup-fatal", &restarted.iter().collect::<Vec<_>>())
+    );
+    assert!(
+        caught.reached,
+        "T7-8：CATCH-UP FAILED — V5/V6 未在 {WINDOW_RESTART:?} 内追平（restarted={final_restarted:?}）\n{}",
+        forensic(
+            "T7-8-catchup",
+            &kids[..5].iter().chain(restarted.iter()).collect::<Vec<_>>()
+        )
+    );
+    eprintln!("T7-8 CATCH-UP SUCCESS: restarted={final_restarted:?}");
+
+    // ── 阶段 G：最终接受点 —— 存活 + fatal（不依赖前面任一步的结论）──
+    let mut dead_final: Vec<&'static str> = Vec::new();
+    for c in kids[..5].iter_mut() {
+        if !c.is_running() {
+            dead_final.push(c.label);
+        }
+    }
+    for c in restarted.iter_mut() {
+        if !c.is_running() {
+            dead_final.push(c.label);
+        }
+    }
+    assert!(
+        dead_final.is_empty(),
+        "T7-8：PROCESS_LIVENESS — 最终接受点有节点已退出 {:?}\n{}",
+        dead_final,
+        forensic(
+            "T7-8-dead-at-acceptance",
+            &kids[..5].iter().chain(restarted.iter()).collect::<Vec<_>>()
+        )
+    );
+    let fatal_final: Vec<(&'static str, String)> = kids[..5]
+        .iter()
+        .chain(restarted.iter())
+        .filter_map(|c| fatal_marker(&c.stdout(), &c.stderr()).map(|m| (c.label, m)))
+        .collect();
+    assert!(
+        fatal_final.is_empty(),
+        "T7-8：FATAL_MARKER — 最终接受点出现 fatal {:?}",
+        fatal_final
+    );
+    eprintln!(
+        "T7-8 PASS: before={before:?} after_stop={after_stop:?} restarted={final_restarted:?}"
+    );
+
+    let mut statuses: Vec<Option<ExitStatus>> =
+        kids[..5].iter_mut().map(ChildGuard::terminate).collect();
+    statuses.extend(restarted.iter_mut().map(ChildGuard::terminate));
+    eprintln!("T7-8 cleanup statuses={statuses:?}");
+}
+
+// ---------------------------------------------------------------------------
 // PHASE 6H-A30 OD-X8 — 观测解析器单元测试
 //
 // 边界：这里的合成行**只**用于解析器单元测试；正式摘要必须来自真实子进程输出。
 // ---------------------------------------------------------------------------
+/// 样本行中 `finalized_ref=` 的取值（32 字节互不相同 ⇒ 可检出截断 / 错位 / 字节序错误）。
+const ODX8_STATUS_SAMPLE_REF: &str =
+    "finalized_ref=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+
 const ODX8_STATUS_SAMPLE: &str = "yazimao-node: status steps=300 head_height=7 \
      finalized_height=7 consensus_height=7 round=0 configured_peers=6 established_peers=4 \
      sync_pending=0 block_inbound_skipped=0 pending_external_qc=0 qc_served=0 \
-     validator_enabled=true";
+     validator_enabled=true rc_certs=0 rc_authority=0 rc_rejected=0 rc_rej=0/0/0/0/0/0 \
+     abandon_bcast_nopeer=0 rc_reeval=0/0 timeout_split=3/0/0 guard_rej=0/0/0/0/0/0/0/0 \
+     wire_drops=0/0/0/0 round_timeouts=3 timer_elapsed=41144 timer_window=120000 \
+     round_step=Prevote proposal_present=true finalized_ref_present=true \
+     finalized_ref=0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20 \
+     inbound=1/2/3/4/5/6/7 inbound_drops=0/0/0/0 peer_state=[] peer_fail=[]";
 
 #[test]
 fn odx8_parser_accepts_zero_and_nonzero_refresh_counts() {
@@ -1659,4 +2491,362 @@ fn odx8_summary_counts_nodes_parsed_and_missing() {
     assert_eq!(observability_counts(&items), (7, 5, 2));
     // 空集 ⇒ (0,0,0)（不产生虚假成功摘要）。
     assert_eq!(observability_counts(&[]), (0, 0, 0));
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 6H-ONEPASS — 权威观测解析器与字段域的回归测试
+//
+// 目的：把「哪些字段是**节点自报**、哪些量在**什么单位域**」固定为可执行断言，
+// 防止本研究线历史上反复出现的两类错误：
+//   ① 把界面的**别名**当成语义（如把 durable QC-history tip 读成 consensus finality）；
+//   ② 把**单位域**搞错（把毫秒值当成 step tick 用）。
+// 边界：这些断言**只**检查解析与单位域，**不**触碰任何共识判据。
+// ---------------------------------------------------------------------------
+
+/// 真实的 `liveness` 行样本（字段顺序与 `bin/yazimao-node.rs` L1216 起的
+/// `liveness_line` 一致；用于确认解析器读的是**节点自报**值）。
+const ONEPASS_LIVENESS_SAMPLE: &str = "yazimao-node: liveness steps=2400 prop_calls=2400 \
+     prop_build_ok=1 prop_skip_not_elected=2068 prop_skip_height_desync=0 \
+     prop_skip_step_guard=331 prop_skip_conflict_target=0 prop_skip_fail=0 \
+     inbound_prop_ok=1 egress_prop_enqueued=1 egress_prop_no_peer=0 egress_prop_refreshed=0 \
+     round_adv_local=4 round_adv_height=0 round_adv_rc=7 elected_is_self=false \
+     prop_absent_steps=1113 proposal_admitted=1 proposal_pending=1 proposal_rejected=0 \
+     proposal_expired=0 net_frames_received=653 net_events_enqueued=653 net_sent=1062 \
+     net_dropped_invalid=0 net_dropped_overflow=0 net_unauthenticated_drops=0 \
+     el_handler_errors=0 el_events_dropped_overflow=0 recovery_runs=1 recovery_candidates=1 \
+     recovery_kept_missing_block=0 recovery_admitted=1 recovery_rejected=0";
+
+#[test]
+fn onepass_liveness_parser_reads_authoritative_advance_sources() {
+    // round 推进的**来源三分**必须逐项可读：本地 timeout / 高度前进 / RC。
+    let l = last_liveness(ONEPASS_LIVENESS_SAMPLE).expect("完整 liveness 行应可解析");
+    assert_eq!(l.steps, 2400);
+    assert_eq!(l.prop_calls, 2400);
+    assert_eq!(l.prop_build_ok, 1);
+    assert_eq!(l.prop_skip_not_elected, 2068);
+    assert_eq!(l.prop_skip_step_guard, 331);
+    assert_eq!(l.round_adv_local, 4);
+    assert_eq!(l.round_adv_height, 0);
+    assert_eq!(l.round_adv_rc, 7);
+    assert!(!l.elected_is_self);
+    assert_eq!(l.prop_absent_steps, 1113);
+    assert_eq!(l.proposal_admitted, 1);
+    assert_eq!(l.proposal_pending, 1);
+    assert_eq!(l.recovery_runs, 1);
+    assert_eq!(l.net_frames_received, 653);
+    assert_eq!(l.net_sent, 1062);
+}
+
+#[test]
+fn onepass_liveness_parser_never_invents_missing_fields() {
+    // 缺任一必需字段 ⇒ None（绝不以 0 冒充「未观测」）。
+    let without_rc = "yazimao-node: liveness steps=1 prop_calls=1 prop_build_ok=0";
+    assert!(last_liveness(without_rc).is_none());
+    // 缺 `round_adv_rc` 之外的字段也同样必须失败（抽样两个）。
+    let missing_local = ONEPASS_LIVENESS_SAMPLE.replace("round_adv_local=4 ", "");
+    assert!(last_liveness(&missing_local).is_none());
+    let missing_elected = ONEPASS_LIVENESS_SAMPLE.replace("elected_is_self=false ", "");
+    assert!(last_liveness(&missing_elected).is_none());
+    assert!(last_liveness("").is_none());
+    assert!(last_liveness("garbage").is_none());
+}
+
+#[test]
+fn onepass_liveness_parser_uses_last_line() {
+    let out = format!(
+        "{}\n{}\n",
+        ONEPASS_LIVENESS_SAMPLE,
+        ONEPASS_LIVENESS_SAMPLE.replace("round_adv_rc=7", "round_adv_rc=9")
+    );
+    assert_eq!(last_liveness(&out).map(|l| l.round_adv_rc), Some(9));
+}
+
+#[test]
+fn onepass_status_domains_are_pinned() {
+    // ① `finalized_height` → `qc_tip` 是**有意**映射（durable QC-history tip），非 consensus finality。
+    let s = last_status(ODX8_STATUS_SAMPLE).expect("完整 status 行应可解析");
+    assert_eq!(s.qc_tip, Some(7));
+    // ② 权威 timeout 事件计数必须来自节点自报字段。
+    assert_eq!(s.round_timeouts, 3);
+    // ③ `timer_window` 为**毫秒**域；`-`（未 arm）⇒ None（不得补 0）。
+    assert_eq!(s.timer_window, Some(120_000));
+    let unarmed = ODX8_STATUS_SAMPLE.replace("timer_window=120000", "timer_window=-");
+    assert_eq!(last_status(&unarmed).and_then(|s| s.timer_window), None);
+    assert!(last_status(&unarmed).is_some(), "未 arm 行仍应整体可解析");
+    let none_armed = ODX8_STATUS_SAMPLE.replace("timer_window=120000", "timer_window=none");
+    assert_eq!(last_status(&none_armed).and_then(|s| s.timer_window), None);
+    assert!(
+        last_status(&none_armed).is_some(),
+        "timer_window=none 仍应整体可解析"
+    );
+    // ④ 缺 `round_timeouts` ⇒ 解析失败（避免把「未观测」读成「0 次超时」）。
+    let no_timeouts = ODX8_STATUS_SAMPLE.replace("round_timeouts=3 ", "");
+    assert!(last_status(&no_timeouts).is_none());
+}
+
+/// **权威 finality 观测**：`finalized_ref_present` 的解析必须 fail-closed，且**不得**与
+/// `qc_tip`（durable QC-history tip 代理）混淆。
+///
+/// 回归目标（防止「观测失败 → 默认 false」这一假阴性路径）：
+/// - `true` / `false` 都是有效值；
+/// - **缺失**或**非法**值 ⇒ 整行不可解析（而不是默认 `false`）；
+/// - `qc_tip == None` **不**覆盖权威 finality 状态（两者语义独立）。
+#[test]
+fn onepass_finality_presence_is_authoritative_and_fail_closed() {
+    // ① 样本行：权威字段为 true。
+    let s = last_status(ODX8_STATUS_SAMPLE).expect("完整 status 行应可解析");
+    assert!(s.finalized_ref_present);
+
+    // ② `false` 是**有效值**，不得被当作「缺失」。
+    // P3：必须**同时**把引用置为 `none`，否则同一行内布尔与哈希自相矛盾（解析端 fail-closed）。
+    let absent = ODX8_STATUS_SAMPLE
+        .replace("finalized_ref_present=true", "finalized_ref_present=false")
+        .replace(ODX8_STATUS_SAMPLE_REF, "finalized_ref=none");
+    let s2 = last_status(&absent).expect("finalized_ref_present=false 仍应整体可解析");
+    assert!(!s2.finalized_ref_present);
+    assert_eq!(s2.finalized_ref, None, "显式 none 必须解析为 None");
+
+    // ③ 缺失 ⇒ 整行不可解析（绝不默认为 false）。
+    let missing = ODX8_STATUS_SAMPLE.replace("finalized_ref_present=true ", "");
+    assert!(
+        last_status(&missing).is_none(),
+        "缺失 finality 权威字段必须 fail-closed（不得默认为 false）"
+    );
+
+    // ④ 非法值（非 true/false）⇒ 整行不可解析（不得猜测）。
+    let bogus =
+        ODX8_STATUS_SAMPLE.replace("finalized_ref_present=true", "finalized_ref_present=yes");
+    assert!(
+        last_status(&bogus).is_none(),
+        "非法 finality 布尔值必须 fail-closed"
+    );
+
+    // ⑤ 与 qc_tip 语义分离：QC tip 缺失 **不** 意味着 finality 未成立。
+    let tip_none = ODX8_STATUS_SAMPLE.replace("finalized_height=7", "finalized_height=none");
+    let s3 = last_status(&tip_none).expect("qc tip 为 none 时整行仍应可解析");
+    assert_eq!(
+        s3.qc_tip, None,
+        "qc_tip 应反映 durable QC-history tip 的缺失"
+    );
+    assert!(
+        s3.finalized_ref_present,
+        "QC tip 缺失不得覆盖权威 finality 状态（两者语义独立）"
+    );
+}
+
+/// **P3-E3** — `finalized_ref` 解析端的完整裁决表（纯函数；无进程 / 无 I/O）。
+///
+/// 覆盖：合法 64 hex / 显式 none / 长度错误 / 非 hex / 空值 / 大小写 / 全零。
+/// 纪律：任何非法输入一律 `None`（**不**猜测、**不**截断补全）。
+#[test]
+fn p3_finalized_ref_token_accepts_exactly_valid_forms() {
+    // ① 显式 none。
+    assert_eq!(parse_finalized_ref_token("none"), Some(None));
+
+    // ② 合法 64 hex ⇒ 逐字节解出。
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(13).wrapping_add(1);
+    }
+    let hex = hex32_hex(&bytes);
+    assert_eq!(hex.len(), 64, "编码必为定长 64");
+    assert_eq!(parse_finalized_ref_token(&hex), Some(Some(bytes)));
+
+    // ③ 大小写不敏感（消费端宽容；生产端恒输出小写）。
+    assert_eq!(
+        parse_finalized_ref_token(&hex.to_uppercase()),
+        Some(Some(bytes))
+    );
+
+    // ④ 全零哈希是**合法值**（不得被误判为缺失）。
+    assert_eq!(
+        parse_finalized_ref_token(&"0".repeat(64)),
+        Some(Some([0u8; 32]))
+    );
+
+    // ⑤ 长度错误（63 / 65 / 32）一律拒绝。
+    assert_eq!(parse_finalized_ref_token(&hex[..63]), None);
+    assert_eq!(parse_finalized_ref_token(&format!("{hex}0")), None);
+    assert_eq!(parse_finalized_ref_token(&hex[..32]), None);
+
+    // ⑥ 非 hex 一律拒绝（含 `0x` 前缀 / 非 hex 字符 / 空串）。
+    assert_eq!(parse_finalized_ref_token(&format!("0x{}", &hex[2..])), None);
+    assert_eq!(
+        parse_finalized_ref_token(&format!("{}zz", &hex[..62])),
+        None
+    );
+    assert_eq!(parse_finalized_ref_token(""), None);
+
+    // ⑦ 与 `none` 相近但非法的值不得被接受（大小写 / 占位符）。
+    assert_eq!(parse_finalized_ref_token("None"), None);
+    assert_eq!(parse_finalized_ref_token("-"), None);
+}
+
+/// **P3-E3** — 整行提取：缺失 / 重复 / 冲突 / 矛盾一律 fail-closed（整行不可解析）。
+#[test]
+fn p3_finalized_ref_line_extraction_is_fail_closed_and_duplicate_safe() {
+    // 基线：样本行可解析，且哈希与样本 fixture 逐字节一致。
+    assert!(
+        ODX8_STATUS_SAMPLE.contains(ODX8_STATUS_SAMPLE_REF),
+        "样本行必须内联同一 fixture（防止常量漂移）"
+    );
+    let s = last_status(ODX8_STATUS_SAMPLE).expect("样本行应可解析");
+    let mut want = [0u8; 32];
+    for (i, b) in want.iter_mut().enumerate() {
+        *b = (i as u8) + 1;
+    }
+    assert_eq!(s.finalized_ref, Some(want), "必须逐字节解出 fixture");
+
+    // ① 缺失 ⇒ 整行不可解析（**绠不**默认为 none）。
+    assert!(
+        last_status(&ODX8_STATUS_SAMPLE.replace(ODX8_STATUS_SAMPLE_REF, "")).is_none(),
+        "缺失 finalized_ref 必须 fail-closed"
+    );
+    // ② 重复（同值）⇒ 整行不可解析（歧义即失败，不取首个 / 末个）。
+    let dup = format!("{ODX8_STATUS_SAMPLE} {ODX8_STATUS_SAMPLE_REF}");
+    assert!(last_status(&dup).is_none(), "重复 token 必须 fail-closed");
+    // ③ 冲突（异值）⇒ 整行不可解析。
+    let conflict = format!("{ODX8_STATUS_SAMPLE} finalized_ref={}", "f".repeat(64));
+    assert!(
+        last_status(&conflict).is_none(),
+        "冲突 token 必须 fail-closed"
+    );
+    // ④ 非法 hex ⇒ 整行不可解析。
+    let bogus = ODX8_STATUS_SAMPLE.replace(
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        &"g".repeat(64),
+    );
+    assert!(last_status(&bogus).is_none(), "非 hex 必须 fail-closed");
+    // ⑤ 布尔与哈希矛盾（true + none）⇒ 整行不可解析。
+    let contradiction = ODX8_STATUS_SAMPLE.replace(ODX8_STATUS_SAMPLE_REF, "finalized_ref=none");
+    assert!(
+        last_status(&contradiction).is_none(),
+        "布尔与哈希矛盾必须 fail-closed"
+    );
+    // ⑥ 既有字段不受影响（保持独立可读）。
+    assert!(s.finalized_ref_present);
+    assert_eq!(s.qc_tip, Some(7));
+    assert_eq!(s.steps, 300);
+    assert_eq!(s.consensus, 7);
+}
+
+#[test]
+fn p4_finality_identity_check_groups_by_head_and_still_detects_same_head_divergence() {
+    let a = [0xAAu8; 32];
+    let b = [0xBBu8; 32];
+
+    // ① 全同 head + 全同 ref ⇒ 单组，无分歧。
+    let heads = vec![Some(7u64); 5];
+    let refs = vec![Some(a); 5];
+    assert_eq!(finality_identity_check(&heads, &refs), (1, vec![]));
+
+    // ② **P4-BASE-01 的真实形状**：4 个节点 head=7 同一 ref，1 个节点 head=6 另一 ref。
+    //    跳 head ⇒ 不同 ref **不是**分歧（组内仍一致），因此不得判为 MISMATCH。
+    let heads = vec![Some(7u64), Some(7), Some(6), Some(7), Some(7)];
+    let refs = vec![Some(a), Some(a), Some(b), Some(a), Some(a)];
+    assert_eq!(
+        finality_identity_check(&heads, &refs),
+        (2, vec![]),
+        "跳 head 的不同引用不得被判为对象分歧"
+    );
+
+    // ③ **真分歧必须仍被检出**：同一 head 下两个不同 ref。
+    let heads = vec![Some(7u64), Some(7), Some(7)];
+    let refs = vec![Some(a), Some(b), Some(a)];
+    assert_eq!(
+        finality_identity_check(&heads, &refs),
+        (1, vec![7]),
+        "同一 head 下的不同引用必须被判为分歧"
+    );
+
+    // ④ 多个 head 同时出现真分歧 ⇒ 只报告出问题的 head。
+    let heads = vec![Some(7u64), Some(7), Some(6), Some(6)];
+    let refs = vec![Some(a), Some(a), Some(a), Some(b)];
+    assert_eq!(finality_identity_check(&heads, &refs), (2, vec![6]));
+
+    // ⑤ 缺失观测不参与比较（完整性由调用方断言），不得伪造一致。
+    let heads = vec![Some(7u64), None, Some(7)];
+    let refs = vec![Some(a), Some(b), Some(a)];
+    assert_eq!(finality_identity_check(&heads, &refs), (1, vec![]));
+    let heads = vec![Some(7u64), Some(7)];
+    let refs = vec![Some(a), None];
+    assert_eq!(finality_identity_check(&heads, &refs), (1, vec![]));
+    // 全部缺失 ⇒ 0 组（调用方必须据此判为观测不完整，而非「一致」）。
+    assert_eq!(
+        finality_identity_check(&[None, None], &[None, None]),
+        (0, vec![])
+    );
+}
+
+/// **P4-A2** — [`poll_traced_live`] 的回归：**存活检测不得被进展判据旁路**。
+///
+/// 这是关闭「节点达成目标后崩溃仍 PASS」假阴性通道的核心单元验证：
+/// 即便判据恒为 `true`，子进程已退出也必须返回 `reached=false` 且报出该标签。
+#[test]
+fn p4_poll_traced_live_detects_dead_child_and_never_reports_reached() {
+    let mut kids = vec![ChildGuard::spawn_command(
+        "sleeper",
+        sleeper_command(),
+        None,
+    )];
+
+    // ① 子进程存活 + 判据不成立 ⇒ 窗口耗尽返回，不得虚报 reached，也不得误报 dead。
+    let out = poll_traced_live(
+        "LIVEPOLL-alive",
+        &mut kids,
+        |_| false,
+        |_| String::new(),
+        Duration::from_millis(60),
+    );
+    assert!(!out.reached, "判据未成立时不得报 reached");
+    assert!(
+        out.dead.is_empty(),
+        "存活子进程不得被报为 dead: {:?}",
+        out.dead
+    );
+    assert!(out.fatal.is_empty(), "无 fatal 输出时不得报 fatal");
+
+    // ② 子进程退出后：**即使判据为真**，也必须 reached=false 且报出该标签。
+    let _ = kids[0].terminate();
+    let out2 = poll_traced_live(
+        "LIVEPOLL-dead",
+        &mut kids,
+        |_| true,
+        |_| String::new(),
+        Duration::from_secs(2),
+    );
+    assert!(!out2.reached, "子进程已退出时不得报 reached");
+    assert_eq!(out2.dead, vec!["sleeper"], "必须报出退出的子进程标签");
+}
+
+#[test]
+fn onepass_configured_window_is_millisecond_domain() {
+    // 生产默认（A3）为**毫秒**域：10_000 / 20_000 / 40_000 / 80_000 / cap 120_000。
+    assert_eq!(configured_window_ms(0), 10_000);
+    assert_eq!(configured_window_ms(1), 20_000);
+    assert_eq!(configured_window_ms(2), 40_000);
+    assert_eq!(configured_window_ms(3), 80_000);
+    assert_eq!(configured_window_ms(4), 120_000);
+    assert_eq!(configured_window_ms(64), 120_000);
+    assert_eq!(configured_window_ms(u64::MAX), 120_000);
+    // 与 A3 **之前**的 tick 域（1000 / 60_000）必须不同 —— 若此断言失败，说明域被改回 tick，
+    // 而 `implied_ms_rate` / 窗口预算的墙钟解释将随之失效。
+    assert_ne!(configured_window_ms(0), 1_000);
+    assert_ne!(configured_window_ms(64), 60_000);
+}
+
+#[test]
+fn onepass_auth_totals_require_parsed_status_and_liveness() {
+    // 只有 status 与 liveness **都**解析成功的节点才计入总量；缺失不得补 0。
+    let s = last_status(ODX8_STATUS_SAMPLE).expect("样本行应可解析");
+    let l = last_liveness(ONEPASS_LIVENESS_SAMPLE).expect("样本行应可解析");
+    let st = vec![Some(s), Some(s), None];
+    let lv = vec![Some(l), None, Some(l)];
+    // 仅 idx0 同时具备 ⇒ (nodes, parsed, timeout=3, local=4, height=0, rc=7, build_ok=1, absent=1113)
+    assert_eq!(auth_totals(&st, &lv), (3, 1, 3, 4, 0, 7, 1, 1113));
+    assert_eq!(auth_totals(&[], &[]), (0, 0, 0, 0, 0, 0, 0, 0));
+    // 两节点均解析 ⇒ 总量相加。
+    let st2 = vec![Some(s), Some(s)];
+    let lv2 = vec![Some(l), Some(l)];
+    assert_eq!(auth_totals(&st2, &lv2), (2, 2, 6, 8, 0, 14, 2, 2226));
 }
