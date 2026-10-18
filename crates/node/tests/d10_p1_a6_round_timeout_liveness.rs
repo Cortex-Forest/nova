@@ -35,7 +35,9 @@ use nova_consensus::vote::VoteType;
 use nova_crypto::address::{
     ADDRESS_VERSION, AddressType, NetworkId, YazimaoAddress, YazimaoAddressPayload,
 };
-use nova_crypto::domain::SigningMessageHash;
+use nova_crypto::domain::{
+    AlgorithmId, DomainId, SigningMessageHash, build_signed_bytes, hash_signing_message,
+};
 use nova_crypto::identity::{
     AccountInit, EconomicsParamsV1, GenesisV1, ProtocolParamsV1, ValidatorInit,
     canonical_genesis_bytes, compute_genesis_hash,
@@ -51,10 +53,17 @@ use nova_node::network_identity::SoftwareNetworkIdentity;
 use nova_node::runtime::{MonotonicClock, NodeRuntime, derive_validator_id};
 use nova_node::signer::{SigningCapability, SigningError};
 use nova_node::wiring::NodeConsensusCommand;
+use nova_runtime::{
+    BLOCK_VERSION, Block, BlockBody, BlockHeader, block_hash, compute_transaction_root,
+    encode_block_header,
+};
 
 const CHAIN_ID: u64 = 1001;
 const STAKE: u128 = 200_000;
-/// 注入用的「不在本节点 DAG 的 target」。
+/// 注入用的「既不在本节点 DAG、也不在 BlockStore」的 target。
+///
+/// 仅用于 **入站 QC 边界**（T5 Case B）：`verify_qc` 在触碰存储之前就以 `UnknownTarget` 拒绝。
+/// 需要「区块真实存在但不在 DAG」的夹具（T3/T4）改用 [`store_only_signed_block`]。
 const TARGET: [u8; 32] = [0xAA; 32];
 
 /// 测试用极小窗口（**A3：毫秒**）：round 0 ⇒ 2 ms，round 1 ⇒ 4 ms（backoff ×2），round 2+ ⇒ cap 4 ms。
@@ -135,6 +144,80 @@ impl KeyProvider for SeedKeyProvider {
 
 fn pubkey_from_seed(seed: [u8; 32]) -> [u8; 32] {
     SigningKey::from_seed(seed).verifying_key().to_bytes()
+}
+
+/// 构造一个**真实 Ed25519 签名**的「仅落盘、不登记 DAG」区块（A6 夹具修复核心）。
+///
+/// # 为什么需要它
+/// 旧 T3/T4 夹具注入「指向 BlockStore 中**不存在**的 block」的 `ProposalRef` —— 该输入不满足
+/// 生产前提：`guard_inbound_proposal` 的 **Guard A1**（`store.contains`）判 `false` ⇒ 入 U1
+/// pending ⇒ `process_command` **不被调用** ⇒ 提案永不安装 ⇒ 目标分支不可达（历史 2 failed 成因）。
+///
+/// # 为什么直接用 `build_proposal()` 不行
+/// `proposer::build_proposal` 返回的 `Block` **未附加** `proposer_signature`（生产路径由
+/// `ValidatorActor::sign_block` → `attach_proposer_signature` 在 B2-B 安全闸之后追加，该闸需要
+/// actor 私有的 `BlockSafetyJournal`）⇒ `put_verified` 的 `verify_block_signature` 必返
+/// `CorruptedState`（这正是上一轮的失败点，属安全属性正常生效）。
+///
+/// # 本实现为何**不是**绕过
+/// 签名域与生产逐字节一致：`build_signed_bytes(Ed25519, DomainId::Block, chain_id, canonical_header)`
+/// ⇒ `hash_signing_message` ⇒ `sign_message_hash`（= `crates/storage/src/block_store.rs` 测试用
+/// 的 `sign_block`、`d10_p1_a22_recovery_state_guard.rs` 的 `signed_block_a` 同款）。
+/// 落盘仍走生产写侧 `BlockStore::put_verified`（**先验签、后写盘**，零持久化失败路径），
+/// 入站仍依次经过 Guard A1 → Guard A2 → Guard C 的**真实**校验。
+/// 唯一「刻意」之处：**不**调用 `register_block` ⇒ `dag.contains(hash) == false`
+/// ⇒ 精确复现 P1-A.5「QC target ∉ DAG」而被冻结 transition 容忍的场景。
+fn store_only_signed_block(
+    chain_id: u64,
+    round: u64,
+    parent_hash: [u8; 32],
+    validator_set_hash: [u8; 32],
+    state_root: [u8; 32],
+    proposer_seed: [u8; 32],
+) -> Block {
+    let body = BlockBody { txs: Vec::new() };
+    let header = BlockHeader {
+        version: BLOCK_VERSION,
+        chain_id,
+        height: 1, // Guard A2：`header.height - 1 == round.height`（本夹具恒为高度 0）
+        round,
+        parent_hash,
+        finality_reference: None,
+        transaction_root: compute_transaction_root(&body),
+        state_root,
+        validator_set_hash,
+        timestamp: 0,
+    };
+    let payload = encode_block_header(&header);
+    let signed = build_signed_bytes(AlgorithmId::Ed25519, DomainId::Block, chain_id, &payload)
+        .expect("签名域编码");
+    let message = hash_signing_message(&signed);
+    let sk = SigningKey::from_seed(proposer_seed);
+    Block {
+        header,
+        body,
+        proposer_signature: sign_message_hash(&sk, &message).to_bytes(),
+    }
+}
+
+/// 把 `store_only_signed_block` 产物经**生产写侧** `put_verified` 落盘，返回其 `block_hash`。
+///
+/// `proposer` 标签 = 真实签名者身份（storage 不授权该标签，授权来源是 `expected_vk` 的验签）。
+fn persist_store_only(
+    rt: &NodeRuntime,
+    block: &Block,
+    proposer_id: ValidatorId,
+    proposer_seed: [u8; 32],
+) -> [u8; 32] {
+    let hash = block_hash(block).expect("block hash");
+    let vk = SigningKey::from_seed(proposer_seed).verifying_key();
+    rt.block_production()
+        .expect("validator adapter")
+        .block_store()
+        .expect("block store")
+        .put_verified(block, proposer_id.as_bytes(), &vk, CHAIN_ID, 1)
+        .expect("put_verified（真实签名验证先于落盘）");
+    hash
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +390,11 @@ struct Fixture {
     local_seed: [u8; 32],
     local_id: ValidatorId,
     genesis_hash: [u8; 32],
+    /// round-1 当选者的确定性 seed（`local_proposer_at_round1 == false` 时**必不为**本地）。
+    ///
+    /// 供 T4 构造「Guard C 可通过、但 `ProposalRef.proposer` 主张旧轮授权」的真实签名区块：
+    /// Guard C 按**当前轮**（round 1）解析期望 proposer ⇒ 区块必须由 round-1 当选者签名。
+    round1_seed: [u8; 32],
 }
 
 /// 固定 seed 扫描（**无 RNG 依赖**）：3 验证者，本地（权重 4/6 = 2/3 ⇒ 单票即达 quorum）+ 对端两个
@@ -346,11 +434,25 @@ fn absent_proposer_fixture(tag: &str, local_proposer_at_round1: bool) -> Fixture
             proposer1 != local_id && proposer1 != proposer0
         };
         if round1_ok {
+            // 取回 round-1 当选者的 seed（本地 / other1 / other2 三者之一）。
+            let round1_seed = if proposer1 == local_id {
+                LOCAL_SEED
+            } else if proposer1 == derive_validator_id(&other1_pk) {
+                [byte; 32]
+            } else {
+                assert_eq!(
+                    proposer1,
+                    derive_validator_id(&other2_pk),
+                    "round-1 当选者必为本地 / other1 / other2 之一"
+                );
+                [!byte; 32]
+            };
             return Fixture {
                 env: Env::new(&genesis, tag),
                 local_seed: LOCAL_SEED,
                 local_id,
                 genesis_hash,
+                round1_seed,
             };
         }
     }
@@ -550,10 +652,35 @@ fn p1a6_finalized_without_finality_still_times_out() {
         "单验证者 ⇒ 本地为 round-0 当选者"
     );
 
-    // 注入「proposal 指向不存在的 block」⇒ 本地 prevote/precommit quorum，但派生 QC target ∉ DAG
-    // （P1-A.5 场景）⇒ 冻结 transition 置 Finalized 而 **finality 不推进**。
+    // 2026-10-18 A6 夹具修复（R3）—— 旧夹具注入「指向 BlockStore 中不存在 block」的 proposal，
+    // 不满足生产前提（Guard A1 判 false ⇒ 入 U1 pending ⇒ 提案不安装 ⇒ step 停在 Propose）。
+    // 现改为：落盘一个**真实签名**的区块（生产写侧 `put_verified`，验签先于落盘），但**刻意不**
+    // 登记 DAG ⇒ 精确复现 P1-A.5「QC target ∉ DAG」⇒ 本地 prevote/precommit quorum、
+    // 冻结 transition 置 Finalized 而 **finality 不推进**。
+    let adapter = rt.block_production().expect("validator adapter");
+    let store_only = store_only_signed_block(
+        CHAIN_ID,
+        0,
+        env.genesis_hash,
+        env.genesis_hash,
+        *adapter.store().state_root().as_bytes(),
+        seed,
+    );
+    let target = persist_store_only(&rt, &store_only, local_id, seed);
+    assert!(
+        adapter
+            .block_store()
+            .expect("block store")
+            .contains(&target)
+            .expect("contains"),
+        "前提：区块已本地可用（Guard A1）"
+    );
+    assert!(
+        !rt.consensus().dag().contains(&target),
+        "前提：刻意不登记 DAG ⇒ target ∉ DAG（P1-A.5）"
+    );
     rt.process_consensus_command(NodeConsensusCommand::Proposal(ProposalRef {
-        block_hash: TARGET,
+        block_hash: target,
         proposer: local_id,
     }))
     .expect("proposal 结构合法 ⇒ 应用");
@@ -641,6 +768,8 @@ fn repeat_proposer_fixture(tag: &str) -> Fixture {
             local_seed: LOCAL_SEED,
             local_id,
             genesis_hash,
+            // 本夹具要求 round-1 当选者 = 本地 ⇒ round-1 seed 即本地 seed。
+            round1_seed: LOCAL_SEED,
         };
     }
     panic!("未能在 255 个确定性 seed 内找到「同高度连续两轮本地当选」fixture");
@@ -755,6 +884,35 @@ fn p1a6_stale_old_round_proposal_is_not_voted() {
 
     // 注入**旧轮** proposal（proposer = round-0 当选者）。诚实记录：`ProposalRef` 无 (height, round)
     // 字段（ADR-0041 冻结编码）⇒ transition 只按 `step == Propose` 判定，无法按轮拒收。
+    //
+    // 2026-10-18 A6 夹具修复（R3）：区块必须**真实存在**，否则 Guard A1 置 `Pended`（提案不安装）
+    // ⇒ 无法观测「已安装但未被投票」。因此落盘一个真实签名的 round-1 区块：
+    //   · 签名者 = round-1 当选者 ⇒ Guard C 的 `validate_block_signature`（期望 key 取自
+    //     `(height-1=0, round_now=1)`）可通过；
+    //   · `ProposalRef.proposer` 仍声明 **round-0** 当选者（= 陈旧轮次的授权主张）
+    //   ⇒ 精确命中【proposer-authority gate 拒绝驱动、未产生任何本地投票】的目标分支。
+    let adapter = rt.block_production().expect("validator adapter");
+    let stale_block = store_only_signed_block(
+        CHAIN_ID,
+        1,
+        fixture.genesis_hash,
+        fixture.genesis_hash,
+        *adapter.store().state_root().as_bytes(),
+        fixture.round1_seed,
+    );
+    let proposer1 = select_proposer(
+        CHAIN_ID,
+        0,
+        1,
+        &fixture.genesis_hash,
+        rt.consensus().validator_set(),
+    )
+    .expect("proposer");
+    let stale_hash = persist_store_only(&rt, &stale_block, proposer1, fixture.round1_seed);
+    assert!(
+        !rt.consensus().dag().contains(&stale_hash),
+        "前提：区块不在 DAG（仅本地可用）"
+    );
     let old_proposer = select_proposer(
         CHAIN_ID,
         0,
@@ -763,8 +921,12 @@ fn p1a6_stale_old_round_proposal_is_not_voted() {
         rt.consensus().validator_set(),
     )
     .expect("proposer");
+    assert_ne!(
+        old_proposer, proposer1,
+        "前提：陈旧轮次当选者 ≠ 当前轮当选者（否则权限门会放行）"
+    );
     let stale = ProposalRef {
-        block_hash: TARGET,
+        block_hash: stale_hash,
         proposer: old_proposer,
     };
     rt.process_consensus_command(NodeConsensusCommand::Proposal(stale))
@@ -780,7 +942,7 @@ fn p1a6_stale_old_round_proposal_is_not_voted() {
         "proposer-authority gate 拒绝驱动 ⇒ 未产生任何本地投票"
     );
     assert_eq!(
-        state.round.prevotes.weight_of(&TARGET),
+        state.round.prevotes.weight_of(&stale_hash),
         0,
         "旧轮 proposal 不得获得任何本地票权重"
     );
@@ -794,7 +956,7 @@ fn p1a6_stale_old_round_proposal_is_not_voted() {
             .round
             .proposal
             .as_ref()
-            .is_some_and(|p| p.block_hash == TARGET),
+            .is_some_and(|p| p.block_hash == stale_hash),
         "已知协议级观察：陈旧 proposal 可被安装（编码无 round 字段）—— 但不得被投票"
     );
 
