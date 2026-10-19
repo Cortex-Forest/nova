@@ -471,6 +471,12 @@ struct Stats {
     round_timeouts: u64,
     /// 当前已 ARM 计时器的窗口（**毫秒**）；`None` = 未 arm / 已被 finality disarm。
     timer_window: Option<u64>,
+    /// **R15 / F-7** —— QC 生命周期计数（只读）。
+    ///
+    /// `None` = 本行**无法采集**（至少一个字段缺失或不可解析），**不是** 0。
+    /// R14 发现 A30 harness 完全未消费这 6 个计数，导致"QC 未到达"与"到达但被拒"
+    /// 在同一份证据里不可分辨；本字段即为该缺口的修复。
+    qc_lifecycle: Option<QcLifecycle>,
 }
 
 /// PHASE 6H-ONEPASS — **liveness 行**（`OUTPUT_MODE=B`）的节点自报权威计数。
@@ -585,6 +591,14 @@ fn auth_totals(
 /// 该关系是区分 **H4（RC 传播/应用）** 与 **H1（timeout 预算）** 的关键：若推进几乎全部
 /// 来自 `round_adv_rc`，则停滞与本地 timeout 预算无关；若 `round_adv_local` 远大于实际
 /// round 变化，则存在「timeout 触发但不推进」的路径（`Ignored`/`Rejected`）。
+/// R15 / F-7 —— 摘要中的 QC 生命周期片段。`MISSING` = 本行不可采集（**不是** 0）。
+fn qc_lifecycle_segment(st: Option<Stats>) -> String {
+    match st.and_then(|s| s.qc_lifecycle) {
+        Some(q) => format!("qc[{}]", q.render()),
+        None => "qc[MISSING]".to_string(),
+    }
+}
+
 fn authoritative_summary(kids: &[ChildGuard]) -> String {
     let outs: Vec<String> = kids.iter().map(|c| c.stdout()).collect();
     let stats: Vec<Option<Stats>> = outs.iter().map(|o| last_status(o)).collect();
@@ -601,7 +615,7 @@ fn authoritative_summary(kids: &[ChildGuard]) -> String {
              round_adv_height={} round_adv_rc={} elected_is_self={} prop_build_ok={} \
              prop_skip_not_elected={} prop_skip_step_guard={} prop_skip_fail={} \
              prop_absent_steps={} proposal(admitted={} pending={} rejected={} expired={}) \
-             recovery_runs={} net(sent={} recv={})]",
+             recovery_runs={} net(sent={} recv={}) {}]",
             c.label,
             st.map_or("MISSING".to_string(), |s| s.round_timeouts.to_string()),
             st.and_then(|s| s.timer_window),
@@ -626,6 +640,7 @@ fn authoritative_summary(kids: &[ChildGuard]) -> String {
             g(|l| l.recovery_runs.to_string()),
             g(|l| l.net_sent.to_string()),
             g(|l| l.net_frames_received.to_string()),
+            qc_lifecycle_segment(st),
         ));
     }
     let (nodes, parsed, to, al, ah, ar, bok, abs) = auth_totals(&stats, &live);
@@ -761,6 +776,7 @@ fn last_status(out: &str) -> Option<Stats> {
         established: num("established_peers=")? as usize,
         round_timeouts: num("round_timeouts=")?,
         timer_window,
+        qc_lifecycle: qc_lifecycle_of(line),
     })
 }
 
@@ -2849,4 +2865,222 @@ fn onepass_auth_totals_require_parsed_status_and_liveness() {
     let st2 = vec![Some(s), Some(s)];
     let lv2 = vec![Some(l), Some(l)];
     assert_eq!(auth_totals(&st2, &lv2), (2, 2, 6, 8, 0, 14, 2, 2226));
+}
+
+
+// =====================================================================================
+// R15 / F-7 —— QC 生命周期观测（测试侧，只读）
+// =====================================================================================
+
+/// 一个 status 行的 6 个 QC 生命周期计数（全部为 `NodeRuntime` 的既有只读计数器，
+/// 由 `bin/yazimao-node.rs` 的 `status_line` 原样打印）。
+///
+/// | 字段 | 生产语义 |
+/// |---|---|
+/// | `qc_history_written` | per-height QC history **成功写入**次数（单调增） |
+/// | `qc_history_write_failed` | 写入**失败**次数（不设锚 => 下一 step 重试） |
+/// | `qc_serve_skipped` | 向对端**附发** QC 时被跳过的次数（超尺寸/签名失败/artifact 损坏） |
+/// | `ext_qc_adopted` | 外部 finality **成功采纳**次数 |
+/// | `ext_qc_rejected` | 外部 QC **未被采纳**次数（前置失败/幂等/过时/冲突/frozen） |
+/// | `inbound_qc_deferred` | 入站 QC 因 `target ∉ DAG` 被**有界暂存**次数 |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct QcLifecycle {
+    qc_history_written: u64,
+    qc_history_write_failed: u64,
+    qc_serve_skipped: u64,
+    ext_qc_adopted: u64,
+    ext_qc_rejected: u64,
+    inbound_qc_deferred: u64,
+}
+
+impl QcLifecycle {
+    const FIELDS: [&'static str; 6] = [
+        "qc_history_written",
+        "qc_history_write_failed",
+        "qc_serve_skipped",
+        "ext_qc_adopted",
+        "ext_qc_rejected",
+        "inbound_qc_deferred",
+    ];
+
+    /// 逐字段 `saturating_sub`。计数器本应单调；回退被压到 0 并由 [`Self::regressed`] 单独报告，
+    /// 因此不会把"计数器回退"静默当成"没有进展"。
+    fn delta(self, prev: Self) -> Self {
+        Self {
+            qc_history_written: self.qc_history_written.saturating_sub(prev.qc_history_written),
+            qc_history_write_failed: self
+                .qc_history_write_failed
+                .saturating_sub(prev.qc_history_write_failed),
+            qc_serve_skipped: self.qc_serve_skipped.saturating_sub(prev.qc_serve_skipped),
+            ext_qc_adopted: self.ext_qc_adopted.saturating_sub(prev.ext_qc_adopted),
+            ext_qc_rejected: self.ext_qc_rejected.saturating_sub(prev.ext_qc_rejected),
+            inbound_qc_deferred: self
+                .inbound_qc_deferred
+                .saturating_sub(prev.inbound_qc_deferred),
+        }
+    }
+
+    /// 任一字段出现回退 => `true`（计数应为累计值；回退说明观测/读取异常，必须显式暴露）。
+    fn regressed(self, prev: Self) -> bool {
+        self.qc_history_written < prev.qc_history_written
+            || self.qc_history_write_failed < prev.qc_history_write_failed
+            || self.qc_serve_skipped < prev.qc_serve_skipped
+            || self.ext_qc_adopted < prev.ext_qc_adopted
+            || self.ext_qc_rejected < prev.ext_qc_rejected
+            || self.inbound_qc_deferred < prev.inbound_qc_deferred
+    }
+
+    fn render(self) -> String {
+        format!(
+            "written={} failed={} serve_skipped={} adopted={} rejected={} deferred={}",
+            self.qc_history_written,
+            self.qc_history_write_failed,
+            self.qc_serve_skipped,
+            self.ext_qc_adopted,
+            self.ext_qc_rejected,
+            self.inbound_qc_deferred
+        )
+    }
+}
+
+/// 从一行 status 文本采集 6 个 QC 生命周期计数。
+///
+/// **全或无**：6 个字段必须全部出现且可解析，否则返回 `None`。
+/// `None` 的语义是"本行不可采集"，与真实值 `0` **严格区分**（绝不静默补 0）。
+fn qc_lifecycle_of(line: &str) -> Option<QcLifecycle> {
+    let num = |k: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix(k))?
+            .parse()
+            .ok()
+    };
+    Some(QcLifecycle {
+        qc_history_written: num("qc_history_written=")?,
+        qc_history_write_failed: num("qc_history_write_failed=")?,
+        qc_serve_skipped: num("qc_serve_skipped=")?,
+        ext_qc_adopted: num("ext_qc_adopted=")?,
+        ext_qc_rejected: num("ext_qc_rejected=")?,
+        inbound_qc_deferred: num("inbound_qc_deferred=")?,
+    })
+}
+
+/// **停滞窗口**报告：给定两次采样的 `Stats`，逐节点输出 QC 生命周期计数的
+/// **原始值 + 差值**，并对不可采集的节点显式标 `MISSING` / `UNAVAILABLE`。
+fn qc_stall_report(label: &str, prev: &[Option<Stats>], cur: &[Option<Stats>]) -> String {
+    let mut lines = vec![format!("{label}: qc-lifecycle window (prev -> cur, delta)")];
+    for i in 0..cur.len() {
+        let c = cur.get(i).copied().flatten().and_then(|s| s.qc_lifecycle);
+        let p = prev.get(i).copied().flatten().and_then(|s| s.qc_lifecycle);
+        let seg = match (p, c) {
+            (Some(p), Some(c)) => {
+                let d = c.delta(p);
+                let reg = if c.regressed(p) { " REGRESSED" } else { "" };
+                format!(
+                    "prev[{}] -> cur[{}] delta[{}]{}",
+                    p.render(),
+                    c.render(),
+                    d.render(),
+                    reg
+                )
+            }
+            (None, Some(c)) => format!("prev[MISSING] -> cur[{}] delta[UNAVAILABLE]", c.render()),
+            (Some(_), None) => "prev[..] -> cur[MISSING] delta[UNAVAILABLE]".to_string(),
+            (None, None) => "prev[MISSING] -> cur[MISSING] delta[UNAVAILABLE]".to_string(),
+        };
+        lines.push(format!("  node[{i}] {seg}"));
+    }
+    lines.join("\n")
+}
+
+// ---------- R15 / F-7 回归（进程内，纯函数）----------
+
+/// 6 个字段缺一不可；缺失一律 `None`，**不得**当作 0。
+#[test]
+fn r15_qc_lifecycle_requires_all_six_fields() {
+    let full = "status steps=1 qc_history_written=3 qc_history_write_failed=0 \
+                qc_serve_skipped=0 ext_qc_adopted=2 ext_qc_rejected=1 inbound_qc_deferred=4";
+    let parsed = qc_lifecycle_of(full).expect("六个字段齐全时必然可解析");
+    assert_eq!(parsed.qc_history_written, 3);
+    assert_eq!(parsed.ext_qc_adopted, 2);
+    assert_eq!(parsed.inbound_qc_deferred, 4);
+
+    for missing in QcLifecycle::FIELDS {
+        let without = full
+            .split_whitespace()
+            .filter(|t| !t.starts_with(&format!("{missing}=")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            qc_lifecycle_of(&without).is_none(),
+            "缺少 {missing}= 时必须返回 None（不得补 0）: {without}"
+        );
+    }
+    let bad = full.replace("qc_history_written=3", "qc_history_written=NotANumber");
+    assert!(qc_lifecycle_of(&bad).is_none(), "非数值不得被静默接受");
+
+    let zeros = "qc_history_written=0 qc_history_write_failed=0 qc_serve_skipped=0 \
+                  ext_qc_adopted=0 ext_qc_rejected=0 inbound_qc_deferred=0";
+    let z = qc_lifecycle_of(zeros).expect("全 0 是可采集的真实值");
+    assert_eq!(z, QcLifecycle::default());
+}
+
+/// 差值计算：单调增时为实际增量；回退被压到 0 并由 `regressed` 单独报告。
+#[test]
+fn r15_qc_lifecycle_delta_is_saturating_and_flags_regression() {
+    let prev = QcLifecycle {
+        qc_history_written: 10,
+        qc_history_write_failed: 1,
+        qc_serve_skipped: 2,
+        ext_qc_adopted: 3,
+        ext_qc_rejected: 4,
+        inbound_qc_deferred: 5,
+    };
+    let cur = QcLifecycle {
+        qc_history_written: 14,
+        qc_history_write_failed: 1,
+        qc_serve_skipped: 2,
+        ext_qc_adopted: 6,
+        ext_qc_rejected: 4,
+        inbound_qc_deferred: 9,
+    };
+    let d = cur.delta(prev);
+    assert_eq!(d.qc_history_written, 4);
+    assert_eq!(d.qc_history_write_failed, 0);
+    assert_eq!(d.ext_qc_adopted, 3);
+    assert_eq!(d.inbound_qc_deferred, 4);
+    assert!(!cur.regressed(prev), "单调增时不得报告回退");
+    assert!(prev.regressed(cur), "回退必须被识别");
+    assert_eq!(prev.delta(cur).qc_history_written, 0, "回退差值饱和为 0");
+}
+
+/// 停滞窗口报告：可采集节点给出 delta，不可采集节点显式 `MISSING`/`UNAVAILABLE`。
+#[test]
+fn r15_qc_stall_report_marks_missing_and_computes_delta() {
+    let mk = |w: u64| Stats {
+        steps: 0,
+        head: 0,
+        qc_tip: None,
+        finalized_ref_present: false,
+        finalized_ref: None,
+        consensus: 0,
+        round: 0,
+        qc_served: 0,
+        established: 0,
+        round_timeouts: 0,
+        timer_window: None,
+        qc_lifecycle: Some(QcLifecycle {
+            qc_history_written: w,
+            ..QcLifecycle::default()
+        }),
+    };
+    let prev = vec![Some(mk(5)), None];
+    let cur = vec![Some(mk(9)), None];
+    let report = qc_stall_report("T-TEST", &prev, &cur);
+    assert!(report.contains("T-TEST: qc-lifecycle window"), "{report}");
+    assert!(report.contains("node[0]") && report.contains("delta["), "{report}");
+    assert!(report.contains("written=4"), "增量必须出现: {report}");
+    assert!(
+        report.contains("node[1] prev[MISSING] -> cur[MISSING] delta[UNAVAILABLE]"),
+        "不可采集必须显式标记: {report}"
+    );
 }
