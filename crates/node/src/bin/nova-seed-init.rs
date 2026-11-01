@@ -32,7 +32,7 @@ enum SeedState {
     Reused,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SeedInitError {
     Usage,
     InvalidExistingSeed,
