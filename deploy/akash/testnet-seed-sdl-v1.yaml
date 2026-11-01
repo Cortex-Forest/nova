@@ -1,0 +1,79 @@
+# Minimal one-service YAZIMAO Testnet Seed deployment.
+#
+# This is intentionally NOT a complete Testnet:
+# - one Seed service only;
+# - no Validator;
+# - no consensus/finality claim;
+# - no user funds or network identity secret are embedded.
+#
+# The image creates its network identity seed on the persistent volume at
+# first boot and reuses it on restart.
+
+---
+version: "2.0"
+
+services:
+  seed:
+    image: ghcr.io/cortex-forest/nova@sha256:f440b26b59eeb4bf59b6eea1909d8df8a91c7614fd73e6cc0fd6d43ebf610709
+    command:
+      - "/usr/local/bin/nova-seed-init"
+      - "--seed-file"
+      - "/storage/network-seed.hex"
+      - "--"
+      - "/usr/local/bin/yazimao-node"
+      - "--genesis"
+      - "/read-only/genesis/genesis.bin"
+      - "--genesis-hash"
+      - "7d1ec6b9fccceb042e5948a9ca90d984836d57189ffdfd3c00850a82bca54e3d"
+      - "--chain-id"
+      - "2002"
+      - "--network-id"
+      - "testnet"
+      - "--storage-dir"
+      - "/storage"
+      - "--network-seed-file"
+      - "/storage/network-seed.hex"
+      - "--listen"
+      - "0.0.0.0:17770"
+      - "--idle-ms"
+      - "1"
+      - "--run-steps"
+      - "0"
+    params:
+      storage:
+        data:
+          mount: /storage
+    expose:
+      - port: 17770
+        as: 17770
+        proto: tcp
+        to:
+          - global: true
+
+profiles:
+  compute:
+    seed:
+      resources:
+        cpu:
+          units: 2
+        memory:
+          size: 4Gi
+        storage:
+          - size: 1Gi
+          - name: data
+            size: 60Gi
+            attributes:
+              persistent: true
+              class: beta1
+  placement:
+    akash:
+      pricing:
+        seed:
+          denom: uact
+          amount: 10000
+
+deployment:
+  seed:
+    akash:
+      profile: seed
+      count: 1

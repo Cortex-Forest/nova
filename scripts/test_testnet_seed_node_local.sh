@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+image="${1:-nova-testnet-seed:local}"
 state="$(mktemp -d /tmp/nova-seed-node.XXXXXX)"
 chmod 0777 "${state}"
 log="${state}/node.log"
 
 docker run --rm --network none \
   --mount "type=bind,src=${state},dst=/storage" \
-  nova-testnet-seed:local \
+  "${image}" \
   --seed-file /storage/network-seed.hex \
   -- /usr/local/bin/yazimao-node \
   --genesis /read-only/genesis/genesis.bin \

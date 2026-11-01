@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+image="${1:-nova-testnet-seed:local}"
 state="$(mktemp -d /tmp/nova-seed-state.XXXXXX)"
 chmod 0777 "${state}"
 
 first="$(docker run --rm --network none \
   --mount "type=bind,src=${state},dst=/storage" \
-  nova-testnet-seed:local \
+  "${image}" \
   --seed-file /storage/network-seed.hex \
   -- /usr/local/bin/yazimao-node --help 2>&1 |
   sed -n 's/^NOVA_SEED_INIT state=\([^ ]*\).*/\1/p')"
 
 second="$(docker run --rm --network none \
   --mount "type=bind,src=${state},dst=/storage" \
-  nova-testnet-seed:local \
+  "${image}" \
   --seed-file /storage/network-seed.hex \
   -- /usr/local/bin/yazimao-node --help 2>&1 |
   sed -n 's/^NOVA_SEED_INIT state=\([^ ]*\).*/\1/p')"
 
 seed_bytes="$(wc -c < "${state}/network-seed.hex")"
 carrier="nova-seed-inspect-$(date +%s)"
-docker create --name "${carrier}" nova-testnet-seed:local >/dev/null
+docker create --name "${carrier}" "${image}" >/dev/null
 trap 'docker rm "${carrier}" >/dev/null 2>&1 || true' EXIT
 docker cp "${carrier}:/read-only/genesis/genesis.bin" "${state}/genesis.bin"
 genesis="$(sha256sum "${state}/genesis.bin" | awk '{print $1}')"
