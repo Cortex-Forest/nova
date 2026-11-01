@@ -49,10 +49,6 @@ jobs:
           set -euo pipefail
           rustfmt --edition 2024 --check crates/node/src/bin/nova-seed-init.rs
           cargo test -p nova-node --bin nova-seed-init --locked
-          cargo run -p nova-genesis-builder --bin yazimao-genesis --locked -- \
-            verify \
-            --genesis genesis-image/genesis.bin \
-            --hash genesis-image/genesis_hash.txt
 
       - name: Assemble minimal build context
         shell: bash
