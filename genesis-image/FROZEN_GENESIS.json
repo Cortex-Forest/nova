@@ -1,0 +1,16 @@
+{
+  "status": "FORMAL_GENESIS_FROZEN",
+  "profile": "testnet",
+  "chain_id": 2002,
+  "network_id": 2,
+  "genesis_timestamp": 1794744000,
+  "account_model": "DEC_TREASURY_B_UNIFIED_TREASURY",
+  "validator_count": 7,
+  "account_count": 8,
+  "genesis_sha256": "7d1ec6b9fccceb042e5948a9ca90d984836d57189ffdfd3c00850a82bca54e3d",
+  "input_sha256": "633cfdbff70d0a3fa062e73092f33f0d4192ffc275397d78a2554a35ea9100ce",
+  "freeze_record_sha256": "3619299f57fdf45902f25db063d255dffcff013bd2a85737a11a80843aa390ee",
+  "owner_grant_id": "GENESIS-FREEZE-20261101T172917Z",
+  "owner_public_key_hex": "6f843137e83517202dfaad8c60515415d83638c56277f12376a6dcb70723cea1",
+  "source_freeze_directory": "nova-formal-genesis-20261101T175534Z"
+}

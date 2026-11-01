@@ -1,0 +1,145 @@
+{
+  "account_count": 8,
+  "allocation": {
+    "account_liquid_sum": "1000000000",
+    "min_validator_stake": "5000000",
+    "non_validator_liquid_sum": "900000000",
+    "total_supply": "1000000000",
+    "validator_bonded_sum": "70000000",
+    "validator_liquid_sum": "100000000"
+  },
+  "artifacts": {
+    "genesis_bin": "genesis.bin",
+    "genesis_hash": "genesis_hash.txt",
+    "summary": "genesis_summary.json"
+  },
+  "canonical_len": 1110,
+  "chain_id": 2002,
+  "decisions": {
+    "default_values": "NONE",
+    "key_model": "A1-1_CONDITIONAL_BINDING",
+    "ordering_policy": "AUTO_SORT_AND_REPORT",
+    "sensitive_fields": "REJECT",
+    "timestamp_policy": "OWNER_PROVIDED_ONLY",
+    "treasury_role": "EXPLICIT_INPUT_FIELD",
+    "u128_encoding": "DECIMAL_STRING",
+    "unknown_fields": "REJECT"
+  },
+  "economics_params": {
+    "fee_burn_bps": 0,
+    "min_validator_stake": "5000000",
+    "total_supply": "1000000000",
+    "unbonding_period_seconds": 86400
+  },
+  "genesis_hash": "7d1ec6b9fccceb042e5948a9ca90d984836d57189ffdfd3c00850a82bca54e3d",
+  "genesis_timestamp": 1794744000,
+  "keys": {
+    "account_public_key_declared": 7,
+    "in_canonical_bytes": false,
+    "key_model": "A1-1_CONDITIONAL_BINDING",
+    "note": "声明 account_public_key 的地址必须可由该公钥推导；未声明时退回共识公钥推导；无跳过校验分支"
+  },
+  "network_id": 2,
+  "protocol_params": {
+    "epoch_length_blocks": 100,
+    "max_block_bytes": 1048576,
+    "max_contract_code_bytes": 32768,
+    "max_contract_storage_bytes": 1048576,
+    "max_gas_per_block": 1000000000,
+    "max_tx_bytes": 4096,
+    "snapshot_interval_blocks": 1000
+  },
+  "reorder": {
+    "accounts": [
+      {
+        "address_payload": "01010223bf927eafc3aee9deb9a26d10990024f761c5b0bcee8e5b64ef00c061f403c7",
+        "canonical_index": 0,
+        "original_index": 5
+      },
+      {
+        "address_payload": "0101025a01ed07015aab8839463cb4aed47fa9ee81dc73ca68ded0fcabb7057147e9eb",
+        "canonical_index": 1,
+        "original_index": 4
+      },
+      {
+        "address_payload": "0101025eec88d8ac924eb0db4ab8b2715a6f348f7fbe584518011b010e06ced93b012e",
+        "canonical_index": 2,
+        "original_index": 0
+      },
+      {
+        "address_payload": "01010297eafeeb196e382258715f1c79dc1da99aaeed1060d8a6bf25858d4c1e8e39a5",
+        "canonical_index": 3,
+        "original_index": 2
+      },
+      {
+        "address_payload": "010102b52bd21ed607d32e3530ef50cc62730621a0d7e53806f4f94fdd397a061cc466",
+        "canonical_index": 4,
+        "original_index": 3
+      },
+      {
+        "address_payload": "010102b92a5fed6411dcf73c217451c69a733638107b3ba38041177b00d9288398abe0",
+        "canonical_index": 5,
+        "original_index": 1
+      },
+      {
+        "address_payload": "010102c571b07541868374423dcd8848592d108f4c8600f027351a082223be1a750c29",
+        "canonical_index": 6,
+        "original_index": 6
+      },
+      {
+        "address_payload": "010102e51603f24e6b1afba5093ab703c233673329b8784fa5fe789209e1cbc834ad08",
+        "canonical_index": 7,
+        "original_index": 7
+      }
+    ],
+    "accounts_reordered": true,
+    "validators": [
+      {
+        "canonical_index": 0,
+        "original_index": 4,
+        "validator_id": "1e8e34a907dfe81307df8d353075a9667c86f16a754bcb55929b963c563eafd6"
+      },
+      {
+        "canonical_index": 1,
+        "original_index": 1,
+        "validator_id": "4c98a6d9a221471de4973dd4510aa215b85bd3e1da927112c0604147a4a56aff"
+      },
+      {
+        "canonical_index": 2,
+        "original_index": 6,
+        "validator_id": "8539cfe5e787ae42987c1179d2fac34ac9736af823c45828baf344cb904fdd4c"
+      },
+      {
+        "canonical_index": 3,
+        "original_index": 3,
+        "validator_id": "9b585c855a12ccfed542b4e7407ee89e04ba70aeb7906fc6f6b3b06f0b7c6935"
+      },
+      {
+        "canonical_index": 4,
+        "original_index": 5,
+        "validator_id": "e5031a364c450aa9a69d9e4d8beb1c68d97a9ebef3e8b175c2d19b8cfbb0e89f"
+      },
+      {
+        "canonical_index": 5,
+        "original_index": 0,
+        "validator_id": "f1e5f1e34bfbffd92e1b9ca6c5fd1daa9fc948b3b1e6a27a72394ef94011de99"
+      },
+      {
+        "canonical_index": 6,
+        "original_index": 2,
+        "validator_id": "f4c715b0db30435010410840970d6edfda6e6d37ad29a9286a5d1739148e5da5"
+      }
+    ],
+    "validators_reordered": true
+  },
+  "schema": "yazimao-genesis-summary-v1",
+  "treasury": {
+    "address": "novat1qyqsyhhv3rv2eyjwkrd54w9jw9dx7dy007l9s3gcqydszrsxemvnkqfwd5an7w",
+    "declared": true,
+    "in_canonical_bytes": false,
+    "in_genesis_hash": false,
+    "note": "输入层元数据；链上角色由政策门禁 + 外部登记册约束，不由 canonical Genesis 表达",
+    "role_source": "input:treasury_account"
+  },
+  "validator_count": 7
+}
