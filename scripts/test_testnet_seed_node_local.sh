@@ -7,6 +7,8 @@ chmod 0777 "${state}"
 log="${state}/node.log"
 
 docker run --rm --network none \
+  --cpus 0.5 \
+  --memory 512m \
   --mount "type=bind,src=${state},dst=/storage" \
   "${image}" \
   --seed-file /storage/network-seed.hex \

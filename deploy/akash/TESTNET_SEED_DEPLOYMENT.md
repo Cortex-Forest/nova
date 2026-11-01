@@ -7,13 +7,17 @@ This deployment is deliberately limited to one Seed service.
 - Genesis:
   `7d1ec6b9fccceb042e5948a9ca90d984836d57189ffdfd3c00850a82bca54e3d`
 - service count: 1
-- persistent storage: 60 GiB `beta1`
+- resources: 0.5 CPU / 512 MiB RAM / 5 GiB persistent `beta1`
 - exposed TCP port: `17770`
 - network identity: generated on first boot inside the persistent volume
 - Validator mode: disabled
 
 The image is public. The first boot creates `/storage/network-seed.hex`
 with mode `0600`, validates it on every restart, and never prints its value.
+
+This `LOW_BUDGET_STAGING` profile is constrained by the Owner's USD 10-20/year
+budget. It is not the approved full-Testnet capacity profile and must not be
+used to claim full workload sizing.
 
 ## Boundaries
 

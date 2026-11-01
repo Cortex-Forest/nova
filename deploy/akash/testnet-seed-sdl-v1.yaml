@@ -8,6 +8,10 @@
 #
 # The image creates its network identity seed on the persistent volume at
 # first boot and reuses it on restart.
+#
+# LOW_BUDGET_STAGING profile: the Owner limited this foothold to USD 10-20/year.
+# It is smaller than the approved full-Testnet 2 CPU / 4 GiB / 60 GiB profile
+# and therefore cannot be used as evidence for full Testnet capacity.
 
 ---
 version: "2.0"
@@ -55,13 +59,13 @@ profiles:
     seed:
       resources:
         cpu:
-          units: 2
+          units: 0.5
         memory:
-          size: 4Gi
+          size: 512Mi
         storage:
-          - size: 1Gi
+          - size: 512Mi
           - name: data
-            size: 60Gi
+            size: 5Gi
             attributes:
               persistent: true
               class: beta1
