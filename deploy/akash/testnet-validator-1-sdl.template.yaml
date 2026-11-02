@@ -32,8 +32,6 @@ services:
       - "--validator-seed-file"
       - "/storage/validator-seed.hex"
       - "--validator"
-      - "--trusted-anchor"
-      - "file-cas:/anchor"
       - "--listen"
       - "0.0.0.0:17771"
       - "--peer"
