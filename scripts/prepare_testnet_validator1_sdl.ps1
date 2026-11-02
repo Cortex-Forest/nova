@@ -71,6 +71,21 @@ if ($rendered -match "__[A-Z0-9_]+__") {
     throw "Rendered SDL still contains placeholders"
 }
 [IO.File]::WriteAllText($OutputPath, $rendered, $utf8NoBom)
+try {
+    $security = New-Object System.Security.AccessControl.FileSecurity
+    $security.SetAccessRuleProtection($true, $false)
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $identity,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $security.AddAccessRule($rule)
+    Set-Acl -LiteralPath $OutputPath -AclObject $security
+} catch {
+    Remove-Item -LiteralPath $OutputPath -Force
+    throw "Could not restrict rendered SDL permissions: $($_.Exception.Message)"
+}
 
 [pscustomobject]@{
     status = "RENDERED"

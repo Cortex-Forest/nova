@@ -10,7 +10,7 @@ version: "2.0"
 
 services:
   validator-1:
-    image: ghcr.io/cortex-forest/nova@sha256:4470653dc2628729c04c5123f5e2246b03798bbac04083c6073f4344a09ec098
+    image: ghcr.io/cortex-forest/nova@sha256:1026426ce9d31d1a41a5ebb7b91ae67bbca4207b00e28d2e627bcd96144e46e2
     command:
       - "/usr/local/bin/nova-validator-init"
       - "--"
