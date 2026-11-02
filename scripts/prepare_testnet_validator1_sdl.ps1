@@ -22,7 +22,7 @@ $ConsensusSeedFile = (Resolve-Path -LiteralPath $ConsensusSeedFile).Path
 $TemplatePath = (Resolve-Path -LiteralPath $TemplatePath).Path
 
 $expectedNodeId = "84f09573fd20a672b497cbfdbc198c604f39016365db19a56a5597351ec50f51"
-$expectedConsensus = "ef1998838a628a74ad586b438554ab66b3ec04092d2e5a8318728c2c32650e86"
+$expectedConsensus = "ef1998838a628a74ad586b438554ab66c3ec04092d2e5a8318728c2c32650e86"
 if ($SeedNodeId -notmatch "^[0-9a-f]{64}$") {
     throw "SeedNodeId must be 64 lowercase hex"
 }
