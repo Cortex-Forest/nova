@@ -3,7 +3,7 @@
 This deployment is deliberately limited to one Seed service.
 
 - image:
-  `ghcr.io/cortex-forest/nova@sha256:f440b26b59eeb4bf59b6eea1909d8df8a91c7614fd73e6cc0fd6d43ebf610709`
+  `ghcr.io/cortex-forest/nova@sha256:7355e666550b17e99be05716961a44c1e22bb24e9d9d44c703cde9b44256be33`
 - Genesis:
   `7d1ec6b9fccceb042e5948a9ca90d984836d57189ffdfd3c00850a82bca54e3d`
 - service count: 1
