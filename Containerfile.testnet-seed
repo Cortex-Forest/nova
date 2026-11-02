@@ -5,7 +5,8 @@
 # - creates a random network identity seed on the persistent volume at first
 #   start, then execs the existing node binary;
 # - does not embed any seed, private key, mnemonic or keystore;
-# - runs as UID/GID 10001.
+# - starts as root only long enough to prepare the platform-created volume,
+#   then replaces itself with the node running as UID/GID 10001.
 
 FROM --platform=linux/amd64 rust:1.96.1-alpine@sha256:f5c84c3751de59f0f318acfbed8b2d04693a12d9171f15835d9c11c9ddcf52db AS builder
 
@@ -36,6 +37,6 @@ LABEL org.opencontainers.image.title="yazimao-node-testnet-seed" \
       org.opencontainers.image.version="0.1.0" \
       io.yazimao.genesis.sha256="7d1ec6b9fccceb042e5948a9ca90d984836d57189ffdfd3c00850a82bca54e3d"
 
-USER 10001:10001
+USER 0:0
 ENTRYPOINT ["/usr/local/bin/nova-seed-init"]
 CMD []

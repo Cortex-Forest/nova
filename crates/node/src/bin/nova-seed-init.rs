@@ -21,6 +21,10 @@ use std::process::ExitCode;
 use zeroize::{Zeroize, Zeroizing};
 
 const NODE_BIN: &str = "/usr/local/bin/yazimao-node";
+const STORAGE_ROOT: &str = "/storage";
+const SERVICE_UID: u32 = 10001;
+#[cfg_attr(not(unix), allow(dead_code))]
+const SERVICE_GID: u32 = 10001;
 const EX_USAGE: u8 = 64;
 const EX_DATAERR: u8 = 65;
 const EX_SOFTWARE: u8 = 70;
@@ -36,8 +40,15 @@ enum SeedState {
 enum SeedInitError {
     Usage,
     InvalidExistingSeed,
-    Io,
+    StorageDirectory,
+    SeedMetadata,
+    SeedRead,
+    SeedCreate,
+    SeedWrite,
+    Ownership,
     Rng,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    NodeExec,
 }
 
 impl SeedInitError {
@@ -45,7 +56,13 @@ impl SeedInitError {
         match self {
             Self::Usage => EX_USAGE,
             Self::InvalidExistingSeed => EX_DATAERR,
-            Self::Io => EX_IOERR,
+            Self::StorageDirectory
+            | Self::SeedMetadata
+            | Self::SeedRead
+            | Self::SeedCreate
+            | Self::SeedWrite
+            | Self::Ownership
+            | Self::NodeExec => EX_IOERR,
             Self::Rng => EX_SOFTWARE,
         }
     }
@@ -54,8 +71,14 @@ impl SeedInitError {
         match self {
             Self::Usage => "usage",
             Self::InvalidExistingSeed => "invalid_existing_seed",
-            Self::Io => "io",
+            Self::StorageDirectory => "storage_directory",
+            Self::SeedMetadata => "seed_metadata",
+            Self::SeedRead => "seed_read",
+            Self::SeedCreate => "seed_create",
+            Self::SeedWrite => "seed_write",
+            Self::Ownership => "ownership",
             Self::Rng => "rng",
+            Self::NodeExec => "node_exec",
         }
     }
 }
@@ -80,7 +103,10 @@ fn main() -> ExitCode {
 fn run(args: &[OsString]) -> Result<(), SeedInitError> {
     let config = parse(args)?;
     let parent = config.seed_file.parent().ok_or(SeedInitError::Usage)?;
-    fs::create_dir_all(parent).map_err(|_| SeedInitError::Io)?;
+    if parent != Path::new(STORAGE_ROOT) {
+        return Err(SeedInitError::Usage);
+    }
+    prepare_storage_root(parent)?;
     let state = ensure_seed_file(&config.seed_file)?;
     eprintln!(
         "NOVA_SEED_INIT state={} path={}",
@@ -88,9 +114,57 @@ fn run(args: &[OsString]) -> Result<(), SeedInitError> {
             SeedState::Created => "created",
             SeedState::Reused => "reused",
         },
-        config.seed_file.display()
+        config.seed_file.display(),
     );
+    eprintln!("NOVA_SEED_INIT runtime_uid={SERVICE_UID}");
     exec_node(&config.node_args)
+}
+
+fn prepare_storage_root(path: &Path) -> Result<(), SeedInitError> {
+    fs::create_dir_all(path).map_err(|_| SeedInitError::StorageDirectory)?;
+    if is_root()? {
+        fix_owner(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o750))
+                .map_err(|_| SeedInitError::Ownership)?;
+        }
+    }
+    Ok(())
+}
+
+fn fix_seed_owner(path: &Path) -> Result<(), SeedInitError> {
+    if is_root()? {
+        fix_owner(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fix_owner(path: &Path) -> Result<(), SeedInitError> {
+    std::os::unix::fs::chown(path, Some(SERVICE_UID), Some(SERVICE_GID))
+        .map_err(|_| SeedInitError::Ownership)
+}
+
+#[cfg(not(unix))]
+fn fix_owner(_path: &Path) -> Result<(), SeedInitError> {
+    Err(SeedInitError::Ownership)
+}
+
+#[cfg(unix)]
+fn is_root() -> Result<bool, SeedInitError> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(fs::metadata("/proc/self")
+        .map_err(|_| SeedInitError::Ownership)?
+        .uid()
+        == 0)
+}
+
+#[cfg(not(unix))]
+fn is_root() -> Result<bool, SeedInitError> {
+    Ok(false)
 }
 
 fn parse(args: &[OsString]) -> Result<Config, SeedInitError> {
@@ -110,10 +184,11 @@ fn ensure_seed_file(path: &Path) -> Result<SeedState, SeedInitError> {
                 return Err(SeedInitError::InvalidExistingSeed);
             }
             validate_seed_file(path)?;
+            fix_seed_owner(path)?;
             Ok(SeedState::Reused)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_seed_file(path),
-        Err(_) => Err(SeedInitError::Io),
+        Err(_) => Err(SeedInitError::SeedMetadata),
     }
 }
 
@@ -134,26 +209,28 @@ fn create_seed_file(path: &Path) -> Result<SeedState, SeedInitError> {
     let mut file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(path).map_err(|_| SeedInitError::Io)?;
+            let metadata = fs::symlink_metadata(path).map_err(|_| SeedInitError::SeedMetadata)?;
             if !metadata.file_type().is_file() {
                 return Err(SeedInitError::InvalidExistingSeed);
             }
             validate_seed_file(path)?;
+            fix_seed_owner(path)?;
             return Ok(SeedState::Reused);
         }
-        Err(_) => return Err(SeedInitError::Io),
+        Err(_) => return Err(SeedInitError::SeedCreate),
     };
 
     if file.write_all(encoded.as_bytes()).is_err() || file.sync_all().is_err() {
         drop(file);
         let _ = fs::remove_file(path);
-        return Err(SeedInitError::Io);
+        return Err(SeedInitError::SeedWrite);
     }
+    fix_seed_owner(path)?;
     Ok(SeedState::Created)
 }
 
 fn validate_seed_file(path: &Path) -> Result<(), SeedInitError> {
-    let bytes = Zeroizing::new(fs::read(path).map_err(|_| SeedInitError::Io)?);
+    let bytes = Zeroizing::new(fs::read(path).map_err(|_| SeedInitError::SeedRead)?);
     if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         return Err(SeedInitError::InvalidExistingSeed);
     }
@@ -192,12 +269,16 @@ fn exec_node(node_args: &[OsString]) -> Result<(), SeedInitError> {
     if node_args.first().map(OsString::as_os_str) != Some(std::ffi::OsStr::new(NODE_BIN)) {
         return Err(SeedInitError::Usage);
     }
-    let error = Command::new(NODE_BIN).args(&node_args[1..]).exec();
+    let error = Command::new(NODE_BIN)
+        .args(&node_args[1..])
+        .uid(SERVICE_UID)
+        .gid(SERVICE_GID)
+        .exec();
     eprintln!(
         "NOVA_SEED_INIT error=node_exec errno={}",
         error.raw_os_error().unwrap_or(0)
     );
-    Err(SeedInitError::Io)
+    Err(SeedInitError::NodeExec)
 }
 
 #[cfg(not(unix))]
