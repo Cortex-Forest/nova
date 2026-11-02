@@ -146,8 +146,14 @@ fn parse(args: &[OsString]) -> Result<Vec<OsString>, ValidatorInitError> {
 fn read_seed_env(name: &str) -> Result<Option<Zeroizing<String>>, ValidatorInitError> {
     match std::env::var(name) {
         Ok(value) => {
-            validate_seed_text(&value)?;
-            Ok(Some(Zeroizing::new(value)))
+            let normalized = normalize_env_text(&value);
+            eprintln!(
+                "NOVA_VALIDATOR_INIT environment name={name} bytes={} normalized_bytes={}",
+                value.len(),
+                normalized.len()
+            );
+            validate_seed_text(normalized)?;
+            Ok(Some(Zeroizing::new(normalized.to_owned())))
         }
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(ValidatorInitError::InvalidSeed),
@@ -259,7 +265,20 @@ fn validate_identity() -> Result<(), ValidatorInitError> {
 
 fn required_public_env(name: &str) -> Result<[u8; 32], ValidatorInitError> {
     let value = std::env::var(name).map_err(|_| ValidatorInitError::IdentityMismatch)?;
-    parse_hex32(&value).ok_or(ValidatorInitError::IdentityMismatch)
+    parse_hex32(normalize_env_text(&value)).ok_or(ValidatorInitError::IdentityMismatch)
+}
+
+fn normalize_env_text(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &trimmed[1..trimmed.len() - 1];
+        }
+    }
+    trimmed
 }
 
 fn read_seed_bytes(path: &Path) -> Result<Zeroizing<[u8; 32]>, ValidatorInitError> {
@@ -388,6 +407,15 @@ mod tests {
             validate_seed_text("abcd"),
             Err(ValidatorInitError::InvalidSeed)
         );
+    }
+
+    #[test]
+    fn normalizes_one_surrounding_quote_pair() {
+        let seed = "11".repeat(32);
+        assert_eq!(normalize_env_text(&format!("\"{seed}\"")), seed.as_str());
+        assert_eq!(normalize_env_text(&format!("  '{seed}'  ")), seed.as_str());
+        validate_seed_text(normalize_env_text(&format!("\"{seed}\"")))
+            .expect("quoted environment value");
     }
 
     #[test]
