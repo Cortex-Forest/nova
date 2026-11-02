@@ -20,12 +20,16 @@ COPY tests/vectors/ ./tests/vectors/
 RUN CARGO_TERM_COLOR=never cargo build --release -p nova-node \
       --bin yazimao-node \
       --bin nova-seed-init \
+      --bin nova-validator-start \
+      --bin nova-validator-init \
       --locked
 
 FROM --platform=linux/amd64 scratch AS runtime
 
 COPY --from=builder --chown=0:0 --chmod=0755 /src/target/release/yazimao-node /usr/local/bin/yazimao-node
 COPY --from=builder --chown=0:0 --chmod=0555 /src/target/release/nova-seed-init /usr/local/bin/nova-seed-init
+COPY --from=builder --chown=0:0 --chmod=0555 /src/target/release/nova-validator-start /usr/local/bin/nova-validator-start
+COPY --from=builder --chown=0:0 --chmod=0555 /src/target/release/nova-validator-init /usr/local/bin/nova-validator-init
 COPY --chown=0:0 --chmod=0755 genesis.bin /read-only/genesis/.keep
 COPY --chown=0:0 --chmod=0444 genesis.bin /read-only/genesis/genesis.bin
 COPY --chown=0:0 --chmod=0444 genesis_hash.txt /read-only/genesis/genesis_hash.txt

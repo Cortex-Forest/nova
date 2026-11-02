@@ -48,7 +48,9 @@ jobs:
         run: |
           set -euo pipefail
           rustfmt --edition 2024 --check crates/node/src/bin/nova-seed-init.rs
+          rustfmt --edition 2024 --check crates/node/src/bin/nova-validator-init.rs
           cargo test -p nova-node --bin nova-seed-init --locked
+          cargo test -p nova-node --bin nova-validator-init --locked
 
       - name: Assemble minimal build context
         shell: bash

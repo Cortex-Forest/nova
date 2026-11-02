@@ -22,4 +22,8 @@ docker buildx build \
   "${context}"
 
 docker run --rm --network none nova-testnet-seed-builder:local \
-  /usr/local/cargo/bin/cargo test -p nova-node --bin nova-seed-init --locked
+  sh -lc '
+    set -eu
+    /usr/local/cargo/bin/cargo test -p nova-node --bin nova-seed-init --locked
+    /usr/local/cargo/bin/cargo test -p nova-node --bin nova-validator-init --locked
+  '
