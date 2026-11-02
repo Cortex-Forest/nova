@@ -32,6 +32,8 @@ services:
       - "--validator-seed-file"
       - "/storage/validator-seed.hex"
       - "--validator"
+      - "--trusted-anchor"
+      - "file-cas:/anchor"
       - "--listen"
       - "0.0.0.0:17771"
       - "--peer"
@@ -51,6 +53,8 @@ services:
           mount: /storage
         safety:
           mount: /safety
+        anchor:
+          mount: /anchor
     expose:
       - port: 17771
         as: 17771
@@ -74,6 +78,11 @@ profiles:
               persistent: true
               class: beta1
           - name: safety
+            size: 1Gi
+            attributes:
+              persistent: true
+              class: beta1
+          - name: anchor
             size: 1Gi
             attributes:
               persistent: true

@@ -7,7 +7,7 @@ context="${TMPDIR:-/tmp}/nova-seed-context-${stamp}"
 
 mkdir -p "${context}/tests"
 cp "${repo}/Cargo.toml" "${repo}/Cargo.lock" "${repo}/rust-toolchain.toml" "${context}/"
-cp -a "${repo}/crates" "${context}/"
+rsync -a --exclude 'target' "${repo}/crates/" "${context}/crates/"
 cp -a "${repo}/tests/vectors" "${context}/tests/"
 cp "${repo}/Containerfile.testnet-seed" "${context}/Containerfile"
 cp "${repo}/genesis-image/genesis.bin" "${context}/genesis.bin"

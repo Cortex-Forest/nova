@@ -28,6 +28,7 @@ const EXPECTED_NODE_ID_VAR: &str = "NOVA_EXPECTED_NETWORK_NODE_ID";
 const EXPECTED_CONSENSUS_PUBKEY_VAR: &str = "NOVA_EXPECTED_CONSENSUS_PUBKEY";
 const STORAGE_ROOT: &str = "/storage";
 const SAFETY_ROOT: &str = "/safety";
+const ANCHOR_ROOT: &str = "/anchor";
 const NETWORK_SEED_FILE: &str = "/storage/network-seed.hex";
 const VALIDATOR_SEED_FILE: &str = "/storage/validator-seed.hex";
 const SERVICE_UID: u32 = 10001;
@@ -106,6 +107,7 @@ fn run(args: &[OsString]) -> Result<(), ValidatorInitError> {
     let node_args = parse(args)?;
     prepare_root(Path::new(STORAGE_ROOT))?;
     prepare_root(Path::new(SAFETY_ROOT))?;
+    prepare_root(Path::new(ANCHOR_ROOT))?;
 
     let network_env = read_seed_env(NETWORK_SEED_VAR)?;
     let validator_env = read_seed_env(VALIDATOR_SEED_VAR)?;
