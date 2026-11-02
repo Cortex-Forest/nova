@@ -1,0 +1,92 @@
+# Validator-1 low-budget staging template.
+#
+# This file intentionally contains placeholders. Render the deployment copy in
+# the local TEMP directory with scripts/prepare_testnet_validator1_sdl.ps1.
+# The rendered file contains Provider-visible testnet software secrets and must
+# never be committed, pasted into chat, attached to a report, or retained.
+
+---
+version: "2.0"
+
+services:
+  validator-1:
+    image: ghcr.io/cortex-forest/nova@sha256:4470653dc2628729c04c5123f5e2246b03798bbac04083c6073f4344a09ec098
+    command:
+      - "/usr/local/bin/nova-validator-init"
+      - "--"
+      - "/usr/local/bin/nova-validator-start"
+      - "--genesis"
+      - "/read-only/genesis/genesis.bin"
+      - "--genesis-hash"
+      - "7d1ec6b9fccceb042e5948a9ca90d984836d57189ffdfd3c00850a82bca54e3d"
+      - "--chain-id"
+      - "2002"
+      - "--network-id"
+      - "testnet"
+      - "--storage-dir"
+      - "/storage"
+      - "--safety-dir"
+      - "/safety"
+      - "--network-seed-file"
+      - "/storage/network-seed.hex"
+      - "--validator-seed-file"
+      - "/storage/validator-seed.hex"
+      - "--validator"
+      - "--listen"
+      - "0.0.0.0:17771"
+      - "--peer"
+      - "__SEED_NODE_ID__@__SEED_HOST_PORT__"
+      - "--idle-ms"
+      - "1"
+      - "--run-steps"
+      - "0"
+    env:
+      - "NOVA_NETWORK_SEED_HEX=__NETWORK_SEED_HEX__"
+      - "NOVA_VALIDATOR_SEED_HEX=__VALIDATOR_SEED_HEX__"
+      - "NOVA_EXPECTED_NETWORK_NODE_ID=84f09573fd20a672b497cbfdbc198c604f39016365db19a56a5597351ec50f51"
+      - "NOVA_EXPECTED_CONSENSUS_PUBKEY=ef1998838a628a74ad586b438554ab66b3ec04092d2e5a8318728c2c32650e86"
+    params:
+      storage:
+        data:
+          mount: /storage
+        safety:
+          mount: /safety
+    expose:
+      - port: 17771
+        as: 17771
+        proto: tcp
+        to:
+          - global: true
+
+profiles:
+  compute:
+    validator-1:
+      resources:
+        cpu:
+          units: 0.5
+        memory:
+          size: 512Mi
+        storage:
+          - size: 512Mi
+          - name: data
+            size: 4Gi
+            attributes:
+              persistent: true
+              class: beta1
+          - name: safety
+            size: 1Gi
+            attributes:
+              persistent: true
+              class: beta1
+  placement:
+    akash:
+      pricing:
+        validator-1:
+          denom: uact
+          amount: 10000
+
+deployment:
+  validator-1:
+    akash:
+      profile: validator-1
+      count: 1
